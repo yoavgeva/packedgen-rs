@@ -1,0 +1,63 @@
+[build-system]
+build-backend = "maturin"
+requires = ["maturin>=1.13,<2.0"]
+
+[project]
+name = "opthash"
+description = "Rust implementations of Elastic Hashing and Funnel Hashing with Python bindings"
+readme = "README.md"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "Aaron Ang" }]
+keywords = ["hashmap", "open-addressing", "elastic-hashing", "funnel-hashing"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/aaron-ang/opthash-rs"
+Issues = "https://github.com/aaron-ang/opthash-rs/issues"
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6",
+    "pytest>=8",
+    "pytest-benchmark>=5",
+    "pytest-codspeed>=4",
+    "py-spy>=0.4.2",
+]
+
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.maturin]
+features = ["python"]
+
+[tool.maturin.generate-ci.github]
+trusted-publishing = true
+publishing-environment = "pypi"
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+addopts = [
+    "--benchmark-disable-gc",
+    "--benchmark-warmup=on",
+    "--benchmark-warmup-iterations=20",
+    "--benchmark-min-rounds=50",
+]
