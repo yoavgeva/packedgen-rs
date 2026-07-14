@@ -22,10 +22,12 @@ overhead, so they are not RSS measurements.
 | 32-byte boxed key -> `u64` | Elastic, reserve 1/8 | 87.553 | 3.7% more |
 | 32-byte boxed key -> `u64` | Elastic, reserve 1/64 | 60.289 | **28.6% less** |
 | 32-byte boxed key -> `u64` | HashBrown | 84.429 | baseline |
+| 32-byte packed key -> `u64` | Packed Elastic, reserve 1/64 | 52.408 | **37.9% less** |
 
 The one-byte-per-entry service-layer negative filter is included in the elastic
-numbers. The binary-key shape still performs one allocation per key; a packed
-key arena is a future optimization.
+numbers. The packed shape stores an eight-byte reference in each table slot and
+uses a segmented arena: 39 measured live allocations versus 1,000,002 for the
+HashBrown boxed-key shape.
 
 Reproduce:
 
@@ -46,6 +48,14 @@ noisy; the scale of the differences is nevertheless clear.
 | Missing `u64` lookup, with negative filter | ~21 ns | ~35 ns | ~2.9 ns |
 | Successful 32-byte binary lookup | ~56 ns | ~68 ns | ~8.2 ns |
 | Bulk insertion throughput | ~23.6 M/s | ~21.0 M/s | ~329 M/s |
+
+The first packed-key run used 20 Criterion samples with one-second warmup and a
+two-second measurement window:
+
+| Packed binary workload | Elastic 1/8 | Elastic 1/64 | HashBrown |
+| --- | ---: | ---: | ---: |
+| Successful 32-byte lookup | ~55.2 ns | ~69.8 ns | ~7.0 ns |
+| 32-byte insertion throughput | ~20.3 M/s | ~18.7 M/s | ~33.1 M/s |
 
 The stable negative filter reduced missing-lookup latency by roughly 94–96%
 without allowing false negatives. It sets bits on insertion, retains them on
@@ -68,5 +78,7 @@ cargo bench --bench mixed_workloads
 - ElasticHash's plausible storage-engine win is fitting a larger working set in
   RAM and avoiding cold I/O. It is not currently a general-purpose HashBrown
   throughput replacement.
-- The next implementation targets are packed binary-key storage and generation
-  rebuilding. Both must preserve the measured density advantage.
+- Packed binary-key storage preserves and strengthens the density advantage,
+  but successful lookups still miss the release gate by a wide margin.
+- The next optimization target is the exact-query routing path: probe schedule,
+  candidate dispatch, and batched lookup. RAM density alone is insufficient.

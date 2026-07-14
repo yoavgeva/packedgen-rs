@@ -9,10 +9,14 @@ repository = "https://github.com/ferricstore/elastichash-rs"
 keywords = ["hashmap", "elastic-hashing", "open-addressing", "database"]
 categories = ["data-structures", "database-implementations"]
 
+[workspace]
+members = [".", "crates/elastic-core"]
+resolver = "3"
+
 [dependencies]
 # Pinned to the paper-fidelity rewrite. We intentionally do not follow a moving
 # branch. The core will be audited and vendored before the first stable release.
-opthash = { git = "https://github.com/aaron-ang/opthash-rs.git", rev = "f2aee1ef02fdfc95944a8fcee711a631c40111b7" }
+opthash = { path = "crates/elastic-core" }
 
 [dev-dependencies]
 criterion = { version = "0.7", features = ["html_reports"] }

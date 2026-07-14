@@ -3,7 +3,7 @@
 use std::alloc::System;
 use std::hint::black_box;
 
-use elastichash::{ElasticConfig, FixedElasticMap, PackedKeyArena, PackedKeyRef};
+use elastichash::{ElasticConfig, FixedElasticMap, PackedBinaryMap, PackedKeyArena, PackedKeyRef};
 use hashbrown::HashMap;
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, Stats, StatsAlloc};
 
@@ -25,6 +25,8 @@ fn main() {
         "elastic-binary-3" => print_elastic_binary(entries, 3),
         "elastic-binary-6" => print_elastic_binary(entries, 6),
         "hashbrown-binary" => print_hashbrown_binary(entries),
+        "packed-binary-3" => print_packed_binary(entries, 3),
+        "packed-binary-6" => print_packed_binary(entries, 6),
         "arena" => {
             print_packed_arena(entries);
             print_boxed_keys(entries);
@@ -37,12 +39,15 @@ fn main() {
             print_elastic_binary(entries, 3);
             print_elastic_binary(entries, 6);
             print_hashbrown_binary(entries);
+            print_packed_binary(entries, 3);
+            print_packed_binary(entries, 6);
             print_packed_arena(entries);
             print_boxed_keys(entries);
         }
         _ => panic!(
             "expected elastic-3, elastic-6, hashbrown, elastic-binary-3, \
-             elastic-binary-6, hashbrown-binary, arena, sweep, or all"
+             elastic-binary-6, hashbrown-binary, packed-binary-3, packed-binary-6, \
+             arena, sweep, or all"
         ),
     }
 }
@@ -94,6 +99,24 @@ fn print_hashbrown_binary(entries: usize) {
     }
     let stats = region.change();
     print_row("hashbrown-binary32", entries, stats);
+    black_box(&map);
+}
+
+fn print_packed_binary(entries: usize, exponent: u32) {
+    let region = Region::new(GLOBAL);
+    let config = ElasticConfig::new(entries)
+        .with_reserve_exponent(exponent)
+        .unwrap();
+    let mut map = PackedBinaryMap::new(config);
+    for key in 0..entries as u64 {
+        map.try_insert(&binary_key_array(key), key).unwrap();
+    }
+    let stats = region.change();
+    print_row(
+        &format!("packed-elastic-binary32-2^-{exponent}"),
+        entries,
+        stats,
+    );
     black_box(&map);
 }
 

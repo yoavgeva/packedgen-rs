@@ -29,8 +29,20 @@ impl NegativeLookupFilter {
     }
 
     #[inline]
+    pub(crate) fn insert_hash(&mut self, hash: u64) {
+        let (word, mask) = self.location_for_hash(hash);
+        self.words[word] |= mask;
+    }
+
+    #[inline]
     pub(crate) fn may_contain<Q: Hash + ?Sized>(&self, key: &Q) -> bool {
         let (word, mask) = self.location(key);
+        self.words[word] & mask == mask
+    }
+
+    #[inline]
+    pub(crate) fn may_contain_hash(&self, hash: u64) -> bool {
+        let (word, mask) = self.location_for_hash(hash);
         self.words[word] & mask == mask
     }
 
@@ -44,7 +56,12 @@ impl NegativeLookupFilter {
 
     #[inline]
     fn location<Q: Hash + ?Sized>(&self, key: &Q) -> (usize, u64) {
-        let mixed = mix(self.hash_builder.hash_one(key));
+        self.location_for_hash(self.hash_builder.hash_one(key))
+    }
+
+    #[inline]
+    fn location_for_hash(&self, hash: u64) -> (usize, u64) {
+        let mixed = mix(hash);
         let word = reduce(mixed, self.words.len());
         let first = (mixed & 63) as u32;
         let distance = 1 + ((mixed >> 6) % 63) as u32;

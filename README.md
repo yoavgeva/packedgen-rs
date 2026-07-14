@@ -5,12 +5,12 @@ database-usable, observable hash index. It is aimed at large, pre-sized,
 binary-keyed indexes that need to operate above 95% occupancy.
 
 The mathematical basis is *Optimal Bounds for Open Addressing Without
-Reordering* by Farach-Colton, Krapivin, and Kuszmaul. The current core is pinned
-to the paper-fidelity implementation in `opthash-rs`; this repository adds the
-service contract that a storage engine needs: explicit capacity epochs,
-capacity errors, lifecycle statistics, differential tests, and workload
-benchmarks. We credit and preserve the upstream implementation rather than
-presenting it as original work.
+Reordering* by Farach-Colton, Krapivin, and Kuszmaul. The repository owns an
+auditable, attributed subtree of the paper-fidelity `opthash-rs` core and adds
+the service contract that a storage engine needs: explicit capacity epochs,
+packed binary keys, capacity errors, lifecycle statistics, differential tests,
+and workload benchmarks. We preserve the upstream history and Apache-2.0
+attribution rather than presenting that foundation as original work.
 
 ## Status
 
@@ -19,6 +19,12 @@ fixed-epoch map. It deliberately rejects an absent insertion at its configured
 live-entry limit instead of silently resizing. Updates to existing keys remain
 valid at the limit. A one-byte-per-entry stable negative filter avoids running
 the expensive exact query schedule for most missing keys.
+
+`PackedBinaryMap` is the first database-oriented layout. It stores eight-byte
+references in the table and immutable key bytes in a segmented arena. Its raw
+lookup path hashes caller bytes once. Deletes cannot make the core re-hash a
+reference as if it were the original key: tombstone cleanup is deferred and a
+bounded, byte-aware routing rebuild preserves survivors.
 
 The intended production architecture is:
 
@@ -60,17 +66,19 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) and
 [`docs/FERRICSTORE.md`](docs/FERRICSTORE.md). The first deliberately unflattering
 performance result is recorded in [`docs/BASELINE.md`](docs/BASELINE.md).
 
-The first measured result at one million entries is a 44% requested-byte saving
-for `u64 -> u64` and a 29% saving for 32-byte boxed keys at `1/64` reserve versus
-HashBrown 0.17.1. HashBrown remains much faster for in-cache operations; see the
-baseline for the complete tradeoff.
+At one million 32-byte binary keys, the packed `1/64` layout uses 52.408
+requested bytes per entry versus HashBrown's 84.429: **37.9% less**. It also
+removes the million per-key allocations. HashBrown remains roughly 10x faster
+for successful lookup on this development machine, so ElasticHash is not yet
+"better than SwissTable" overall. The release gates forbid making that claim
+until the latency gap is closed and the RAM-limited system benchmark wins.
 
 ## Development
 
 ```text
 cargo fmt --all -- --check
-cargo test --all-targets
-cargo clippy --all-targets --all-features -- -D warnings
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 cargo run --release --example memory_probe -- all 1000000
 cargo bench
 ```

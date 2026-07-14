@@ -157,6 +157,10 @@ pub struct CapacityError {
 }
 
 impl CapacityError {
+    pub(crate) const fn new(live_limit: usize) -> Self {
+        Self { live_limit }
+    }
+
     /// Configured maximum live entries for the current epoch.
     #[must_use]
     pub const fn live_limit(self) -> usize {

@@ -865,7 +865,7 @@ where
     #[inline]
     fn find<Q>(&self, key: &Q, hash: u64, fingerprint: u8) -> Option<usize>
     where
-        Q: Hash + Equivalent<K> + ?Sized,
+        Q: Equivalent<K> + ?Sized,
     {
         self.find_location(key, hash, fingerprint)
     }
@@ -878,7 +878,7 @@ where
         fingerprint: u8,
     ) -> Option<&'a SlotEntry<K, V>>
     where
-        Q: Hash + Equivalent<K> + ?Sized,
+        Q: Equivalent<K> + ?Sized,
     {
         self.find_entry_ref(key, hash, fingerprint)
     }
@@ -886,6 +886,22 @@ where
     #[inline]
     fn insert_for_vacant(&mut self, key: K, value: V, hash: u64) -> usize {
         self.insert_for_vacant_entry(key, value, hash)
+    }
+
+    fn insert_for_vacant_in_place(&mut self, key: K, value: V, hash: u64) -> Result<usize, (K, V)> {
+        let fingerprint = control::control_fingerprint(hash);
+        let exact = self.search_exact_for_insert(&key, hash, fingerprint);
+        let (slot, exceptional) = match exact {
+            SearchResult::Vacant(slot) => (slot, false),
+            SearchResult::Full | SearchResult::RangeFailure => {
+                let Some(slot) = self.first_free_global() else {
+                    return Err((key, value));
+                };
+                (slot, true)
+            }
+            SearchResult::Hit(_) => unreachable!("known-absent Funnel insertion found a key"),
+        };
+        Ok(self.place_new_entry(slot, key, value, fingerprint, exceptional))
     }
 
     fn insert(&mut self, key: K, value: V, hash: u64) -> Option<V>
@@ -920,6 +936,15 @@ where
         if self.tombstones > capacity::tombstone_cleanup_threshold(self.shape.n) {
             self.resize_with_transition(self.shape.n, EpochTransition::TombstoneCleanup);
         }
+        (entry.key, entry.value)
+    }
+
+    fn remove_deferred(&mut self, slot: usize) -> (K, V) {
+        let entry = unsafe { self.storage.take(slot) };
+        self.storage.mark_tombstone(slot);
+        self.len -= 1;
+        self.tombstones += 1;
+        self.epoch.note_delete();
         (entry.key, entry.value)
     }
 

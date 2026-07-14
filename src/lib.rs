@@ -9,8 +9,10 @@ mod arena;
 mod config;
 mod filter;
 mod map;
+mod packed_map;
 
 pub use arena::{ArenaError, PackedKeyArena, PackedKeyRef};
 pub use config::{ConfigError, ElasticConfig};
 pub use map::{CapacityError, FixedElasticMap, InsertOutcome, MapStats};
 pub use opthash::{EpochSnapshot, EpochTransition, ReserveFraction};
+pub use packed_map::{PackedBinaryMap, PackedMapError, PackedMapStats};

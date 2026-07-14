@@ -89,7 +89,7 @@ pub trait TableBackend<K, V>: Sized {
     /// location is valid per [`Location`](TableBackend::Location).
     fn find<Q>(&self, key: &Q, hash: u64, fingerprint: u8) -> Option<Self::Location>
     where
-        Q: Hash + Equivalent<K> + ?Sized;
+        Q: Equivalent<K> + ?Sized;
 
     /// Find and borrow the occupied slot for `key` by precomputed hash and
     /// fingerprint. This interface lets backends retain the slot reference
@@ -104,13 +104,22 @@ pub trait TableBackend<K, V>: Sized {
         fingerprint: u8,
     ) -> Option<&'a SlotEntry<K, V>>
     where
-        Q: Hash + Equivalent<K> + ?Sized;
+        Q: Equivalent<K> + ?Sized;
 
     // -- Insert / remove --
 
     /// Insert a known-absent key, resize as needed, and return its location
     /// (valid per [`Location`](TableBackend::Location)).
     fn insert_for_vacant(&mut self, key: K, value: V, hash: u64) -> Self::Location;
+
+    /// Insert a known-absent entry without growing or rebuilding the table.
+    /// Returns the original key and value only when no physical free slot remains.
+    fn insert_for_vacant_in_place(
+        &mut self,
+        key: K,
+        value: V,
+        hash: u64,
+    ) -> Result<Self::Location, (K, V)>;
 
     /// Insert `key` → `value` and return the previous value. Backends may
     /// override this two-probe default with single-pass insertion.
@@ -129,6 +138,9 @@ pub trait TableBackend<K, V>: Sized {
     /// Remove the entry at `loc` (valid per [`Location`](TableBackend::Location)),
     /// update bookkeeping, and resize if needed.
     fn remove(&mut self, loc: Self::Location) -> (K, V);
+
+    /// Remove an entry while deferring tombstone cleanup to the caller.
+    fn remove_deferred(&mut self, loc: Self::Location) -> (K, V);
 
     /// Mark `loc` (valid per [`Location`](TableBackend::Location)) as a tombstone
     /// without updating counters — draining iterators use it after moving the
@@ -465,6 +477,94 @@ where
     {
         let hash = self.table.hash(key);
         self.table.find_entry(key, hash, fingerprint(hash))
+    }
+
+    /// Hashes a borrowed key with this map's configured hash builder.
+    ///
+    /// The returned hash can be reused with the `*_prehashed` operations. It is
+    /// meaningful only for maps using an equivalent hash-builder state.
+    #[must_use]
+    pub fn hash_key<Q: Hash + ?Sized>(&self, key: &Q) -> u64 {
+        self.table.hash(key)
+    }
+
+    /// Returns a value using a caller-supplied hash and equivalence query.
+    ///
+    /// This supports compact stored-key descriptors whose borrowed query has a
+    /// different `Hash` representation. An incorrect hash behaves like a miss.
+    #[must_use]
+    pub fn get_prehashed<Q>(&self, hash: u64, key: &Q) -> Option<&V>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        self.table
+            .find_entry(key, hash, fingerprint(hash))
+            .map(|entry| &entry.value)
+    }
+
+    /// Returns a mutable value using a caller-supplied hash and equivalence
+    /// query.
+    pub fn get_mut_prehashed<Q>(&mut self, hash: u64, key: &Q) -> Option<&mut V>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        let location = self.table.find(key, hash, fingerprint(hash))?;
+        Some(unsafe { &mut self.slot_entry_mut(location).value })
+    }
+
+    /// Tests membership using a caller-supplied hash and equivalence query.
+    #[must_use]
+    pub fn contains_prehashed<Q>(&self, hash: u64, key: &Q) -> bool
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        self.table.find(key, hash, fingerprint(hash)).is_some()
+    }
+
+    /// Removes an entry using a caller-supplied hash and equivalence query.
+    pub fn remove_prehashed<Q>(&mut self, hash: u64, key: &Q) -> Option<(K, V)>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        let location = self.table.find(key, hash, fingerprint(hash))?;
+        Some(self.table.remove(location))
+    }
+
+    /// Removes an entry by caller-supplied hash without triggering a rehash.
+    ///
+    /// This is intended for higher-level fixed-epoch containers that rebuild
+    /// using the original key material. Repeated use accumulates tombstones.
+    pub fn remove_prehashed_deferred<Q>(&mut self, hash: u64, key: &Q) -> Option<(K, V)>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        let location = self.table.find(key, hash, fingerprint(hash))?;
+        Some(self.table.remove_deferred(location))
+    }
+
+    /// Inserts a key known to be absent using its caller-supplied hash.
+    ///
+    /// Calling this for an equivalent key already in the map creates a logical
+    /// duplicate. Use [`contains_prehashed`](Self::contains_prehashed) first
+    /// unless absence is guaranteed by a higher-level index contract.
+    pub fn insert_unique_prehashed(&mut self, hash: u64, key: K, value: V) -> &mut V {
+        let location = self.table.insert_for_vacant(key, value, hash);
+        unsafe { &mut self.slot_entry_mut(location).value }
+    }
+
+    /// Inserts a known-absent entry by caller-supplied hash without allowing
+    /// growth or a same-size rehash.
+    ///
+    /// Returns the value reference on success, or the original key and value
+    /// if the backing table has no physical free slot.
+    pub fn try_insert_unique_prehashed_in_place(
+        &mut self,
+        hash: u64,
+        key: K,
+        value: V,
+    ) -> Result<&mut V, (K, V)> {
+        let location = self.table.insert_for_vacant_in_place(key, value, hash)?;
+        Ok(unsafe { &mut self.slot_entry_mut(location).value })
     }
 
     /// Inserts `key`/`value`. Returns the previous value for `key`, if any.

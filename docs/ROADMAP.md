@@ -11,11 +11,14 @@
 
 ## Gate 1: database key layout
 
-- Replace one allocation per key with an immutable generation-owned key arena.
-- Store `{key_offset, key_length}` in fixed-size slots.
+- [x] Replace one allocation per key with an immutable generation-owned key arena.
+- [x] Store packed `{segment, key_offset, key_length}` references in eight-byte slots.
+- [x] Add prehashed, allocation-free lookup using original byte equivalence.
+- [x] Add bounded byte-aware routing rebuild after delete churn.
+- [ ] Compact dead arena bytes during a full generation rebuild.
 - Define a packed metadata value suitable for disk-location indexes.
 - Keep hot payload ownership separate from index slots.
-- Provide fallible allocation and batch-load APIs.
+- [ ] Provide fallible whole-map construction and batch-load APIs.
 
 ## Gate 2: single-writer, lock-free-reader generations
 
@@ -43,4 +46,3 @@ A stable release requires:
 - missing-key benchmarks, not only successful lookups;
 - measured total bytes per live entry including arenas and filters;
 - a documented crash/recovery contract for every consumer.
-

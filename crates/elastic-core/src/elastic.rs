@@ -848,6 +848,18 @@ where
         let (level, slot) = self
             .first_free_slot()
             .expect("Elastic insertion limit must leave a free slot");
+        self.place_exceptional_entry_at(key, value, key_hash, key_fingerprint, level, slot)
+    }
+
+    fn place_exceptional_entry_at(
+        &mut self,
+        key: K,
+        value: V,
+        key_hash: u64,
+        key_fingerprint: u8,
+        level: usize,
+        slot: usize,
+    ) -> (usize, usize) {
         self.probe_high_water |= EXCEPTIONAL_PLACEMENT_FLAG;
         self.write_new_entry(key, value, key_hash, key_fingerprint, level, slot)
     }
@@ -1052,7 +1064,7 @@ where
     #[inline]
     fn find<Q>(&self, key: &Q, hash: u64, fingerprint: u8) -> Option<(usize, usize)>
     where
-        Q: Hash + Equivalent<K> + ?Sized,
+        Q: Equivalent<K> + ?Sized,
     {
         self.find_slot_indices_with_hash(key, hash, fingerprint)
     }
@@ -1065,7 +1077,7 @@ where
         fingerprint: u8,
     ) -> Option<&'a SlotEntry<K, V>>
     where
-        Q: Hash + Equivalent<K> + ?Sized,
+        Q: Equivalent<K> + ?Sized,
     {
         self.find_entry_with_hash(key, hash, fingerprint)
     }
@@ -1075,6 +1087,23 @@ where
     #[inline]
     fn insert_for_vacant(&mut self, key: K, value: V, hash: u64) -> (usize, usize) {
         self.insert_for_vacant_entry(key, value, hash)
+    }
+
+    fn insert_for_vacant_in_place(
+        &mut self,
+        key: K,
+        value: V,
+        hash: u64,
+    ) -> Result<(usize, usize), (K, V)> {
+        let fingerprint = control::control_fingerprint(hash);
+        self.scheduler.advance_batch_window();
+        if let Some(placement) = self.choose_slot_for_new_key(hash, self.scheduler.target()) {
+            return Ok(self.place_new_entry(key, value, hash, fingerprint, placement));
+        }
+        let Some((level, slot)) = self.first_free_slot() else {
+            return Err((key, value));
+        };
+        Ok(self.place_exceptional_entry_at(key, value, hash, fingerprint, level, slot))
     }
 
     #[inline]
@@ -1099,6 +1128,10 @@ where
             self.resize_with_transition(self.total_slots, EpochTransition::TombstoneCleanup);
         }
         kv
+    }
+
+    fn remove_deferred(&mut self, (level_idx, slot_idx): (usize, usize)) -> (K, V) {
+        self.take_and_tombstone(level_idx, slot_idx)
     }
 
     #[inline]
