@@ -1082,6 +1082,35 @@ where
         self.find_entry_with_hash(key, hash, fingerprint)
     }
 
+    #[inline]
+    fn location_bits((level, slot): (usize, usize)) -> u64 {
+        ((level as u64) << 32) | slot as u64
+    }
+
+    #[inline]
+    fn location_from_bits(bits: u64) -> Option<(usize, usize)> {
+        let level = usize::try_from(bits >> 32).ok()?;
+        let slot = usize::try_from(bits & u64::from(u32::MAX)).ok()?;
+        Some((level, slot))
+    }
+
+    #[inline]
+    fn find_entry_at<'a, Q>(
+        &'a self,
+        (level, slot): (usize, usize),
+        key: &Q,
+        fingerprint: u8,
+    ) -> Option<&'a SlotEntry<K, V>>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        let descriptor = self.levels.get(level)?;
+        if slot >= descriptor.capacity() {
+            return None;
+        }
+        self.entry_if_match(level, slot, fingerprint, key)
+    }
+
     // -- Insert / remove --
 
     #[inline]

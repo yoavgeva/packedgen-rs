@@ -15,6 +15,9 @@
 - [x] Store packed `{segment, key_offset, key_length}` references in eight-byte slots.
 - [x] Add prehashed, allocation-free lookup using original byte equivalence.
 - [x] Add bounded byte-aware routing rebuild after delete churn.
+- [x] Add a verified direct-location accelerator with exact-search fallback.
+- [x] Add bucket-local definite-negative proofs guarded by overflow bits.
+- [ ] Adapt routing-cache size to the epoch's available memory advantage.
 - [ ] Compact dead arena bytes during a full generation rebuild.
 - Define a packed metadata value suitable for disk-location indexes.
 - Keep hot payload ownership separate from index slots.

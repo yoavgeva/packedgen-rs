@@ -97,6 +97,27 @@ fn byte_aware_rebuild_preserves_survivors_after_heavy_deletes() {
     }
 }
 
+#[test]
+fn routing_accelerator_is_bounded_and_caches_most_routes() {
+    let capacity = 10_000;
+    let mut map = PackedBinaryMap::new(ElasticConfig::new(capacity));
+    for index in 0..capacity {
+        map.try_insert(format!("route-{index}").as_bytes(), index)
+            .unwrap();
+    }
+
+    let stats = map.stats();
+    assert_eq!(
+        stats.route_cache_bytes,
+        capacity * 10 + capacity.div_ceil(64) * 8
+    );
+    assert!(stats.route_cache_entries > capacity * 4 / 5, "{stats:?}");
+    assert_eq!(
+        stats.route_cache_entries + stats.route_cache_overflows,
+        capacity
+    );
+}
+
 fn mix(mut value: u64) -> u64 {
     value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);

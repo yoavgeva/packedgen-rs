@@ -10,6 +10,7 @@ mod config;
 mod filter;
 mod map;
 mod packed_map;
+mod route_cache;
 
 pub use arena::{ArenaError, PackedKeyArena, PackedKeyRef};
 pub use config::{ConfigError, ElasticConfig};

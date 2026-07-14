@@ -884,6 +884,33 @@ where
     }
 
     #[inline]
+    fn location_bits(slot: usize) -> u64 {
+        slot as u64
+    }
+
+    #[inline]
+    fn location_from_bits(bits: u64) -> Option<usize> {
+        usize::try_from(bits).ok()
+    }
+
+    #[inline]
+    fn find_entry_at<'a, Q>(
+        &'a self,
+        slot: usize,
+        key: &Q,
+        fingerprint: u8,
+    ) -> Option<&'a SlotEntry<K, V>>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        if slot >= self.shape.n || self.storage.control_at(slot) != fingerprint {
+            return None;
+        }
+        let entry = unsafe { self.storage.get_ref(slot) };
+        key.equivalent(&entry.key).then_some(entry)
+    }
+
+    #[inline]
     fn insert_for_vacant(&mut self, key: K, value: V, hash: u64) -> usize {
         self.insert_for_vacant_entry(key, value, hash)
     }

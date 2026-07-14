@@ -4,6 +4,7 @@ use std::mem;
 use opthash::{ElasticHashMap, EpochSnapshot, Equivalent, ReserveFraction};
 
 use crate::filter::NegativeLookupFilter;
+use crate::route_cache::RouteCache;
 use crate::{
     ArenaError, CapacityError, ElasticConfig, InsertOutcome, PackedKeyArena, PackedKeyRef,
 };
@@ -17,6 +18,7 @@ pub struct PackedBinaryMap<V> {
     inner: ElasticHashMap<PackedKeyRef, V>,
     arena: PackedKeyArena,
     negative_filter: NegativeLookupFilter,
+    route_cache: RouteCache,
     live_limit: usize,
     live_key_bytes: usize,
     deletes_since_rebuild: usize,
@@ -33,6 +35,7 @@ impl<V> PackedBinaryMap<V> {
             ),
             arena: PackedKeyArena::new(),
             negative_filter: NegativeLookupFilter::new(config.live_capacity()),
+            route_cache: RouteCache::new(config.live_capacity()),
             live_limit: config.live_capacity(),
             live_key_bytes: 0,
             deletes_since_rebuild: 0,
@@ -56,6 +59,7 @@ impl<V> PackedBinaryMap<V> {
             ),
             arena: PackedKeyArena::with_segment_bytes(segment_bytes)?,
             negative_filter: NegativeLookupFilter::new(config.live_capacity()),
+            route_cache: RouteCache::new(config.live_capacity()),
             live_limit: config.live_capacity(),
             live_key_bytes: 0,
             deletes_since_rebuild: 0,
@@ -90,21 +94,25 @@ impl<V> PackedBinaryMap<V> {
 
         let key_ref = self.arena.insert(key).map_err(PackedMapError::Arena)?;
         self.negative_filter.insert_hash(hash);
-        if let Err((key_ref, value)) = self
+        let location = match self
             .inner
-            .try_insert_unique_prehashed_in_place(hash, key_ref, value)
+            .try_insert_unique_prehashed_in_place_with_location(hash, key_ref, value)
         {
-            self.rebuild_core();
-            if self
-                .inner
-                .try_insert_unique_prehashed_in_place(hash, key_ref, value)
-                .is_err()
-            {
-                return Err(PackedMapError::Capacity(CapacityError::new(
-                    self.live_limit,
-                )));
+            Ok((location, _)) => location,
+            Err((key_ref, value)) => {
+                self.rebuild_core();
+                let Ok((location, _)) = self
+                    .inner
+                    .try_insert_unique_prehashed_in_place_with_location(hash, key_ref, value)
+                else {
+                    return Err(PackedMapError::Capacity(CapacityError::new(
+                        self.live_limit,
+                    )));
+                };
+                location
             }
-        }
+        };
+        self.route_cache.insert(hash, location);
         self.live_key_bytes += key.len();
         Ok(InsertOutcome::Inserted)
     }
@@ -113,16 +121,20 @@ impl<V> PackedBinaryMap<V> {
     #[must_use]
     pub fn get(&self, key: &[u8]) -> Option<&V> {
         let hash = self.inner.hash_key(key);
-        if !self.negative_filter.may_contain_hash(hash) {
+        let query = PackedQuery {
+            arena: &self.arena,
+            bytes: key,
+        };
+        for location in self.route_cache.candidates(hash) {
+            if let Some(value) = self.inner.get_prehashed_at(location, hash, &query) {
+                return Some(value);
+            }
+        }
+        if self.route_cache.definitely_absent(hash) || !self.negative_filter.may_contain_hash(hash)
+        {
             return None;
         }
-        self.inner.get_prehashed(
-            hash,
-            &PackedQuery {
-                arena: &self.arena,
-                bytes: key,
-            },
-        )
+        self.inner.get_prehashed(hash, &query)
     }
 
     /// Returns whether a binary key is live.
@@ -161,6 +173,7 @@ impl<V> PackedBinaryMap<V> {
         self.inner.clear();
         self.arena.clear();
         self.negative_filter.clear();
+        self.route_cache.clear();
         self.live_key_bytes = 0;
         self.deletes_since_rebuild = 0;
     }
@@ -187,6 +200,9 @@ impl<V> PackedBinaryMap<V> {
             reserve: self.inner.reserve_fraction(),
             epoch: self.inner.epoch(),
             negative_filter_bytes: self.negative_filter.bytes(),
+            route_cache_bytes: self.route_cache.bytes(),
+            route_cache_entries: self.route_cache.cached(),
+            route_cache_overflows: self.route_cache.overflowed(),
             arena_allocated_bytes: self.arena.allocated_bytes(),
             arena_key_bytes: self.arena.key_bytes(),
             live_key_bytes: self.live_key_bytes,
@@ -204,15 +220,18 @@ impl<V> PackedBinaryMap<V> {
             self.inner.reserve_fraction(),
         );
         let old = mem::replace(&mut self.inner, replacement);
+        self.route_cache.clear();
         for (key_ref, value) in old {
             let bytes = self
                 .arena
                 .get(key_ref)
                 .expect("live packed key reference must resolve");
             let hash = self.inner.hash_key(bytes);
-            self.inner
-                .try_insert_unique_prehashed_in_place(hash, key_ref, value)
+            let (location, _) = self
+                .inner
+                .try_insert_unique_prehashed_in_place_with_location(hash, key_ref, value)
                 .unwrap_or_else(|_| panic!("fresh elastic epoch must fit every live entry"));
+            self.route_cache.insert(hash, location);
         }
         self.deletes_since_rebuild = 0;
         self.rebuild_negative_filter();
@@ -275,6 +294,12 @@ pub struct PackedMapStats {
     pub epoch: EpochSnapshot,
     /// Requested bytes in the definite-negative filter.
     pub negative_filter_bytes: usize,
+    /// Requested bytes in the best-effort direct-location accelerator.
+    pub route_cache_bytes: usize,
+    /// Live routes retained by the accelerator.
+    pub route_cache_entries: usize,
+    /// Routes that fell back to the exact schedule because their bucket filled.
+    pub route_cache_overflows: usize,
     /// Requested capacity held by key-arena segments and their directory.
     pub arena_allocated_bytes: usize,
     /// All key bytes appended in this generation, including removed keys.

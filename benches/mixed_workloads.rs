@@ -194,11 +194,58 @@ fn binary_key_lookups(criterion: &mut Criterion) {
     group.finish();
 }
 
+fn binary_key_missing_lookups(criterion: &mut Criterion) {
+    let entries = 1 << 15;
+    let corpus: Vec<Box<[u8]>> = (0..entries as u64)
+        .map(|index| binary_key(index, BINARY_KEY_BYTES))
+        .collect();
+    let misses: Vec<Box<[u8]>> = (entries as u64..(entries * 2) as u64)
+        .map(|index| binary_key(index, BINARY_KEY_BYTES))
+        .collect();
+    let mut group = criterion.benchmark_group("missing_lookup_binary_32");
+    group.throughput(Throughput::Elements(1));
+
+    for exponent in [3, 6] {
+        let config = ElasticConfig::new(entries)
+            .with_reserve_exponent(exponent)
+            .unwrap();
+        let mut packed = PackedBinaryMap::new(config);
+        for (index, key) in corpus.iter().enumerate() {
+            packed.try_insert(key, index as u64).unwrap();
+        }
+        let mut cursor = 0_usize;
+        group.bench_with_input(
+            BenchmarkId::new("packed-elastic", format!("reserve_2^-{exponent}")),
+            &exponent,
+            |bencher, _| {
+                bencher.iter(|| {
+                    cursor = cursor.wrapping_add(1) % entries;
+                    packed.get(black_box(misses[cursor].as_ref()))
+                });
+            },
+        );
+    }
+
+    let mut map = HashMap::with_capacity(entries);
+    for (index, key) in corpus.iter().enumerate() {
+        map.insert(key.clone(), index as u64);
+    }
+    let mut cursor = 0_usize;
+    group.bench_function("hashbrown", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % entries;
+            map.get(black_box(misses[cursor].as_ref()))
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     missing_lookups,
     bulk_insertions,
     binary_key_lookups,
+    binary_key_missing_lookups,
     binary_key_insertions
 );
 criterion_main!(benches);

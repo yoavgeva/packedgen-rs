@@ -32,6 +32,7 @@ fn main() {
             print_boxed_keys(entries);
         }
         "sweep" => print_sweep(),
+        "packed-sweep" => print_packed_sweep(),
         "all" => {
             print_elastic(entries, 3);
             print_elastic(entries, 6);
@@ -47,7 +48,7 @@ fn main() {
         _ => panic!(
             "expected elastic-3, elastic-6, hashbrown, elastic-binary-3, \
              elastic-binary-6, hashbrown-binary, packed-binary-3, packed-binary-6, \
-             arena, sweep, or all"
+             arena, sweep, packed-sweep, or all"
         ),
     }
 }
@@ -150,6 +151,15 @@ fn print_sweep() {
     ] {
         print_elastic(entries, 6);
         print_hashbrown(entries);
+    }
+}
+
+fn print_packed_sweep() {
+    for entries in [
+        100_000, 250_000, 450_000, 458_752, 500_000, 900_000, 917_504, 1_000_000,
+    ] {
+        print_packed_binary(entries, 6);
+        print_hashbrown_binary(entries);
     }
 }
 

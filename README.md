@@ -66,12 +66,13 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) and
 [`docs/FERRICSTORE.md`](docs/FERRICSTORE.md). The first deliberately unflattering
 performance result is recorded in [`docs/BASELINE.md`](docs/BASELINE.md).
 
-At one million 32-byte binary keys, the packed `1/64` layout uses 52.408
-requested bytes per entry versus HashBrown's 84.429: **37.9% less**. It also
-removes the million per-key allocations. HashBrown remains roughly 10x faster
-for successful lookup on this development machine, so ElasticHash is not yet
-"better than SwissTable" overall. The release gates forbid making that claim
-until the latency gap is closed and the RAM-limited system benchmark wins.
+At one million 32-byte binary keys, the accelerated packed `1/64` layout uses
+62.533 requested bytes per entry versus HashBrown's 84.429: **25.9% less**. It
+also removes the million per-key allocations. The two-way routing accelerator
+reduced successful lookup from roughly 70 ns to 28 ns, but HashBrown remains
+around 7 ns on this development machine. ElasticHash is therefore not yet
+"better than SwissTable" overall; the release gates require the remaining
+latency work and a RAM-limited system win.
 
 ## Development
 

@@ -22,12 +22,13 @@ overhead, so they are not RSS measurements.
 | 32-byte boxed key -> `u64` | Elastic, reserve 1/8 | 87.553 | 3.7% more |
 | 32-byte boxed key -> `u64` | Elastic, reserve 1/64 | 60.289 | **28.6% less** |
 | 32-byte boxed key -> `u64` | HashBrown | 84.429 | baseline |
-| 32-byte packed key -> `u64` | Packed Elastic, reserve 1/64 | 52.408 | **37.9% less** |
+| 32-byte packed key -> `u64`, before routing cache | Packed Elastic, reserve 1/64 | 52.408 | **37.9% less** |
+| 32-byte packed key -> `u64`, accelerated | Packed Elastic, reserve 1/64 | 62.533 | **25.9% less** |
 
 The one-byte-per-entry service-layer negative filter is included in the elastic
 numbers. The packed shape stores an eight-byte reference in each table slot and
-uses a segmented arena: 39 measured live allocations versus 1,000,002 for the
-HashBrown boxed-key shape.
+uses a segmented arena. The accelerated shape also includes a bounded two-way
+direct-location cache and one overflow bit per bucket.
 
 Reproduce:
 
@@ -57,6 +58,25 @@ two-second measurement window:
 | Successful 32-byte lookup | ~55.2 ns | ~69.8 ns | ~7.0 ns |
 | 32-byte insertion throughput | ~20.3 M/s | ~18.7 M/s | ~33.1 M/s |
 
+After adding the verified-location accelerator:
+
+| Accelerated binary workload | Elastic 1/8 | Elastic 1/64 | HashBrown |
+| --- | ---: | ---: | ---: |
+| Successful 32-byte lookup | ~24.9 ns | ~27.8 ns | ~6.8 ns |
+| Missing 32-byte lookup | ~10.5 ns | ~11.5 ns | ~4.8 ns |
+| 32-byte insertion throughput | ~18.9 M/s | ~16.4 M/s | ~37.0 M/s |
+
+The cache is advisory: every direct location is checked against table bounds,
+control fingerprint, and original key bytes. Stale entries and tag collisions
+fall back to the exact elastic schedule. A bucket can reject an absent tag only
+when its overflow bit proves every assigned live route was cached.
+
+The packed memory sweep exposed a remaining cliff: at 100,000 entries the
+accelerated layout uses 76.898 B/entry versus HashBrown's 64.768 (+18.7%). At
+250,000 and 1,000,000 entries it saves about 24.6% and 25.9%; around HashBrown's
+efficient thresholds it is roughly 5–6% larger. Adaptive cache budgeting is
+therefore required before the no-cliff gate passes.
+
 The stable negative filter reduced missing-lookup latency by roughly 94–96%
 without allowing false negatives. It sets bits on insertion, retains them on
 ordinary deletion, and rebuilds when the core starts a new allocation epoch.
@@ -78,7 +98,8 @@ cargo bench --bench mixed_workloads
 - ElasticHash's plausible storage-engine win is fitting a larger working set in
   RAM and avoiding cold I/O. It is not currently a general-purpose HashBrown
   throughput replacement.
-- Packed binary-key storage preserves and strengthens the density advantage,
-  but successful lookups still miss the release gate by a wide margin.
+- Packed binary-key storage plus verified direct routing preserves a density
+  advantage at favorable capacities and cuts successful lookup by about 60%,
+  but the hit, miss, insertion, and memory-cliff gates still need work.
 - The next optimization target is the exact-query routing path: probe schedule,
   candidate dispatch, and batched lookup. RAM density alone is insufficient.

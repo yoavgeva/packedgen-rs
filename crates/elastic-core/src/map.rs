@@ -106,6 +106,22 @@ pub trait TableBackend<K, V>: Sized {
     where
         Q: Equivalent<K> + ?Sized;
 
+    /// Encode a location for a higher-level fixed-epoch routing index.
+    fn location_bits(location: Self::Location) -> u64;
+
+    /// Decode and validate an externally retained location.
+    fn location_from_bits(bits: u64) -> Option<Self::Location>;
+
+    /// Verify a retained location before exposing its entry.
+    fn find_entry_at<'a, Q>(
+        &'a self,
+        location: Self::Location,
+        key: &Q,
+        fingerprint: u8,
+    ) -> Option<&'a SlotEntry<K, V>>
+    where
+        Q: Equivalent<K> + ?Sized;
+
     // -- Insert / remove --
 
     /// Insert a known-absent key, resize as needed, and return its location
@@ -275,6 +291,27 @@ fn fingerprint(hash: u64) -> u8 {
 pub struct HashMap<K, V, P: TableBackend<K, V>> {
     table: P,
     _marker: PhantomData<(K, V)>,
+}
+
+/// Opaque slot location retained by a fixed-epoch routing accelerator.
+///
+/// Locations are hints rather than authority: [`HashMap::get_prehashed_at`]
+/// validates bounds, control fingerprint, and key equivalence on every use.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PrehashedLocation(u64);
+
+impl PrehashedLocation {
+    /// Reconstructs a retained location from its compact representation.
+    #[must_use]
+    pub const fn from_bits(bits: u64) -> Self {
+        Self(bits)
+    }
+
+    /// Compact backend-specific representation.
+    #[must_use]
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
 }
 
 impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
@@ -502,6 +539,21 @@ where
             .map(|entry| &entry.value)
     }
 
+    /// Verifies a retained fixed-epoch location and returns its value.
+    ///
+    /// Stale, foreign, out-of-range, or non-equivalent locations behave like
+    /// misses. Callers may safely fall back to [`get_prehashed`](Self::get_prehashed).
+    #[must_use]
+    pub fn get_prehashed_at<Q>(&self, location: PrehashedLocation, hash: u64, key: &Q) -> Option<&V>
+    where
+        Q: Equivalent<K> + ?Sized,
+    {
+        let location = P::location_from_bits(location.bits())?;
+        self.table
+            .find_entry_at(location, key, fingerprint(hash))
+            .map(|entry| &entry.value)
+    }
+
     /// Returns a mutable value using a caller-supplied hash and equivalence
     /// query.
     pub fn get_mut_prehashed<Q>(&mut self, hash: u64, key: &Q) -> Option<&mut V>
@@ -563,8 +615,23 @@ where
         key: K,
         value: V,
     ) -> Result<&mut V, (K, V)> {
+        self.try_insert_unique_prehashed_in_place_with_location(hash, key, value)
+            .map(|(_, value)| value)
+    }
+
+    /// In-place prehashed insertion that also returns its epoch-stable slot
+    /// location for a higher-level routing accelerator.
+    pub fn try_insert_unique_prehashed_in_place_with_location(
+        &mut self,
+        hash: u64,
+        key: K,
+        value: V,
+    ) -> Result<(PrehashedLocation, &mut V), (K, V)> {
         let location = self.table.insert_for_vacant_in_place(key, value, hash)?;
-        Ok(unsafe { &mut self.slot_entry_mut(location).value })
+        let retained = PrehashedLocation::from_bits(P::location_bits(location));
+        Ok((retained, unsafe {
+            &mut self.slot_entry_mut(location).value
+        }))
     }
 
     /// Inserts `key`/`value`. Returns the previous value for `key`, if any.

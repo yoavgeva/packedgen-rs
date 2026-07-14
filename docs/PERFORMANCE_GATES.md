@@ -26,9 +26,12 @@ For large binary-keyed, fixed-epoch indexes:
    operations per second by retaining a larger working set and avoiding cold
    reads.
 
-The current implementation passes only parts of the density gate. It is far
-from the point-operation gates. Measurements that fail a gate remain in the
-repository; they are optimization inputs, not marketing exclusions.
+The accelerated packed layout passes the one-million-entry density target and
+is close to the missing-lookup and insertion limits, but it still fails the
+successful-hit gate. The 100,000-entry sweep point exceeds HashBrown by more
+than the allowed memory margin, so adaptive accelerator sizing is also open.
+Measurements that fail a gate remain in the repository; they are optimization
+inputs, not marketing exclusions.
 
 ## Correctness gates
 

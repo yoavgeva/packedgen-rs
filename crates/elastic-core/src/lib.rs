@@ -30,6 +30,7 @@ pub use common::DefaultHashBuilder;
 pub use common::error::{TryBuildError, TryReserveError};
 pub use common::reserve::{ReserveFraction, ReserveFractionError};
 pub use epoch::{EpochSnapshot, EpochTransition};
+pub use map::PrehashedLocation;
 
 pub use elastic::{
     ElasticDifference, ElasticDrain, ElasticEntry, ElasticExtractIf, ElasticHashMap,
