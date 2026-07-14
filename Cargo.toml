@@ -1,0 +1,36 @@
+[package]
+name = "elastichash"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Service-oriented elastic hashing with explicit capacity epochs"
+license = "MIT"
+repository = "https://github.com/ferricstore/elastichash-rs"
+keywords = ["hashmap", "elastic-hashing", "open-addressing", "database"]
+categories = ["data-structures", "database-implementations"]
+
+[dependencies]
+# Pinned to the paper-fidelity rewrite. We intentionally do not follow a moving
+# branch. The core will be audited and vendored before the first stable release.
+opthash = { git = "https://github.com/aaron-ang/opthash-rs.git", rev = "f2aee1ef02fdfc95944a8fcee711a631c40111b7" }
+
+[dev-dependencies]
+criterion = { version = "0.7", features = ["html_reports"] }
+hashbrown = "0.17.1"
+stats_alloc = "0.1.10"
+
+[[bench]]
+name = "point_ops"
+harness = false
+
+[[bench]]
+name = "mixed_workloads"
+harness = false
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
