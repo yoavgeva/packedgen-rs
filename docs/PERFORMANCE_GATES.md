@@ -27,11 +27,10 @@ For large binary-keyed, fixed-epoch indexes:
    reads.
 
 The accelerated packed layout passes the one-million-entry density target and
-is close to the missing-lookup and insertion limits, but it still fails the
-successful-hit gate. The 100,000-entry sweep point exceeds HashBrown by more
-than the allowed memory margin, so adaptive accelerator sizing is also open.
-Measurements that fail a gate remain in the repository; they are optimization
-inputs, not marketing exclusions.
+the tested no-cliff sweep after adaptive cache budgeting. It is close to the
+missing-lookup and insertion limits, but still fails the successful-hit and
+median-sweep density gates. Measurements that fail a gate remain in the
+repository; they are optimization inputs, not marketing exclusions.
 
 ## Correctness gates
 

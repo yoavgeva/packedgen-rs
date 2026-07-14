@@ -3,7 +3,7 @@
 use std::hint::black_box;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use elastichash::{ElasticConfig, FixedElasticMap, PackedBinaryMap};
+use elastichash::{ElasticConfig, FixedElasticMap, PackedBinaryMap, RouteCacheBudget};
 use hashbrown::HashMap;
 
 mod support;
@@ -64,7 +64,8 @@ fn binary_key_insertions(criterion: &mut Criterion) {
     for exponent in [3, 6] {
         let config = ElasticConfig::new(entries)
             .with_reserve_exponent(exponent)
-            .unwrap();
+            .unwrap()
+            .with_route_cache_budget(RouteCacheBudget::ReadOptimized);
         group.bench_with_input(
             BenchmarkId::new("packed-elastic", format!("reserve_2^-{exponent}")),
             &config,
@@ -146,7 +147,8 @@ fn binary_key_lookups(criterion: &mut Criterion) {
     for exponent in [3, 6] {
         let config = ElasticConfig::new(entries)
             .with_reserve_exponent(exponent)
-            .unwrap();
+            .unwrap()
+            .with_route_cache_budget(RouteCacheBudget::ReadOptimized);
         let mut map = FixedElasticMap::new(config);
         for (index, key) in corpus.iter().enumerate() {
             map.try_insert(key.clone(), index as u64).unwrap();
@@ -208,7 +210,8 @@ fn binary_key_missing_lookups(criterion: &mut Criterion) {
     for exponent in [3, 6] {
         let config = ElasticConfig::new(entries)
             .with_reserve_exponent(exponent)
-            .unwrap();
+            .unwrap()
+            .with_route_cache_budget(RouteCacheBudget::ReadOptimized);
         let mut packed = PackedBinaryMap::new(config);
         for (index, key) in corpus.iter().enumerate() {
             packed.try_insert(key, index as u64).unwrap();

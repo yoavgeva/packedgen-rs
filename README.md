@@ -26,6 +26,10 @@ lookup path hashes caller bytes once. Deletes cannot make the core re-hash a
 reference as if it were the original key: tombstone cleanup is deferred and a
 bounded, byte-aware routing rebuild preserves survivors.
 
+Routing memory is explicit through `RouteCacheBudget`: the default adaptive
+policy keeps small-map overhead within the measured memory ceiling, `Compact`
+disables direct routes, and `ReadOptimized` reserves two route slots per entry.
+
 The intended production architecture is:
 
 1. one table per application shard;

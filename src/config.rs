@@ -8,6 +8,7 @@ use opthash::ReserveFraction;
 pub struct ElasticConfig {
     live_capacity: NonZeroUsize,
     reserve: ReserveFraction,
+    route_cache_budget: RouteCacheBudget,
 }
 
 impl ElasticConfig {
@@ -32,6 +33,7 @@ impl ElasticConfig {
         Ok(Self {
             live_capacity,
             reserve: ReserveFraction::DEFAULT,
+            route_cache_budget: RouteCacheBudget::Adaptive,
         })
     }
 
@@ -59,6 +61,37 @@ impl ElasticConfig {
     pub const fn reserve(self) -> ReserveFraction {
         self.reserve
     }
+
+    /// Selects the packed-map direct-routing memory budget.
+    #[must_use]
+    pub const fn with_route_cache_budget(mut self, budget: RouteCacheBudget) -> Self {
+        self.route_cache_budget = budget;
+        self
+    }
+
+    pub(crate) fn route_cache_slots(self) -> usize {
+        match self.route_cache_budget {
+            RouteCacheBudget::Compact => 0,
+            RouteCacheBudget::Adaptive if self.live_capacity() < (1 << 17) => {
+                self.live_capacity().saturating_mul(3).div_ceil(4)
+            }
+            RouteCacheBudget::ReadOptimized | RouteCacheBudget::Adaptive => {
+                self.live_capacity().saturating_mul(2)
+            }
+        }
+    }
+}
+
+/// Memory policy for the packed map's advisory direct-routing cache.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RouteCacheBudget {
+    /// Use a smaller cache below 128K entries and a dense cache for large maps.
+    #[default]
+    Adaptive,
+    /// Disable direct routes; retain the packed arena and exact elastic lookup.
+    Compact,
+    /// Allocate two route slots per configured entry for lookup-heavy indexes.
+    ReadOptimized,
 }
 
 /// Invalid elastic-hash configuration.
@@ -82,3 +115,26 @@ impl fmt::Display for ConfigError {
 }
 
 impl std::error::Error for ConfigError {}
+
+#[cfg(test)]
+mod tests {
+    use super::{ElasticConfig, RouteCacheBudget};
+
+    #[test]
+    fn route_cache_budgets_are_bounded_and_adaptive() {
+        assert_eq!(ElasticConfig::new(100_000).route_cache_slots(), 75_000);
+        assert_eq!(ElasticConfig::new(250_000).route_cache_slots(), 500_000);
+        assert_eq!(
+            ElasticConfig::new(250_000)
+                .with_route_cache_budget(RouteCacheBudget::Compact)
+                .route_cache_slots(),
+            0
+        );
+        assert_eq!(
+            ElasticConfig::new(10_000)
+                .with_route_cache_budget(RouteCacheBudget::ReadOptimized)
+                .route_cache_slots(),
+            20_000
+        );
+    }
+}

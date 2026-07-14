@@ -17,7 +17,7 @@
 - [x] Add bounded byte-aware routing rebuild after delete churn.
 - [x] Add a verified direct-location accelerator with exact-search fallback.
 - [x] Add bucket-local definite-negative proofs guarded by overflow bits.
-- [ ] Adapt routing-cache size to the epoch's available memory advantage.
+- [x] Adapt routing-cache size for small epochs to avoid measured memory cliffs.
 - [ ] Compact dead arena bytes during a full generation rebuild.
 - Define a packed metadata value suitable for disk-location indexes.
 - Keep hot payload ownership separate from index slots.

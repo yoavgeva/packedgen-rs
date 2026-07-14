@@ -23,8 +23,9 @@ impl RouteCache {
     /// Two ways and one bucket per live entry gives two cache slots per
     /// configured entry. The low-occupancy buckets keep insertion and hit
     /// scans short; overflow safely falls back to the exact schedule.
-    pub(crate) fn new(live_capacity: usize) -> Self {
-        let bucket_count = live_capacity;
+    pub(crate) fn new(live_capacity: usize, route_slots: usize) -> Self {
+        let route_slots = route_slots.min(live_capacity.saturating_mul(2));
+        let bucket_count = route_slots.div_ceil(WAYS);
         let slots = bucket_count.saturating_mul(WAYS);
         Self {
             tags: vec![0; slots].into_boxed_slice(),
@@ -180,7 +181,7 @@ mod tests {
     #[test]
     fn locations_round_trip_and_wrong_tags_do_not_match() {
         let location = PrehashedLocation::from_bits((3_u64 << 32) | 0x2a);
-        let mut cache = RouteCache::new(16);
+        let mut cache = RouteCache::new(16, 32);
         cache.insert(7, location);
 
         assert_eq!(cache.candidates(7).collect::<Vec<_>>(), [location]);
@@ -191,7 +192,7 @@ mod tests {
 
     #[test]
     fn full_bucket_overflows_without_evicting_existing_routes() {
-        let mut cache = RouteCache::new(4);
+        let mut cache = RouteCache::new(4, 8);
         for slot in 0..3_u64 {
             cache.insert(0, PrehashedLocation::from_bits(slot));
         }

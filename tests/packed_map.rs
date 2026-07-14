@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 
-use elastichash::{ElasticConfig, InsertOutcome, PackedBinaryMap, PackedMapError};
+use elastichash::{
+    ElasticConfig, InsertOutcome, PackedBinaryMap, PackedMapError, RouteCacheBudget,
+};
 
 #[test]
 fn binary_crud_and_replacement_reuse_packed_key() {
@@ -100,7 +102,9 @@ fn byte_aware_rebuild_preserves_survivors_after_heavy_deletes() {
 #[test]
 fn routing_accelerator_is_bounded_and_caches_most_routes() {
     let capacity = 10_000;
-    let mut map = PackedBinaryMap::new(ElasticConfig::new(capacity));
+    let mut map = PackedBinaryMap::new(
+        ElasticConfig::new(capacity).with_route_cache_budget(RouteCacheBudget::ReadOptimized),
+    );
     for index in 0..capacity {
         map.try_insert(format!("route-{index}").as_bytes(), index)
             .unwrap();

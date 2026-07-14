@@ -71,11 +71,11 @@ control fingerprint, and original key bytes. Stale entries and tag collisions
 fall back to the exact elastic schedule. A bucket can reject an absent tag only
 when its overflow bit proves every assigned live route was cached.
 
-The packed memory sweep exposed a remaining cliff: at 100,000 entries the
-accelerated layout uses 76.898 B/entry versus HashBrown's 64.768 (+18.7%). At
-250,000 and 1,000,000 entries it saves about 24.6% and 25.9%; around HashBrown's
-efficient thresholds it is roughly 5–6% larger. Adaptive cache budgeting is
-therefore required before the no-cliff gate passes.
+The first packed sweep exposed a 100,000-entry cliff. Adaptive cache budgeting
+reduced that point from 76.898 to 70.570 B/entry versus HashBrown's 64.768
+(+9.0%), bringing every tested capacity inside the 10% no-cliff ceiling. At
+250,000 and 1,000,000 entries the layout saves about 24.6% and 25.9%; around
+HashBrown's efficient thresholds it remains roughly 5–6% larger.
 
 The stable negative filter reduced missing-lookup latency by roughly 94–96%
 without allowing false negatives. It sets bits on insertion, retains them on
@@ -100,6 +100,6 @@ cargo bench --bench mixed_workloads
   throughput replacement.
 - Packed binary-key storage plus verified direct routing preserves a density
   advantage at favorable capacities and cuts successful lookup by about 60%,
-  but the hit, miss, insertion, and memory-cliff gates still need work.
+  but the hit, miss, insertion, and median-density gates still need work.
 - The next optimization target is the exact-query routing path: probe schedule,
   candidate dispatch, and batched lookup. RAM density alone is insufficient.
