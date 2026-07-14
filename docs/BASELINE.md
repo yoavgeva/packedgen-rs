@@ -66,6 +66,11 @@ After adding the verified-location accelerator:
 | Missing 32-byte lookup | ~10.5 ns | ~11.5 ns | ~4.8 ns |
 | 32-byte insertion throughput | ~18.9 M/s | ~16.4 M/s | ~37.0 M/s |
 
+At one million keys, where both indexes exceed the small in-cache fixture, the
+read-optimized `1/64` packed map measured ~63.7 ns per successful lookup versus
+HashBrown's ~25.8 ns. The gap narrows from roughly 4x at 32K keys to 2.47x, but
+still misses the 1.5x release gate.
+
 The cache is advisory: every direct location is checked against table bounds,
 control fingerprint, and original key bytes. Stale entries and tag collisions
 fall back to the exact elastic schedule. A bucket can reject an absent tag only

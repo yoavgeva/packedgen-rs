@@ -13,6 +13,7 @@ use support::{binary_key, scramble};
 const LOOKUP_ENTRIES: usize = 1 << 17;
 const INSERT_ENTRIES: usize = 1 << 14;
 const BINARY_KEY_BYTES: usize = 32;
+const LARGE_BINARY_ENTRIES: usize = 1 << 20;
 
 fn missing_lookups(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("missing_lookup_u64");
@@ -243,12 +244,49 @@ fn binary_key_missing_lookups(criterion: &mut Criterion) {
     group.finish();
 }
 
+fn large_binary_key_lookups(criterion: &mut Criterion) {
+    let corpus: Vec<Box<[u8]>> = (0..LARGE_BINARY_ENTRIES as u64)
+        .map(|index| binary_key(index, BINARY_KEY_BYTES))
+        .collect();
+    let config = ElasticConfig::new(LARGE_BINARY_ENTRIES)
+        .with_reserve_exponent(6)
+        .unwrap()
+        .with_route_cache_budget(RouteCacheBudget::ReadOptimized);
+    let mut packed = PackedBinaryMap::new(config);
+    for (index, key) in corpus.iter().enumerate() {
+        packed.try_insert(key, index as u64).unwrap();
+    }
+    let mut hashbrown = HashMap::with_capacity(LARGE_BINARY_ENTRIES);
+    for (index, key) in corpus.iter().enumerate() {
+        hashbrown.insert(key.clone(), index as u64);
+    }
+
+    let mut group = criterion.benchmark_group("successful_lookup_binary_32_large_1m");
+    group.throughput(Throughput::Elements(1));
+    let mut cursor = 0_usize;
+    group.bench_function("packed-elastic/reserve_2^-6", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % LARGE_BINARY_ENTRIES;
+            packed.get(black_box(corpus[cursor].as_ref()))
+        });
+    });
+    let mut cursor = 0_usize;
+    group.bench_function("hashbrown", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % LARGE_BINARY_ENTRIES;
+            hashbrown.get(black_box(corpus[cursor].as_ref()))
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     missing_lookups,
     bulk_insertions,
     binary_key_lookups,
     binary_key_missing_lookups,
+    large_binary_key_lookups,
     binary_key_insertions
 );
 criterion_main!(benches);
