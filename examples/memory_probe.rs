@@ -3,7 +3,7 @@
 use std::alloc::System;
 use std::hint::black_box;
 
-use elastichash::{ElasticConfig, FixedElasticMap};
+use elastichash::{ElasticConfig, FixedElasticMap, PackedKeyArena, PackedKeyRef};
 use hashbrown::HashMap;
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, Stats, StatsAlloc};
 
@@ -25,6 +25,11 @@ fn main() {
         "elastic-binary-3" => print_elastic_binary(entries, 3),
         "elastic-binary-6" => print_elastic_binary(entries, 6),
         "hashbrown-binary" => print_hashbrown_binary(entries),
+        "arena" => {
+            print_packed_arena(entries);
+            print_boxed_keys(entries);
+        }
+        "sweep" => print_sweep(),
         "all" => {
             print_elastic(entries, 3);
             print_elastic(entries, 6);
@@ -32,10 +37,12 @@ fn main() {
             print_elastic_binary(entries, 3);
             print_elastic_binary(entries, 6);
             print_hashbrown_binary(entries);
+            print_packed_arena(entries);
+            print_boxed_keys(entries);
         }
         _ => panic!(
             "expected elastic-3, elastic-6, hashbrown, elastic-binary-3, \
-             elastic-binary-6, hashbrown-binary, or all"
+             elastic-binary-6, hashbrown-binary, arena, sweep, or all"
         ),
     }
 }
@@ -90,6 +97,39 @@ fn print_hashbrown_binary(entries: usize) {
     black_box(&map);
 }
 
+fn print_packed_arena(entries: usize) {
+    let region = Region::new(GLOBAL);
+    let key_bytes = entries.checked_mul(32).expect("key byte count overflow");
+    let mut arena = PackedKeyArena::with_segment_bytes(key_bytes).unwrap();
+    let mut references = Vec::<PackedKeyRef>::with_capacity(entries);
+    for key in 0..entries as u64 {
+        references.push(arena.insert(&binary_key_array(key)).unwrap());
+    }
+    let stats = region.change();
+    print_row("packed-key-arena32", entries, stats);
+    black_box((&arena, &references));
+}
+
+fn print_boxed_keys(entries: usize) {
+    let region = Region::new(GLOBAL);
+    let mut keys = Vec::<Box<[u8]>>::with_capacity(entries);
+    for key in 0..entries as u64 {
+        keys.push(binary_key(key));
+    }
+    let stats = region.change();
+    print_row("boxed-key-vector32", entries, stats);
+    black_box(&keys);
+}
+
+fn print_sweep() {
+    for entries in [
+        100_000, 250_000, 450_000, 458_752, 500_000, 900_000, 917_504, 1_000_000,
+    ] {
+        print_elastic(entries, 6);
+        print_hashbrown(entries);
+    }
+}
+
 fn print_row(name: &str, entries: usize, stats: Stats) {
     let live_bytes = net_live_bytes(stats);
     #[allow(clippy::cast_precision_loss)]
@@ -119,11 +159,15 @@ fn mix(mut value: u64) -> u64 {
 }
 
 fn binary_key(index: u64) -> Box<[u8]> {
-    let mut key = vec![0_u8; 32];
+    binary_key_array(index).to_vec().into_boxed_slice()
+}
+
+fn binary_key_array(index: u64) -> [u8; 32] {
+    let mut key = [0_u8; 32];
     let mut state = index;
     for chunk in key.chunks_mut(8) {
         state = mix(state);
         chunk.copy_from_slice(&state.to_le_bytes());
     }
-    key.into_boxed_slice()
+    key
 }

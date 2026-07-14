@@ -5,10 +5,12 @@
 //! measure. Concurrency and background rebuilding are planned, not yet
 //! implemented.
 
+mod arena;
 mod config;
 mod filter;
 mod map;
 
+pub use arena::{ArenaError, PackedKeyArena, PackedKeyRef};
 pub use config::{ConfigError, ElasticConfig};
 pub use map::{CapacityError, FixedElasticMap, InsertOutcome, MapStats};
 pub use opthash::{EpochSnapshot, EpochTransition, ReserveFraction};
