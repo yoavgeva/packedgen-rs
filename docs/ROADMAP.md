@@ -24,7 +24,8 @@
 - [x] Allow the single writer to defer maintenance to a controlled boundary.
 - Define a packed metadata value suitable for disk-location indexes.
 - Keep hot payload ownership separate from index slots.
-- [ ] Provide fallible whole-map construction and batch-load APIs.
+- [x] Provide fallible whole-map construction across core and auxiliary indexes.
+- [ ] Provide a batch-load API.
 
 ## Gate 2: single-writer, lock-free-reader generations
 

@@ -15,11 +15,18 @@ pub(crate) struct NegativeLookupFilter {
 impl NegativeLookupFilter {
     /// Eight filter bits per configured live entry, rounded to whole words.
     pub(crate) fn new(live_capacity: usize) -> Self {
+        Self::try_new(live_capacity).expect("negative-filter allocation failed")
+    }
+
+    pub(crate) fn try_new(live_capacity: usize) -> Result<Self, ()> {
         let words = live_capacity.div_ceil(8).max(1);
-        Self {
-            words: vec![0; words].into_boxed_slice(),
+        let mut storage = Vec::new();
+        storage.try_reserve_exact(words).map_err(|_| ())?;
+        storage.resize(words, 0);
+        Ok(Self {
+            words: storage.into_boxed_slice(),
             hash_builder: DefaultHashBuilder::default(),
-        }
+        })
     }
 
     #[inline]

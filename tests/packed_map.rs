@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 
 use elastichash::{
-    ElasticConfig, InsertOutcome, MaintenanceMode, PackedBinaryMap, PackedMapError,
-    RouteCacheBudget,
+    ElasticConfig, InsertOutcome, MaintenanceMode, PackedBinaryMap, PackedBuildError,
+    PackedMapError, RouteCacheBudget,
 };
 
 #[test]
@@ -46,6 +46,20 @@ fn fixed_capacity_rejects_new_key_but_allows_replacement() {
         PackedMapError::Capacity(capacity) if capacity.live_limit() == 2
     ));
     assert_eq!(map.try_insert(b"a", 4), Ok(InsertOutcome::Replaced(1)));
+}
+
+#[test]
+fn fallible_construction_reports_core_capacity_overflow() {
+    let error = PackedBinaryMap::<u64>::try_new(ElasticConfig::new(usize::MAX))
+        .err()
+        .unwrap();
+    assert!(matches!(
+        error,
+        PackedBuildError::Core(opthash::TryBuildError::CapacityOverflow)
+    ));
+
+    let map = PackedBinaryMap::<u64>::try_new(ElasticConfig::new(32)).unwrap();
+    assert_eq!(map.len(), 0);
 }
 
 #[test]

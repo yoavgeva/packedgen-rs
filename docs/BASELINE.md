@@ -110,6 +110,12 @@ Structural mutations invalidate that snapshot; allocation-safe restart has the
 same whole-snapshot cost, while value-only replacement leaves it valid. This is
 small relative to cutover but remains an unbounded-by-budget phase.
 
+Fallible construction at 100K read-optimized capacity measured ~29.8 us for
+packed ElasticHash versus ~1.33 us for pre-sized HashBrown, a 22x gap. The
+Elastic constructor eagerly initializes high-occupancy table geometry, filter,
+and route storage; the typed failure path is service-usable, but initial memory
+touch is materially more expensive.
+
 The cache is advisory: every direct location is checked against table bounds,
 control fingerprint, and original key bytes. Stale entries and tag collisions
 fall back to the exact elastic schedule. A bucket can reject an absent tag only

@@ -24,13 +24,28 @@ impl RouteCache {
     /// configured entry. The low-occupancy buckets keep insertion and hit
     /// scans short; overflow safely falls back to the exact schedule.
     pub(crate) fn new(live_capacity: usize, route_slots: usize) -> Self {
+        Self::try_new(live_capacity, route_slots).expect("route-cache allocation failed")
+    }
+
+    pub(crate) fn try_new(live_capacity: usize, route_slots: usize) -> Result<Self, ()> {
         let route_slots = route_slots.min(live_capacity.saturating_mul(2));
         let bucket_count = route_slots.div_ceil(WAYS);
         let slots = bucket_count.saturating_mul(WAYS);
-        Self {
-            tags: vec![0; slots].into_boxed_slice(),
-            locations: vec![0; slots].into_boxed_slice(),
-            overflow_buckets: vec![0; bucket_count.div_ceil(64)].into_boxed_slice(),
+        let mut tags = Vec::new();
+        tags.try_reserve_exact(slots).map_err(|_| ())?;
+        tags.resize(slots, 0);
+        let mut locations = Vec::new();
+        locations.try_reserve_exact(slots).map_err(|_| ())?;
+        locations.resize(slots, 0);
+        let mut overflow_buckets = Vec::new();
+        overflow_buckets
+            .try_reserve_exact(bucket_count.div_ceil(64))
+            .map_err(|_| ())?;
+        overflow_buckets.resize(bucket_count.div_ceil(64), 0);
+        Ok(Self {
+            tags: tags.into_boxed_slice(),
+            locations: locations.into_boxed_slice(),
+            overflow_buckets: overflow_buckets.into_boxed_slice(),
             bucket_count,
             bucket_mask: if bucket_count.is_power_of_two() {
                 bucket_count - 1
@@ -39,7 +54,7 @@ impl RouteCache {
             },
             cached: 0,
             overflowed: 0,
-        }
+        })
     }
 
     pub(crate) fn insert(&mut self, hash: u64, location: PrehashedLocation) {

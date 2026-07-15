@@ -18,6 +18,27 @@ const BINARY_KEY_BYTES: usize = 32;
 const LARGE_BINARY_ENTRIES: usize = 1 << 20;
 const LOOKUP_BATCH: usize = 32;
 const CHURN_ENTRIES: usize = 1 << 14;
+const CONSTRUCTION_ENTRIES: usize = 100_000;
+
+fn fallible_construction(criterion: &mut Criterion) {
+    let config = ElasticConfig::new(CONSTRUCTION_ENTRIES)
+        .with_reserve_exponent(6)
+        .unwrap()
+        .with_route_cache_budget(RouteCacheBudget::ReadOptimized);
+    let mut group = criterion.benchmark_group("construct_binary_index_100k");
+    group.throughput(Throughput::Elements(CONSTRUCTION_ENTRIES as u64));
+    group.bench_function("packed-elastic", |bencher| {
+        bencher.iter(|| black_box(PackedBinaryMap::<u64>::try_new(config).unwrap()));
+    });
+    group.bench_function("hashbrown", |bencher| {
+        bencher.iter(|| {
+            black_box(HashMap::<Box<[u8]>, u64>::with_capacity(
+                CONSTRUCTION_ENTRIES,
+            ))
+        });
+    });
+    group.finish();
+}
 
 fn missing_lookups(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("missing_lookup_u64");
@@ -499,6 +520,7 @@ criterion_group!(
     delete_and_compact_binary,
     maintenance_rebuild_binary,
     maintenance_prepare_step_binary,
-    maintenance_begin_binary
+    maintenance_begin_binary,
+    fallible_construction
 );
 criterion_main!(benches);

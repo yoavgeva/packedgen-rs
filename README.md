@@ -65,6 +65,10 @@ assert_eq!(map.try_insert(b"key".to_vec(), 42), Ok(InsertOutcome::Inserted));
 assert_eq!(map.get(b"key".as_slice()), Some(&42));
 ```
 
+Services should prefer `PackedBinaryMap::try_new(config)`, which reports core
+geometry, capacity, and every eager auxiliary allocation as `PackedBuildError`
+instead of panicking.
+
 ## What we must prove
 
 The project will not claim a performance or RAM win from load factor alone.

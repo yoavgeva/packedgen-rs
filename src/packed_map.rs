@@ -1,7 +1,7 @@
 use core::fmt;
 use std::mem;
 
-use opthash::{ElasticHashMap, EpochSnapshot, Equivalent, ReserveFraction};
+use opthash::{ElasticHashMap, EpochSnapshot, Equivalent, ReserveFraction, TryBuildError};
 
 use crate::filter::NegativeLookupFilter;
 use crate::route_cache::RouteCache;
@@ -32,16 +32,35 @@ pub struct PackedBinaryMap<V> {
 
 impl<V> PackedBinaryMap<V> {
     /// Constructs a fixed-epoch binary map using the default key-segment size.
+    ///
+    /// # Panics
+    ///
+    /// Panics when core geometry overflows or allocation fails. Use
+    /// [`Self::try_new`] for service-controlled construction.
     #[must_use]
     pub fn new(config: ElasticConfig) -> Self {
-        Self {
-            inner: ElasticHashMap::with_capacity_and_reserve(
+        Self::try_new(config)
+            .unwrap_or_else(|error| panic!("packed map construction failed: {error}"))
+    }
+
+    /// Fallibly constructs a complete fixed-epoch binary map.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PackedBuildError`] for core geometry, capacity, or allocation
+    /// failure, including the negative filter and route cache allocations.
+    pub fn try_new(config: ElasticConfig) -> Result<Self, PackedBuildError> {
+        Ok(Self {
+            inner: ElasticHashMap::try_with_capacity_and_reserve(
                 config.live_capacity(),
                 config.reserve(),
-            ),
+            )
+            .map_err(PackedBuildError::Core)?,
             arena: PackedKeyArena::new(),
-            negative_filter: NegativeLookupFilter::new(config.live_capacity()),
-            route_cache: RouteCache::new(config.live_capacity(), config.route_cache_slots()),
+            negative_filter: NegativeLookupFilter::try_new(config.live_capacity())
+                .map_err(|()| PackedBuildError::AuxiliaryAllocation)?,
+            route_cache: RouteCache::try_new(config.live_capacity(), config.route_cache_slots())
+                .map_err(|()| PackedBuildError::AuxiliaryAllocation)?,
             live_limit: config.live_capacity(),
             live_key_bytes: 0,
             deletes_since_rebuild: 0,
@@ -50,7 +69,7 @@ impl<V> PackedBinaryMap<V> {
             compaction_failures: 0,
             arena_allocated_bytes_reclaimed: 0,
             structural_revision: 0,
-        }
+        })
     }
 
     /// Constructs a fixed-epoch map with explicit key-arena allocation
@@ -576,6 +595,26 @@ impl fmt::Display for MaintenanceError {
 }
 
 impl std::error::Error for MaintenanceError {}
+
+/// Failure while constructing a complete packed map.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PackedBuildError {
+    /// The owned elastic core rejected geometry, capacity, or allocation.
+    Core(TryBuildError),
+    /// The negative filter or route cache allocation failed.
+    AuxiliaryAllocation,
+}
+
+impl fmt::Display for PackedBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Core(error) => error.fmt(formatter),
+            Self::AuxiliaryAllocation => formatter.write_str("auxiliary index allocation failed"),
+        }
+    }
+}
+
+impl std::error::Error for PackedBuildError {}
 
 struct PackedQuery<'a> {
     arena: &'a PackedKeyArena,
