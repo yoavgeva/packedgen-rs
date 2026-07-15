@@ -102,6 +102,9 @@ fn byte_aware_rebuild_preserves_survivors_after_heavy_deletes() {
     assert_eq!(stats.dead_key_bytes(), 0);
     assert_eq!(stats.arena_key_bytes, stats.live_key_bytes);
     assert!(stats.arena_allocated_bytes < allocated_before_deletes);
+    assert_eq!(stats.maintenance_runs, 2);
+    assert_eq!(stats.compaction_failures, 0);
+    assert!(stats.arena_allocated_bytes_reclaimed > 0);
     for (index, key) in keys.iter().enumerate().skip(capacity / 2) {
         assert_eq!(map.get(key), Some(&index));
     }
@@ -127,6 +130,7 @@ fn deferred_maintenance_moves_compaction_to_an_explicit_boundary() {
     assert!(map.maintain());
     assert!(!map.maintenance_due());
     assert_eq!(map.stats().dead_key_bytes(), 0);
+    assert_eq!(map.stats().maintenance_runs, 1);
     assert!(!map.maintain());
     for (index, key) in keys.iter().enumerate().skip(capacity / 4) {
         assert_eq!(map.get(key), Some(&index));

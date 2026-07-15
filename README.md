@@ -32,7 +32,8 @@ disables direct routes, and `ReadOptimized` reserves two route slots per entry.
 Delete maintenance is synchronous by default. Single-writer services can select
 `MaintenanceMode::Deferred`, observe `maintenance_due()`, and call `maintain()`
 at a controlled boundary so table rebuild and arena compaction do not land on
-the request that crosses the delete threshold.
+the request that crosses the delete threshold. `PackedMapStats` exposes
+maintenance runs, compaction-staging failures, and reclaimed arena capacity.
 
 The intended production architecture is:
 

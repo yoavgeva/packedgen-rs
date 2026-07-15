@@ -92,6 +92,13 @@ ElasticHash maintenance. The owner must subsequently call `maintain()` to pay
 the rebuild and reclaim dead bytes; this makes the work schedulable but does not
 yet make maintenance incremental or concurrent.
 
+An isolated maintenance benchmark removes request-path deletion from the timed
+region and rebuilds the 12,288 survivors. Packed ElasticHash measured ~1.46 ms
+versus ~118 us for rebuilding HashBrown from the same owned entries, a 12.4x
+gap. `PackedMapStats` now reports completed maintenance runs, failed compaction
+staging, and cumulative allocated arena bytes reclaimed so this cost and its
+memory effect are observable in a service.
+
 The cache is advisory: every direct location is checked against table bounds,
 control fingerprint, and original key bytes. Stale entries and tag collisions
 fall back to the exact elastic schedule. A bucket can reject an absent tag only

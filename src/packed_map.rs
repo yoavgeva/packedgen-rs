@@ -24,6 +24,9 @@ pub struct PackedBinaryMap<V> {
     live_key_bytes: usize,
     deletes_since_rebuild: usize,
     maintenance_mode: MaintenanceMode,
+    maintenance_runs: usize,
+    compaction_failures: usize,
+    arena_allocated_bytes_reclaimed: usize,
 }
 
 impl<V> PackedBinaryMap<V> {
@@ -42,6 +45,9 @@ impl<V> PackedBinaryMap<V> {
             live_key_bytes: 0,
             deletes_since_rebuild: 0,
             maintenance_mode: config.maintenance_mode(),
+            maintenance_runs: 0,
+            compaction_failures: 0,
+            arena_allocated_bytes_reclaimed: 0,
         }
     }
 
@@ -67,6 +73,9 @@ impl<V> PackedBinaryMap<V> {
             live_key_bytes: 0,
             deletes_since_rebuild: 0,
             maintenance_mode: config.maintenance_mode(),
+            maintenance_runs: 0,
+            compaction_failures: 0,
+            arena_allocated_bytes_reclaimed: 0,
         })
     }
 
@@ -250,6 +259,9 @@ impl<V> PackedBinaryMap<V> {
         self.route_cache.clear();
         self.live_key_bytes = 0;
         self.deletes_since_rebuild = 0;
+        self.maintenance_runs = 0;
+        self.compaction_failures = 0;
+        self.arena_allocated_bytes_reclaimed = 0;
     }
 
     /// Number of live keys.
@@ -281,6 +293,9 @@ impl<V> PackedBinaryMap<V> {
             arena_key_bytes: self.arena.key_bytes(),
             live_key_bytes: self.live_key_bytes,
             deletes_since_rebuild: self.deletes_since_rebuild,
+            maintenance_runs: self.maintenance_runs,
+            compaction_failures: self.compaction_failures,
+            arena_allocated_bytes_reclaimed: self.arena_allocated_bytes_reclaimed,
         }
     }
 
@@ -289,7 +304,13 @@ impl<V> PackedBinaryMap<V> {
     }
 
     fn rebuild_core(&mut self) {
-        let compaction = self.build_compacted_arena().ok();
+        let allocated_before = self.arena.allocated_bytes();
+        let compaction = if let Ok(compaction) = self.build_compacted_arena() {
+            Some(compaction)
+        } else {
+            self.compaction_failures += 1;
+            None
+        };
         let replacement = ElasticHashMap::with_capacity_and_reserve(
             self.live_limit,
             self.inner.reserve_fraction(),
@@ -322,6 +343,9 @@ impl<V> PackedBinaryMap<V> {
         }
         self.deletes_since_rebuild = 0;
         self.negative_filter = replacement_filter;
+        self.maintenance_runs += 1;
+        self.arena_allocated_bytes_reclaimed +=
+            allocated_before.saturating_sub(self.arena.allocated_bytes());
     }
 
     fn build_compacted_arena(
@@ -404,6 +428,12 @@ pub struct PackedMapStats {
     pub live_key_bytes: usize,
     /// Deletes accumulated since the last byte-aware table rebuild.
     pub deletes_since_rebuild: usize,
+    /// Completed table-maintenance runs since construction or clear.
+    pub maintenance_runs: usize,
+    /// Compaction staging attempts that failed and fell back to table-only rebuild.
+    pub compaction_failures: usize,
+    /// Cumulative requested arena capacity released by successful compactions.
+    pub arena_allocated_bytes_reclaimed: usize,
 }
 
 impl PackedMapStats {

@@ -172,6 +172,58 @@ fn delete_and_compact_binary(criterion: &mut Criterion) {
     group.finish();
 }
 
+fn maintenance_rebuild_binary(criterion: &mut Criterion) {
+    let corpus: Vec<Box<[u8]>> = (0..CHURN_ENTRIES as u64)
+        .map(|index| binary_key(index, BINARY_KEY_BYTES))
+        .collect();
+    let deletes = CHURN_ENTRIES / 4;
+    let config = ElasticConfig::new(CHURN_ENTRIES)
+        .with_reserve_exponent(6)
+        .unwrap()
+        .with_route_cache_budget(RouteCacheBudget::ReadOptimized)
+        .with_maintenance_mode(MaintenanceMode::Deferred);
+    let mut group = criterion.benchmark_group("maintenance_binary_32_rebuild");
+    group.throughput(Throughput::Elements((CHURN_ENTRIES - deletes) as u64));
+
+    group.bench_function("packed-elastic", |bencher| {
+        bencher.iter_batched(
+            || {
+                let mut map = PackedBinaryMap::new(config);
+                for (index, key) in corpus.iter().enumerate() {
+                    map.try_insert(key, index as u64).unwrap();
+                }
+                for key in &corpus[..deletes] {
+                    map.remove(key).unwrap();
+                }
+                map
+            },
+            |mut map| black_box(map.maintain()),
+            BatchSize::LargeInput,
+        );
+    });
+    group.bench_function("hashbrown-rebuild", |bencher| {
+        bencher.iter_batched(
+            || {
+                let mut map = HashMap::with_capacity(CHURN_ENTRIES);
+                for (index, key) in corpus.iter().enumerate() {
+                    map.insert(key.clone(), index as u64);
+                }
+                for key in &corpus[..deletes] {
+                    map.remove(key.as_ref()).unwrap();
+                }
+                map
+            },
+            |mut map| {
+                let mut replacement = HashMap::with_capacity(map.len());
+                replacement.extend(map.drain());
+                black_box(replacement)
+            },
+            BatchSize::LargeInput,
+        );
+    });
+    group.finish();
+}
+
 fn bulk_insertions(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("bulk_insert_u64");
     group.throughput(Throughput::Elements(INSERT_ENTRIES as u64));
@@ -384,6 +436,7 @@ criterion_group!(
     binary_key_missing_lookups,
     large_binary_key_lookups,
     binary_key_insertions,
-    delete_and_compact_binary
+    delete_and_compact_binary,
+    maintenance_rebuild_binary
 );
 criterion_main!(benches);

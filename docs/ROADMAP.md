@@ -40,7 +40,8 @@
 - Definite-negative membership filter with deletion-safe maintenance.
 - TTL metadata and conditional delete/update primitives.
 - Batch lookup and batch publication to amortize FFI or network boundaries.
-- Operational metrics and configurable pressure/rebuild thresholds.
+- [x] Expose maintenance runs, staging failures, and reclaimed arena capacity.
+- Configurable pressure/rebuild thresholds.
 
 ## Release gates
 
