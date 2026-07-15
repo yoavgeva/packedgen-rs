@@ -45,16 +45,18 @@ MiB budget with one million queries on the development machine:
 
 | Implementation | Entries | Live requested bytes | Budget used | Hit latency |
 | --- | ---: | ---: | ---: | ---: |
-| Packed Elastic, reserve 1/64, read optimized | 1,032,192 | 63,939,352 | 95.3% | 143.2 ns |
-| HashBrown | 917,504 | 55,574,536 | 82.8% | 41.3 ns |
+| Packed Elastic, reserve 1/64, read optimized | 1,032,192 | 63,939,352 | 95.3% | 149–159 ns |
+| HashBrown | 917,504 | 55,574,536 | 82.8% | 35–37 ns |
 
 Packed Elastic holds 12.5% more records under this exact budget, below the 25%
-density release gate, and the successful lookup is 3.46x slower. HashBrown's
+density release gate, and the five-sample median successful lookup was
+approximately 4.0–4.5x slower across two fresh processes. HashBrown's
 next allocation-capacity step exceeds the budget, which explains its unused
 space and demonstrates why a fixed-budget result can differ sharply from the
 one-million-entry bytes-per-entry result. These are requested allocator bytes,
 not RSS; page residency and cache-miss behavior still require a Linux-pinned
-system run.
+system run. The process-to-process timing spread is retained here rather than
+selecting the more favorable sample.
 
 Reproduce the raw smoke fixture:
 

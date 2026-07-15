@@ -25,8 +25,12 @@ fn main() {
     let lookups = arguments.next().map_or(1_000_000, |value| {
         value.parse::<usize>().expect("lookups must be an integer")
     });
+    let samples = arguments.next().map_or(5, |value| {
+        value.parse::<usize>().expect("samples must be an integer")
+    });
     assert!(budget_mib > 0, "budget MiB must be positive");
     assert!(lookups > 0, "lookups must be positive");
+    assert!(samples > 0, "samples must be positive");
     let budget = budget_mib
         .checked_mul(1024 * 1024)
         .expect("byte budget overflow");
@@ -37,14 +41,20 @@ fn main() {
         packed_entries > 0 && hashbrown_entries > 0,
         "budget must fit at least one entry in both implementations"
     );
-    let packed = run_packed(packed_entries, lookups);
-    let hashbrown = run_hashbrown(hashbrown_entries, lookups);
+    let packed = run_packed(packed_entries, lookups, samples);
+    let hashbrown = run_hashbrown(hashbrown_entries, lookups, samples);
 
     println!(
-        "implementation,budget_bytes,entries,live_bytes,budget_utilization,lookups,ns_per_lookup,lookups_per_second"
+        "implementation,budget_bytes,entries,live_bytes,budget_utilization,lookups,samples,median_ns_per_lookup,lookups_per_second"
     );
-    print_row("packed-elastic-binary32-2^-6", budget, lookups, packed);
-    print_row("hashbrown-binary32", budget, lookups, hashbrown);
+    print_row(
+        "packed-elastic-binary32-2^-6",
+        budget,
+        lookups,
+        samples,
+        packed,
+    );
+    print_row("hashbrown-binary32", budget, lookups, samples, hashbrown);
 }
 
 fn max_entries_within_budget(budget: usize, measure: fn(usize) -> usize) -> usize {
@@ -81,11 +91,11 @@ fn measure_hashbrown_bytes(entries: usize) -> usize {
     bytes
 }
 
-fn run_packed(entries: usize, lookups: usize) -> ProbeResult {
+fn run_packed(entries: usize, lookups: usize, samples: usize) -> ProbeResult {
     let region = Region::new(GLOBAL);
     let map = build_packed(entries);
     let live_bytes = net_live_bytes(region.change());
-    let elapsed = time_hits(entries, lookups, |key| map.get(key).copied());
+    let elapsed = median_hit_time(entries, lookups, samples, |key| map.get(key).copied());
     black_box(&map);
     ProbeResult {
         entries,
@@ -94,11 +104,11 @@ fn run_packed(entries: usize, lookups: usize) -> ProbeResult {
     }
 }
 
-fn run_hashbrown(entries: usize, lookups: usize) -> ProbeResult {
+fn run_hashbrown(entries: usize, lookups: usize, samples: usize) -> ProbeResult {
     let region = Region::new(GLOBAL);
     let map = build_hashbrown(entries);
     let live_bytes = net_live_bytes(region.change());
-    let elapsed = time_hits(entries, lookups, |key| map.get(key).copied());
+    let elapsed = median_hit_time(entries, lookups, samples, |key| map.get(key).copied());
     black_box(&map);
     ProbeResult {
         entries,
@@ -130,16 +140,28 @@ fn build_hashbrown(entries: usize) -> HashMap<Box<[u8]>, u64> {
     map
 }
 
-fn time_hits(
+fn median_hit_time(
     entries: usize,
     lookups: usize,
+    samples: usize,
     mut get: impl FnMut(&[u8]) -> Option<u64>,
 ) -> Duration {
     assert!(
         entries > 0,
         "positive RAM budget must fit at least one entry"
     );
-    let started = Instant::now();
+    run_hits(entries, lookups.min(100_000), &mut get);
+    let mut elapsed = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        let started = Instant::now();
+        run_hits(entries, lookups, &mut get);
+        elapsed.push(started.elapsed());
+    }
+    elapsed.sort_unstable();
+    elapsed[elapsed.len() / 2]
+}
+
+fn run_hits(entries: usize, lookups: usize, get: &mut impl FnMut(&[u8]) -> Option<u64>) {
     let mut checksum = 0_u64;
     for query in 0..lookups {
         let query = u64::try_from(query).expect("lookup index must fit u64");
@@ -147,9 +169,7 @@ fn time_hits(
         let index = mix(query) % entry_count;
         checksum ^= get(&binary_key(index)).expect("generated hit key must exist");
     }
-    let elapsed = started.elapsed();
     black_box(checksum);
-    elapsed
 }
 
 #[derive(Clone, Copy)]
@@ -159,7 +179,7 @@ struct ProbeResult {
     elapsed: Duration,
 }
 
-fn print_row(name: &str, budget: usize, lookups: usize, result: ProbeResult) {
+fn print_row(name: &str, budget: usize, lookups: usize, samples: usize, result: ProbeResult) {
     #[allow(clippy::cast_precision_loss)]
     let utilization = result.live_bytes as f64 / budget as f64;
     #[allow(clippy::cast_precision_loss)]
@@ -167,7 +187,7 @@ fn print_row(name: &str, budget: usize, lookups: usize, result: ProbeResult) {
     #[allow(clippy::cast_precision_loss)]
     let throughput = lookups as f64 / result.elapsed.as_secs_f64();
     println!(
-        "{name},{budget},{},{},{utilization:.6},{lookups},{nanoseconds:.3},{throughput:.0}",
+        "{name},{budget},{},{},{utilization:.6},{lookups},{samples},{nanoseconds:.3},{throughput:.0}",
         result.entries, result.live_bytes
     );
 }

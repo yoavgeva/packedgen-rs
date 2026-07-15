@@ -7,7 +7,9 @@
 - Add deterministic placement vectors derived independently from the paper.
 - Differential-test insert, replace, remove, miss, and rebuild behavior.
 - Instrument successful, unsuccessful, and insertion probe counts.
-- Measure resident bytes through a counting allocator and process RSS.
+- [x] Measure requested live bytes through a counting allocator.
+- [x] Compare retained working sets under the same requested-allocation budget.
+- Measure process RSS and page residency under a pinned system workload.
 
 ## Gate 1: database key layout
 
