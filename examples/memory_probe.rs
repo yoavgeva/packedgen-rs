@@ -3,7 +3,9 @@
 use std::alloc::System;
 use std::hint::black_box;
 
-use elastichash::{ElasticConfig, FixedElasticMap, PackedBinaryMap, PackedKeyArena, PackedKeyRef};
+use elastichash::{
+    ElasticConfig, FixedElasticMap, FrozenPackedMap, PackedBinaryMap, PackedKeyArena, PackedKeyRef,
+};
 use hashbrown::HashMap;
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, Stats, StatsAlloc};
 
@@ -27,6 +29,7 @@ fn main() {
         "hashbrown-binary" => print_hashbrown_binary(entries),
         "packed-binary-3" => print_packed_binary(entries, 3),
         "packed-binary-6" => print_packed_binary(entries, 6),
+        "frozen-binary" => print_frozen_binary(entries),
         "arena" => {
             print_packed_arena(entries);
             print_boxed_keys(entries);
@@ -48,7 +51,7 @@ fn main() {
         _ => panic!(
             "expected elastic-3, elastic-6, hashbrown, elastic-binary-3, \
              elastic-binary-6, hashbrown-binary, packed-binary-3, packed-binary-6, \
-             arena, sweep, packed-sweep, or all"
+             frozen-binary, arena, sweep, packed-sweep, or all"
         ),
     }
 }
@@ -121,6 +124,23 @@ fn print_packed_binary(entries: usize, exponent: u32) {
     black_box(&map);
 }
 
+fn print_frozen_binary(entries: usize) {
+    let region = Region::new(GLOBAL);
+    let map = FrozenPackedMap::try_from_entries((0..entries).map(|index| {
+        let value = u64::try_from(index).expect("entry index must fit u64");
+        (binary_key_array(value), value)
+    }))
+    .unwrap();
+    let stats = region.change();
+    let components = map.stats();
+    eprintln!(
+        "frozen-components: arena_allocated_bytes={}, slot_bytes={}, index_bits_per_entry={:.3}",
+        components.arena_allocated_bytes, components.slot_bytes, components.index_bits_per_entry
+    );
+    print_row("frozen-ptrhash-binary32", entries, stats);
+    black_box(&map);
+}
+
 fn print_packed_arena(entries: usize) {
     let region = Region::new(GLOBAL);
     let key_bytes = entries.checked_mul(32).expect("key byte count overflow");
@@ -174,14 +194,9 @@ fn print_row(name: &str, entries: usize, stats: Stats) {
 }
 
 fn net_live_bytes(stats: Stats) -> usize {
-    let allocated = stats
+    stats
         .bytes_allocated
-        .saturating_sub(stats.bytes_deallocated);
-    if stats.bytes_reallocated >= 0 {
-        allocated.saturating_add(stats.bytes_reallocated.cast_unsigned())
-    } else {
-        allocated.saturating_sub(stats.bytes_reallocated.unsigned_abs())
-    }
+        .saturating_sub(stats.bytes_deallocated)
 }
 
 fn mix(mut value: u64) -> u64 {

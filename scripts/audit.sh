@@ -13,5 +13,6 @@ cargo fmt --all -- --check
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo run --release --locked --example memory_probe -- packed-binary-6 "$entries"
+cargo run --release --locked --example memory_probe -- frozen-binary "$entries"
 cargo run --release --locked --example memory_probe -- hashbrown-binary "$entries"
 cargo run --release --locked --example ram_budget_probe -- "$budget_mib" "$lookups" "$samples"

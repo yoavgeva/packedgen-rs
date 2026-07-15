@@ -68,14 +68,9 @@ struct Measurement {
 
 impl From<Stats> for Measurement {
     fn from(stats: Stats) -> Self {
-        let allocated = stats
+        let live_bytes = stats
             .bytes_allocated
             .saturating_sub(stats.bytes_deallocated);
-        let live_bytes = if stats.bytes_reallocated >= 0 {
-            allocated.saturating_add(stats.bytes_reallocated.cast_unsigned())
-        } else {
-            allocated.saturating_sub(stats.bytes_reallocated.unsigned_abs())
-        };
         Self {
             live_bytes,
             allocations: stats.allocations,

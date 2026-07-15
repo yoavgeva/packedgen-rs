@@ -1,5 +1,14 @@
 # Roadmap
 
+## Alternative backend experiments
+
+- [x] Build an exact frozen PtrHash backend over packed binary keys.
+- [x] Compare frozen retained bytes, hits, misses, and construction with HashBrown.
+- [x] Correct allocator accounting to avoid double-counting reallocation deltas.
+- Add batched/prefetched frozen lookup and serialization.
+- Build a fully dynamic cache-line bucket directory with dense entry indexes.
+- Compare both alternatives under identical fixed-RAM and operation fixtures.
+
 ## Gate 0: algorithm and measurement integrity
 
 - Pin and audit the finite elastic geometry and batch schedule.

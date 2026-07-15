@@ -50,14 +50,9 @@ fn hashbrown_live_bytes(entries: usize) -> usize {
 }
 
 fn net_live_bytes(stats: Stats) -> usize {
-    let allocated = stats
+    stats
         .bytes_allocated
-        .saturating_sub(stats.bytes_deallocated);
-    if stats.bytes_reallocated >= 0 {
-        allocated.saturating_add(stats.bytes_reallocated.cast_unsigned())
-    } else {
-        allocated.saturating_sub(stats.bytes_reallocated.unsigned_abs())
-    }
+        .saturating_sub(stats.bytes_deallocated)
 }
 
 fn mix(mut value: u64) -> u64 {

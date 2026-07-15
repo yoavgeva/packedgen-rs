@@ -64,6 +64,39 @@ Reproduce the raw smoke fixture:
 cargo run --release --example ram_budget_probe -- 64 1000000
 ```
 
+## Frozen perfect-hash backend
+
+The experimental immutable `FrozenPackedMap` uses PtrHash 2.0.1 to assign a
+dense slot, then compares the original bytes in the packed arena. It therefore
+does not accept an unknown key merely because the perfect hash maps that key to
+a member slot.
+
+At one million 32-byte keys with `u64` values:
+
+| Implementation | Requested bytes/entry | Successful lookup |
+| --- | ---: | ---: |
+| Frozen PtrHash, `gxhash` | 49.004 | ~14.5 ns |
+| Packed Elastic, reserve 1/64 | 62.532 | ~58.5 ns |
+| HashBrown | 84.429 | ~27.1 ns |
+
+PtrHash reported 2.99 bits/entry of retained pilot and remap metadata. The
+frozen backend used 42.0% fewer requested bytes than HashBrown and was about
+1.87x faster for this million-key successful-lookup smoke run. On the 32K
+fixture it measured ~8.0 ns per hit and ~9.0 ns per miss, versus HashBrown at
+~7.5 ns and ~5.2 ns. The miss ratio is about 1.74x and remains within the
+existing 2x gate.
+
+The result depends materially on hashing. Portable XXH3-128 is the default and
+measured ~19.2 ns per hit on the 32K fixture; the faster GxHash path is opt-in
+because it requires hardware AES and has no unsupported-CPU fallback. At 16K
+entries, frozen construction measured ~1.78 ms versus HashBrown collection at
+~0.48 ms and packed Elastic loading at ~1.03 ms.
+
+Under the corrected 64 MiB requested-allocation probe, the frozen backend held
+1,376,256 entries, exactly 50% more than HashBrown's 917,504. Its larger working
+set measured ~43.0 ns per hit versus ~36.2 ns for HashBrown in the same short
+run. These raw Cargo measurements remain development-machine smoke evidence.
+
 ## Point-operation latency
 
 Criterion smoke runs used deterministic mixed keys, optimized code, 10 samples,

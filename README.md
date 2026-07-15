@@ -106,6 +106,16 @@ lookup from ~66.2 to ~54.0 ns/key, versus ~27.9 ns/key for batched HashBrown.
 ElasticHash is therefore not yet "better than SwissTable" overall; the release
 gates require the remaining latency work and a RAM-limited system win.
 
+`FrozenPackedMap` explores a second, immutable backend built on PtrHash 2.0.1.
+It retains exact semantics by checking the original packed key after perfect
+indexing. At one million 32-byte keys it used 49.004 requested bytes per entry,
+42.0% less than HashBrown. With the opt-in `gxhash` hardware-AES feature, its
+measured successful lookup was ~14.5 ns/key versus HashBrown's ~27.1 ns/key on
+the same million-key corpus. Frozen construction is slower (~1.78 ms versus
+~0.48 ms for 16K entries), so this backend deliberately trades build and
+mutation support for density and read speed. The portable XXH3-128 path remains
+the default; enable `gxhash` only on supported AES-capable targets.
+
 The same-requested-RAM probe exposes allocation cliffs that a single
 bytes-per-entry point hides. With a 64 MiB requested-allocation budget, packed
 Elastic held 1,032,192 records versus HashBrown's 917,504 (**12.5% more**), but
@@ -122,6 +132,7 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run --release --example memory_probe -- all 1000000
 cargo run --release --example ram_budget_probe -- 64 1000000
+cargo bench --features gxhash --bench mixed_workloads -- successful_lookup_binary_32
 cargo bench
 # or run the complete local release audit
 scripts/audit.sh

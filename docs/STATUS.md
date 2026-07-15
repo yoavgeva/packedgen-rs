@@ -7,6 +7,12 @@ paper-derived owned core, packed binary keys, explicit fixed capacity, and
 reproducible comparisons against HashBrown 0.17.1. It is not yet a production
 replacement for SwissTable, ETS, or a concurrent storage-engine index.
 
+An additional immutable `FrozenPackedMap` prototype now demonstrates a stronger
+read-only point: 49.004 requested bytes/entry and ~14.5 ns successful lookup at
+one million 32-byte keys with hardware-accelerated hashing, versus HashBrown at
+84.429 bytes/entry and ~27.1 ns. This is the current best backend for frozen
+generations, not a replacement for the dynamic map.
+
 ## Current evidence
 
 | Area | Best current evidence | Gate |
@@ -22,6 +28,7 @@ replacement for SwissTable, ETS, or a concurrent storage-engine index.
 | Maintenance pause | About 1.46–1.64 ms for tested rebuild fixtures | Fail: final cutover remains whole-map |
 | Concurrent readers | Generation identity and stale-plan model exist; publication/reclamation do not | Not implemented |
 | RSS/system win | Requested-byte harness exists; pinned RSS and cold-read workload do not | Not demonstrated |
+| Frozen exact generation | 42.0% less requested RAM and ~1.87x faster million-key hits with `gxhash` | Pass for immutable reads; build and portability remain |
 
 Numbers are Apple M4 Max development-machine smoke measurements unless noted.
 They are useful for direction and regression detection, not cross-machine

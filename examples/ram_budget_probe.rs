@@ -8,7 +8,7 @@ use std::alloc::System;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use elastichash::{ElasticConfig, PackedBinaryMap, RouteCacheBudget};
+use elastichash::{ElasticConfig, FrozenPackedMap, PackedBinaryMap, RouteCacheBudget};
 use hashbrown::HashMap;
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, Stats, StatsAlloc};
 
@@ -36,12 +36,14 @@ fn main() {
         .expect("byte budget overflow");
 
     let packed_entries = max_entries_within_budget(budget, measure_packed_bytes);
+    let frozen_entries = max_entries_within_budget(budget, measure_frozen_bytes);
     let hashbrown_entries = max_entries_within_budget(budget, measure_hashbrown_bytes);
     assert!(
-        packed_entries > 0 && hashbrown_entries > 0,
-        "budget must fit at least one entry in both implementations"
+        packed_entries > 0 && frozen_entries > 0 && hashbrown_entries > 0,
+        "budget must fit at least one entry in every implementation"
     );
     let packed = run_packed(packed_entries, lookups, samples);
+    let frozen = run_frozen(frozen_entries, lookups, samples);
     let hashbrown = run_hashbrown(hashbrown_entries, lookups, samples);
 
     println!(
@@ -54,6 +56,7 @@ fn main() {
         samples,
         packed,
     );
+    print_row("frozen-ptrhash-binary32", budget, lookups, samples, frozen);
     print_row("hashbrown-binary32", budget, lookups, samples, hashbrown);
 }
 
@@ -91,6 +94,14 @@ fn measure_hashbrown_bytes(entries: usize) -> usize {
     bytes
 }
 
+fn measure_frozen_bytes(entries: usize) -> usize {
+    let region = Region::new(GLOBAL);
+    let map = build_frozen(entries);
+    let bytes = net_live_bytes(region.change());
+    black_box(&map);
+    bytes
+}
+
 fn run_packed(entries: usize, lookups: usize, samples: usize) -> ProbeResult {
     let region = Region::new(GLOBAL);
     let map = build_packed(entries);
@@ -107,6 +118,19 @@ fn run_packed(entries: usize, lookups: usize, samples: usize) -> ProbeResult {
 fn run_hashbrown(entries: usize, lookups: usize, samples: usize) -> ProbeResult {
     let region = Region::new(GLOBAL);
     let map = build_hashbrown(entries);
+    let live_bytes = net_live_bytes(region.change());
+    let elapsed = median_hit_time(entries, lookups, samples, |key| map.get(key).copied());
+    black_box(&map);
+    ProbeResult {
+        entries,
+        live_bytes,
+        elapsed,
+    }
+}
+
+fn run_frozen(entries: usize, lookups: usize, samples: usize) -> ProbeResult {
+    let region = Region::new(GLOBAL);
+    let map = build_frozen(entries);
     let live_bytes = net_live_bytes(region.change());
     let elapsed = median_hit_time(entries, lookups, samples, |key| map.get(key).copied());
     black_box(&map);
@@ -138,6 +162,14 @@ fn build_hashbrown(entries: usize) -> HashMap<Box<[u8]>, u64> {
         map.insert(binary_key(value).to_vec().into_boxed_slice(), value);
     }
     map
+}
+
+fn build_frozen(entries: usize) -> FrozenPackedMap<u64> {
+    FrozenPackedMap::try_from_entries((0..entries).map(|index| {
+        let value = u64::try_from(index).expect("entry index must fit u64");
+        (binary_key(value), value)
+    }))
+    .expect("unique generated keys must build a frozen map")
 }
 
 fn median_hit_time(
@@ -193,14 +225,9 @@ fn print_row(name: &str, budget: usize, lookups: usize, samples: usize, result: 
 }
 
 fn net_live_bytes(stats: Stats) -> usize {
-    let allocated = stats
+    stats
         .bytes_allocated
-        .saturating_sub(stats.bytes_deallocated);
-    if stats.bytes_reallocated >= 0 {
-        allocated.saturating_add(stats.bytes_reallocated.cast_unsigned())
-    } else {
-        allocated.saturating_sub(stats.bytes_reallocated.unsigned_abs())
-    }
+        .saturating_sub(stats.bytes_deallocated)
 }
 
 fn mix(mut value: u64) -> u64 {

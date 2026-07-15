@@ -13,10 +13,15 @@ categories = ["data-structures", "database-implementations"]
 members = [".", "crates/elastic-core"]
 resolver = "3"
 
+[features]
+default = []
+gxhash = ["ptr_hash/gxhash"]
+
 [dependencies]
 # Pinned to the paper-fidelity rewrite. We intentionally do not follow a moving
 # branch. The core will be audited and vendored before the first stable release.
 opthash = { path = "crates/elastic-core" }
+ptr_hash = { version = "2.0.1", default-features = false }
 
 [dev-dependencies]
 criterion = { version = "0.7", features = ["html_reports"] }

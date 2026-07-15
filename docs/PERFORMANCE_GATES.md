@@ -50,6 +50,14 @@ degradation but does not itself pass the successful-hit gate.
 Measurements that fail a gate remain in the repository; they are optimization
 inputs, not marketing exclusions.
 
+The immutable `FrozenPackedMap` is evaluated separately from the fully dynamic
+gate. Its first million-key run used 42.0% fewer requested bytes than HashBrown
+and measured successful lookup about 1.87x faster with the opt-in hardware-AES
+hasher. Under 64 MiB it retained 50% more records, with about 1.19x slower hits
+over that larger working set. Construction was about 3.7x slower than building
+HashBrown at 16K entries. These results justify continued frozen-backend work
+but do not satisfy dynamic insert/delete or portable-performance requirements.
+
 ## Correctness gates
 
 - Differential agreement with `HashMap` across mixed operations.

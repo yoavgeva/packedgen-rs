@@ -4,7 +4,8 @@ use std::hint::black_box;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use elastichash::{
-    ElasticConfig, FixedElasticMap, MaintenanceMode, PackedBinaryMap, RouteCacheBudget,
+    ElasticConfig, FixedElasticMap, FrozenPackedMap, MaintenanceMode, PackedBinaryMap,
+    RouteCacheBudget,
 };
 use hashbrown::HashMap;
 
@@ -221,6 +222,19 @@ fn batch_load_binary(criterion: &mut Criterion) {
                     .enumerate()
                     .map(|(index, key)| (key.clone(), index as u64))
                     .collect::<HashMap<_, _>>(),
+            )
+        });
+    });
+    group.bench_function("frozen-ptrhash", |bencher| {
+        bencher.iter(|| {
+            black_box(
+                FrozenPackedMap::try_from_entries(
+                    corpus
+                        .iter()
+                        .enumerate()
+                        .map(|(index, key)| (key.as_ref(), index as u64)),
+                )
+                .unwrap(),
             )
         });
     });
@@ -505,6 +519,20 @@ fn binary_key_lookups(criterion: &mut Criterion) {
             map.get(black_box(corpus[cursor].as_ref()))
         });
     });
+    let frozen = FrozenPackedMap::try_from_entries(
+        corpus
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (key.as_ref(), index as u64)),
+    )
+    .unwrap();
+    let mut cursor = 0_usize;
+    group.bench_function("frozen-ptrhash", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % entries;
+            frozen.get(black_box(corpus[cursor].as_ref()))
+        });
+    });
     group.finish();
 }
 
@@ -552,6 +580,20 @@ fn binary_key_missing_lookups(criterion: &mut Criterion) {
             map.get(black_box(misses[cursor].as_ref()))
         });
     });
+    let frozen = FrozenPackedMap::try_from_entries(
+        corpus
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (key.as_ref(), index as u64)),
+    )
+    .unwrap();
+    let mut cursor = 0_usize;
+    group.bench_function("frozen-ptrhash", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % entries;
+            frozen.get(black_box(misses[cursor].as_ref()))
+        });
+    });
     group.finish();
 }
 
@@ -571,6 +613,13 @@ fn large_binary_key_lookups(criterion: &mut Criterion) {
     for (index, key) in corpus.iter().enumerate() {
         hashbrown.insert(key.clone(), index as u64);
     }
+    let frozen = FrozenPackedMap::try_from_entries(
+        corpus
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (key.as_ref(), index as u64)),
+    )
+    .unwrap();
 
     let mut group = criterion.benchmark_group("successful_lookup_binary_32_large_1m");
     group.throughput(Throughput::Elements(1));
@@ -586,6 +635,13 @@ fn large_binary_key_lookups(criterion: &mut Criterion) {
         bencher.iter(|| {
             cursor = cursor.wrapping_add(1) % LARGE_BINARY_ENTRIES;
             hashbrown.get(black_box(corpus[cursor].as_ref()))
+        });
+    });
+    let mut cursor = 0_usize;
+    group.bench_function("frozen-ptrhash", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % LARGE_BINARY_ENTRIES;
+            frozen.get(black_box(corpus[cursor].as_ref()))
         });
     });
     group.finish();

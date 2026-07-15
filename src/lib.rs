@@ -8,12 +8,14 @@
 mod arena;
 mod config;
 mod filter;
+mod frozen_map;
 mod map;
 mod packed_map;
 mod route_cache;
 
 pub use arena::{ArenaError, PackedKeyArena, PackedKeyRef};
 pub use config::{ConfigError, ElasticConfig, MaintenanceMode, RouteCacheBudget};
+pub use frozen_map::{FrozenBuildError, FrozenMapStats, FrozenPackedMap};
 pub use map::{CapacityError, FixedElasticMap, InsertOutcome, MapStats};
 pub use opthash::{EpochSnapshot, EpochTransition, ReserveFraction};
 pub use packed_map::{
