@@ -20,7 +20,7 @@
 - [x] Adapt routing-cache size for small epochs to avoid measured memory cliffs.
 - [x] Add a permanent one-million-key lookup comparison for out-of-cache behavior.
 - [x] Add fixed-size batched lookup with route probes ordered across the batch.
-- [ ] Compact dead arena bytes during a full generation rebuild.
+- [x] Compact dead arena bytes during a full generation rebuild.
 - Define a packed metadata value suitable for disk-location indexes.
 - Keep hot payload ownership separate from index slots.
 - [ ] Provide fallible whole-map construction and batch-load APIs.

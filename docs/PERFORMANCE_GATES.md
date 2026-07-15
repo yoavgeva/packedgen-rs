@@ -31,6 +31,8 @@ the tested no-cliff sweep after adaptive cache budgeting. It is close to the
 missing-lookup and insertion limits, but still fails the successful-hit and
 median-sweep density gates. Fixed 32-key batches narrow the measured large-index
 hit gap from 2.56x to 1.94x HashBrown, still outside the 1.5x limit.
+Synchronous delete-threshold rebuild and arena compaction also fails the churn
+gate: the first 16K-entry smoke fixture pauses for ~1.68 ms at the threshold.
 Measurements that fail a gate remain in the repository; they are optimization
 inputs, not marketing exclusions.
 

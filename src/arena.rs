@@ -202,6 +202,15 @@ impl PackedKeyArena {
         self.key_bytes = 0;
     }
 
+    pub(crate) const fn empty_like(&self) -> Self {
+        Self {
+            segments: Vec::new(),
+            segment_bytes: self.segment_bytes,
+            keys: 0,
+            key_bytes: 0,
+        }
+    }
+
     fn allocate_segment(&mut self, minimum: usize) -> Result<(), ArenaError> {
         if self.segments.len() >= MAX_SEGMENTS {
             return Err(ArenaError::TooManySegments);

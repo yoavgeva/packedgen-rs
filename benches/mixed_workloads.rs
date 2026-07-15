@@ -15,6 +15,7 @@ const INSERT_ENTRIES: usize = 1 << 14;
 const BINARY_KEY_BYTES: usize = 32;
 const LARGE_BINARY_ENTRIES: usize = 1 << 20;
 const LOOKUP_BATCH: usize = 32;
+const CHURN_ENTRIES: usize = 1 << 14;
 
 fn missing_lookups(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("missing_lookup_u64");
@@ -92,6 +93,57 @@ fn binary_key_insertions(criterion: &mut Criterion) {
                 for (index, key) in corpus.iter().enumerate() {
                     black_box(map.insert(key.clone(), index as u64));
                 }
+            },
+            BatchSize::LargeInput,
+        );
+    });
+    group.finish();
+}
+
+fn delete_and_compact_binary(criterion: &mut Criterion) {
+    let corpus: Vec<Box<[u8]>> = (0..CHURN_ENTRIES as u64)
+        .map(|index| binary_key(index, BINARY_KEY_BYTES))
+        .collect();
+    let deletes = CHURN_ENTRIES / 4;
+    let config = ElasticConfig::new(CHURN_ENTRIES)
+        .with_reserve_exponent(6)
+        .unwrap()
+        .with_route_cache_budget(RouteCacheBudget::ReadOptimized);
+    let mut group = criterion.benchmark_group("delete_binary_32_with_compaction");
+    group.throughput(Throughput::Elements(deletes as u64));
+
+    group.bench_function("packed-elastic/reserve_2^-6", |bencher| {
+        bencher.iter_batched(
+            || {
+                let mut map = PackedBinaryMap::new(config);
+                for (index, key) in corpus.iter().enumerate() {
+                    map.try_insert(key, index as u64).unwrap();
+                }
+                map
+            },
+            |mut map| {
+                for key in &corpus[..deletes] {
+                    black_box(map.remove(key).unwrap());
+                }
+                black_box(map.stats())
+            },
+            BatchSize::LargeInput,
+        );
+    });
+    group.bench_function("hashbrown", |bencher| {
+        bencher.iter_batched(
+            || {
+                let mut map = HashMap::with_capacity(CHURN_ENTRIES);
+                for (index, key) in corpus.iter().enumerate() {
+                    map.insert(key.clone(), index as u64);
+                }
+                map
+            },
+            |mut map| {
+                for key in &corpus[..deletes] {
+                    black_box(map.remove(key.as_ref()).unwrap());
+                }
+                black_box(map)
             },
             BatchSize::LargeInput,
         );
@@ -310,6 +362,7 @@ criterion_group!(
     binary_key_lookups,
     binary_key_missing_lookups,
     large_binary_key_lookups,
-    binary_key_insertions
+    binary_key_insertions,
+    delete_and_compact_binary
 );
 criterion_main!(benches);

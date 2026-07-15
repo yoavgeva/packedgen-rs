@@ -78,6 +78,14 @@ route probes across the batch improved ElasticHash by 18.4% without increasing
 resident map memory. This is an API-level throughput option, not a claim that
 individual request latency improved, and it still misses the 1.5x gate.
 
+The first explicit churn smoke run filled a 16K packed map, deleted 4,096
+32-byte keys, and included the threshold-triggered table rebuild and arena
+compaction. Packed ElasticHash took ~1.68 ms for the batch (~2.43 M deletes/s)
+versus ~69 us for HashBrown (~59.2 M deletes/s). The operations are not
+equivalent—HashBrown does not compact an external key arena—but the 24x pause
+ratio demonstrates that compaction must become incremental or move off the
+request path before the churn gate can pass.
+
 The cache is advisory: every direct location is checked against table bounds,
 control fingerprint, and original key bytes. Stale entries and tag collisions
 fall back to the exact elastic schedule. A bucket can reject an absent tag only

@@ -77,11 +77,13 @@ fn mixed_operations_match_standard_hash_map() {
 #[test]
 fn byte_aware_rebuild_preserves_survivors_after_heavy_deletes() {
     let capacity = 1_024;
-    let mut map = PackedBinaryMap::new(
+    let mut map = PackedBinaryMap::with_key_segment_bytes(
         ElasticConfig::new(capacity)
             .with_reserve_exponent(6)
             .unwrap(),
-    );
+        128,
+    )
+    .unwrap();
     let keys: Vec<Vec<u8>> = (0..capacity)
         .map(|index| format!("packed-key-{index:08}").into_bytes())
         .collect();
@@ -89,11 +91,16 @@ fn byte_aware_rebuild_preserves_survivors_after_heavy_deletes() {
     for (index, key) in keys.iter().enumerate() {
         map.try_insert(key, index).unwrap();
     }
+    let allocated_before_deletes = map.stats().arena_allocated_bytes;
     for key in &keys[..capacity / 2] {
         assert!(map.remove(key).is_some());
     }
 
-    assert_eq!(map.stats().deletes_since_rebuild, 0);
+    let stats = map.stats();
+    assert_eq!(stats.deletes_since_rebuild, 0);
+    assert_eq!(stats.dead_key_bytes(), 0);
+    assert_eq!(stats.arena_key_bytes, stats.live_key_bytes);
+    assert!(stats.arena_allocated_bytes < allocated_before_deletes);
     for (index, key) in keys.iter().enumerate().skip(capacity / 2) {
         assert_eq!(map.get(key), Some(&index));
     }

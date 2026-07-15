@@ -265,36 +265,58 @@ impl<V> PackedBinaryMap<V> {
     }
 
     fn rebuild_core(&mut self) {
+        let compaction = self.build_compacted_arena().ok();
         let replacement = ElasticHashMap::with_capacity_and_reserve(
             self.live_limit,
             self.inner.reserve_fraction(),
         );
         let old = mem::replace(&mut self.inner, replacement);
+        let remapped_refs = compaction.map(|(replacement_arena, remapped_refs)| {
+            drop(mem::replace(&mut self.arena, replacement_arena));
+            remapped_refs
+        });
+        let mut replacement_filter = NegativeLookupFilter::new(self.live_limit);
         self.route_cache.clear();
         for (key_ref, value) in old {
+            let rebuilt_ref = remapped_refs.as_ref().map_or(key_ref, |references| {
+                references
+                    .binary_search_by_key(&key_ref, |(old_ref, _)| *old_ref)
+                    .map(|index| references[index].1)
+                    .expect("every live packed key must have a compacted reference")
+            });
             let bytes = self
                 .arena
-                .get(key_ref)
+                .get(rebuilt_ref)
                 .expect("live packed key reference must resolve");
             let hash = self.inner.hash_key(bytes);
             let (location, _) = self
                 .inner
-                .try_insert_unique_prehashed_in_place_with_location(hash, key_ref, value)
+                .try_insert_unique_prehashed_in_place_with_location(hash, rebuilt_ref, value)
                 .unwrap_or_else(|_| panic!("fresh elastic epoch must fit every live entry"));
+            replacement_filter.insert_hash(hash);
             self.route_cache.insert(hash, location);
         }
         self.deletes_since_rebuild = 0;
-        self.rebuild_negative_filter();
+        self.negative_filter = replacement_filter;
     }
 
-    fn rebuild_negative_filter(&mut self) {
-        let mut replacement = NegativeLookupFilter::new(self.live_limit);
-        for (key_ref, _) in &self.inner {
-            if let Some(bytes) = self.arena.get(*key_ref) {
-                replacement.insert_hash(self.inner.hash_key(bytes));
-            }
+    fn build_compacted_arena(
+        &self,
+    ) -> Result<(PackedKeyArena, Vec<(PackedKeyRef, PackedKeyRef)>), ArenaError> {
+        let mut replacement = self.arena.empty_like();
+        let mut references = Vec::new();
+        references
+            .try_reserve_exact(self.inner.len())
+            .map_err(|_| ArenaError::AllocationFailed)?;
+        for (old_ref, _) in &self.inner {
+            let bytes = self
+                .arena
+                .get(*old_ref)
+                .expect("live packed key reference must resolve");
+            references.push((*old_ref, replacement.insert(bytes)?));
         }
-        self.negative_filter = replacement;
+        references.sort_unstable_by_key(|(old_ref, _)| *old_ref);
+        Ok((replacement, references))
     }
 }
 
