@@ -105,6 +105,11 @@ copying from the final cutover in caller-selected slices, but the initial live
 reference snapshot and final table rebuild are still whole-map operations; the
 1.46 ms cutover evidence therefore remains the governing p99 failure.
 
+Capturing the initial 12,288-reference maintenance snapshot measured ~35.0 us.
+Structural mutations invalidate that snapshot; allocation-safe restart has the
+same whole-snapshot cost, while value-only replacement leaves it valid. This is
+small relative to cutover but remains an unbounded-by-budget phase.
+
 The cache is advisory: every direct location is checked against table bounds,
 control fingerprint, and original key bytes. Stale entries and tag collisions
 fall back to the exact elastic schedule. A bucket can reject an absent tag only

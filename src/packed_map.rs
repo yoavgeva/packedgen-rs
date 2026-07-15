@@ -285,6 +285,30 @@ impl<V> PackedBinaryMap<V> {
         })
     }
 
+    /// Returns whether structural mutation invalidated a staged plan.
+    #[must_use]
+    pub fn maintenance_plan_is_stale(&self, plan: &PackedMaintenancePlan) -> bool {
+        plan.source_revision != self.structural_revision
+    }
+
+    /// Replaces a stale or unwanted plan with a fresh snapshot.
+    ///
+    /// The replacement is fully allocated before the old plan is discarded, so
+    /// allocation failure leaves the caller's existing plan intact.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArenaError::AllocationFailed`] if the new reference snapshot
+    /// cannot be allocated.
+    pub fn try_restart_maintenance(
+        &self,
+        plan: &mut PackedMaintenancePlan,
+    ) -> Result<(), ArenaError> {
+        let replacement = self.try_begin_maintenance()?;
+        *plan = replacement;
+        Ok(())
+    }
+
     /// Copies at most `max_entries` live keys into a staged compact arena.
     ///
     /// A structural mutation after the plan began returns
@@ -478,7 +502,7 @@ impl<V> PackedBinaryMap<V> {
         &self,
         plan: &PackedMaintenancePlan,
     ) -> Result<(), MaintenanceError> {
-        if plan.source_revision != self.structural_revision {
+        if self.maintenance_plan_is_stale(plan) {
             return Err(MaintenanceError::StalePlan);
         }
         Ok(())

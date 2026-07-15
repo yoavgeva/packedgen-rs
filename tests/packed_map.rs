@@ -175,6 +175,38 @@ fn staged_maintenance_bounds_key_copying_before_cutover() {
 }
 
 #[test]
+fn staged_maintenance_detects_structural_changes_and_restarts() {
+    let config = ElasticConfig::new(16).with_maintenance_mode(MaintenanceMode::Deferred);
+    let mut map = PackedBinaryMap::new(config);
+    map.try_insert(b"alpha", 1).unwrap();
+    map.try_insert(b"beta", 2).unwrap();
+
+    let mut plan = map.try_begin_maintenance().unwrap();
+    map.try_insert(b"alpha", 10).unwrap();
+    assert!(!map.maintenance_plan_is_stale(&plan));
+    while !plan.is_ready() {
+        map.prepare_maintenance_step(&mut plan, 1).unwrap();
+    }
+    map.finish_maintenance(&mut plan).unwrap();
+    assert_eq!(map.get(b"alpha"), Some(&10));
+
+    let mut plan = map.try_begin_maintenance().unwrap();
+    map.try_insert(b"gamma", 3).unwrap();
+    assert!(map.maintenance_plan_is_stale(&plan));
+    assert_eq!(
+        map.prepare_maintenance_step(&mut plan, 1),
+        Err(elastichash::MaintenanceError::StalePlan)
+    );
+    map.try_restart_maintenance(&mut plan).unwrap();
+    assert!(!map.maintenance_plan_is_stale(&plan));
+    while !plan.is_ready() {
+        map.prepare_maintenance_step(&mut plan, 1).unwrap();
+    }
+    map.finish_maintenance(&mut plan).unwrap();
+    assert_eq!(map.get(b"gamma"), Some(&3));
+}
+
+#[test]
 fn routing_accelerator_is_bounded_and_caches_most_routes() {
     let capacity = 10_000;
     let mut map = PackedBinaryMap::new(

@@ -37,6 +37,9 @@ maintenance runs, compaction-staging failures, and reclaimed arena capacity.
 `try_begin_maintenance` plus `prepare_maintenance_step` can copy compacted key
 bytes in bounded owner-selected slices before `finish_maintenance` performs the
 remaining table cutover.
+Structural mutation marks a staged plan stale; the writer can detect this and
+restart allocation-safely. Replacing only a value keeps the plan valid because
+packed key references do not move.
 
 The intended production architecture is:
 

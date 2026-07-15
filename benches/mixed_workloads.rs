@@ -255,6 +255,35 @@ fn maintenance_prepare_step_binary(criterion: &mut Criterion) {
     group.finish();
 }
 
+fn maintenance_begin_binary(criterion: &mut Criterion) {
+    let corpus: Vec<Box<[u8]>> = (0..CHURN_ENTRIES as u64)
+        .map(|index| binary_key(index, BINARY_KEY_BYTES))
+        .collect();
+    let config = ElasticConfig::new(CHURN_ENTRIES)
+        .with_reserve_exponent(6)
+        .unwrap()
+        .with_maintenance_mode(MaintenanceMode::Deferred);
+    let mut group = criterion.benchmark_group("maintenance_begin_binary_32_12k");
+    group.throughput(Throughput::Elements((CHURN_ENTRIES * 3 / 4) as u64));
+    group.bench_function("packed-elastic", |bencher| {
+        bencher.iter_batched(
+            || {
+                let mut map = PackedBinaryMap::new(config);
+                for (index, key) in corpus.iter().enumerate() {
+                    map.try_insert(key, index as u64).unwrap();
+                }
+                for key in &corpus[..CHURN_ENTRIES / 4] {
+                    map.remove(key).unwrap();
+                }
+                map
+            },
+            |map| black_box(map.try_begin_maintenance().unwrap()),
+            BatchSize::LargeInput,
+        );
+    });
+    group.finish();
+}
+
 fn bulk_insertions(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("bulk_insert_u64");
     group.throughput(Throughput::Elements(INSERT_ENTRIES as u64));
@@ -469,6 +498,7 @@ criterion_group!(
     binary_key_insertions,
     delete_and_compact_binary,
     maintenance_rebuild_binary,
-    maintenance_prepare_step_binary
+    maintenance_prepare_step_binary,
+    maintenance_begin_binary
 );
 criterion_main!(benches);
