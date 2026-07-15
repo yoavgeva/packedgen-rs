@@ -105,6 +105,13 @@ lookup from ~66.2 to ~54.0 ns/key, versus ~27.9 ns/key for batched HashBrown.
 ElasticHash is therefore not yet "better than SwissTable" overall; the release
 gates require the remaining latency work and a RAM-limited system win.
 
+The same-requested-RAM probe exposes allocation cliffs that a single
+bytes-per-entry point hides. With a 64 MiB requested-allocation budget, packed
+Elastic held 1,032,192 records versus HashBrown's 917,504 (**12.5% more**), but
+its successful lookup loop was 143.2 ns/key versus 41.3 ns/key. This fails the
+project's 25%-more-records density gate and the lookup gate; it is evidence of
+a useful capacity direction, not an overall win.
+
 ## Development
 
 ```text
@@ -112,6 +119,7 @@ cargo fmt --all -- --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run --release --example memory_probe -- all 1000000
+cargo run --release --example ram_budget_probe -- 64 1000000
 cargo bench
 ```
 

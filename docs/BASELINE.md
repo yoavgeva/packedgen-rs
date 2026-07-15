@@ -36,6 +36,32 @@ Reproduce:
 cargo run --release --example memory_probe -- all 1000000
 ```
 
+## Same requested-RAM working set
+
+The `ram_budget_probe` binary-searches the largest 32-byte-key map whose
+requested live allocations fit a fixed budget, then times deterministic
+successful lookups over each implementation's resulting working set. At a 64
+MiB budget with one million queries on the development machine:
+
+| Implementation | Entries | Live requested bytes | Budget used | Hit latency |
+| --- | ---: | ---: | ---: | ---: |
+| Packed Elastic, reserve 1/64, read optimized | 1,032,192 | 63,939,352 | 95.3% | 143.2 ns |
+| HashBrown | 917,504 | 55,574,536 | 82.8% | 41.3 ns |
+
+Packed Elastic holds 12.5% more records under this exact budget, below the 25%
+density release gate, and the successful lookup is 3.46x slower. HashBrown's
+next allocation-capacity step exceeds the budget, which explains its unused
+space and demonstrates why a fixed-budget result can differ sharply from the
+one-million-entry bytes-per-entry result. These are requested allocator bytes,
+not RSS; page residency and cache-miss behavior still require a Linux-pinned
+system run.
+
+Reproduce the raw smoke fixture:
+
+```text
+cargo run --release --example ram_budget_probe -- 64 1000000
+```
+
 ## Point-operation latency
 
 Criterion smoke runs used deterministic mixed keys, optimized code, 10 samples,

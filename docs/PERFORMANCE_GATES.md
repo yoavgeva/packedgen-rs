@@ -31,6 +31,10 @@ the tested no-cliff sweep after adaptive cache budgeting. It is close to the
 missing-lookup and insertion limits, but still fails the successful-hit and
 median-sweep density gates. Fixed 32-key batches narrow the measured large-index
 hit gap from 2.56x to 1.94x HashBrown, still outside the 1.5x limit.
+Under the same 64 MiB requested-allocation budget, the packed map holds 12.5%
+more 32-byte-key records, below the 25% density gate, while its scalar hit loop
+is 3.46x slower. This fixed-budget harness captures capacity-allocation cliffs
+but does not yet measure RSS or page residency.
 Synchronous delete-threshold rebuild and arena compaction also fails the churn
 gate: the first 16K-entry smoke fixture pauses for ~1.68 ms at the threshold.
 Deferred mode reduces that request-path delete batch to ~98.2 us, 1.41x
