@@ -122,6 +122,28 @@ fn routing_accelerator_is_bounded_and_caches_most_routes() {
     );
 }
 
+#[test]
+fn batched_lookup_preserves_order_across_hits_and_misses() {
+    for budget in [RouteCacheBudget::Compact, RouteCacheBudget::ReadOptimized] {
+        let mut map = PackedBinaryMap::new(ElasticConfig::new(16).with_route_cache_budget(budget));
+        map.try_insert(b"alpha", 1).unwrap();
+        map.try_insert(b"beta", 2).unwrap();
+        map.try_insert(b"gamma", 3).unwrap();
+
+        assert_eq!(map.get(b"alpha"), Some(&1));
+        assert_eq!(
+            map.get_many([b"gamma".as_slice(), b"missing", b"alpha", b"beta"]),
+            [Some(&3), None, Some(&1), Some(&2)]
+        );
+        assert_eq!(map.remove(b"gamma"), Some(3));
+        assert_eq!(
+            map.get_many([b"gamma".as_slice(), b"alpha", b"missing"]),
+            [None, Some(&1), None]
+        );
+        assert_eq!(map.get_many::<0>([]), []);
+    }
+}
+
 fn mix(mut value: u64) -> u64 {
     value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);

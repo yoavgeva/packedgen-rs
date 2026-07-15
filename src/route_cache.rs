@@ -99,7 +99,7 @@ impl RouteCache {
     /// none of its retained tags matches the query.
     pub(crate) fn definitely_absent(&self, hash: u64) -> bool {
         let Some(start) = self.bucket_start(hash) else {
-            return true;
+            return false;
         };
         let bucket = start / WAYS;
         if self.overflow_buckets[bucket / 64] & (1_u64 << (bucket % 64)) != 0 {
@@ -188,6 +188,14 @@ mod tests {
         assert!(cache.candidates(1_u64 << 63).next().is_none());
         assert!(cache.definitely_absent(1_u64 << 63));
         assert_eq!(expand_location(0).bits(), 0);
+    }
+
+    #[test]
+    fn disabled_cache_never_claims_definite_absence() {
+        let cache = RouteCache::new(16, 0);
+
+        assert!(cache.candidates(7).next().is_none());
+        assert!(!cache.definitely_absent(7));
     }
 
     #[test]

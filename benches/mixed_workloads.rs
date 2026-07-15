@@ -14,6 +14,7 @@ const LOOKUP_ENTRIES: usize = 1 << 17;
 const INSERT_ENTRIES: usize = 1 << 14;
 const BINARY_KEY_BYTES: usize = 32;
 const LARGE_BINARY_ENTRIES: usize = 1 << 20;
+const LOOKUP_BATCH: usize = 32;
 
 fn missing_lookups(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("missing_lookup_u64");
@@ -275,6 +276,28 @@ fn large_binary_key_lookups(criterion: &mut Criterion) {
         bencher.iter(|| {
             cursor = cursor.wrapping_add(1) % LARGE_BINARY_ENTRIES;
             hashbrown.get(black_box(corpus[cursor].as_ref()))
+        });
+    });
+    group.finish();
+
+    let mut group = criterion.benchmark_group("successful_lookup_binary_32_large_1m_batch_32");
+    group.throughput(Throughput::Elements(LOOKUP_BATCH as u64));
+    let mut cursor = 0_usize;
+    group.bench_function("packed-elastic/reserve_2^-6", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(LOOKUP_BATCH) % (LARGE_BINARY_ENTRIES - LOOKUP_BATCH);
+            let keys: [&[u8]; LOOKUP_BATCH] =
+                core::array::from_fn(|offset| corpus[cursor + offset].as_ref());
+            black_box(packed.get_many(keys))
+        });
+    });
+    let mut cursor = 0_usize;
+    group.bench_function("hashbrown", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(LOOKUP_BATCH) % (LARGE_BINARY_ENTRIES - LOOKUP_BATCH);
+            black_box(core::array::from_fn::<_, LOOKUP_BATCH, _>(|offset| {
+                hashbrown.get(corpus[cursor + offset].as_ref())
+            }))
         });
     });
     group.finish();

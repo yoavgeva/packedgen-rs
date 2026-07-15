@@ -73,10 +73,11 @@ performance result is recorded in [`docs/BASELINE.md`](docs/BASELINE.md).
 At one million 32-byte binary keys, the accelerated packed `1/64` layout uses
 62.533 requested bytes per entry versus HashBrown's 84.429: **25.9% less**. It
 also removes the million per-key allocations. The two-way routing accelerator
-reduced successful lookup from roughly 70 ns to 28 ns, but HashBrown remains
-around 7 ns on this development machine. ElasticHash is therefore not yet
-"better than SwissTable" overall; the release gates require the remaining
-latency work and a RAM-limited system win.
+reduced the small-fixture successful lookup from roughly 70 ns to 28 ns, versus
+HashBrown around 7 ns. At one million keys, fixed batches of 32 reduce Elastic
+lookup from ~66.2 to ~54.0 ns/key, versus ~27.9 ns/key for batched HashBrown.
+ElasticHash is therefore not yet "better than SwissTable" overall; the release
+gates require the remaining latency work and a RAM-limited system win.
 
 ## Development
 

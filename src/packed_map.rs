@@ -137,6 +137,56 @@ impl<V> PackedBinaryMap<V> {
         self.inner.get_prehashed(hash, &query)
     }
 
+    /// Looks up a fixed batch of binary keys in a memory-latency-friendly
+    /// order.
+    ///
+    /// Hashes and route candidates are prepared first, then each cache way is
+    /// resolved across the whole batch before exact fallbacks run. This keeps
+    /// independent table and arena reads in flight together on large indexes.
+    #[must_use]
+    pub fn get_many<const N: usize>(&self, keys: [&[u8]; N]) -> [Option<&V>; N] {
+        let hashes = keys.map(|key| self.inner.hash_key(key));
+        let candidates: [[Option<opthash::PrehashedLocation>; 2]; N] =
+            core::array::from_fn(|index| {
+                let mut routes = self.route_cache.candidates(hashes[index]);
+                [routes.next(), routes.next()]
+            });
+        let mut results = [None; N];
+
+        for way in [0, 1] {
+            for index in 0..N {
+                if results[index].is_some() {
+                    continue;
+                }
+                let Some(location) = candidates[index][way] else {
+                    continue;
+                };
+                let query = PackedQuery {
+                    arena: &self.arena,
+                    bytes: keys[index],
+                };
+                results[index] = self.inner.get_prehashed_at(location, hashes[index], &query);
+            }
+        }
+
+        for index in 0..N {
+            if results[index].is_some()
+                || self.route_cache.definitely_absent(hashes[index])
+                || !self.negative_filter.may_contain_hash(hashes[index])
+            {
+                continue;
+            }
+            results[index] = self.inner.get_prehashed(
+                hashes[index],
+                &PackedQuery {
+                    arena: &self.arena,
+                    bytes: keys[index],
+                },
+            );
+        }
+        results
+    }
+
     /// Returns whether a binary key is live.
     #[must_use]
     pub fn contains_key(&self, key: &[u8]) -> bool {

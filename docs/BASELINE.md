@@ -71,6 +71,13 @@ read-optimized `1/64` packed map measured ~63.7 ns per successful lookup versus
 HashBrown's ~25.8 ns. The gap narrows from roughly 4x at 32K keys to 2.47x, but
 still misses the 1.5x release gate.
 
+A paired scalar-and-batch smoke run measured fixed batches of 32 at ~54.0
+ns/key for packed ElasticHash versus ~27.9 ns/key for HashBrown, a 1.94x gap.
+In that same run scalar packed lookup was ~66.2 ns/key, so ordering independent
+route probes across the batch improved ElasticHash by 18.4% without increasing
+resident map memory. This is an API-level throughput option, not a claim that
+individual request latency improved, and it still misses the 1.5x gate.
+
 The cache is advisory: every direct location is checked against table bounds,
 control fingerprint, and original key bytes. Stale entries and tag collisions
 fall back to the exact elastic schedule. A bucket can reject an absent tag only
@@ -106,5 +113,6 @@ cargo bench --bench mixed_workloads
 - Packed binary-key storage plus verified direct routing preserves a density
   advantage at favorable capacities and cuts successful lookup by about 60%,
   but the hit, miss, insertion, and median-density gates still need work.
-- The next optimization target is the exact-query routing path: probe schedule,
-  candidate dispatch, and batched lookup. RAM density alone is insufficient.
+- Batched lookup overlaps independent route probes and improves the large-index
+  hit path, but further work must remove dependent reads from scalar and batch
+  candidate dispatch. RAM density alone is insufficient.

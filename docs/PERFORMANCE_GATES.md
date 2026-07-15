@@ -29,8 +29,10 @@ For large binary-keyed, fixed-epoch indexes:
 The accelerated packed layout passes the one-million-entry density target and
 the tested no-cliff sweep after adaptive cache budgeting. It is close to the
 missing-lookup and insertion limits, but still fails the successful-hit and
-median-sweep density gates. Measurements that fail a gate remain in the
-repository; they are optimization inputs, not marketing exclusions.
+median-sweep density gates. Fixed 32-key batches narrow the measured large-index
+hit gap from 2.56x to 1.94x HashBrown, still outside the 1.5x limit.
+Measurements that fail a gate remain in the repository; they are optimization
+inputs, not marketing exclusions.
 
 ## Correctness gates
 
