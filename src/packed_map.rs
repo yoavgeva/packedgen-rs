@@ -276,7 +276,9 @@ impl<V> PackedBinaryMap<V> {
         self.structural_revision = self.structural_revision.wrapping_add(1);
         self.live_key_bytes = self.live_key_bytes.saturating_sub(key_ref.len());
         self.deletes_since_rebuild += 1;
-        if self.maintenance_mode == MaintenanceMode::Synchronous && self.maintenance_due() {
+        if (self.maintenance_mode == MaintenanceMode::Synchronous && self.maintenance_due())
+            || self.deletes_since_rebuild >= self.required_maintenance_threshold()
+        {
             self.rebuild_core();
         }
         Some(value)
@@ -469,6 +471,10 @@ impl<V> PackedBinaryMap<V> {
 
     fn rebuild_delete_threshold(&self) -> usize {
         (self.live_limit / 4).max(1)
+    }
+
+    fn required_maintenance_threshold(&self) -> usize {
+        self.live_limit.div_ceil(2).max(1)
     }
 
     fn rebuild_core(&mut self) {

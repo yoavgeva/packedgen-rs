@@ -116,7 +116,9 @@ pub enum MaintenanceMode {
     Synchronous,
     /// Mark maintenance due and let the single writer choose when to rebuild.
     /// An insertion may still force maintenance if accumulated tombstones leave
-    /// no physical slot for a new key.
+    /// no physical slot for a new key. Reaching one deletion per two configured
+    /// entries also forces maintenance to bound ignored tombstones and dead key
+    /// bytes.
     Deferred,
 }
 

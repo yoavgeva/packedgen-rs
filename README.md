@@ -40,6 +40,8 @@ remaining table cutover.
 Structural mutation marks a staged plan stale; the writer can detect this and
 restart allocation-safely. Replacing only a value keeps the plan valid because
 packed key references do not move.
+Deferred mode emits its soft maintenance signal at 25% deleted entries and
+forces maintenance at 50%, bounding ignored tombstones and dead arena bytes.
 
 The intended production architecture is:
 

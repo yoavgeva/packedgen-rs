@@ -19,6 +19,7 @@ const LARGE_BINARY_ENTRIES: usize = 1 << 20;
 const LOOKUP_BATCH: usize = 32;
 const CHURN_ENTRIES: usize = 1 << 14;
 const CONSTRUCTION_ENTRIES: usize = 100_000;
+const DEFERRED_LOOKUP_ENTRIES: usize = 1 << 15;
 
 fn fallible_construction(criterion: &mut Criterion) {
     let config = ElasticConfig::new(CONSTRUCTION_ENTRIES)
@@ -37,6 +38,71 @@ fn fallible_construction(criterion: &mut Criterion) {
             ))
         });
     });
+    group.finish();
+}
+
+fn deferred_delete_lookup_degradation(criterion: &mut Criterion) {
+    let corpus: Vec<Box<[u8]>> = (0..DEFERRED_LOOKUP_ENTRIES as u64)
+        .map(|index| binary_key(index, BINARY_KEY_BYTES))
+        .collect();
+    let misses: Vec<Box<[u8]>> = (DEFERRED_LOOKUP_ENTRIES as u64
+        ..(DEFERRED_LOOKUP_ENTRIES * 2) as u64)
+        .map(|index| binary_key(index, BINARY_KEY_BYTES))
+        .collect();
+    let config = ElasticConfig::new(DEFERRED_LOOKUP_ENTRIES)
+        .with_reserve_exponent(6)
+        .unwrap()
+        .with_route_cache_budget(RouteCacheBudget::ReadOptimized)
+        .with_maintenance_mode(MaintenanceMode::Deferred);
+    let mut group = criterion.benchmark_group("lookup_binary_32_after_deferred_deletes");
+    group.throughput(Throughput::Elements(1));
+
+    for (label, deletes) in [
+        ("0pct", 0),
+        ("12pct", DEFERRED_LOOKUP_ENTRIES / 8),
+        ("25pct", DEFERRED_LOOKUP_ENTRIES / 4),
+        ("50pct-minus-one", DEFERRED_LOOKUP_ENTRIES / 2 - 1),
+    ] {
+        let mut packed = PackedBinaryMap::new(config);
+        let mut hashbrown = HashMap::with_capacity(DEFERRED_LOOKUP_ENTRIES);
+        for (index, key) in corpus.iter().enumerate() {
+            packed.try_insert(key, index as u64).unwrap();
+            hashbrown.insert(key.clone(), index as u64);
+        }
+        for key in &corpus[..deletes] {
+            packed.remove(key).unwrap();
+            hashbrown.remove(key.as_ref()).unwrap();
+        }
+
+        let mut cursor = deletes;
+        group.bench_function(format!("hit/packed-elastic/{label}"), |bencher| {
+            bencher.iter(|| {
+                cursor = deletes + (cursor + 1 - deletes) % (DEFERRED_LOOKUP_ENTRIES - deletes);
+                packed.get(black_box(corpus[cursor].as_ref()))
+            });
+        });
+        let mut cursor = deletes;
+        group.bench_function(format!("hit/hashbrown/{label}"), |bencher| {
+            bencher.iter(|| {
+                cursor = deletes + (cursor + 1 - deletes) % (DEFERRED_LOOKUP_ENTRIES - deletes);
+                hashbrown.get(black_box(corpus[cursor].as_ref()))
+            });
+        });
+        let mut cursor = 0;
+        group.bench_function(format!("miss/packed-elastic/{label}"), |bencher| {
+            bencher.iter(|| {
+                cursor = (cursor + 1) % DEFERRED_LOOKUP_ENTRIES;
+                packed.get(black_box(misses[cursor].as_ref()))
+            });
+        });
+        let mut cursor = 0;
+        group.bench_function(format!("miss/hashbrown/{label}"), |bencher| {
+            bencher.iter(|| {
+                cursor = (cursor + 1) % DEFERRED_LOOKUP_ENTRIES;
+                hashbrown.get(black_box(misses[cursor].as_ref()))
+            });
+        });
+    }
     group.finish();
 }
 
@@ -560,6 +626,7 @@ criterion_group!(
     maintenance_prepare_step_binary,
     maintenance_begin_binary,
     fallible_construction,
-    batch_load_binary
+    batch_load_binary,
+    deferred_delete_lookup_degradation
 );
 criterion_main!(benches);

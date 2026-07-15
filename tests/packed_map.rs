@@ -177,6 +177,32 @@ fn deferred_maintenance_moves_compaction_to_an_explicit_boundary() {
 }
 
 #[test]
+fn deferred_maintenance_has_a_hard_delete_ceiling() {
+    let capacity = 64;
+    let config = ElasticConfig::new(capacity).with_maintenance_mode(MaintenanceMode::Deferred);
+    let mut map = PackedBinaryMap::new(config);
+    let keys: Vec<Vec<u8>> = (0..capacity)
+        .map(|index| format!("ceiling-{index:04}").into_bytes())
+        .collect();
+    for (index, key) in keys.iter().enumerate() {
+        map.try_insert(key, index).unwrap();
+    }
+    for key in &keys[..capacity / 2 - 1] {
+        map.remove(key).unwrap();
+    }
+    assert_eq!(map.stats().maintenance_runs, 0);
+    assert!(map.maintenance_due());
+
+    map.remove(&keys[capacity / 2 - 1]).unwrap();
+    assert_eq!(map.stats().maintenance_runs, 1);
+    assert_eq!(map.stats().deletes_since_rebuild, 0);
+    assert_eq!(map.stats().dead_key_bytes(), 0);
+    for (index, key) in keys.iter().enumerate().skip(capacity / 2) {
+        assert_eq!(map.get(key), Some(&index));
+    }
+}
+
+#[test]
 fn staged_maintenance_bounds_key_copying_before_cutover() {
     let capacity = 32;
     let config = ElasticConfig::new(capacity).with_maintenance_mode(MaintenanceMode::Deferred);

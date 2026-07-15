@@ -122,6 +122,14 @@ versus ~35.7 M/s for collecting owned boxed keys into HashBrown. ElasticHash is
 partial map and reports the zero-based input index; duplicate keys use normal
 replacement semantics.
 
+The deferred-delete lookup sweep measured successful 32-byte hits at ~30.1 ns
+with no deletes, ~33.6 ns at 12.5%, ~35.4 ns at the 25% soft maintenance signal,
+and ~39.5 ns immediately below the forced 50% ceiling. The bounded worst case
+is therefore 31% slower than the fresh map and ~4.9x HashBrown at the same
+point. Missing lookup stayed roughly flat at ~10.1–10.8 ns because the stable
+negative filter avoids tombstone probing. Deferred mode forcibly rebuilds at
+50% deleted entries even if the owner ignores the soft signal.
+
 The cache is advisory: every direct location is checked against table bounds,
 control fingerprint, and original key bytes. Stale entries and tag collisions
 fall back to the exact elastic schedule. A bucket can reject an absent tag only

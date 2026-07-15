@@ -39,7 +39,7 @@
 
 ## Gate 3: service semantics
 
-- Tombstone and deletion policy with bounded degradation.
+- [x] Bound deferred tombstones with a measured forced-maintenance ceiling.
 - Definite-negative membership filter with deletion-safe maintenance.
 - TTL metadata and conditional delete/update primitives.
 - Batch lookup and batch publication to amortize FFI or network boundaries.
