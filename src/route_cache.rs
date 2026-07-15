@@ -43,12 +43,13 @@ impl RouteCache {
     }
 
     pub(crate) fn insert(&mut self, hash: u64, location: PrehashedLocation) {
-        let Some(compact) = compact_location(location) else {
+        let Some(start) = self.bucket_start(hash) else {
             self.overflowed += 1;
             return;
         };
-        let Some(start) = self.bucket_start(hash) else {
+        let Some(compact) = compact_location(location) else {
             self.overflowed += 1;
+            self.mark_overflow(start);
             return;
         };
         let tag = tag(hash);
@@ -61,7 +62,7 @@ impl RouteCache {
             }
         }
         self.overflowed += 1;
-        self.overflow_buckets[start / WAYS / 64] |= 1_u64 << (start / WAYS % 64);
+        self.mark_overflow(start);
     }
 
     pub(crate) fn candidates(&self, hash: u64) -> RouteCandidates<'_> {
@@ -122,6 +123,11 @@ impl RouteCache {
         };
         Some(bucket * WAYS)
     }
+
+    fn mark_overflow(&mut self, start: usize) {
+        let bucket = start / WAYS;
+        self.overflow_buckets[bucket / 64] |= 1_u64 << (bucket % 64);
+    }
 }
 
 pub(crate) struct RouteCandidates<'a> {
@@ -175,7 +181,7 @@ fn reduce(hash: u64, upper: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{RouteCache, expand_location};
+    use super::{MAX_LEVEL, RouteCache, expand_location};
     use opthash::PrehashedLocation;
 
     #[test]
@@ -196,6 +202,18 @@ mod tests {
 
         assert!(cache.candidates(7).next().is_none());
         assert!(!cache.definitely_absent(7));
+    }
+
+    #[test]
+    fn unrepresentable_location_disables_the_bucket_negative_proof() {
+        let mut cache = RouteCache::new(4, 8);
+        let unrepresentable = PrehashedLocation::from_bits((MAX_LEVEL + 1) << 32);
+
+        cache.insert(0, unrepresentable);
+
+        assert_eq!(cache.cached(), 0);
+        assert_eq!(cache.overflowed(), 1);
+        assert!(!cache.definitely_absent(1));
     }
 
     #[test]
