@@ -138,6 +138,43 @@ fn deferred_maintenance_moves_compaction_to_an_explicit_boundary() {
 }
 
 #[test]
+fn staged_maintenance_bounds_key_copying_before_cutover() {
+    let capacity = 32;
+    let config = ElasticConfig::new(capacity).with_maintenance_mode(MaintenanceMode::Deferred);
+    let mut map = PackedBinaryMap::with_key_segment_bytes(config, 64).unwrap();
+    let keys: Vec<Vec<u8>> = (0..capacity)
+        .map(|index| format!("staged-{index:04}").into_bytes())
+        .collect();
+    for (index, key) in keys.iter().enumerate() {
+        map.try_insert(key, index).unwrap();
+    }
+    for key in &keys[..8] {
+        map.remove(key).unwrap();
+    }
+
+    let mut plan = map.try_begin_maintenance().unwrap();
+    assert!(!plan.is_ready());
+    let idle = map.prepare_maintenance_step(&mut plan, 0).unwrap();
+    assert_eq!(idle.copied, 0);
+    assert_eq!(idle.remaining, 24);
+    assert!(matches!(
+        map.finish_maintenance(&mut plan),
+        Err(elastichash::MaintenanceError::PlanNotReady { remaining: 24 })
+    ));
+
+    while !plan.is_ready() {
+        let progress = map.prepare_maintenance_step(&mut plan, 3).unwrap();
+        assert!(progress.copied <= 3);
+    }
+    map.finish_maintenance(&mut plan).unwrap();
+    assert_eq!(map.stats().dead_key_bytes(), 0);
+    assert_eq!(map.stats().maintenance_runs, 1);
+    for (index, key) in keys.iter().enumerate().skip(8) {
+        assert_eq!(map.get(key), Some(&index));
+    }
+}
+
+#[test]
 fn routing_accelerator_is_bounded_and_caches_most_routes() {
     let capacity = 10_000;
     let mut map = PackedBinaryMap::new(

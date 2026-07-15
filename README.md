@@ -34,6 +34,9 @@ Delete maintenance is synchronous by default. Single-writer services can select
 at a controlled boundary so table rebuild and arena compaction do not land on
 the request that crosses the delete threshold. `PackedMapStats` exposes
 maintenance runs, compaction-staging failures, and reclaimed arena capacity.
+`try_begin_maintenance` plus `prepare_maintenance_step` can copy compacted key
+bytes in bounded owner-selected slices before `finish_maintenance` performs the
+remaining table cutover.
 
 The intended production architecture is:
 

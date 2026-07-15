@@ -28,6 +28,7 @@
 
 ## Gate 2: single-writer, lock-free-reader generations
 
+- [x] Stage packed-key copying in bounded owner-driven maintenance steps.
 - Publish immutable entry records with release/acquire ordering.
 - Replace values by pointer swap; reclaim old records after readers exit.
 - Build a new generation without blocking reads.

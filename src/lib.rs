@@ -16,4 +16,7 @@ pub use arena::{ArenaError, PackedKeyArena, PackedKeyRef};
 pub use config::{ConfigError, ElasticConfig, MaintenanceMode, RouteCacheBudget};
 pub use map::{CapacityError, FixedElasticMap, InsertOutcome, MapStats};
 pub use opthash::{EpochSnapshot, EpochTransition, ReserveFraction};
-pub use packed_map::{PackedBinaryMap, PackedMapError, PackedMapStats};
+pub use packed_map::{
+    MaintenanceError, MaintenanceProgress, PackedBinaryMap, PackedMaintenancePlan, PackedMapError,
+    PackedMapStats,
+};

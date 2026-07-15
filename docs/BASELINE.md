@@ -99,6 +99,12 @@ gap. `PackedMapStats` now reports completed maintenance runs, failed compaction
 staging, and cumulative allocated arena bytes reclaimed so this cost and its
 memory effect are observable in a service.
 
+The first staged-maintenance API bounds key copying by entry count. Preparing
+256 live 32-byte keys measured ~2.57 us (~99.7 M keys/s). This removes key-byte
+copying from the final cutover in caller-selected slices, but the initial live
+reference snapshot and final table rebuild are still whole-map operations; the
+1.46 ms cutover evidence therefore remains the governing p99 failure.
+
 The cache is advisory: every direct location is checked against table bounds,
 control fingerprint, and original key bytes. Stale entries and tag collisions
 fall back to the exact elastic schedule. A bucket can reject an absent tag only

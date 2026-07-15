@@ -27,6 +27,7 @@ pub struct PackedBinaryMap<V> {
     maintenance_runs: usize,
     compaction_failures: usize,
     arena_allocated_bytes_reclaimed: usize,
+    structural_revision: u64,
 }
 
 impl<V> PackedBinaryMap<V> {
@@ -48,6 +49,7 @@ impl<V> PackedBinaryMap<V> {
             maintenance_runs: 0,
             compaction_failures: 0,
             arena_allocated_bytes_reclaimed: 0,
+            structural_revision: 0,
         }
     }
 
@@ -76,6 +78,7 @@ impl<V> PackedBinaryMap<V> {
             maintenance_runs: 0,
             compaction_failures: 0,
             arena_allocated_bytes_reclaimed: 0,
+            structural_revision: 0,
         })
     }
 
@@ -112,8 +115,9 @@ impl<V> PackedBinaryMap<V> {
             .try_insert_unique_prehashed_in_place_with_location(hash, key_ref, value)
         {
             Ok((location, _)) => location,
-            Err((key_ref, value)) => {
+            Err((_key_ref, value)) => {
                 self.rebuild_core();
+                let key_ref = self.arena.insert(key).map_err(PackedMapError::Arena)?;
                 let Ok((location, _)) = self
                     .inner
                     .try_insert_unique_prehashed_in_place_with_location(hash, key_ref, value)
@@ -127,6 +131,7 @@ impl<V> PackedBinaryMap<V> {
         };
         self.route_cache.insert(hash, location);
         self.live_key_bytes += key.len();
+        self.structural_revision = self.structural_revision.wrapping_add(1);
         Ok(InsertOutcome::Inserted)
     }
 
@@ -223,6 +228,7 @@ impl<V> PackedBinaryMap<V> {
             },
         );
         let (key_ref, value) = removed?;
+        self.structural_revision = self.structural_revision.wrapping_add(1);
         self.live_key_bytes = self.live_key_bytes.saturating_sub(key_ref.len());
         self.deletes_since_rebuild += 1;
         if self.maintenance_mode == MaintenanceMode::Synchronous && self.maintenance_due() {
@@ -251,6 +257,98 @@ impl<V> PackedBinaryMap<V> {
         true
     }
 
+    /// Starts a staged maintenance plan for the current structural revision.
+    ///
+    /// This allocates and captures compact references, but key-byte copying is
+    /// left to [`prepare_maintenance_step`](Self::prepare_maintenance_step).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArenaError::AllocationFailed`] if the reference snapshot
+    /// cannot be allocated.
+    pub fn try_begin_maintenance(&self) -> Result<PackedMaintenancePlan, ArenaError> {
+        let mut pending_refs = Vec::new();
+        pending_refs
+            .try_reserve_exact(self.inner.len())
+            .map_err(|_| ArenaError::AllocationFailed)?;
+        pending_refs.extend(self.inner.iter().map(|(key_ref, _)| *key_ref));
+        let mut remapped_refs = Vec::new();
+        remapped_refs
+            .try_reserve_exact(self.inner.len())
+            .map_err(|_| ArenaError::AllocationFailed)?;
+        Ok(PackedMaintenancePlan {
+            source_revision: self.structural_revision,
+            pending_refs,
+            next: 0,
+            replacement_arena: self.arena.empty_like(),
+            remapped_refs,
+        })
+    }
+
+    /// Copies at most `max_entries` live keys into a staged compact arena.
+    ///
+    /// A structural mutation after the plan began returns
+    /// [`MaintenanceError::StalePlan`]. A zero budget performs no copying.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintenanceError::StalePlan`] after structural mutation or
+    /// [`MaintenanceError::Arena`] when staged key storage cannot grow.
+    pub fn prepare_maintenance_step(
+        &self,
+        plan: &mut PackedMaintenancePlan,
+        max_entries: usize,
+    ) -> Result<MaintenanceProgress, MaintenanceError> {
+        self.validate_maintenance_plan(plan)?;
+        let end = plan
+            .next
+            .saturating_add(max_entries)
+            .min(plan.pending_refs.len());
+        for old_ref in &plan.pending_refs[plan.next..end] {
+            let bytes = self
+                .arena
+                .get(*old_ref)
+                .ok_or(MaintenanceError::StalePlan)?;
+            let new_ref = plan
+                .replacement_arena
+                .insert(bytes)
+                .map_err(MaintenanceError::Arena)?;
+            plan.remapped_refs.push((*old_ref, new_ref));
+        }
+        let copied = end - plan.next;
+        plan.next = end;
+        Ok(MaintenanceProgress {
+            copied,
+            remaining: plan.pending_refs.len() - plan.next,
+        })
+    }
+
+    /// Finishes a fully prepared plan and atomically replaces the writer's
+    /// table and key arena.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintenanceError::PlanNotReady`] when keys remain or
+    /// [`MaintenanceError::StalePlan`] after structural mutation.
+    pub fn finish_maintenance(
+        &mut self,
+        plan: &mut PackedMaintenancePlan,
+    ) -> Result<(), MaintenanceError> {
+        self.validate_maintenance_plan(plan)?;
+        if plan.next != plan.pending_refs.len() {
+            return Err(MaintenanceError::PlanNotReady {
+                remaining: plan.pending_refs.len() - plan.next,
+            });
+        }
+        plan.remapped_refs
+            .sort_unstable_by_key(|(old_ref, _)| *old_ref);
+        let empty_arena = plan.replacement_arena.empty_like();
+        let replacement_arena = mem::replace(&mut plan.replacement_arena, empty_arena);
+        let remapped_refs = mem::take(&mut plan.remapped_refs);
+        self.rebuild_core_with_compaction(Some((replacement_arena, remapped_refs)));
+        Ok(())
+    }
+
     /// Removes every entry and releases packed key segments.
     pub fn clear(&mut self) {
         self.inner.clear();
@@ -262,6 +360,7 @@ impl<V> PackedBinaryMap<V> {
         self.maintenance_runs = 0;
         self.compaction_failures = 0;
         self.arena_allocated_bytes_reclaimed = 0;
+        self.structural_revision = self.structural_revision.wrapping_add(1);
     }
 
     /// Number of live keys.
@@ -304,13 +403,20 @@ impl<V> PackedBinaryMap<V> {
     }
 
     fn rebuild_core(&mut self) {
-        let allocated_before = self.arena.allocated_bytes();
         let compaction = if let Ok(compaction) = self.build_compacted_arena() {
             Some(compaction)
         } else {
             self.compaction_failures += 1;
             None
         };
+        self.rebuild_core_with_compaction(compaction);
+    }
+
+    fn rebuild_core_with_compaction(
+        &mut self,
+        compaction: Option<(PackedKeyArena, Vec<(PackedKeyRef, PackedKeyRef)>)>,
+    ) {
+        let allocated_before = self.arena.allocated_bytes();
         let replacement = ElasticHashMap::with_capacity_and_reserve(
             self.live_limit,
             self.inner.reserve_fraction(),
@@ -346,6 +452,7 @@ impl<V> PackedBinaryMap<V> {
         self.maintenance_runs += 1;
         self.arena_allocated_bytes_reclaimed +=
             allocated_before.saturating_sub(self.arena.allocated_bytes());
+        self.structural_revision = self.structural_revision.wrapping_add(1);
     }
 
     fn build_compacted_arena(
@@ -366,7 +473,85 @@ impl<V> PackedBinaryMap<V> {
         references.sort_unstable_by_key(|(old_ref, _)| *old_ref);
         Ok((replacement, references))
     }
+
+    fn validate_maintenance_plan(
+        &self,
+        plan: &PackedMaintenancePlan,
+    ) -> Result<(), MaintenanceError> {
+        if plan.source_revision != self.structural_revision {
+            return Err(MaintenanceError::StalePlan);
+        }
+        Ok(())
+    }
 }
+
+/// Opaque staged key-compaction work for a [`PackedBinaryMap`].
+pub struct PackedMaintenancePlan {
+    source_revision: u64,
+    pending_refs: Vec<PackedKeyRef>,
+    next: usize,
+    replacement_arena: PackedKeyArena,
+    remapped_refs: Vec<(PackedKeyRef, PackedKeyRef)>,
+}
+
+impl PackedMaintenancePlan {
+    /// Keys still waiting to be copied before cutover.
+    #[must_use]
+    pub fn remaining(&self) -> usize {
+        self.pending_refs.len() - self.next
+    }
+
+    /// Returns whether every captured key has been copied.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.remaining() == 0
+    }
+}
+
+/// Result of one bounded maintenance-preparation step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaintenanceProgress {
+    /// Keys copied by this step.
+    pub copied: usize,
+    /// Keys still waiting to be copied.
+    pub remaining: usize,
+}
+
+impl MaintenanceProgress {
+    /// Returns whether the plan is ready for final cutover.
+    #[must_use]
+    pub const fn is_ready(self) -> bool {
+        self.remaining == 0
+    }
+}
+
+/// Failure while preparing or finishing staged maintenance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaintenanceError {
+    /// Key-arena allocation failed while staging compacted bytes.
+    Arena(ArenaError),
+    /// The map was structurally mutated after the plan began.
+    StalePlan,
+    /// Cutover was requested before all live keys were copied.
+    PlanNotReady {
+        /// Keys still waiting to be copied.
+        remaining: usize,
+    },
+}
+
+impl fmt::Display for MaintenanceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Arena(error) => error.fmt(formatter),
+            Self::StalePlan => formatter.write_str("maintenance plan is stale"),
+            Self::PlanNotReady { remaining } => {
+                write!(formatter, "maintenance plan has {remaining} keys remaining")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MaintenanceError {}
 
 struct PackedQuery<'a> {
     arena: &'a PackedKeyArena,
