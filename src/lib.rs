@@ -13,7 +13,7 @@ mod packed_map;
 mod route_cache;
 
 pub use arena::{ArenaError, PackedKeyArena, PackedKeyRef};
-pub use config::{ConfigError, ElasticConfig, RouteCacheBudget};
+pub use config::{ConfigError, ElasticConfig, MaintenanceMode, RouteCacheBudget};
 pub use map::{CapacityError, FixedElasticMap, InsertOutcome, MapStats};
 pub use opthash::{EpochSnapshot, EpochTransition, ReserveFraction};
 pub use packed_map::{PackedBinaryMap, PackedMapError, PackedMapStats};

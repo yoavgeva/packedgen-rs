@@ -21,6 +21,7 @@
 - [x] Add a permanent one-million-key lookup comparison for out-of-cache behavior.
 - [x] Add fixed-size batched lookup with route probes ordered across the batch.
 - [x] Compact dead arena bytes during a full generation rebuild.
+- [x] Allow the single writer to defer maintenance to a controlled boundary.
 - Define a packed metadata value suitable for disk-location indexes.
 - Keep hot payload ownership separate from index slots.
 - [ ] Provide fallible whole-map construction and batch-load APIs.

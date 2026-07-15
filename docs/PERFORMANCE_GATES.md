@@ -33,6 +33,9 @@ median-sweep density gates. Fixed 32-key batches narrow the measured large-index
 hit gap from 2.56x to 1.94x HashBrown, still outside the 1.5x limit.
 Synchronous delete-threshold rebuild and arena compaction also fails the churn
 gate: the first 16K-entry smoke fixture pauses for ~1.68 ms at the threshold.
+Deferred mode reduces that request-path delete batch to ~98.2 us, 1.41x
+HashBrown, but the separately scheduled maintenance pause still fails the p99
+gate until rebuilding becomes incremental or concurrent.
 Measurements that fail a gate remain in the repository; they are optimization
 inputs, not marketing exclusions.
 

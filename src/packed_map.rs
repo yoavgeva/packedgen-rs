@@ -6,7 +6,8 @@ use opthash::{ElasticHashMap, EpochSnapshot, Equivalent, ReserveFraction};
 use crate::filter::NegativeLookupFilter;
 use crate::route_cache::RouteCache;
 use crate::{
-    ArenaError, CapacityError, ElasticConfig, InsertOutcome, PackedKeyArena, PackedKeyRef,
+    ArenaError, CapacityError, ElasticConfig, InsertOutcome, MaintenanceMode, PackedKeyArena,
+    PackedKeyRef,
 };
 
 /// Binary-key elastic map backed by a segmented packed-key arena.
@@ -22,6 +23,7 @@ pub struct PackedBinaryMap<V> {
     live_limit: usize,
     live_key_bytes: usize,
     deletes_since_rebuild: usize,
+    maintenance_mode: MaintenanceMode,
 }
 
 impl<V> PackedBinaryMap<V> {
@@ -39,6 +41,7 @@ impl<V> PackedBinaryMap<V> {
             live_limit: config.live_capacity(),
             live_key_bytes: 0,
             deletes_since_rebuild: 0,
+            maintenance_mode: config.maintenance_mode(),
         }
     }
 
@@ -63,6 +66,7 @@ impl<V> PackedBinaryMap<V> {
             live_limit: config.live_capacity(),
             live_key_bytes: 0,
             deletes_since_rebuild: 0,
+            maintenance_mode: config.maintenance_mode(),
         })
     }
 
@@ -212,10 +216,30 @@ impl<V> PackedBinaryMap<V> {
         let (key_ref, value) = removed?;
         self.live_key_bytes = self.live_key_bytes.saturating_sub(key_ref.len());
         self.deletes_since_rebuild += 1;
-        if self.deletes_since_rebuild >= self.rebuild_delete_threshold() {
+        if self.maintenance_mode == MaintenanceMode::Synchronous && self.maintenance_due() {
             self.rebuild_core();
         }
         Some(value)
+    }
+
+    /// Returns whether delete churn has crossed the maintenance threshold.
+    #[must_use]
+    pub fn maintenance_due(&self) -> bool {
+        self.deletes_since_rebuild >= self.rebuild_delete_threshold()
+    }
+
+    /// Rebuilds the fixed epoch and compacts dead key bytes when any deletes
+    /// have accumulated. Returns whether maintenance work was performed.
+    ///
+    /// Deferred-mode owners can call this at a controlled single-writer
+    /// boundary to keep rebuild latency off the request that crossed the
+    /// threshold.
+    pub fn maintain(&mut self) -> bool {
+        if self.deletes_since_rebuild == 0 {
+            return false;
+        }
+        self.rebuild_core();
+        true
     }
 
     /// Removes every entry and releases packed key segments.

@@ -86,6 +86,12 @@ equivalent—HashBrown does not compact an external key arena—but the 24x paus
 ratio demonstrates that compaction must become incremental or move off the
 request path before the churn gate can pass.
 
+With `MaintenanceMode::Deferred`, the same 4,096-delete request-path batch took
+~98.2 us (~41.7 M deletes/s), 1.41x HashBrown and 16.7x faster than synchronous
+ElasticHash maintenance. The owner must subsequently call `maintain()` to pay
+the rebuild and reclaim dead bytes; this makes the work schedulable but does not
+yet make maintenance incremental or concurrent.
+
 The cache is advisory: every direct location is checked against table bounds,
 control fingerprint, and original key bytes. Stale entries and tag collisions
 fall back to the exact elastic schedule. A bucket can reject an absent tag only

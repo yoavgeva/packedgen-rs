@@ -9,6 +9,7 @@ pub struct ElasticConfig {
     live_capacity: NonZeroUsize,
     reserve: ReserveFraction,
     route_cache_budget: RouteCacheBudget,
+    maintenance_mode: MaintenanceMode,
 }
 
 impl ElasticConfig {
@@ -34,6 +35,7 @@ impl ElasticConfig {
             live_capacity,
             reserve: ReserveFraction::DEFAULT,
             route_cache_budget: RouteCacheBudget::Adaptive,
+            maintenance_mode: MaintenanceMode::Synchronous,
         })
     }
 
@@ -69,6 +71,18 @@ impl ElasticConfig {
         self
     }
 
+    /// Selects whether delete-threshold maintenance runs inline or is deferred
+    /// until the owner explicitly requests it.
+    #[must_use]
+    pub const fn with_maintenance_mode(mut self, mode: MaintenanceMode) -> Self {
+        self.maintenance_mode = mode;
+        self
+    }
+
+    pub(crate) const fn maintenance_mode(self) -> MaintenanceMode {
+        self.maintenance_mode
+    }
+
     pub(crate) fn route_cache_slots(self) -> usize {
         match self.route_cache_budget {
             RouteCacheBudget::Compact => 0,
@@ -92,6 +106,18 @@ pub enum RouteCacheBudget {
     Compact,
     /// Allocate two route slots per configured entry for lookup-heavy indexes.
     ReadOptimized,
+}
+
+/// Policy for tombstone cleanup and packed-key compaction after deletions.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MaintenanceMode {
+    /// Rebuild synchronously when the configured delete threshold is crossed.
+    #[default]
+    Synchronous,
+    /// Mark maintenance due and let the single writer choose when to rebuild.
+    /// An insertion may still force maintenance if accumulated tombstones leave
+    /// no physical slot for a new key.
+    Deferred,
 }
 
 /// Invalid elastic-hash configuration.
@@ -118,7 +144,7 @@ impl std::error::Error for ConfigError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{ElasticConfig, RouteCacheBudget};
+    use super::{ElasticConfig, MaintenanceMode, RouteCacheBudget};
 
     #[test]
     fn route_cache_budgets_are_bounded_and_adaptive() {
@@ -135,6 +161,20 @@ mod tests {
                 .with_route_cache_budget(RouteCacheBudget::ReadOptimized)
                 .route_cache_slots(),
             20_000
+        );
+    }
+
+    #[test]
+    fn synchronous_maintenance_is_the_safe_default() {
+        assert_eq!(
+            ElasticConfig::new(1).maintenance_mode(),
+            MaintenanceMode::Synchronous
+        );
+        assert_eq!(
+            ElasticConfig::new(1)
+                .with_maintenance_mode(MaintenanceMode::Deferred)
+                .maintenance_mode(),
+            MaintenanceMode::Deferred
         );
     }
 }

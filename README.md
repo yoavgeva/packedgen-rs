@@ -29,6 +29,10 @@ bounded, byte-aware routing rebuild preserves survivors.
 Routing memory is explicit through `RouteCacheBudget`: the default adaptive
 policy keeps small-map overhead within the measured memory ceiling, `Compact`
 disables direct routes, and `ReadOptimized` reserves two route slots per entry.
+Delete maintenance is synchronous by default. Single-writer services can select
+`MaintenanceMode::Deferred`, observe `maintenance_due()`, and call `maintain()`
+at a controlled boundary so table rebuild and arena compaction do not land on
+the request that crosses the delete threshold.
 
 The intended production architecture is:
 

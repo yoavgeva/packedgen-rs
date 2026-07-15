@@ -3,7 +3,8 @@
 use std::collections::HashMap;
 
 use elastichash::{
-    ElasticConfig, InsertOutcome, PackedBinaryMap, PackedMapError, RouteCacheBudget,
+    ElasticConfig, InsertOutcome, MaintenanceMode, PackedBinaryMap, PackedMapError,
+    RouteCacheBudget,
 };
 
 #[test]
@@ -102,6 +103,32 @@ fn byte_aware_rebuild_preserves_survivors_after_heavy_deletes() {
     assert_eq!(stats.arena_key_bytes, stats.live_key_bytes);
     assert!(stats.arena_allocated_bytes < allocated_before_deletes);
     for (index, key) in keys.iter().enumerate().skip(capacity / 2) {
+        assert_eq!(map.get(key), Some(&index));
+    }
+}
+
+#[test]
+fn deferred_maintenance_moves_compaction_to_an_explicit_boundary() {
+    let capacity = 64;
+    let config = ElasticConfig::new(capacity).with_maintenance_mode(MaintenanceMode::Deferred);
+    let mut map = PackedBinaryMap::with_key_segment_bytes(config, 64).unwrap();
+    let keys: Vec<Vec<u8>> = (0..capacity)
+        .map(|index| format!("deferred-{index:04}").into_bytes())
+        .collect();
+    for (index, key) in keys.iter().enumerate() {
+        map.try_insert(key, index).unwrap();
+    }
+
+    for key in &keys[..capacity / 4] {
+        assert!(map.remove(key).is_some());
+    }
+    assert!(map.maintenance_due());
+    assert!(map.stats().dead_key_bytes() > 0);
+    assert!(map.maintain());
+    assert!(!map.maintenance_due());
+    assert_eq!(map.stats().dead_key_bytes(), 0);
+    assert!(!map.maintain());
+    for (index, key) in keys.iter().enumerate().skip(capacity / 4) {
         assert_eq!(map.get(key), Some(&index));
     }
 }

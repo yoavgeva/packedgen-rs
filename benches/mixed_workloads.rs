@@ -3,7 +3,9 @@
 use std::hint::black_box;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use elastichash::{ElasticConfig, FixedElasticMap, PackedBinaryMap, RouteCacheBudget};
+use elastichash::{
+    ElasticConfig, FixedElasticMap, MaintenanceMode, PackedBinaryMap, RouteCacheBudget,
+};
 use hashbrown::HashMap;
 
 mod support;
@@ -109,7 +111,7 @@ fn delete_and_compact_binary(criterion: &mut Criterion) {
         .with_reserve_exponent(6)
         .unwrap()
         .with_route_cache_budget(RouteCacheBudget::ReadOptimized);
-    let mut group = criterion.benchmark_group("delete_binary_32_with_compaction");
+    let mut group = criterion.benchmark_group("delete_binary_32_threshold_batch");
     group.throughput(Throughput::Elements(deletes as u64));
 
     group.bench_function("packed-elastic/reserve_2^-6", |bencher| {
@@ -126,6 +128,25 @@ fn delete_and_compact_binary(criterion: &mut Criterion) {
                     black_box(map.remove(key).unwrap());
                 }
                 black_box(map.stats())
+            },
+            BatchSize::LargeInput,
+        );
+    });
+    group.bench_function("packed-elastic/deferred", |bencher| {
+        bencher.iter_batched(
+            || {
+                let mut map =
+                    PackedBinaryMap::new(config.with_maintenance_mode(MaintenanceMode::Deferred));
+                for (index, key) in corpus.iter().enumerate() {
+                    map.try_insert(key, index as u64).unwrap();
+                }
+                map
+            },
+            |mut map| {
+                for key in &corpus[..deletes] {
+                    black_box(map.remove(key).unwrap());
+                }
+                black_box(map.maintenance_due())
             },
             BatchSize::LargeInput,
         );
