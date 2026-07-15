@@ -44,7 +44,7 @@
 - TTL metadata and conditional delete/update primitives.
 - Batch lookup and batch publication to amortize FFI or network boundaries.
 - [x] Expose maintenance runs, staging failures, and reclaimed arena capacity.
-- Configurable pressure/rebuild thresholds.
+- [x] Configurable pressure/rebuild thresholds.
 
 ## Release gates
 

@@ -128,7 +128,11 @@ and ~39.5 ns immediately below the forced 50% ceiling. The bounded worst case
 is therefore 31% slower than the fresh map and ~4.9x HashBrown at the same
 point. Missing lookup stayed roughly flat at ~10.1–10.8 ns because the stable
 negative filter avoids tombstone probing. Deferred mode forcibly rebuilds at
-50% deleted entries even if the owner ignores the soft signal.
+50% deleted entries even if the owner ignores the soft signal. These defaults
+are configurable with `with_maintenance_threshold_percents`; exact rounded-up
+entry thresholds are computed once during construction, so policy selection
+does not add percentage arithmetic to the request path. A stricter hard limit
+trades more frequent rebuilds for a lower tombstone-latency ceiling.
 
 The cache is advisory: every direct location is checked against table bounds,
 control fingerprint, and original key bytes. Stale entries and tag collisions

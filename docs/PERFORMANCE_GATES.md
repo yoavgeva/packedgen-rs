@@ -36,10 +36,12 @@ gate: the first 16K-entry smoke fixture pauses for ~1.68 ms at the threshold.
 Deferred mode reduces that request-path delete batch to ~98.2 us, 1.41x
 HashBrown, but the separately scheduled maintenance pause still fails the p99
 gate until rebuilding becomes incremental or concurrent.
-Deferred tombstones are now bounded by a forced 50% rebuild. Immediately below
-that ceiling, measured successful-hit latency is 31% above a fresh packed map;
-missing lookup remains flat. The bound prevents unlimited degradation but does
-not itself pass the successful-hit gate.
+Deferred tombstones are bounded by a forced 50% rebuild by default. Immediately
+below that ceiling, measured successful-hit latency is 31% above a fresh packed
+map; missing lookup remains flat. Operators can configure stricter validated
+soft/hard percentages when that tradeoff fits their workload. Exact entry
+thresholds are precomputed at construction. The bound prevents unlimited
+degradation but does not itself pass the successful-hit gate.
 Measurements that fail a gate remain in the repository; they are optimization
 inputs, not marketing exclusions.
 

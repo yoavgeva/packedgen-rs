@@ -28,6 +28,8 @@ pub struct PackedBinaryMap<V> {
     compaction_failures: usize,
     arena_allocated_bytes_reclaimed: usize,
     structural_revision: u64,
+    soft_delete_threshold: usize,
+    hard_delete_threshold: usize,
 }
 
 impl<V> PackedBinaryMap<V> {
@@ -69,6 +71,14 @@ impl<V> PackedBinaryMap<V> {
             compaction_failures: 0,
             arena_allocated_bytes_reclaimed: 0,
             structural_revision: 0,
+            soft_delete_threshold: threshold_count(
+                config.live_capacity(),
+                config.maintenance_threshold_percents().0,
+            ),
+            hard_delete_threshold: threshold_count(
+                config.live_capacity(),
+                config.maintenance_threshold_percents().1,
+            ),
         })
     }
 
@@ -124,6 +134,14 @@ impl<V> PackedBinaryMap<V> {
             compaction_failures: 0,
             arena_allocated_bytes_reclaimed: 0,
             structural_revision: 0,
+            soft_delete_threshold: threshold_count(
+                config.live_capacity(),
+                config.maintenance_threshold_percents().0,
+            ),
+            hard_delete_threshold: threshold_count(
+                config.live_capacity(),
+                config.maintenance_threshold_percents().1,
+            ),
         })
     }
 
@@ -277,7 +295,7 @@ impl<V> PackedBinaryMap<V> {
         self.live_key_bytes = self.live_key_bytes.saturating_sub(key_ref.len());
         self.deletes_since_rebuild += 1;
         if (self.maintenance_mode == MaintenanceMode::Synchronous && self.maintenance_due())
-            || self.deletes_since_rebuild >= self.required_maintenance_threshold()
+            || self.deletes_since_rebuild >= self.hard_delete_threshold
         {
             self.rebuild_core();
         }
@@ -466,15 +484,13 @@ impl<V> PackedBinaryMap<V> {
             maintenance_runs: self.maintenance_runs,
             compaction_failures: self.compaction_failures,
             arena_allocated_bytes_reclaimed: self.arena_allocated_bytes_reclaimed,
+            soft_delete_threshold: self.soft_delete_threshold,
+            hard_delete_threshold: self.hard_delete_threshold,
         }
     }
 
     fn rebuild_delete_threshold(&self) -> usize {
-        (self.live_limit / 4).max(1)
-    }
-
-    fn required_maintenance_threshold(&self) -> usize {
-        self.live_limit.div_ceil(2).max(1)
+        self.soft_delete_threshold
     }
 
     fn rebuild_core(&mut self) {
@@ -748,6 +764,10 @@ pub struct PackedMapStats {
     pub compaction_failures: usize,
     /// Cumulative requested arena capacity released by successful compactions.
     pub arena_allocated_bytes_reclaimed: usize,
+    /// Deletes that mark deferred maintenance due.
+    pub soft_delete_threshold: usize,
+    /// Deletes that force maintenance even in deferred mode.
+    pub hard_delete_threshold: usize,
 }
 
 impl PackedMapStats {
@@ -756,4 +776,9 @@ impl PackedMapStats {
     pub fn dead_key_bytes(self) -> usize {
         self.arena_key_bytes.saturating_sub(self.live_key_bytes)
     }
+}
+
+fn threshold_count(capacity: usize, percent: u8) -> usize {
+    let scaled = (capacity as u128) * u128::from(percent);
+    usize::try_from(scaled.div_ceil(100)).expect("percentage threshold cannot exceed capacity")
 }

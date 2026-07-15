@@ -10,6 +10,8 @@ pub struct ElasticConfig {
     reserve: ReserveFraction,
     route_cache_budget: RouteCacheBudget,
     maintenance_mode: MaintenanceMode,
+    maintenance_soft_percent: u8,
+    maintenance_hard_percent: u8,
 }
 
 impl ElasticConfig {
@@ -36,6 +38,8 @@ impl ElasticConfig {
             reserve: ReserveFraction::DEFAULT,
             route_cache_budget: RouteCacheBudget::Adaptive,
             maintenance_mode: MaintenanceMode::Synchronous,
+            maintenance_soft_percent: 25,
+            maintenance_hard_percent: 50,
         })
     }
 
@@ -81,6 +85,35 @@ impl ElasticConfig {
 
     pub(crate) const fn maintenance_mode(self) -> MaintenanceMode {
         self.maintenance_mode
+    }
+
+    /// Sets the soft maintenance signal and forced-maintenance ceiling as
+    /// percentages of configured live capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::InvalidMaintenanceThresholds`] unless
+    /// `1 <= soft_percent <= hard_percent <= 100`.
+    pub fn with_maintenance_threshold_percents(
+        mut self,
+        soft_percent: u8,
+        hard_percent: u8,
+    ) -> Result<Self, ConfigError> {
+        if soft_percent == 0 || soft_percent > hard_percent || hard_percent > 100 {
+            return Err(ConfigError::InvalidMaintenanceThresholds {
+                soft_percent,
+                hard_percent,
+            });
+        }
+        self.maintenance_soft_percent = soft_percent;
+        self.maintenance_hard_percent = hard_percent;
+        Ok(self)
+    }
+
+    /// Configured `(soft, hard)` delete-pressure percentages.
+    #[must_use]
+    pub const fn maintenance_threshold_percents(self) -> (u8, u8) {
+        (self.maintenance_soft_percent, self.maintenance_hard_percent)
     }
 
     pub(crate) fn route_cache_slots(self) -> usize {
@@ -129,6 +162,13 @@ pub enum ConfigError {
     ZeroCapacity,
     /// Reserve fractions use the exact form `2^-d`, with `d > 0`.
     InvalidReserveExponent(u32),
+    /// Maintenance percentages must satisfy `1 <= soft <= hard <= 100`.
+    InvalidMaintenanceThresholds {
+        /// Rejected soft percentage.
+        soft_percent: u8,
+        /// Rejected hard percentage.
+        hard_percent: u8,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -138,6 +178,13 @@ impl fmt::Display for ConfigError {
             Self::InvalidReserveExponent(value) => {
                 write!(formatter, "reserve exponent must be positive, got {value}")
             }
+            Self::InvalidMaintenanceThresholds {
+                soft_percent,
+                hard_percent,
+            } => write!(
+                formatter,
+                "maintenance thresholds require 1 <= soft <= hard <= 100, got {soft_percent}/{hard_percent}"
+            ),
         }
     }
 }
@@ -178,5 +225,20 @@ mod tests {
                 .maintenance_mode(),
             MaintenanceMode::Deferred
         );
+    }
+
+    #[test]
+    fn maintenance_thresholds_are_validated() {
+        let config = ElasticConfig::new(10)
+            .with_maintenance_threshold_percents(20, 30)
+            .unwrap();
+        assert_eq!(config.maintenance_threshold_percents(), (20, 30));
+        for invalid in [(0, 50), (51, 50), (25, 101)] {
+            assert!(
+                ElasticConfig::new(10)
+                    .with_maintenance_threshold_percents(invalid.0, invalid.1)
+                    .is_err()
+            );
+        }
     }
 }

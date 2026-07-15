@@ -203,6 +203,31 @@ fn deferred_maintenance_has_a_hard_delete_ceiling() {
 }
 
 #[test]
+fn configured_maintenance_thresholds_use_exact_entry_counts() {
+    let config = ElasticConfig::new(10)
+        .with_maintenance_mode(MaintenanceMode::Deferred)
+        .with_maintenance_threshold_percents(20, 30)
+        .unwrap();
+    let mut map = PackedBinaryMap::new(config);
+    let keys: Vec<Vec<u8>> = (0..10)
+        .map(|index| format!("pressure-{index}").into_bytes())
+        .collect();
+    for (index, key) in keys.iter().enumerate() {
+        map.try_insert(key, index).unwrap();
+    }
+    assert_eq!(map.stats().soft_delete_threshold, 2);
+    assert_eq!(map.stats().hard_delete_threshold, 3);
+
+    map.remove(&keys[0]).unwrap();
+    assert!(!map.maintenance_due());
+    map.remove(&keys[1]).unwrap();
+    assert!(map.maintenance_due());
+    map.remove(&keys[2]).unwrap();
+    assert_eq!(map.stats().maintenance_runs, 1);
+    assert!(!map.maintenance_due());
+}
+
+#[test]
 fn staged_maintenance_bounds_key_copying_before_cutover() {
     let capacity = 32;
     let config = ElasticConfig::new(capacity).with_maintenance_mode(MaintenanceMode::Deferred);

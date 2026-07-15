@@ -41,7 +41,10 @@ Structural mutation marks a staged plan stale; the writer can detect this and
 restart allocation-safely. Replacing only a value keeps the plan valid because
 packed key references do not move.
 Deferred mode emits its soft maintenance signal at 25% deleted entries and
-forces maintenance at 50%, bounding ignored tombstones and dead arena bytes.
+forces maintenance at 50% by default, bounding ignored tombstones and dead
+arena bytes. `with_maintenance_threshold_percents` can select a stricter policy;
+construction validates it and precomputes the exact entry counts exposed in
+`PackedMapStats`.
 
 The intended production architecture is:
 
