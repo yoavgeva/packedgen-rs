@@ -35,7 +35,8 @@
 - Replace values by pointer swap; reclaim old records after readers exit.
 - Build a new generation without blocking reads.
 - Replay the single-writer delta and atomically cut over.
-- Prove no stale resurrection across insert/delete/rebuild races with Loom.
+- [x] Model stale-cutover rejection across short insert/delete/update traces.
+- Prove the concurrent publication and reclamation implementation with Loom.
 
 ## Gate 3: service semantics
 

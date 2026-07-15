@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 
 use elastichash::{
-    ElasticConfig, InsertOutcome, MaintenanceMode, PackedBinaryMap, PackedBuildError,
-    PackedLoadError, PackedMapError, RouteCacheBudget,
+    ElasticConfig, InsertOutcome, MaintenanceError, MaintenanceMode, PackedBinaryMap,
+    PackedBuildError, PackedLoadError, PackedMapError, RouteCacheBudget,
 };
 
 #[test]
@@ -225,6 +225,93 @@ fn configured_maintenance_thresholds_use_exact_entry_counts() {
     map.remove(&keys[2]).unwrap();
     assert_eq!(map.stats().maintenance_runs, 1);
     assert!(!map.maintenance_due());
+}
+
+#[test]
+fn maintenance_cutover_advances_the_published_generation_once() {
+    let config = ElasticConfig::new(8).with_maintenance_mode(MaintenanceMode::Deferred);
+    let mut map = PackedBinaryMap::new(config);
+    map.try_insert(b"alpha", 1).unwrap();
+    map.try_insert(b"beta", 2).unwrap();
+    let generation = map.generation();
+
+    let mut plan = map.try_begin_maintenance().unwrap();
+    assert_eq!(plan.source_generation(), generation);
+    map.prepare_maintenance_step(&mut plan, usize::MAX).unwrap();
+    assert_eq!(map.generation(), generation);
+    map.finish_maintenance(&mut plan).unwrap();
+
+    assert_eq!(map.generation().sequence(), generation.sequence() + 1);
+    assert_eq!(map.stats().generation, map.generation());
+    assert_eq!(map.get(b"alpha"), Some(&1));
+    assert_eq!(map.get(b"beta"), Some(&2));
+}
+
+#[test]
+fn staged_cutover_model_never_resurrects_across_writer_traces() {
+    const TRACE_LEN: usize = 4;
+    const OPERATIONS: usize = 4;
+
+    for encoded_trace in 0..OPERATIONS.pow(4) {
+        let config = ElasticConfig::new(8).with_maintenance_mode(MaintenanceMode::Deferred);
+        let mut map = PackedBinaryMap::new(config);
+        let mut reference = HashMap::from([(b"alpha".to_vec(), 1_u64), (b"beta".to_vec(), 2_u64)]);
+        for (key, value) in &reference {
+            map.try_insert(key, *value).unwrap();
+        }
+
+        let source_generation = map.generation();
+        let mut plan = map.try_begin_maintenance().unwrap();
+        map.prepare_maintenance_step(&mut plan, usize::MAX).unwrap();
+        let mut trace = encoded_trace;
+        let mut structurally_changed = false;
+        for step in 0..TRACE_LEN {
+            let value = 10 + u64::try_from(step).unwrap();
+            match trace % OPERATIONS {
+                0 => {
+                    map.try_insert(b"alpha", value).unwrap();
+                    reference.insert(b"alpha".to_vec(), value);
+                }
+                1 => {
+                    let inserted = map.try_insert(b"gamma", value).unwrap();
+                    structurally_changed |= inserted == InsertOutcome::Inserted;
+                    reference.insert(b"gamma".to_vec(), value);
+                }
+                2 => {
+                    structurally_changed |= map.remove(b"beta").is_some();
+                    reference.remove(b"beta".as_slice());
+                }
+                _ => {
+                    assert_eq!(map.remove(b"missing"), None);
+                }
+            }
+            trace /= OPERATIONS;
+        }
+
+        let cutover = map.finish_maintenance(&mut plan);
+        if structurally_changed {
+            assert_eq!(cutover, Err(MaintenanceError::StalePlan));
+            assert_eq!(map.generation(), source_generation);
+        } else {
+            assert_eq!(cutover, Ok(()));
+            assert_eq!(
+                map.generation().sequence(),
+                source_generation.sequence() + 1
+            );
+        }
+        assert_eq!(map.len(), reference.len());
+        for (key, value) in &reference {
+            assert_eq!(map.get(key), Some(value));
+        }
+        assert_eq!(
+            map.contains_key(b"beta"),
+            reference.contains_key(b"beta".as_slice())
+        );
+        assert_eq!(
+            map.contains_key(b"gamma"),
+            reference.contains_key(b"gamma".as_slice())
+        );
+    }
 }
 
 #[test]

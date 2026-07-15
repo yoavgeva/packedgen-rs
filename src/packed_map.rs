@@ -28,6 +28,7 @@ pub struct PackedBinaryMap<V> {
     compaction_failures: usize,
     arena_allocated_bytes_reclaimed: usize,
     structural_revision: u64,
+    generation: PackedGeneration,
     soft_delete_threshold: usize,
     hard_delete_threshold: usize,
 }
@@ -71,6 +72,7 @@ impl<V> PackedBinaryMap<V> {
             compaction_failures: 0,
             arena_allocated_bytes_reclaimed: 0,
             structural_revision: 0,
+            generation: PackedGeneration::INITIAL,
             soft_delete_threshold: threshold_count(
                 config.live_capacity(),
                 config.maintenance_threshold_percents().0,
@@ -134,6 +136,7 @@ impl<V> PackedBinaryMap<V> {
             compaction_failures: 0,
             arena_allocated_bytes_reclaimed: 0,
             structural_revision: 0,
+            generation: PackedGeneration::INITIAL,
             soft_delete_threshold: threshold_count(
                 config.live_capacity(),
                 config.maintenance_threshold_percents().0,
@@ -343,6 +346,7 @@ impl<V> PackedBinaryMap<V> {
             .map_err(|_| ArenaError::AllocationFailed)?;
         Ok(PackedMaintenancePlan {
             source_revision: self.structural_revision,
+            source_generation: self.generation,
             pending_refs,
             next: 0,
             replacement_arena: self.arena.empty_like(),
@@ -354,6 +358,7 @@ impl<V> PackedBinaryMap<V> {
     #[must_use]
     pub fn maintenance_plan_is_stale(&self, plan: &PackedMaintenancePlan) -> bool {
         plan.source_revision != self.structural_revision
+            || plan.source_generation != self.generation
     }
 
     /// Replaces a stale or unwanted plan with a fresh snapshot.
@@ -450,6 +455,7 @@ impl<V> PackedBinaryMap<V> {
         self.compaction_failures = 0;
         self.arena_allocated_bytes_reclaimed = 0;
         self.structural_revision = self.structural_revision.wrapping_add(1);
+        self.generation = self.generation.next();
     }
 
     /// Number of live keys.
@@ -462,6 +468,16 @@ impl<V> PackedBinaryMap<V> {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
+    }
+
+    /// Identifier of the currently published table generation.
+    ///
+    /// Ordinary in-generation writes leave this unchanged. Maintenance
+    /// cutover and `clear` advance it, allowing an owner to detect that a
+    /// previously observed table generation has been retired.
+    #[must_use]
+    pub const fn generation(&self) -> PackedGeneration {
+        self.generation
     }
 
     /// Captures occupancy, epoch, filter, and packed-key memory state.
@@ -486,6 +502,7 @@ impl<V> PackedBinaryMap<V> {
             arena_allocated_bytes_reclaimed: self.arena_allocated_bytes_reclaimed,
             soft_delete_threshold: self.soft_delete_threshold,
             hard_delete_threshold: self.hard_delete_threshold,
+            generation: self.generation,
         }
     }
 
@@ -544,6 +561,7 @@ impl<V> PackedBinaryMap<V> {
         self.arena_allocated_bytes_reclaimed +=
             allocated_before.saturating_sub(self.arena.allocated_bytes());
         self.structural_revision = self.structural_revision.wrapping_add(1);
+        self.generation = self.generation.next();
     }
 
     fn build_compacted_arena(
@@ -579,6 +597,7 @@ impl<V> PackedBinaryMap<V> {
 /// Opaque staged key-compaction work for a [`PackedBinaryMap`].
 pub struct PackedMaintenancePlan {
     source_revision: u64,
+    source_generation: PackedGeneration,
     pending_refs: Vec<PackedKeyRef>,
     next: usize,
     replacement_arena: PackedKeyArena,
@@ -586,6 +605,12 @@ pub struct PackedMaintenancePlan {
 }
 
 impl PackedMaintenancePlan {
+    /// Published table generation captured when staging began.
+    #[must_use]
+    pub const fn source_generation(&self) -> PackedGeneration {
+        self.source_generation
+    }
+
     /// Keys still waiting to be copied before cutover.
     #[must_use]
     pub fn remaining(&self) -> usize {
@@ -768,6 +793,8 @@ pub struct PackedMapStats {
     pub soft_delete_threshold: usize,
     /// Deletes that force maintenance even in deferred mode.
     pub hard_delete_threshold: usize,
+    /// Currently published table generation.
+    pub generation: PackedGeneration,
 }
 
 impl PackedMapStats {
@@ -775,6 +802,24 @@ impl PackedMapStats {
     #[must_use]
     pub fn dead_key_bytes(self) -> usize {
         self.arena_key_bytes.saturating_sub(self.live_key_bytes)
+    }
+}
+
+/// Opaque identifier for one published packed-table generation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PackedGeneration(u64);
+
+impl PackedGeneration {
+    const INITIAL: Self = Self(0);
+
+    /// Monotonic generation sequence within a map instance.
+    #[must_use]
+    pub const fn sequence(self) -> u64 {
+        self.0
+    }
+
+    const fn next(self) -> Self {
+        Self(self.0.wrapping_add(1))
     }
 }
 

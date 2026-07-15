@@ -40,6 +40,9 @@ remaining table cutover.
 Structural mutation marks a staged plan stale; the writer can detect this and
 restart allocation-safely. Replacing only a value keeps the plan valid because
 packed key references do not move.
+Every successful maintenance cutover advances an observable `PackedGeneration`;
+exhaustive short writer-trace tests verify that a stale staged plan cannot
+resurrect a removed key or discard an inserted key.
 Deferred mode emits its soft maintenance signal at 25% deleted entries and
 forces maintenance at 50% by default, bounding ignored tombstones and dead
 arena bytes. `with_maintenance_threshold_percents` can select a stricter policy;
