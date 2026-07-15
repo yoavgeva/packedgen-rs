@@ -68,6 +68,9 @@ assert_eq!(map.get(b"key".as_slice()), Some(&42));
 Services should prefer `PackedBinaryMap::try_new(config)`, which reports core
 geometry, capacity, and every eager auxiliary allocation as `PackedBuildError`
 instead of panicking.
+`PackedBinaryMap::try_from_entries` atomically loads an iterator: duplicate keys
+replace earlier values, while failure reports the input index and never exposes
+the partial map.
 
 ## What we must prove
 

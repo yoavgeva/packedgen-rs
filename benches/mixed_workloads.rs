@@ -123,6 +123,44 @@ fn binary_key_insertions(criterion: &mut Criterion) {
     group.finish();
 }
 
+fn batch_load_binary(criterion: &mut Criterion) {
+    let corpus: Vec<Box<[u8]>> = (0..INSERT_ENTRIES as u64)
+        .map(|index| binary_key(index, BINARY_KEY_BYTES))
+        .collect();
+    let config = ElasticConfig::new(INSERT_ENTRIES)
+        .with_reserve_exponent(6)
+        .unwrap()
+        .with_route_cache_budget(RouteCacheBudget::ReadOptimized);
+    let mut group = criterion.benchmark_group("batch_load_binary_32");
+    group.throughput(Throughput::Elements(INSERT_ENTRIES as u64));
+    group.bench_function("packed-elastic", |bencher| {
+        bencher.iter(|| {
+            black_box(
+                PackedBinaryMap::try_from_entries(
+                    config,
+                    corpus
+                        .iter()
+                        .enumerate()
+                        .map(|(index, key)| (key.as_ref(), index as u64)),
+                )
+                .unwrap(),
+            )
+        });
+    });
+    group.bench_function("hashbrown", |bencher| {
+        bencher.iter(|| {
+            black_box(
+                corpus
+                    .iter()
+                    .enumerate()
+                    .map(|(index, key)| (key.clone(), index as u64))
+                    .collect::<HashMap<_, _>>(),
+            )
+        });
+    });
+    group.finish();
+}
+
 fn delete_and_compact_binary(criterion: &mut Criterion) {
     let corpus: Vec<Box<[u8]>> = (0..CHURN_ENTRIES as u64)
         .map(|index| binary_key(index, BINARY_KEY_BYTES))
@@ -521,6 +559,7 @@ criterion_group!(
     maintenance_rebuild_binary,
     maintenance_prepare_step_binary,
     maintenance_begin_binary,
-    fallible_construction
+    fallible_construction,
+    batch_load_binary
 );
 criterion_main!(benches);

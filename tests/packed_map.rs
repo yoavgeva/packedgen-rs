@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use elastichash::{
     ElasticConfig, InsertOutcome, MaintenanceMode, PackedBinaryMap, PackedBuildError,
-    PackedMapError, RouteCacheBudget,
+    PackedLoadError, PackedMapError, RouteCacheBudget,
 };
 
 #[test]
@@ -60,6 +60,31 @@ fn fallible_construction_reports_core_capacity_overflow() {
 
     let map = PackedBinaryMap::<u64>::try_new(ElasticConfig::new(32)).unwrap();
     assert_eq!(map.len(), 0);
+}
+
+#[test]
+fn batch_load_is_atomic_and_reports_the_failing_input_index() {
+    let map = PackedBinaryMap::try_from_entries(
+        ElasticConfig::new(2),
+        [(b"alpha".as_slice(), 1), (b"beta", 2), (b"alpha", 3)],
+    )
+    .unwrap();
+    assert_eq!(map.len(), 2);
+    assert_eq!(map.get(b"alpha"), Some(&3));
+
+    let error = PackedBinaryMap::try_from_entries(
+        ElasticConfig::new(2),
+        [(b"alpha".as_slice(), 1), (b"beta", 2), (b"gamma", 3)],
+    )
+    .err()
+    .unwrap();
+    assert!(matches!(
+        error,
+        PackedLoadError::Entry {
+            index: 2,
+            source: PackedMapError::Capacity(_)
+        }
+    ));
 }
 
 #[test]

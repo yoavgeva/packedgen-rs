@@ -17,6 +17,6 @@ pub use config::{ConfigError, ElasticConfig, MaintenanceMode, RouteCacheBudget};
 pub use map::{CapacityError, FixedElasticMap, InsertOutcome, MapStats};
 pub use opthash::{EpochSnapshot, EpochTransition, ReserveFraction};
 pub use packed_map::{
-    MaintenanceError, MaintenanceProgress, PackedBinaryMap, PackedBuildError,
+    MaintenanceError, MaintenanceProgress, PackedBinaryMap, PackedBuildError, PackedLoadError,
     PackedMaintenancePlan, PackedMapError, PackedMapStats,
 };

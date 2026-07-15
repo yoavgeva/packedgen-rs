@@ -72,6 +72,32 @@ impl<V> PackedBinaryMap<V> {
         })
     }
 
+    /// Fallibly constructs and loads a complete map from binary-key entries.
+    ///
+    /// Duplicate keys replace earlier values using ordinary map semantics. On
+    /// failure, the partially built map is dropped and never exposed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PackedLoadError::Build`] when construction fails, or
+    /// [`PackedLoadError::Entry`] with the zero-based failing input index when
+    /// insertion exceeds capacity, a key is too long, or allocation fails.
+    pub fn try_from_entries<I, K>(
+        config: ElasticConfig,
+        entries: I,
+    ) -> Result<Self, PackedLoadError>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<[u8]>,
+    {
+        let mut map = Self::try_new(config).map_err(PackedLoadError::Build)?;
+        for (index, (key, value)) in entries.into_iter().enumerate() {
+            map.try_insert(key.as_ref(), value)
+                .map_err(|source| PackedLoadError::Entry { index, source })?;
+        }
+        Ok(map)
+    }
+
     /// Constructs a fixed-epoch map with explicit key-arena allocation
     /// granularity.
     ///
@@ -615,6 +641,40 @@ impl fmt::Display for PackedBuildError {
 }
 
 impl std::error::Error for PackedBuildError {}
+
+/// Failure while atomically constructing and loading a packed map.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PackedLoadError {
+    /// Empty-map construction failed before consuming entries.
+    Build(PackedBuildError),
+    /// An entry failed after construction.
+    Entry {
+        /// Zero-based position in the input iterator.
+        index: usize,
+        /// Insertion failure for that entry.
+        source: PackedMapError,
+    },
+}
+
+impl fmt::Display for PackedLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Build(error) => write!(formatter, "packed map construction failed: {error}"),
+            Self::Entry { index, source } => {
+                write!(formatter, "packed entry {index} failed: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PackedLoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Build(error) => Some(error),
+            Self::Entry { source, .. } => Some(source),
+        }
+    }
+}
 
 struct PackedQuery<'a> {
     arena: &'a PackedKeyArena,

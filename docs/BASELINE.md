@@ -116,6 +116,12 @@ Elastic constructor eagerly initializes high-occupancy table geometry, filter,
 and route storage; the typed failure path is service-usable, but initial memory
 touch is materially more expensive.
 
+The atomic public batch loader measured ~15.6 M 32-byte entries/s at 16K keys,
+versus ~35.7 M/s for collecting owned boxed keys into HashBrown. ElasticHash is
+2.28x slower and narrowly misses the 2x insertion gate. Failure drops the
+partial map and reports the zero-based input index; duplicate keys use normal
+replacement semantics.
+
 The cache is advisory: every direct location is checked against table bounds,
 control fingerprint, and original key bytes. Stale entries and tag collisions
 fall back to the exact elastic schedule. A bucket can reject an absent tag only

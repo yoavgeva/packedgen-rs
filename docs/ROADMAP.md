@@ -25,7 +25,7 @@
 - Define a packed metadata value suitable for disk-location indexes.
 - Keep hot payload ownership separate from index slots.
 - [x] Provide fallible whole-map construction across core and auxiliary indexes.
-- [ ] Provide a batch-load API.
+- [x] Provide an atomic fallible batch-load API with indexed errors.
 
 ## Gate 2: single-writer, lock-free-reader generations
 
