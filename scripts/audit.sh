@@ -4,10 +4,10 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
-budget_mib="${ELASTICHASH_AUDIT_BUDGET_MIB:-64}"
-lookups="${ELASTICHASH_AUDIT_LOOKUPS:-1000000}"
-entries="${ELASTICHASH_AUDIT_ENTRIES:-1000000}"
-samples="${ELASTICHASH_AUDIT_SAMPLES:-5}"
+budget_mib="${PACKEDGEN_AUDIT_BUDGET_MIB:-${ELASTICHASH_AUDIT_BUDGET_MIB:-64}}"
+lookups="${PACKEDGEN_AUDIT_LOOKUPS:-${ELASTICHASH_AUDIT_LOOKUPS:-1000000}}"
+entries="${PACKEDGEN_AUDIT_ENTRIES:-${ELASTICHASH_AUDIT_ENTRIES:-1000000}}"
+samples="${PACKEDGEN_AUDIT_SAMPLES:-${ELASTICHASH_AUDIT_SAMPLES:-5}}"
 
 cargo fmt --all -- --check
 cargo test --workspace --locked

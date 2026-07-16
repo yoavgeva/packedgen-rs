@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use elastichash::{ElasticConfig, FixedElasticMap, InsertOutcome};
+use packedgen::{ElasticConfig, FixedElasticMap, InsertOutcome};
 
 #[test]
 fn matches_std_map_for_mixed_operations() {

@@ -3,7 +3,7 @@
 use std::alloc::System;
 use std::hint::black_box;
 
-use elastichash::{PackedKeyArena, PackedKeyRef};
+use packedgen::{PackedKeyArena, PackedKeyRef};
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, Stats, StatsAlloc};
 
 #[global_allocator]

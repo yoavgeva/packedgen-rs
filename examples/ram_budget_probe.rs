@@ -8,8 +8,11 @@ use std::alloc::System;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use elastichash::{ElasticConfig, FrozenPackedMap, PackedBinaryMap, RouteCacheBudget};
 use hashbrown::HashMap;
+use packedgen::{
+    ElasticConfig, FrozenPackedMap, PackedBinaryMap, RouteCacheBudget, SegmentedLoad,
+    SegmentedSwissMap,
+};
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, Stats, StatsAlloc};
 
 #[global_allocator]
@@ -38,13 +41,41 @@ fn main() {
     let packed_entries = max_entries_within_budget(budget, measure_packed_bytes);
     let frozen_entries = max_entries_within_budget(budget, measure_frozen_bytes);
     let hashbrown_entries = max_entries_within_budget(budget, measure_hashbrown_bytes);
+    let segmented_compact_entries =
+        max_entries_within_budget(budget, measure_segmented_compact_bytes);
+    let segmented_balanced_entries =
+        max_entries_within_budget(budget, measure_segmented_balanced_bytes);
+    let segmented_fast_entries = max_entries_within_budget(budget, measure_segmented_fast_bytes);
     assert!(
-        packed_entries > 0 && frozen_entries > 0 && hashbrown_entries > 0,
+        packed_entries > 0
+            && frozen_entries > 0
+            && hashbrown_entries > 0
+            && segmented_compact_entries > 0
+            && segmented_balanced_entries > 0
+            && segmented_fast_entries > 0,
         "budget must fit at least one entry in every implementation"
     );
     let packed = run_packed(packed_entries, lookups, samples);
     let frozen = run_frozen(frozen_entries, lookups, samples);
     let hashbrown = run_hashbrown(hashbrown_entries, lookups, samples);
+    let segmented_compact = run_segmented(
+        segmented_compact_entries,
+        lookups,
+        samples,
+        SegmentedLoad::Compact,
+    );
+    let segmented_balanced = run_segmented(
+        segmented_balanced_entries,
+        lookups,
+        samples,
+        SegmentedLoad::Balanced,
+    );
+    let segmented_fast = run_segmented(
+        segmented_fast_entries,
+        lookups,
+        samples,
+        SegmentedLoad::Fast,
+    );
 
     println!(
         "implementation,budget_bytes,entries,live_bytes,budget_utilization,lookups,samples,median_ns_per_lookup,lookups_per_second"
@@ -58,6 +89,27 @@ fn main() {
     );
     print_row("frozen-ptrhash-binary32", budget, lookups, samples, frozen);
     print_row("hashbrown-binary32", budget, lookups, samples, hashbrown);
+    print_row(
+        "segmented-swiss-compact-binary32",
+        budget,
+        lookups,
+        samples,
+        segmented_compact,
+    );
+    print_row(
+        "segmented-swiss-balanced-binary32",
+        budget,
+        lookups,
+        samples,
+        segmented_balanced,
+    );
+    print_row(
+        "segmented-swiss-fast-binary32",
+        budget,
+        lookups,
+        samples,
+        segmented_fast,
+    );
 }
 
 fn max_entries_within_budget(budget: usize, measure: fn(usize) -> usize) -> usize {
@@ -102,6 +154,26 @@ fn measure_frozen_bytes(entries: usize) -> usize {
     bytes
 }
 
+fn measure_segmented_compact_bytes(entries: usize) -> usize {
+    measure_segmented_bytes(entries, SegmentedLoad::Compact)
+}
+
+fn measure_segmented_balanced_bytes(entries: usize) -> usize {
+    measure_segmented_bytes(entries, SegmentedLoad::Balanced)
+}
+
+fn measure_segmented_fast_bytes(entries: usize) -> usize {
+    measure_segmented_bytes(entries, SegmentedLoad::Fast)
+}
+
+fn measure_segmented_bytes(entries: usize, load: SegmentedLoad) -> usize {
+    let region = Region::new(GLOBAL);
+    let map = build_segmented(entries, load);
+    let bytes = net_live_bytes(region.change());
+    black_box(&map);
+    bytes
+}
+
 fn run_packed(entries: usize, lookups: usize, samples: usize) -> ProbeResult {
     let region = Region::new(GLOBAL);
     let map = build_packed(entries);
@@ -141,6 +213,24 @@ fn run_frozen(entries: usize, lookups: usize, samples: usize) -> ProbeResult {
     }
 }
 
+fn run_segmented(
+    entries: usize,
+    lookups: usize,
+    samples: usize,
+    load: SegmentedLoad,
+) -> ProbeResult {
+    let region = Region::new(GLOBAL);
+    let map = build_segmented(entries, load);
+    let live_bytes = net_live_bytes(region.change());
+    let elapsed = median_hit_time(entries, lookups, samples, |key| map.get(key).copied());
+    black_box(&map);
+    ProbeResult {
+        entries,
+        live_bytes,
+        elapsed,
+    }
+}
+
 fn build_packed(entries: usize) -> PackedBinaryMap<u64> {
     let config = ElasticConfig::new(entries)
         .with_reserve_exponent(6)
@@ -170,6 +260,18 @@ fn build_frozen(entries: usize) -> FrozenPackedMap<u64> {
         (binary_key(value), value)
     }))
     .expect("unique generated keys must build a frozen map")
+}
+
+fn build_segmented(entries: usize, load: SegmentedLoad) -> SegmentedSwissMap<u64> {
+    let key_bytes = entries.checked_mul(32).expect("key byte count overflow");
+    let mut map = SegmentedSwissMap::try_with_capacity_key_bytes_and_load(entries, key_bytes, load)
+        .expect("segmented SwissTable allocation must fit");
+    for index in 0..entries {
+        let value = u64::try_from(index).expect("entry index must fit u64");
+        map.try_insert(&binary_key(value), value)
+            .expect("segmented SwissTable insertion must succeed");
+    }
+    map
 }
 
 fn median_hit_time(

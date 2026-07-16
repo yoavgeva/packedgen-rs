@@ -3,7 +3,6 @@ use std::mem;
 
 use opthash::{ElasticHashMap, EpochSnapshot, Equivalent, ReserveFraction, TryBuildError};
 
-use crate::filter::NegativeLookupFilter;
 use crate::route_cache::RouteCache;
 use crate::{
     ArenaError, CapacityError, ElasticConfig, InsertOutcome, MaintenanceMode, PackedKeyArena,
@@ -18,7 +17,6 @@ use crate::{
 pub struct PackedBinaryMap<V> {
     inner: ElasticHashMap<PackedKeyRef, V>,
     arena: PackedKeyArena,
-    negative_filter: NegativeLookupFilter,
     route_cache: RouteCache,
     live_limit: usize,
     live_key_bytes: usize,
@@ -51,7 +49,7 @@ impl<V> PackedBinaryMap<V> {
     /// # Errors
     ///
     /// Returns [`PackedBuildError`] for core geometry, capacity, or allocation
-    /// failure, including the negative filter and route cache allocations.
+    /// failure, including the route cache allocation.
     pub fn try_new(config: ElasticConfig) -> Result<Self, PackedBuildError> {
         Ok(Self {
             inner: ElasticHashMap::try_with_capacity_and_reserve(
@@ -60,8 +58,6 @@ impl<V> PackedBinaryMap<V> {
             )
             .map_err(PackedBuildError::Core)?,
             arena: PackedKeyArena::new(),
-            negative_filter: NegativeLookupFilter::try_new(config.live_capacity())
-                .map_err(|()| PackedBuildError::AuxiliaryAllocation)?,
             route_cache: RouteCache::try_new(config.live_capacity(), config.route_cache_slots())
                 .map_err(|()| PackedBuildError::AuxiliaryAllocation)?,
             live_limit: config.live_capacity(),
@@ -126,7 +122,6 @@ impl<V> PackedBinaryMap<V> {
                 config.reserve(),
             ),
             arena: PackedKeyArena::with_segment_bytes(segment_bytes)?,
-            negative_filter: NegativeLookupFilter::new(config.live_capacity()),
             route_cache: RouteCache::new(config.live_capacity(), config.route_cache_slots()),
             live_limit: config.live_capacity(),
             live_key_bytes: 0,
@@ -158,7 +153,7 @@ impl<V> PackedBinaryMap<V> {
     /// arena error when the key is too large or allocation fails.
     pub fn try_insert(&mut self, key: &[u8], value: V) -> Result<InsertOutcome<V>, PackedMapError> {
         let hash = self.inner.hash_key(key);
-        if self.negative_filter.may_contain_hash(hash) {
+        if self.inner.may_contain_prehashed(hash) {
             let query = PackedQuery {
                 arena: &self.arena,
                 bytes: key,
@@ -175,7 +170,6 @@ impl<V> PackedBinaryMap<V> {
         }
 
         let key_ref = self.arena.insert(key).map_err(PackedMapError::Arena)?;
-        self.negative_filter.insert_hash(hash);
         let location = match self
             .inner
             .try_insert_unique_prehashed_in_place_with_location(hash, key_ref, value)
@@ -214,7 +208,8 @@ impl<V> PackedBinaryMap<V> {
                 return Some(value);
             }
         }
-        if self.route_cache.definitely_absent(hash) || !self.negative_filter.may_contain_hash(hash)
+        if self.route_cache.miss_after_candidates_is_definite(hash)
+            || !self.inner.may_contain_prehashed(hash)
         {
             return None;
         }
@@ -237,14 +232,19 @@ impl<V> PackedBinaryMap<V> {
             });
         let mut results = [None; N];
 
-        for way in [0, 1] {
-            for index in 0..N {
+        // Resolve the first two cache ways across the whole batch. This keeps
+        // the common route-hit path short; the exact Elastic fallback below
+        // still checks the remaining ways (and all non-cached routes), so this
+        // is only a throughput choice, never a correctness shortcut.
+        let ways = [(); 2];
+        for (way, ()) in ways.iter().enumerate() {
+            for (index, cached_candidates) in candidates.iter().enumerate() {
+                let Some(location) = cached_candidates[way] else {
+                    continue;
+                };
                 if results[index].is_some() {
                     continue;
                 }
-                let Some(location) = candidates[index][way] else {
-                    continue;
-                };
                 let query = PackedQuery {
                     arena: &self.arena,
                     bytes: keys[index],
@@ -256,7 +256,7 @@ impl<V> PackedBinaryMap<V> {
         for index in 0..N {
             if results[index].is_some()
                 || self.route_cache.definitely_absent(hashes[index])
-                || !self.negative_filter.may_contain_hash(hashes[index])
+                || !self.inner.may_contain_prehashed(hashes[index])
             {
                 continue;
             }
@@ -283,7 +283,7 @@ impl<V> PackedBinaryMap<V> {
     /// compacting generation rebuild.
     pub fn remove(&mut self, key: &[u8]) -> Option<V> {
         let hash = self.inner.hash_key(key);
-        if !self.negative_filter.may_contain_hash(hash) {
+        if !self.inner.may_contain_prehashed(hash) {
             return None;
         }
         let removed = self.inner.remove_prehashed_deferred(
@@ -447,7 +447,6 @@ impl<V> PackedBinaryMap<V> {
     pub fn clear(&mut self) {
         self.inner.clear();
         self.arena.clear();
-        self.negative_filter.clear();
         self.route_cache.clear();
         self.live_key_bytes = 0;
         self.deletes_since_rebuild = 0;
@@ -489,7 +488,7 @@ impl<V> PackedBinaryMap<V> {
             core_capacity: self.inner.capacity(),
             reserve: self.inner.reserve_fraction(),
             epoch: self.inner.epoch(),
-            negative_filter_bytes: self.negative_filter.bytes(),
+            negative_filter_bytes: self.inner.membership_filter_bytes(),
             route_cache_bytes: self.route_cache.bytes(),
             route_cache_entries: self.route_cache.cached(),
             route_cache_overflows: self.route_cache.overflowed(),
@@ -534,7 +533,6 @@ impl<V> PackedBinaryMap<V> {
             drop(mem::replace(&mut self.arena, replacement_arena));
             remapped_refs
         });
-        let mut replacement_filter = NegativeLookupFilter::new(self.live_limit);
         self.route_cache.clear();
         for (key_ref, value) in old {
             let rebuilt_ref = remapped_refs.as_ref().map_or(key_ref, |references| {
@@ -552,11 +550,9 @@ impl<V> PackedBinaryMap<V> {
                 .inner
                 .try_insert_unique_prehashed_in_place_with_location(hash, rebuilt_ref, value)
                 .unwrap_or_else(|_| panic!("fresh elastic epoch must fit every live entry"));
-            replacement_filter.insert_hash(hash);
             self.route_cache.insert(hash, location);
         }
         self.deletes_since_rebuild = 0;
-        self.negative_filter = replacement_filter;
         self.maintenance_runs += 1;
         self.arena_allocated_bytes_reclaimed +=
             allocated_before.saturating_sub(self.arena.allocated_bytes());

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use elastichash::{ElasticConfig, FixedElasticMap};
+use packedgen::{ElasticConfig, FixedElasticMap};
 
 const ENTRIES: usize = 200_000;
 

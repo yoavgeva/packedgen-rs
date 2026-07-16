@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use elastichash::{
+use packedgen::{
     ElasticConfig, InsertOutcome, MaintenanceError, MaintenanceMode, PackedBinaryMap,
     PackedBuildError, PackedLoadError, PackedMapError, RouteCacheBudget,
 };
@@ -336,7 +336,7 @@ fn staged_maintenance_bounds_key_copying_before_cutover() {
     assert_eq!(idle.remaining, 24);
     assert!(matches!(
         map.finish_maintenance(&mut plan),
-        Err(elastichash::MaintenanceError::PlanNotReady { remaining: 24 })
+        Err(packedgen::MaintenanceError::PlanNotReady { remaining: 24 })
     ));
 
     while !plan.is_ready() {
@@ -372,7 +372,7 @@ fn staged_maintenance_detects_structural_changes_and_restarts() {
     assert!(map.maintenance_plan_is_stale(&plan));
     assert_eq!(
         map.prepare_maintenance_step(&mut plan, 1),
-        Err(elastichash::MaintenanceError::StalePlan)
+        Err(packedgen::MaintenanceError::StalePlan)
     );
     map.try_restart_maintenance(&mut plan).unwrap();
     assert!(!map.maintenance_plan_is_stale(&plan));
@@ -397,7 +397,7 @@ fn routing_accelerator_is_bounded_and_caches_most_routes() {
     let stats = map.stats();
     assert_eq!(
         stats.route_cache_bytes,
-        capacity * 10 + capacity.div_ceil(64) * 8
+        capacity * 8 + (capacity * 2).div_ceil(4).div_ceil(64) * 8
     );
     assert!(stats.route_cache_entries > capacity * 4 / 5, "{stats:?}");
     assert_eq!(

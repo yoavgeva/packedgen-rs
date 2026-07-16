@@ -106,6 +106,18 @@ pub trait TableBackend<K, V>: Sized {
     where
         Q: Equivalent<K> + ?Sized;
 
+    /// Return whether backend membership metadata permits `hash` to be live.
+    /// A false result is definitive; a true result may be a false positive.
+    fn may_contain_hash(&self, hash: u64) -> bool {
+        let _ = hash;
+        true
+    }
+
+    /// Bytes retained by the backend membership metadata.
+    fn membership_filter_bytes(&self) -> usize {
+        0
+    }
+
     /// Encode a location for a higher-level fixed-epoch routing index.
     fn location_bits(location: Self::Location) -> u64;
 
@@ -537,6 +549,22 @@ where
         self.table
             .find_entry(key, hash, fingerprint(hash))
             .map(|entry| &entry.value)
+    }
+
+    /// Checks the backend's definite-negative membership metadata.
+    ///
+    /// A false result proves that no entry with `hash` is live in the current
+    /// allocation epoch. A true result is only a hint and must be followed by
+    /// an exact lookup.
+    #[must_use]
+    pub fn may_contain_prehashed(&self, hash: u64) -> bool {
+        self.table.may_contain_hash(hash)
+    }
+
+    /// Bytes retained by definite-negative membership metadata.
+    #[must_use]
+    pub fn membership_filter_bytes(&self) -> usize {
+        self.table.membership_filter_bytes()
     }
 
     /// Verifies a retained fixed-epoch location and returns its value.

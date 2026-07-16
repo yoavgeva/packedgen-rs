@@ -3,11 +3,11 @@
 use std::hint::black_box;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use elastichash::{
-    ElasticConfig, FixedElasticMap, FrozenPackedMap, MaintenanceMode, PackedBinaryMap,
-    RouteCacheBudget,
-};
 use hashbrown::HashMap;
+use packedgen::{
+    BucketPackedMap, ElasticConfig, FixedElasticMap, FrozenPackedMap, MaintenanceMode,
+    PackedBinaryMap, PackedSwissMap, RouteCacheBudget, SegmentedSwissMap,
+};
 
 mod support;
 
@@ -182,6 +182,48 @@ fn binary_key_insertions(criterion: &mut Criterion) {
             |mut map| {
                 for (index, key) in corpus.iter().enumerate() {
                     black_box(map.insert(key.clone(), index as u64));
+                }
+            },
+            BatchSize::LargeInput,
+        );
+    });
+    group.bench_function("cacheline-bucket", |bencher| {
+        bencher.iter_batched(
+            || BucketPackedMap::new(entries),
+            |mut map| {
+                for (index, key) in corpus.iter().enumerate() {
+                    black_box(map.try_insert(key, index as u64).unwrap());
+                }
+            },
+            BatchSize::LargeInput,
+        );
+    });
+    group.bench_function("packed-swiss", |bencher| {
+        bencher.iter_batched(
+            || {
+                PackedSwissMap::try_with_capacity_and_key_bytes(entries, entries * BINARY_KEY_BYTES)
+                    .unwrap()
+            },
+            |mut map| {
+                for (index, key) in corpus.iter().enumerate() {
+                    black_box(map.try_insert(key, index as u64).unwrap());
+                }
+            },
+            BatchSize::LargeInput,
+        );
+    });
+    group.bench_function("segmented-packed-swiss", |bencher| {
+        bencher.iter_batched(
+            || {
+                SegmentedSwissMap::try_with_capacity_and_key_bytes(
+                    entries,
+                    entries * BINARY_KEY_BYTES,
+                )
+                .unwrap()
+            },
+            |mut map| {
+                for (index, key) in corpus.iter().enumerate() {
+                    black_box(map.try_insert(key, index as u64).unwrap());
                 }
             },
             BatchSize::LargeInput,
@@ -462,6 +504,7 @@ fn bulk_insertions(criterion: &mut Criterion) {
     group.finish();
 }
 
+#[allow(clippy::too_many_lines)]
 fn binary_key_lookups(criterion: &mut Criterion) {
     let entries = 1 << 15;
     let corpus: Vec<Box<[u8]>> = (0..entries as u64)
@@ -533,6 +576,43 @@ fn binary_key_lookups(criterion: &mut Criterion) {
             frozen.get(black_box(corpus[cursor].as_ref()))
         });
     });
+    let mut bucket = BucketPackedMap::new(entries);
+    for (index, key) in corpus.iter().enumerate() {
+        bucket.try_insert(key, index as u64).unwrap();
+    }
+    let mut cursor = 0_usize;
+    group.bench_function("cacheline-bucket", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % entries;
+            bucket.get(black_box(corpus[cursor].as_ref()))
+        });
+    });
+    let mut swiss =
+        PackedSwissMap::try_with_capacity_and_key_bytes(entries, entries * BINARY_KEY_BYTES)
+            .unwrap();
+    for (index, key) in corpus.iter().enumerate() {
+        swiss.try_insert(key, index as u64).unwrap();
+    }
+    let mut cursor = 0_usize;
+    group.bench_function("packed-swiss", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % entries;
+            swiss.get(black_box(corpus[cursor].as_ref()))
+        });
+    });
+    let mut segmented =
+        SegmentedSwissMap::try_with_capacity_and_key_bytes(entries, entries * BINARY_KEY_BYTES)
+            .unwrap();
+    for (index, key) in corpus.iter().enumerate() {
+        segmented.try_insert(key, index as u64).unwrap();
+    }
+    let mut cursor = 0_usize;
+    group.bench_function("segmented-packed-swiss", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % entries;
+            segmented.get(black_box(corpus[cursor].as_ref()))
+        });
+    });
     group.finish();
 }
 
@@ -594,9 +674,47 @@ fn binary_key_missing_lookups(criterion: &mut Criterion) {
             frozen.get(black_box(misses[cursor].as_ref()))
         });
     });
+    let mut bucket = BucketPackedMap::new(entries);
+    for (index, key) in corpus.iter().enumerate() {
+        bucket.try_insert(key, index as u64).unwrap();
+    }
+    let mut cursor = 0_usize;
+    group.bench_function("cacheline-bucket", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % entries;
+            bucket.get(black_box(misses[cursor].as_ref()))
+        });
+    });
+    let mut swiss =
+        PackedSwissMap::try_with_capacity_and_key_bytes(entries, entries * BINARY_KEY_BYTES)
+            .unwrap();
+    for (index, key) in corpus.iter().enumerate() {
+        swiss.try_insert(key, index as u64).unwrap();
+    }
+    let mut cursor = 0_usize;
+    group.bench_function("packed-swiss", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % entries;
+            swiss.get(black_box(misses[cursor].as_ref()))
+        });
+    });
+    let mut segmented =
+        SegmentedSwissMap::try_with_capacity_and_key_bytes(entries, entries * BINARY_KEY_BYTES)
+            .unwrap();
+    for (index, key) in corpus.iter().enumerate() {
+        segmented.try_insert(key, index as u64).unwrap();
+    }
+    let mut cursor = 0_usize;
+    group.bench_function("segmented-packed-swiss", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % entries;
+            segmented.get(black_box(misses[cursor].as_ref()))
+        });
+    });
     group.finish();
 }
 
+#[allow(clippy::too_many_lines)]
 fn large_binary_key_lookups(criterion: &mut Criterion) {
     let corpus: Vec<Box<[u8]>> = (0..LARGE_BINARY_ENTRIES as u64)
         .map(|index| binary_key(index, BINARY_KEY_BYTES))
@@ -620,6 +738,26 @@ fn large_binary_key_lookups(criterion: &mut Criterion) {
             .map(|(index, key)| (key.as_ref(), index as u64)),
     )
     .unwrap();
+    let mut bucket = BucketPackedMap::new(LARGE_BINARY_ENTRIES);
+    for (index, key) in corpus.iter().enumerate() {
+        bucket.try_insert(key, index as u64).unwrap();
+    }
+    let mut swiss = PackedSwissMap::try_with_capacity_and_key_bytes(
+        LARGE_BINARY_ENTRIES,
+        LARGE_BINARY_ENTRIES * BINARY_KEY_BYTES,
+    )
+    .unwrap();
+    for (index, key) in corpus.iter().enumerate() {
+        swiss.try_insert(key, index as u64).unwrap();
+    }
+    let mut segmented = SegmentedSwissMap::try_with_capacity_and_key_bytes(
+        LARGE_BINARY_ENTRIES,
+        LARGE_BINARY_ENTRIES * BINARY_KEY_BYTES,
+    )
+    .unwrap();
+    for (index, key) in corpus.iter().enumerate() {
+        segmented.try_insert(key, index as u64).unwrap();
+    }
 
     let mut group = criterion.benchmark_group("successful_lookup_binary_32_large_1m");
     group.throughput(Throughput::Elements(1));
@@ -642,6 +780,27 @@ fn large_binary_key_lookups(criterion: &mut Criterion) {
         bencher.iter(|| {
             cursor = cursor.wrapping_add(1) % LARGE_BINARY_ENTRIES;
             frozen.get(black_box(corpus[cursor].as_ref()))
+        });
+    });
+    let mut cursor = 0_usize;
+    group.bench_function("cacheline-bucket", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % LARGE_BINARY_ENTRIES;
+            bucket.get(black_box(corpus[cursor].as_ref()))
+        });
+    });
+    let mut cursor = 0_usize;
+    group.bench_function("packed-swiss", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % LARGE_BINARY_ENTRIES;
+            swiss.get(black_box(corpus[cursor].as_ref()))
+        });
+    });
+    let mut cursor = 0_usize;
+    group.bench_function("segmented-packed-swiss", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % LARGE_BINARY_ENTRIES;
+            segmented.get(black_box(corpus[cursor].as_ref()))
         });
     });
     group.finish();

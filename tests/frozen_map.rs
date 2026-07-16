@@ -1,6 +1,18 @@
 #![allow(missing_docs)]
 
-use elastichash::{FrozenBuildError, FrozenPackedMap};
+use packedgen::{FrozenBuildError, FrozenPackedMap};
+
+#[test]
+fn singleton_map_rejects_arbitrary_misses_without_index_remapping() {
+    let map = FrozenPackedMap::try_from_entries([(b"member".as_slice(), 7_u64)]).unwrap();
+
+    assert_eq!(map.get(b"member"), Some(&7));
+    assert_eq!(map.get(b"not-a-member"), None);
+    assert_eq!(
+        map.get_many([b"not-a-member".as_slice(), b"member".as_slice()]),
+        [None, Some(&7)]
+    );
+}
 
 #[test]
 fn exact_hits_and_unknown_keys_are_distinguished() {
@@ -50,6 +62,36 @@ fn empty_map_has_exact_empty_semantics() {
     assert!(map.is_empty());
     assert_eq!(map.get(b"anything"), None);
     assert!(map.stats().index_bits_per_entry.abs() < f64::EPSILON);
+}
+
+#[test]
+fn batched_lookup_preserves_order_and_exact_miss_semantics() {
+    let entries: Vec<(Vec<u8>, u64)> = (0..32_u64)
+        .map(|index| (binary_key(index), index))
+        .collect();
+    let map = FrozenPackedMap::try_from_entries(
+        entries.iter().map(|(key, value)| (key.as_slice(), *value)),
+    )
+    .unwrap();
+    let absent = binary_key(10_000);
+    let results = map.get_many([
+        entries[19].0.as_slice(),
+        absent.as_slice(),
+        entries[0].0.as_slice(),
+        entries[31].0.as_slice(),
+    ]);
+
+    assert_eq!(
+        results.map(Option::<&u64>::copied),
+        [Some(19), None, Some(0), Some(31)]
+    );
+}
+
+#[test]
+fn batched_lookup_on_empty_map_returns_all_misses() {
+    let map = FrozenPackedMap::<u64>::try_from_entries(std::iter::empty::<(&[u8], u64)>()).unwrap();
+    let results = map.get_many([b"one".as_slice(), b"two".as_slice()]);
+    assert_eq!(results, [None, None]);
 }
 
 fn binary_key(index: u64) -> Vec<u8> {

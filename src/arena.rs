@@ -7,13 +7,23 @@ const SEGMENT_SHIFT: u32 = OFFSET_BITS;
 const LENGTH_SHIFT: u32 = OFFSET_BITS + SEGMENT_BITS;
 const SEGMENT_MASK: u64 = (1_u64 << SEGMENT_BITS) - 1;
 const LENGTH_MASK: u64 = (1_u64 << LENGTH_BITS) - 1;
+const EMBEDDED_LENGTH_BITS: u32 = 8;
+const EMBEDDED_TAG_BITS: u32 = LENGTH_BITS - EMBEDDED_LENGTH_BITS;
+const EMBEDDED_TAG_MASK: u64 = (1_u64 << EMBEDDED_TAG_BITS) - 1;
+const EMBEDDED_TAG_SHIFT: u32 = LENGTH_SHIFT + EMBEDDED_LENGTH_BITS;
+const EMBEDDED_TAG_WORD_MASK: u64 = EMBEDDED_TAG_MASK << EMBEDDED_TAG_SHIFT;
 const MAX_SEGMENTS: usize = 1 << SEGMENT_BITS;
 
 /// Largest key accepted by the packed arena: exactly 64 KiB.
 pub const MAX_PACKED_KEY_BYTES: usize = 1 << 16;
 
 /// Default allocation granularity for packed key bytes.
-pub const DEFAULT_KEY_SEGMENT_BYTES: usize = 1 << 20;
+///
+/// A 64-KiB segment bounds unused tail space for unknown key workloads while
+/// keeping segment-directory overhead negligible (about 0.04% for 32-byte
+/// keys). Callers with very large, uniform keys can still choose a larger
+/// segment through [`PackedKeyArena::with_segment_bytes`].
+pub const DEFAULT_KEY_SEGMENT_BYTES: usize = 1 << 16;
 
 /// An eight-byte reference to immutable bytes in a [`PackedKeyArena`].
 ///
@@ -24,9 +34,13 @@ pub const DEFAULT_KEY_SEGMENT_BYTES: usize = 1 << 20;
 pub struct PackedKeyRef(u64);
 
 impl PackedKeyRef {
+    #[cfg(feature = "kphf")]
+    pub(crate) const EMPTY_SLOT: Self = Self(LENGTH_MASK << LENGTH_SHIFT);
+
     /// Byte offset within the referenced segment.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
+    #[inline]
     pub const fn offset(self) -> u32 {
         // The packed representation intentionally stores the offset in the
         // low 32 bits, so truncation is the decoding operation.
@@ -35,12 +49,14 @@ impl PackedKeyRef {
 
     /// Segment index within the originating arena.
     #[must_use]
+    #[inline]
     pub const fn segment(self) -> u16 {
         ((self.0 >> SEGMENT_SHIFT) & SEGMENT_MASK) as u16
     }
 
     /// Key length in bytes.
     #[must_use]
+    #[inline]
     pub const fn len(self) -> usize {
         ((self.0 >> LENGTH_SHIFT) & LENGTH_MASK) as usize
     }
@@ -60,6 +76,40 @@ impl PackedKeyRef {
                 | (u64::try_from(segment).expect("validated segment") << SEGMENT_SHIFT)
                 | (u64::try_from(length).expect("validated key length") << LENGTH_SHIFT),
         )
+    }
+
+    pub(crate) fn with_embedded_tag(self, tag: u16) -> Self {
+        debug_assert!(u8::try_from(self.len()).is_ok());
+        debug_assert!(u64::from(tag) <= EMBEDDED_TAG_MASK);
+        Self(self.0 | (u64::from(tag) << EMBEDDED_TAG_SHIFT))
+    }
+
+    pub(crate) const fn embedded_tag(self) -> u16 {
+        ((self.0 >> EMBEDDED_TAG_SHIFT) & EMBEDDED_TAG_MASK) as u16
+    }
+
+    pub(crate) const fn without_embedded_tag(self) -> Self {
+        Self(self.0 & !EMBEDDED_TAG_WORD_MASK)
+    }
+
+    #[cfg(feature = "kphf")]
+    pub(crate) const fn is_empty_slot(self) -> bool {
+        self.0 == Self::EMPTY_SLOT.0
+    }
+
+    #[cfg(feature = "kphf")]
+    pub(crate) const fn raw(self) -> u64 {
+        self.0
+    }
+
+    #[cfg(feature = "kphf")]
+    pub(crate) fn embedded_tag_word(tag: u16) -> u64 {
+        u64::from(tag) << EMBEDDED_TAG_SHIFT
+    }
+
+    #[cfg(feature = "kphf")]
+    pub(crate) const fn embedded_tag_word_mask() -> u64 {
+        EMBEDDED_TAG_WORD_MASK
     }
 }
 
@@ -150,6 +200,7 @@ impl PackedKeyArena {
 
     /// Resolves a reference produced by this arena.
     #[must_use]
+    #[inline]
     pub fn get(&self, key_ref: PackedKeyRef) -> Option<&[u8]> {
         let segment = self.segments.get(usize::from(key_ref.segment()))?;
         let start = usize::try_from(key_ref.offset()).ok()?;

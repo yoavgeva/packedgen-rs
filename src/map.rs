@@ -4,7 +4,7 @@ use std::hash::Hash;
 
 use opthash::{ElasticHashMap, EpochSnapshot, ReserveFraction};
 
-use crate::{ElasticConfig, filter::NegativeLookupFilter};
+use crate::ElasticConfig;
 
 /// A fixed-epoch elastic map that rejects growth past an explicit live limit.
 ///
@@ -13,7 +13,6 @@ use crate::{ElasticConfig, filter::NegativeLookupFilter};
 pub struct FixedElasticMap<K: Eq + Hash, V> {
     inner: ElasticHashMap<K, V>,
     live_limit: usize,
-    negative_filter: NegativeLookupFilter,
 }
 
 impl<K, V> FixedElasticMap<K, V>
@@ -29,7 +28,6 @@ where
                 config.reserve(),
             ),
             live_limit: config.live_capacity(),
-            negative_filter: NegativeLookupFilter::new(config.live_capacity()),
         }
     }
 
@@ -43,21 +41,28 @@ where
     /// Returns [`CapacityError`] when an absent key would exceed the configured
     /// live-entry limit.
     pub fn try_insert(&mut self, key: K, value: V) -> Result<InsertOutcome<V>, CapacityError> {
-        if self.inner.len() >= self.live_limit && !self.inner.contains_key(&key) {
+        // Hash once and reuse the result across the service filter and core.
+        // This removes a second hash from the capacity/replacement path while
+        // retaining the single-pass core insertion path for ordinary writes.
+        let hash = self.inner.hash_key(&key);
+        if self.inner.len() >= self.live_limit {
+            if !self.inner.may_contain_prehashed(hash) {
+                return Err(CapacityError {
+                    live_limit: self.live_limit,
+                });
+            }
+            if let Some(previous) = self.inner.get_mut_prehashed(hash, &key) {
+                return Ok(InsertOutcome::Replaced(core::mem::replace(previous, value)));
+            }
             return Err(CapacityError {
                 live_limit: self.live_limit,
             });
         }
 
-        let generation = self.inner.epoch().generation;
-        self.negative_filter.insert(&key);
         let outcome = match self.inner.insert(key, value) {
             Some(previous) => InsertOutcome::Replaced(previous),
             None => InsertOutcome::Inserted,
         };
-        if self.inner.epoch().generation != generation {
-            self.rebuild_negative_filter();
-        }
         Ok(outcome)
     }
 
@@ -68,10 +73,11 @@ where
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        if !self.negative_filter.may_contain(key) {
+        let hash = self.inner.hash_key(key);
+        if !self.inner.may_contain_prehashed(hash) {
             return None;
         }
-        self.inner.get(key)
+        self.inner.get_prehashed(hash, key)
     }
 
     /// Returns whether an equivalent borrowed key is present.
@@ -81,7 +87,8 @@ where
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        self.negative_filter.may_contain(key) && self.inner.contains_key(key)
+        let hash = self.inner.hash_key(key);
+        self.inner.may_contain_prehashed(hash) && self.inner.contains_prehashed(hash, key)
     }
 
     /// Removes a key and returns its value.
@@ -90,21 +97,18 @@ where
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        if !self.negative_filter.may_contain(key) {
+        let hash = self.inner.hash_key(key);
+        if !self.inner.may_contain_prehashed(hash) {
             return None;
         }
-        let generation = self.inner.epoch().generation;
-        let removed = self.inner.remove(key);
-        if self.inner.epoch().generation != generation {
-            self.rebuild_negative_filter();
-        }
-        removed
+        self.inner
+            .remove_prehashed(hash, key)
+            .map(|(_, value)| value)
     }
 
     /// Removes every entry while retaining the allocation.
     pub fn clear(&mut self) {
         self.inner.clear();
-        self.negative_filter.clear();
     }
 
     /// Number of live entries.
@@ -128,16 +132,8 @@ where
             core_capacity: self.inner.capacity(),
             reserve: self.inner.reserve_fraction(),
             epoch: self.inner.epoch(),
-            negative_filter_bytes: self.negative_filter.bytes(),
+            negative_filter_bytes: self.inner.membership_filter_bytes(),
         }
-    }
-
-    fn rebuild_negative_filter(&mut self) {
-        let mut replacement = NegativeLookupFilter::new(self.live_limit);
-        for (key, _) in &self.inner {
-            replacement.insert(key);
-        }
-        self.negative_filter = replacement;
     }
 }
 
@@ -193,7 +189,7 @@ pub struct MapStats {
     pub reserve: ReserveFraction,
     /// Core allocation-epoch lifecycle state.
     pub epoch: EpochSnapshot,
-    /// Requested bytes in the service-layer definite-negative filter.
+    /// Requested bytes in the core definite-negative membership filter.
     pub negative_filter_bytes: usize,
 }
 

@@ -119,12 +119,12 @@ impl ElasticConfig {
     pub(crate) fn route_cache_slots(self) -> usize {
         match self.route_cache_budget {
             RouteCacheBudget::Compact => 0,
-            RouteCacheBudget::Adaptive if self.live_capacity() < (1 << 17) => {
-                self.live_capacity().saturating_mul(3).div_ceil(4)
-            }
-            RouteCacheBudget::ReadOptimized | RouteCacheBudget::Adaptive => {
-                self.live_capacity().saturating_mul(2)
-            }
+            // Four-way buckets retain most routes at one physical slot per
+            // entry. This is the default RAM/performance balance.
+            RouteCacheBudget::Adaptive => self.live_capacity(),
+            // Keep the old denser route directory available for latency-first
+            // callers; it now benefits from four-way buckets as well.
+            RouteCacheBudget::ReadOptimized => self.live_capacity().saturating_mul(2),
         }
     }
 }
@@ -197,8 +197,8 @@ mod tests {
 
     #[test]
     fn route_cache_budgets_are_bounded_and_adaptive() {
-        assert_eq!(ElasticConfig::new(100_000).route_cache_slots(), 75_000);
-        assert_eq!(ElasticConfig::new(250_000).route_cache_slots(), 500_000);
+        assert_eq!(ElasticConfig::new(100_000).route_cache_slots(), 100_000);
+        assert_eq!(ElasticConfig::new(250_000).route_cache_slots(), 250_000);
         assert_eq!(
             ElasticConfig::new(250_000)
                 .with_route_cache_budget(RouteCacheBudget::Compact)

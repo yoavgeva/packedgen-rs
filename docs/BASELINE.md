@@ -23,12 +23,16 @@ overhead, so they are not RSS measurements.
 | 32-byte boxed key -> `u64` | Elastic, reserve 1/64 | 60.289 | **28.6% less** |
 | 32-byte boxed key -> `u64` | HashBrown | 84.429 | baseline |
 | 32-byte packed key -> `u64`, before routing cache | Packed Elastic, reserve 1/64 | 52.408 | **37.9% less** |
-| 32-byte packed key -> `u64`, accelerated | Packed Elastic, reserve 1/64 | 62.533 | **25.9% less** |
+| 32-byte packed key -> `u64`, accelerated (adaptive, one route slot/entry) | Packed Elastic, reserve 1/64 | 54.991 | **34.9% less** |
+| 32-byte packed key -> `u64`, accelerated (read optimized, two route slots/entry) | Packed Elastic, reserve 1/64 | 59.022 | **30.1% less** |
 
-The one-byte-per-entry service-layer negative filter is included in the elastic
-numbers. The packed shape stores an eight-byte reference in each table slot and
-uses a segmented arena. The accelerated shape also includes a bounded two-way
-direct-location cache and one overflow bit per bucket.
+The core's one-byte-per-entry negative filter is included in the elastic
+numbers; the former duplicate wrapper filter has been removed. The packed shape
+stores an eight-byte reference in each table slot and uses a 64-KiB segmented
+arena by default. The accelerated shape also includes a bounded two-choice,
+four-way packed-`u32` location cache and one overflow bit per bucket. The
+adaptive policy uses one physical route slot per configured entry; the
+read-optimized policy uses two.
 
 Reproduce:
 
@@ -45,12 +49,12 @@ MiB budget with one million queries on the development machine:
 
 | Implementation | Entries | Live requested bytes | Budget used | Hit latency |
 | --- | ---: | ---: | ---: | ---: |
-| Packed Elastic, reserve 1/64, read optimized | 1,032,192 | 63,939,352 | 95.3% | 149–159 ns |
-| HashBrown | 917,504 | 55,574,536 | 82.8% | 35–37 ns |
+| Packed Elastic, reserve 1/64, read optimized | 1,032,192 | 60,264,824 | 89.8% | 121.1 ns |
+| HashBrown | 917,504 | 55,574,536 | 82.8% | 39.7 ns |
 
 Packed Elastic holds 12.5% more records under this exact budget, below the 25%
-density release gate, and the five-sample median successful lookup was
-approximately 4.0–4.5x slower across two fresh processes. HashBrown's
+density release gate, and the latest five-sample median successful lookup was
+approximately 3.05x slower. HashBrown's
 next allocation-capacity step exceeds the budget, which explains its unused
 space and demonstrates why a fixed-budget result can differ sharply from the
 one-million-entry bytes-per-entry result. These are requested allocator bytes,
@@ -76,7 +80,7 @@ At one million 32-byte keys with `u64` values:
 | Implementation | Requested bytes/entry | Successful lookup |
 | --- | ---: | ---: |
 | Frozen PtrHash, `gxhash` | 49.004 | ~14.5 ns |
-| Packed Elastic, reserve 1/64 | 62.532 | ~58.5 ns |
+| Packed Elastic, reserve 1/64, read optimized | 59.022 | ~54.8 ns |
 | HashBrown | 84.429 | ~27.1 ns |
 
 PtrHash reported 2.99 bits/entry of retained pilot and remap metadata. The
@@ -97,6 +101,20 @@ Under the corrected 64 MiB requested-allocation probe, the frozen backend held
 set measured ~43.0 ns per hit versus ~36.2 ns for HashBrown in the same short
 run. These raw Cargo measurements remain development-machine smoke evidence.
 
+## Mutable SwissTable comparison backends
+
+The repository keeps two deliberately non-elastic mutable baselines. The
+segmented backend splits the planned route space across power-of-two SwissTable
+segments to avoid one global capacity cliff. On the one-million 32-byte-key
+fixture, its balanced policy retained about 53.6 B/entry, versus packed
+Elastic's 54.991 B/entry adaptive layout. A recent quick sequential Criterion
+run measured about 29.1 ns for SegmentedSwiss and 54.8 ns for read-optimized
+Packed Elastic. At a 64 MiB requested budget, the balanced segmented map held
+1,252,314 records and measured 56.5 ns per hit; HashBrown held 917,504 and
+measured 39.7 ns. This is evidence for the current
+performance/memory frontier, not a claim that the paper-derived Elastic probe
+has beaten SwissTable.
+
 ## Point-operation latency
 
 Criterion smoke runs used deterministic mixed keys, optimized code, 10 samples,
@@ -111,6 +129,12 @@ noisy; the scale of the differences is nevertheless clear.
 | Successful 32-byte binary lookup | ~56 ns | ~68 ns | ~8.2 ns |
 | Bulk insertion throughput | ~23.6 M/s | ~21.0 M/s | ~329 M/s |
 
+The current `FixedElasticMap` path reuses the core hash between its negative
+filter and Elastic lookup. A fresh smoke run measured successful `u64` hits at
+roughly 54 ns (reserve 1/8) and 71 ns (reserve 1/64); this is a hot-path
+improvement over the earlier double-hash wrapper, but remains slower than
+SwissTable.
+
 The first packed-key run used 20 Criterion samples with one-second warmup and a
 two-second measurement window:
 
@@ -123,13 +147,14 @@ After adding the verified-location accelerator:
 
 | Accelerated binary workload | Elastic 1/8 | Elastic 1/64 | HashBrown |
 | --- | ---: | ---: | ---: |
-| Successful 32-byte lookup | ~24.9 ns | ~27.8 ns | ~6.8 ns |
-| Missing 32-byte lookup | ~10.5 ns | ~11.5 ns | ~4.8 ns |
-| 32-byte insertion throughput | ~18.9 M/s | ~16.4 M/s | ~37.0 M/s |
+| Successful 32-byte lookup | ~24.9 ns | ~24.2 ns | ~6.8 ns |
+| Missing 32-byte lookup | ~10.5 ns | ~10.8 ns | ~4.8 ns |
+| 32-byte insertion throughput | ~18.9 M/s | ~16.3 M/s | ~37.0 M/s |
 
 At one million keys, where both indexes exceed the small in-cache fixture, the
-read-optimized `1/64` packed map measured ~63.7 ns per successful lookup versus
-HashBrown's ~25.8 ns. The gap narrows from roughly 4x at 32K keys to 2.47x, but
+read-optimized `1/64` packed map most recently measured ~54.8 ns per successful
+lookup versus HashBrown's ~23–26 ns. The gap narrows from roughly 4x at 32K keys
+to about 2.1–2.4x, but
 still misses the 1.5x release gate.
 
 A paired scalar-and-batch smoke run measured fixed batches of 32 at ~54.0
@@ -200,15 +225,16 @@ control fingerprint, and original key bytes. Stale entries and tag collisions
 fall back to the exact elastic schedule. A bucket can reject an absent tag only
 when its overflow bit proves every assigned live route was cached.
 
-The first packed sweep exposed a 100,000-entry cliff. Adaptive cache budgeting
-reduced that point from 76.898 to 70.570 B/entry versus HashBrown's 64.768
-(+9.0%), bringing every tested capacity inside the 10% no-cliff ceiling. At
-250,000 and 1,000,000 entries the layout saves about 24.6% and 25.9%; around
-HashBrown's efficient thresholds it remains roughly 5–6% larger.
+The first packed sweep exposed a 100,000-entry cliff. The 64-KiB arena removed
+most of that small-map waste. The current two-choice packed route cache brings
+the one-million adaptive point to 54.991 B/entry versus HashBrown's 84.429;
+read-optimized mode is 59.022 B/entry and cached every route in the measured
+fixture.
 
-The stable negative filter reduced missing-lookup latency by roughly 94–96%
-without allowing false negatives. It sets bits on insertion, retains them on
-ordinary deletion, and rebuilds when the core starts a new allocation epoch.
+The stable core negative filter reduced missing-lookup latency by roughly
+94–96% without allowing false negatives. It sets bits on insertion, retains
+them on ordinary deletion, and rebuilds when the core starts a new allocation
+epoch. Removing the wrapper's duplicate copy saved another byte per entry.
 
 Reproduce:
 

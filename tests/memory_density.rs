@@ -3,8 +3,8 @@
 use std::alloc::System;
 use std::hint::black_box;
 
-use elastichash::{ElasticConfig, FixedElasticMap};
 use hashbrown::HashMap;
+use packedgen::{ElasticConfig, FixedElasticMap};
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, Stats, StatsAlloc};
 
 #[global_allocator]

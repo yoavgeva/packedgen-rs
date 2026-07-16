@@ -1,6 +1,6 @@
 # Performance gates
 
-ElasticHash is not considered usable merely because it reaches a high load
+PackedGen is not considered usable merely because it reaches a high load
 factor. A release must demonstrate a better storage-engine tradeoff than
 HashBrown/SwissTable on the same machine, allocator, key corpus, values, and
 logical capacity.

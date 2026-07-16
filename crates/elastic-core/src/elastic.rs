@@ -1083,6 +1083,16 @@ where
     }
 
     #[inline]
+    fn may_contain_hash(&self, hash: u64) -> bool {
+        self.membership_maybe_contains(hash)
+    }
+
+    #[inline]
+    fn membership_filter_bytes(&self) -> usize {
+        self.membership_words() * mem::size_of::<u64>()
+    }
+
+    #[inline]
     fn location_bits((level, slot): (usize, usize)) -> u64 {
         ((level as u64) << 32) | slot as u64
     }
@@ -2279,17 +2289,18 @@ mod tests {
         let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
             ElasticHashMap::with_capacity_and_hasher(64, IdentityBuildHasher);
         let inserted_hash = map.table().hash_key(&7_u64);
-        assert!(!map.table().membership_maybe_contains(inserted_hash));
+        assert!(!map.may_contain_prehashed(inserted_hash));
+        assert!(map.membership_filter_bytes() > 0);
 
         assert_eq!(map.insert(7, 11), None);
-        assert!(map.table().membership_maybe_contains(inserted_hash));
+        assert!(map.may_contain_prehashed(inserted_hash));
 
         assert_eq!(map.insert(7, 13), Some(11));
         assert_eq!(map.len(), 1);
-        assert!(map.table().membership_maybe_contains(inserted_hash));
+        assert!(map.may_contain_prehashed(inserted_hash));
 
         assert_eq!(map.remove(&7), Some(13));
-        assert!(map.table().membership_maybe_contains(inserted_hash));
+        assert!(map.may_contain_prehashed(inserted_hash));
         assert_eq!(map.insert(7, 17), None);
         assert_eq!(map.get(&7), Some(&17));
     }

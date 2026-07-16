@@ -1,12 +1,12 @@
 [package]
-name = "elastichash"
+name = "packedgen"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Service-oriented elastic hashing with explicit capacity epochs"
+description = "Packed lock-free generational hash maps for memory-dense concurrent workloads"
 license = "MIT"
-repository = "https://github.com/ferricstore/elastichash-rs"
-keywords = ["hashmap", "elastic-hashing", "open-addressing", "database"]
+repository = "https://github.com/yoavgeva/packedgen-rs"
+keywords = ["hashmap", "concurrent", "lock-free", "database", "cache"]
 categories = ["data-structures", "database-implementations"]
 
 [workspace]
@@ -15,18 +15,60 @@ resolver = "3"
 
 [features]
 default = []
-gxhash = ["ptr_hash/gxhash"]
+gxhash = ["ptr_hash/gxhash", "ph?/gxhash"]
+shared-gx = ["dep:gxhash", "gxhash"]
+prepared-keys = []
+prepared-batch-gate = ["prepared-keys"]
+phast = ["dep:ph"]
+kphf = []
 
 [dependencies]
-# Pinned to the paper-fidelity rewrite. We intentionally do not follow a moving
-# branch. The core will be audited and vendored before the first stable release.
-opthash = { path = "crates/elastic-core" }
+# Paper-derived comparison backend retained as an owned workspace crate. It is
+# not the placement algorithm used by PackedGen's primary generation maps.
+arc-swap = "1.9.1"
+opthash = { version = "=0.10.3", path = "crates/elastic-core" }
 ptr_hash = { version = "2.0.1", default-features = false }
+hashbrown = "0.17.1"
+gxhash = { version = "=3.5.0", optional = true }
+papaya = "0.2.4"
+parking_lot = "0.12"
+ph = { version = "=0.11.0", default-features = false, optional = true }
+wide = { version = "0.7.33", default-features = false }
 
 [dev-dependencies]
 criterion = { version = "0.7", features = ["html_reports"] }
-hashbrown = "0.17.1"
+dashmap = "=6.2.1"
+flurry = "=0.5.2"
+scc = "=3.8.5"
 stats_alloc = "0.1.10"
+
+[[example]]
+name = "phast_frozen_probe"
+required-features = ["phast"]
+
+[[example]]
+name = "atomic_index_backend_probe"
+required-features = ["phast"]
+
+[[example]]
+name = "kphf_frozen_probe"
+required-features = ["kphf"]
+
+[[example]]
+name = "hash_schedule_probe"
+required-features = ["gxhash"]
+
+[[example]]
+name = "prepared_key_probe"
+required-features = ["prepared-keys"]
+
+[[example]]
+name = "prepared_batch_probe"
+required-features = ["prepared-keys"]
+
+[[example]]
+name = "prepared_batch_rebuild_probe"
+required-features = ["prepared-keys"]
 
 [[bench]]
 name = "point_ops"
