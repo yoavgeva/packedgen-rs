@@ -2668,7 +2668,7 @@ fn concurrent_prepared_replacement_batches_recycle_without_lost_values() {
 fn long_key(index: usize) -> [u8; 64] {
     let mut key = [0_u8; 64];
     let mut state = index as u64;
-    for chunk in key.chunks_exact_mut(8) {
+    for chunk in key.as_chunks_mut::<8>().0 {
         state = state.wrapping_add(0x9e37_79b9_7f4a_7c15).rotate_left(17);
         chunk.copy_from_slice(&state.to_le_bytes());
     }

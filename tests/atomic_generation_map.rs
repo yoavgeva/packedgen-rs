@@ -1849,7 +1849,7 @@ fn increment(value: &NonMaxU64) -> NonMaxU64 {
 
 fn binary_key(value: u64) -> [u8; 32] {
     let mut key = [0_u8; 32];
-    for (word, chunk) in key.chunks_exact_mut(8).enumerate() {
+    for (word, chunk) in key.as_chunks_mut::<8>().0.iter_mut().enumerate() {
         chunk.copy_from_slice(&value.wrapping_add(word as u64).to_le_bytes());
     }
     key

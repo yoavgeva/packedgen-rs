@@ -2094,7 +2094,7 @@ mod tests {
         };
         let mut key = [0_u8; 48];
         let mut state = u64::try_from(index).unwrap();
-        for chunk in key.chunks_exact_mut(8) {
+        for chunk in key.as_chunks_mut::<8>().0 {
             state = state
                 .wrapping_add(0x9e37_79b9_7f4a_7c15)
                 .rotate_left(17)

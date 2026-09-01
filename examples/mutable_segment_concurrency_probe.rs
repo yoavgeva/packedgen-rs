@@ -1087,7 +1087,7 @@ fn mixed_index(operation: usize, len: usize) -> usize {
 fn mixed_key(index: usize) -> Box<[u8]> {
     let mut key = [0_u8; 48];
     let mut state = u64::try_from(index).expect("entry index fits u64");
-    for chunk in key.chunks_exact_mut(8) {
+    for chunk in key.as_chunks_mut::<8>().0 {
         state = mix(state);
         chunk.copy_from_slice(&state.to_le_bytes());
     }

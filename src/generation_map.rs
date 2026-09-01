@@ -3491,7 +3491,7 @@ impl Drop for AtomicPreparedWriter {
             return;
         }
         let previous = self.generation.writer_stripes[self.stripe].fetch_sub(1, Ordering::Release);
-        debug_assert!(previous & WRITER_STRIPE_CLOSED == 0);
+        debug_assert_eq!(previous & WRITER_STRIPE_CLOSED, 0);
         debug_assert!(previous & WRITER_STRIPE_COUNT_MASK > 0);
     }
 }
@@ -3551,7 +3551,7 @@ impl Drop for AtomicPreparedBorrowedWriter<'_> {
             return;
         }
         let previous = self.generation.writer_stripes[self.stripe].fetch_sub(1, Ordering::Release);
-        debug_assert!(previous & WRITER_STRIPE_CLOSED == 0);
+        debug_assert_eq!(previous & WRITER_STRIPE_CLOSED, 0);
         debug_assert!(previous & WRITER_STRIPE_COUNT_MASK > 0);
     }
 }
@@ -3822,7 +3822,7 @@ impl<V, C, B> Drop for GenerationWriter<V, C, B> {
         }
         let previous =
             self.generation.writer_stripes[self.route.stripe].fetch_sub(1, Ordering::Release);
-        debug_assert!(previous & WRITER_STRIPE_CLOSED == 0);
+        debug_assert_eq!(previous & WRITER_STRIPE_CLOSED, 0);
         debug_assert!(previous & WRITER_STRIPE_COUNT_MASK > 0);
     }
 }
@@ -5083,7 +5083,7 @@ fn try_acquire_writer_stripe(counter: &AtomicUsize) -> Option<usize> {
 fn release_writer_stripe(counter: &AtomicUsize, amount: isize, released: &mut bool) {
     if amount == 0 {
         let previous = counter.fetch_sub(1, Ordering::Release);
-        debug_assert!(previous & WRITER_STRIPE_CLOSED == 0);
+        debug_assert_eq!(previous & WRITER_STRIPE_CLOSED, 0);
         debug_assert!(previous & WRITER_STRIPE_COUNT_MASK > 0);
         *released = true;
         return;
@@ -5095,7 +5095,7 @@ fn release_writer_stripe(counter: &AtomicUsize, amount: isize, released: &mut bo
             -1 => counter.fetch_sub(WRITER_STRIPE_LEN_UNIT + 1, Ordering::Release),
             _ => panic!("writer stripe release length must be one entry"),
         };
-        debug_assert!(previous & WRITER_STRIPE_CLOSED == 0);
+        debug_assert_eq!(previous & WRITER_STRIPE_CLOSED, 0);
         debug_assert!(previous & WRITER_STRIPE_COUNT_MASK > 0);
         let raw = (previous & WRITER_STRIPE_LEN_MASK) >> WRITER_STRIPE_LEN_SHIFT;
         debug_assert!(amount != 1 || raw < WRITER_STRIPE_LEN_VALUE_MASK);
@@ -5106,7 +5106,7 @@ fn release_writer_stripe(counter: &AtomicUsize, amount: isize, released: &mut bo
 
     let mut state = counter.load(Ordering::Relaxed);
     loop {
-        debug_assert!(state & WRITER_STRIPE_CLOSED == 0);
+        debug_assert_eq!(state & WRITER_STRIPE_CLOSED, 0);
         debug_assert!(state & WRITER_STRIPE_COUNT_MASK > 0);
         let next_delta = writer_stripe_len_delta(state)
             .checked_add(amount)

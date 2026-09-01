@@ -447,7 +447,7 @@ fn increment(value: &NonMaxU64) -> NonMaxU64 {
 fn binary_key(value: u64) -> [u8; 32] {
     let mut key = [0_u8; 32];
     let mut state = value;
-    for chunk in key.chunks_exact_mut(8) {
+    for chunk in key.as_chunks_mut::<8>().0 {
         state = mix(state);
         chunk.copy_from_slice(&state.to_le_bytes());
     }

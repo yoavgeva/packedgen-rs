@@ -73,7 +73,7 @@ fn net_live_bytes(stats: Stats) -> usize {
 fn key(index: u64) -> [u8; 32] {
     let mut result = [0_u8; 32];
     let mut state = index;
-    for chunk in result.chunks_exact_mut(8) {
+    for chunk in result.as_chunks_mut::<8>().0 {
         state = mix(state);
         chunk.copy_from_slice(&state.to_le_bytes());
     }

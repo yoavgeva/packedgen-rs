@@ -499,7 +499,7 @@ fn mixed_index(operation: usize, len: usize) -> usize {
 fn mixed_binary_key(index: usize) -> Box<[u8]> {
     let mut key = [0_u8; 48];
     let mut state = index as u64;
-    for chunk in key.chunks_exact_mut(8) {
+    for chunk in key.as_chunks_mut::<8>().0 {
         state = mix(state);
         chunk.copy_from_slice(&state.to_le_bytes());
     }
