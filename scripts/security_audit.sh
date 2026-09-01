@@ -26,7 +26,7 @@ line_two="$(printf '%s\n' "$tree" | sed -n '2p')"
 line_three="$(printf '%s\n' "$tree" | sed -n '3p')"
 if [[ "$line_count" != 3 \
   || "$line_one" != 'fxhash v0.2.1' \
-  || "$line_two" != 'ptr_hash v2.0.1' \
+  || "$line_two" != 'ptr_hash v2.1.1' \
   || "$line_three" != packedgen\ v0.1.0\ * ]]; then
   printf 'fxhash dependency path changed; review the RustSec exception:\n%s\n' "$tree" >&2
   exit 1

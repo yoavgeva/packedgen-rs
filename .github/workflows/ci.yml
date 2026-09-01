@@ -18,6 +18,10 @@ jobs:
         with:
           key: msrv
       - name: Check every PackedGen target and feature
+        env:
+          # gxhash deliberately refuses to compile unless the target enables
+          # the AES/SSE2 instructions required by its explicit opt-in feature.
+          RUSTFLAGS: -C target-cpu=native
         run: cargo check -p packedgen --all-targets --all-features
       - name: Check the paper-reference crate's stable feature set
         run: cargo check -p packedgen-opthash --all-targets
@@ -38,8 +42,12 @@ jobs:
       - name: Tests
         run: cargo test --workspace --all-targets
       - name: Root runtime tests with every feature
+        env:
+          RUSTFLAGS: -C target-cpu=native
         run: cargo test -p packedgen --all-targets --all-features
       - name: Clippy
+        env:
+          RUSTFLAGS: -C target-cpu=native
         run: cargo clippy -p packedgen --all-targets --all-features -- -D warnings
       - name: Clippy for the paper-reference crate
         run: cargo clippy -p packedgen-opthash --all-targets -- -D warnings

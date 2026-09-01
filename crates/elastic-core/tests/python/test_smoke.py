@@ -67,7 +67,7 @@ def test_clear_resets_len(m):
     assert 0 not in m
 
 
-def test_live_map_destruction_does_not_abort_interpreter_shutdown(map_cls):
+def test_live_map_destruction_does_not_abort_interpreter_shutdown(map_cls, tmp_path):
     script = f"""
 import opthash
 cache = opthash.{map_cls.__name__}(capacity=16)
@@ -78,6 +78,7 @@ for index in range(100):
         [sys.executable, "-c", script],
         capture_output=True,
         check=False,
+        cwd=tmp_path,
         text=True,
     )
     assert completed.returncode == 0, completed.stderr
