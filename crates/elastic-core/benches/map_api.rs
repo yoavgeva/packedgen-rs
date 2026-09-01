@@ -70,6 +70,52 @@ fn bench_extract_if(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_extract_if_early_drop(c: &mut Criterion) {
+    let pairs = harness::make_pairs(MAP_SIZE);
+    let mut group = c.benchmark_group("extract_if_early_drop");
+    group.throughput(Throughput::Elements(1));
+
+    bench_populated!(
+        group,
+        "extract_if_early_drop",
+        BatchSize::PerIteration,
+        &pairs,
+        |map| {
+            let mut extracted = map.extract_if(|_, _| true);
+            black_box(extracted.next())
+        },
+    );
+
+    group.finish();
+}
+
+fn bench_extract_if_early_drop_burst(c: &mut Criterion) {
+    const BURST: usize = 256;
+
+    let pairs = harness::make_pairs(MAP_SIZE);
+    let mut group = c.benchmark_group("extract_if_early_drop_burst");
+    group.throughput(Throughput::Elements(BURST as u64));
+
+    bench_populated!(
+        group,
+        "extract_if_early_drop_burst",
+        BatchSize::PerIteration,
+        &pairs,
+        |map| {
+            let mut checksum = 0_u64;
+            for _ in 0..BURST {
+                let mut extracted = map.extract_if(|_, _| true);
+                if let Some((key, value)) = extracted.next() {
+                    checksum ^= key ^ value;
+                }
+            }
+            black_box(checksum)
+        },
+    );
+
+    group.finish();
+}
+
 #[allow(clippy::redundant_closure_for_method_calls)]
 fn bench_clear_drop(c: &mut Criterion) {
     let mut group = c.benchmark_group("clear_drop");
@@ -255,6 +301,8 @@ criterion_group!(
         bench_iter_mut,
         bench_drain,
         bench_extract_if,
+        bench_extract_if_early_drop,
+        bench_extract_if_early_drop_burst,
         bench_clear_drop,
         bench_entry_or_insert,
         bench_shrink_to_fit,

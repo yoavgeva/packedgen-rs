@@ -1,3 +1,6 @@
+import subprocess
+import sys
+
 import pytest
 
 
@@ -62,6 +65,22 @@ def test_clear_resets_len(m):
     m.clear()
     assert len(m) == 0
     assert 0 not in m
+
+
+def test_live_map_destruction_does_not_abort_interpreter_shutdown(map_cls):
+    script = f"""
+import opthash
+cache = opthash.{map_cls.__name__}(capacity=16)
+for index in range(100):
+    cache[f\"key-{{index}}\"] = index
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 @pytest.mark.parametrize("bad_key", [[1, 2, 3], {"a": 1}, {1, 2, 3}])

@@ -84,6 +84,7 @@ impl PackedKeyRef {
         Self(self.0 | (u64::from(tag) << EMBEDDED_TAG_SHIFT))
     }
 
+    #[cfg(not(feature = "miss-optimized-frozen"))]
     pub(crate) const fn embedded_tag(self) -> u16 {
         ((self.0 >> EMBEDDED_TAG_SHIFT) & EMBEDDED_TAG_MASK) as u16
     }
@@ -97,9 +98,14 @@ impl PackedKeyRef {
         self.0 == Self::EMPTY_SLOT.0
     }
 
-    #[cfg(feature = "kphf")]
+    #[cfg(any(feature = "kphf", feature = "miss-optimized-frozen"))]
     pub(crate) const fn raw(self) -> u64 {
         self.0
+    }
+
+    #[cfg(feature = "miss-optimized-frozen")]
+    pub(crate) const fn from_raw(raw: u64) -> Self {
+        Self(raw)
     }
 
     #[cfg(feature = "kphf")]

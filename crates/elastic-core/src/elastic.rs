@@ -136,13 +136,33 @@ struct Level<T> {
     tombstones: u32,
 }
 
+#[allow(
+    unsafe_code,
+    reason = "the descriptor carries table-owned arena pointers"
+)]
+// SAFETY: a level descriptor owns no allocation; its pointers refer into the
+// arena owned by the containing table. Moving it is sound when `T` is `Send`.
 unsafe impl<T: Send> Send for Level<T> {}
+#[allow(
+    unsafe_code,
+    reason = "shared descriptor access is read-only and T is Sync"
+)]
+// SAFETY: shared level access reads immutable controls/entries only. Mutation
+// requires exclusive access to the containing table, and `T: Sync` permits
+// shared entry references across threads.
 unsafe impl<T: Sync> Sync for Level<T> {}
 
 // `Level` is read on every lookup — keep it within one 64-byte cache line.
 const _: () = assert!(mem::size_of::<Level<SlotEntry<u64, u64>>>() <= 64);
 
-impl<T> ArenaSlots<T> for Level<T> {
+#[allow(
+    unsafe_code,
+    reason = "binds one level descriptor to its validated arena extents"
+)]
+// SAFETY: `ElasticTable` constructs every level from the checked map-level
+// arena layout. The cached pointers cover exactly `capacity` control bytes and
+// aligned slots, and all value initialization follows the control protocol.
+unsafe impl<T> ArenaSlots<T> for Level<T> {
     #[inline]
     fn ctrl_ptr(&self) -> *mut u8 {
         self.ctrl_ptr
@@ -211,23 +231,74 @@ pub struct ElasticTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glo
     probe_schedule: Vec<PhiRoute>,
 }
 
+#[allow(
+    unsafe_code,
+    reason = "repairs metadata by scanning the table-owned control arena"
+)]
+impl<K, V, S, A: Allocator + Clone> ElasticTable<K, V, S, A> {
+    #[cold]
+    fn repair_metadata_from_controls(&mut self, original_len: usize) {
+        let mut live = 0_usize;
+        for level in &mut self.levels {
+            let mut level_live = 0_usize;
+            let mut tombstones = 0_usize;
+            for slot in 0..level.capacity() {
+                // SAFETY: the loop spans this level's exact control extent and
+                // reads control metadata only.
+                let control = unsafe { level.control_at(slot) };
+                level_live += usize::from(control.is_occupied());
+                tombstones += usize::from(control == CTRL_TOMBSTONE);
+            }
+            debug_assert!(level_live <= level.capacity as usize);
+            debug_assert!(tombstones <= level.capacity as usize);
+            level.len = level_live as u32;
+            level.tombstones = tombstones as u32;
+            live += level_live;
+        }
+        self.len = live;
+        for _ in live..original_len {
+            self.epoch.note_delete();
+        }
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "all cached pointers target the stable table-owned arena"
+)]
+// SAFETY: cached level pointers target the table-owned heap arena, whose
+// address is stable when the table moves. All owned components are `Send`.
 unsafe impl<K: Send, V: Send, S: Send, A: Allocator + Clone + Send> Send
     for ElasticTable<K, V, S, A>
 {
 }
+#[allow(
+    unsafe_code,
+    reason = "shared access is read-only and all components are Sync"
+)]
+// SAFETY: shared table methods only read arena entries and metadata. Structural
+// mutation requires `&mut self`; all referenced components are `Sync`.
 unsafe impl<K: Sync, V: Sync, S: Sync, A: Allocator + Clone + Sync> Sync
     for ElasticTable<K, V, S, A>
 {
 }
 
+#[allow(
+    unsafe_code,
+    reason = "drop visits initialized arena slots before matching deallocation"
+)]
 impl<K, V, S, A: Allocator + Clone> Drop for ElasticTable<K, V, S, A> {
     fn drop(&mut self) {
         let levels = &mut self.levels;
-        self.arena.drop_table(&self.alloc, || {
-            for level in levels {
-                level.drop_values();
-            }
-        });
+        // SAFETY: `self.alloc` created `self.arena`, and the closure visits
+        // every region descriptor exactly once before deallocation.
+        unsafe {
+            self.arena.drop_table(&self.alloc, || {
+                for level in levels {
+                    level.drop_values();
+                }
+            });
+        }
     }
 }
 
@@ -554,6 +625,10 @@ impl ElasticGeometry {
 
 /// Stamps level descriptors with arena-relative `(ctrl_ptr, data_ptr)`.
 /// Split out so the alloc-then-deallocate-on-error wrapper stays shallow.
+#[allow(
+    unsafe_code,
+    reason = "stamps checked sub-extents inside one allocated arena"
+)]
 fn build_elastic_levels<K, V>(
     arena_base: *mut u8,
     data_base_off: usize,
@@ -574,6 +649,10 @@ fn build_elastic_levels<K, V>(
 }
 
 #[allow(clippy::cast_ptr_alignment)]
+#[allow(
+    unsafe_code,
+    reason = "initializes and rolls back one validated packed arena allocation"
+)]
 fn try_alloc_elastic_arena<K, V, A: Allocator + Clone>(
     level_capacities: &[usize],
     alloc: &A,
@@ -586,6 +665,8 @@ fn try_alloc_elastic_arena<K, V, A: Allocator + Clone>(
     );
     let arena = Arena::try_allocate_with_ctrl_zeroed(arena_layout.layout, total_ctrl, alloc)?;
     if arena_layout.membership_words != 0 {
+        // SAFETY: `elastic_arena_layout` reserves this aligned membership tail
+        // inside the allocation, with exactly `membership_words` words.
         unsafe {
             ptr::write_bytes(
                 arena
@@ -604,7 +685,9 @@ fn try_alloc_elastic_arena<K, V, A: Allocator + Clone>(
     {
         Ok(levels) => Ok((arena, levels)),
         Err(e) => {
-            arena.deallocate(alloc);
+            // SAFETY: this allocation was created by `alloc`, and level
+            // construction failed before any values could be initialized.
+            unsafe { arena.deallocate(alloc) };
             Err(e)
         }
     }
@@ -634,6 +717,10 @@ impl<K, V> arena::RegionSet for LevelSlice<K, V> {
     }
 }
 
+#[allow(
+    unsafe_code,
+    reason = "implements packed control-byte and slot operations inside the owned arena"
+)]
 impl<K, V, S, A> ElasticTable<K, V, S, A>
 where
     K: Eq + Hash,
@@ -724,6 +811,8 @@ where
     fn membership_ptr(&self) -> *mut u64 {
         let tail_span = membership_tail_span::<K, V>(self.total_slots);
         debug_assert!(tail_span <= self.arena.layout_size());
+        // SAFETY: the arena layout reserves an aligned membership tail of
+        // `tail_span` bytes at exactly this offset.
         unsafe {
             self.arena
                 .as_ptr()
@@ -739,6 +828,8 @@ where
             return false;
         }
         let (word, bits) = membership_location(hash, words);
+        // SAFETY: `membership_location` reduces `word` into `0..words`, and the
+        // membership tail contains exactly that many initialized words.
         unsafe { *self.membership_ptr().add(word) & bits == bits }
     }
 
@@ -749,6 +840,8 @@ where
             return;
         }
         let (word, bits) = membership_location(hash, words);
+        // SAFETY: `membership_location` reduces `word` into the allocated tail;
+        // `&mut self` provides exclusive mutation.
         unsafe {
             *self.membership_ptr().add(word) |= bits;
         }
@@ -757,6 +850,8 @@ where
     fn clear_membership(&mut self) {
         let words = self.membership_words();
         if words != 0 {
+            // SAFETY: `membership_ptr` addresses an initialized writable tail
+            // containing exactly `words` words.
             unsafe { ptr::write_bytes(self.membership_ptr(), 0, words) };
         }
     }
@@ -765,6 +860,8 @@ where
         let words = self.membership_words();
         debug_assert_eq!(words, source.membership_words());
         if words != 0 {
+            // SAFETY: source and destination layouts contain equal-size,
+            // non-overlapping membership tails of exactly `words` words.
             unsafe {
                 ptr::copy_nonoverlapping(source.membership_ptr(), self.membership_ptr(), words);
             };
@@ -774,12 +871,38 @@ where
     /// Removes all entries, keeping allocated capacity.
     fn clear(&mut self) {
         for level in &mut self.levels {
-            level.drop_values();
-            level.clear_all_controls();
-            level.len = 0;
+            if level.tombstones != 0 {
+                for slot in 0..level.capacity() {
+                    // SAFETY: the loop spans this level's exact control extent.
+                    if unsafe { level.control_at(slot) } == CTRL_TOMBSTONE {
+                        // SAFETY: the same loop bound proves `slot` is in-bounds.
+                        unsafe { level.set_control(slot, control::CTRL_EMPTY) };
+                    }
+                }
+            }
             level.tombstones = 0;
+
+            let ctrl = level.ctrl_ptr;
+            let data = level.data_ptr;
+            let capacity = level.capacity as usize;
+            let level_len = &mut level.len;
+            let total_len = &mut self.len;
+            // SAFETY: the copied pointers describe this exclusively borrowed
+            // level's arena extents. The counter references point into the
+            // disjoint descriptor/table metadata, and are decremented before
+            // each initialized slot is handed to its destructor.
+            unsafe {
+                arena::clear_occupied_slots_raw_with(ctrl, data, capacity, |slot| {
+                    *level_len -= 1;
+                    *total_len -= 1;
+                    // SAFETY: the arena callback yields each initialized slot
+                    // once after clearing its control byte.
+                    ptr::drop_in_place(slot);
+                });
+            }
+            debug_assert_eq!(*level_len, 0);
         }
-        self.len = 0;
+        debug_assert_eq!(self.len, 0);
         self.scheduler.reset();
         self.probe_high_water = 0;
         self.probe_schedule.clear();
@@ -870,7 +993,11 @@ where
             .enumerate()
             .find_map(|(level_index, level)| {
                 (0..level.capacity())
-                    .find(|&slot| level.control_at(slot).is_free())
+                    .find(|&slot| {
+                        // SAFETY: the candidate comes from this level's exact
+                        // `0..capacity` range.
+                        unsafe { level.control_at(slot) }.is_free()
+                    })
                     .map(|slot| (level_index, slot))
             })
     }
@@ -887,8 +1014,14 @@ where
     ) -> (usize, usize) {
         {
             let level = &mut self.levels[level_idx];
-            let prev_ctrl = level.control_at(slot_idx);
-            level.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
+            // SAFETY: insertion routing returns an in-bounds free slot in this
+            // exact level; exceptional placement scans the same level extent.
+            let prev_ctrl = unsafe { level.control_at(slot_idx) };
+            // SAFETY: the routing/search proof above also establishes that the
+            // in-bounds destination is free and uninitialized.
+            unsafe {
+                level.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
+            }
             level.len += 1;
             if prev_ctrl == CTRL_TOMBSTONE {
                 level.tombstones -= 1;
@@ -911,7 +1044,8 @@ where
         let levels_ptr: *const Level<SlotEntry<K, V>> = self.levels.as_ptr();
         // SAFETY: shared `&Level` only — never `&mut` — so no aliasing tag.
         let level = unsafe { &*levels_ptr.add(level_idx) };
-        level.slot_ptr(slot_idx)
+        // SAFETY: the caller proves `slot_idx` is a live slot in this level.
+        unsafe { level.slot_ptr(slot_idx) }
     }
 
     /// Take + tombstone + decrement counters for the slot at `loc`. Backs
@@ -919,8 +1053,11 @@ where
     fn take_and_tombstone(&mut self, level_idx: usize, slot_idx: usize) -> (K, V) {
         let removed = {
             let level = &mut self.levels[level_idx];
+            // SAFETY: the table location identifies an occupied in-bounds slot.
             let removed = unsafe { level.take(slot_idx) };
-            level.mark_tombstone(slot_idx);
+            // SAFETY: the same location remains in-bounds after moving its
+            // value out and must become a tombstone before reuse.
+            unsafe { level.mark_tombstone(slot_idx) };
             level.len -= 1;
             level.tombstones += 1;
             removed
@@ -978,7 +1115,7 @@ where
 
     /// Prime the scan and cross level boundaries off the hot path.
     #[cold]
-    fn scan_advance(&self, scan: &mut ElasticScan) -> Option<ElasticScanItem<K, V>> {
+    fn scan_advance(&self, scan: &mut ElasticScan<K, V>) -> Option<ElasticScanItem<K, V>> {
         if !scan.region.started() {
             if self.levels.is_empty() {
                 return None;
@@ -986,7 +1123,7 @@ where
             scan.region.enter(&self.levels[0]);
         }
         loop {
-            if let Some((ptr, slot_idx)) = scan.region.step::<SlotEntry<K, V>>() {
+            if let Some((ptr, slot_idx)) = scan.region.step() {
                 return Some((ptr, (scan.level_idx, slot_idx)));
             }
             scan.level_idx += 1;
@@ -999,7 +1136,15 @@ where
 }
 
 #[allow(private_interfaces)]
-impl<K, V, S, A> map::TableBackend<K, V> for ElasticTable<K, V, S, A>
+#[allow(
+    unsafe_code,
+    reason = "implements the audited raw backend contract over the packed arena"
+)]
+// SAFETY: ElasticTable locations always pair a live level with an in-bounds
+// occupied slot. Its scan walks every level monotonically and yields each slot
+// at most once, and its arena lifecycle keeps initialized controls and values
+// synchronized through construction, mutation, resize, and teardown.
+unsafe impl<K, V, S, A> map::TableBackend<K, V> for ElasticTable<K, V, S, A>
 where
     K: Eq + Hash,
     S: BuildHasher,
@@ -1045,16 +1190,20 @@ where
 
     #[inline]
     unsafe fn slot_ref(&self, (level_idx, slot_idx): (usize, usize)) -> &SlotEntry<K, V> {
+        // SAFETY: `TableBackend` requires a live location from this table.
         unsafe { self.slot_ref(level_idx, slot_idx) }
     }
 
     #[inline]
     unsafe fn slot_ptr(&self, (level_idx, slot_idx): (usize, usize)) -> *mut SlotEntry<K, V> {
+        // SAFETY: `TableBackend` requires a live location from this table.
         unsafe { self.slot_ptr_at(level_idx, slot_idx) }
     }
 
     #[inline]
     fn replace_value(&mut self, (level_idx, slot_idx): (usize, usize), value: V) -> V {
+        // SAFETY: `TableBackend` supplies a live location and `&mut self`
+        // provides exclusive access to its value.
         let slot = unsafe { self.slot_mut(level_idx, slot_idx) };
         mem::replace(&mut slot.value, value)
     }
@@ -1118,7 +1267,9 @@ where
         if slot >= descriptor.capacity() {
             return None;
         }
-        self.entry_if_match(level, slot, fingerprint, key)
+        // SAFETY: both the level lookup and explicit capacity check above
+        // validate this exact location for the current table geometry.
+        unsafe { self.entry_if_match(level, slot, fingerprint, key) }
     }
 
     // -- Insert / remove --
@@ -1175,13 +1326,16 @@ where
 
     #[inline]
     fn tombstone_slot(&mut self, (level_idx, slot_idx): (usize, usize)) {
-        self.levels[level_idx].mark_tombstone(slot_idx);
+        // SAFETY: `TableBackend` requires a live location from this table.
+        unsafe { self.levels[level_idx].mark_tombstone(slot_idx) };
     }
 
     #[inline]
     fn extract_finish(&mut self, (level_idx, slot_idx): (usize, usize)) {
         let level = &mut self.levels[level_idx];
-        level.mark_tombstone(slot_idx);
+        // SAFETY: the iterator yields an occupied in-bounds slot from this
+        // level and calls `extract_finish` before advancing structural state.
+        unsafe { level.mark_tombstone(slot_idx) };
         level.len -= 1;
         level.tombstones += 1;
         self.len -= 1;
@@ -1194,12 +1348,24 @@ where
         }
     }
 
+    #[inline(always)]
+    fn finish_deferred_removals_on_drop(&mut self) {
+        #[cfg(feature = "std")]
+        {
+            if self.levels.iter().any(Level::needs_cleanup) && !std::thread::panicking() {
+                self.resize_with_transition(self.total_slots, EpochTransition::TombstoneCleanup);
+            }
+        }
+        #[cfg(not(feature = "std"))]
+        let _ = self;
+    }
+
     // -- Iterate --
 
-    type Scan = ElasticScan;
+    type Scan = ElasticScan<K, V>;
 
     #[inline]
-    fn scan(&self) -> ElasticScan {
+    fn scan(&self) -> ElasticScan<K, V> {
         ElasticScan {
             level_idx: 0,
             region: RegionCursor::new(),
@@ -1207,10 +1373,10 @@ where
     }
 
     #[inline]
-    fn scan_next(&self, scan: &mut ElasticScan) -> Option<ElasticScanItem<K, V>> {
+    fn scan_next(&self, scan: &mut ElasticScan<K, V>) -> Option<ElasticScanItem<K, V>> {
         // Hot path: another occupied slot in the level the cursor already holds.
         if scan.region.started()
-            && let Some((ptr, slot_idx)) = scan.region.step::<SlotEntry<K, V>>()
+            && let Some((ptr, slot_idx)) = scan.region.step()
         {
             return Some((ptr, (scan.level_idx, slot_idx)));
         }
@@ -1281,6 +1447,10 @@ where
         self.epoch.start(EpochTransition::Clear, 0);
     }
 
+    fn repair_after_failed_drain(&mut self, original_len: usize) {
+        self.repair_metadata_from_controls(original_len);
+    }
+
     fn clone_table(&self) -> Self
     where
         K: Clone,
@@ -1299,7 +1469,9 @@ where
         // `V::clone` panics, drop the already-cloned values (OCCUPIED on
         // `dst_arena`) and deallocate the partially-filled arena. `Arena`
         // has no `Drop`, so without this the whole allocation would leak.
-        let mut guard = arena::ArenaDropGuard::new(arena, levels, self.alloc.clone());
+        // SAFETY: the arena and descriptors were constructed together with
+        // `self.alloc`; the guard owns every value initialized during cloning.
+        let mut guard = unsafe { arena::ArenaDropGuard::new(arena, levels, self.alloc.clone()) };
 
         for (dst, src_lvl) in guard.regions_mut().iter_mut().zip(self.levels.iter()) {
             dst.clone_region_from(src_lvl);
@@ -1331,11 +1503,15 @@ where
 
 /// Track a pointerless scan across elastic levels.
 #[derive(Clone)]
-pub struct ElasticScan {
+pub struct ElasticScan<K, V> {
     level_idx: usize,
-    region: RegionCursor,
+    region: RegionCursor<SlotEntry<K, V>>,
 }
 
+#[allow(
+    unsafe_code,
+    reason = "implements checked routing and probing over packed arena extents"
+)]
 impl<K, V, S, A> ElasticTable<K, V, S, A>
 where
     K: Eq + Hash,
@@ -1396,7 +1572,10 @@ where
         // If `insert_unique` panics, the guard unwinds: drops any survivors
         // then deallocates `old_arena` — `Arena` has no `Drop`, so without the
         // guard the backing allocation would leak.
-        let mut guard = arena::ArenaDropGuard::new(old_arena, old_levels, self.alloc.clone());
+        // SAFETY: `old_arena` and `old_levels` came from this table and were
+        // allocated with `self.alloc`.
+        let mut guard =
+            unsafe { arena::ArenaDropGuard::new(old_arena, old_levels, self.alloc.clone()) };
         let mut used_exceptional_placement = false;
         for level in guard.regions_mut().iter_mut() {
             level.drain_values_and_clear(|entry| {
@@ -1422,26 +1601,30 @@ where
     {
         let prior_epoch = self.epoch;
         let hash_builder = self.hash_builder.clone();
-        let mut new_map = Self::try_with_slots_and_reserve_fraction_and_hasher_in(
+        let mut old_map = Self::try_with_slots_and_reserve_fraction_and_hasher_in(
             new_capacity,
             self.reserve_fraction,
             hash_builder,
             self.alloc.clone(),
         )?;
 
+        // Publish the fully allocated destination before invoking user Hash.
+        // On unwind, `self` is therefore a valid partial destination while
+        // `old_map` drops every source entry not yet moved.
+        mem::swap(self, &mut old_map);
+
         // Clear each source ctrl before handing the moved entry to
         // `insert_unique`. If that panics (e.g. via a user-provided `Hash`
-        // impl), the un-iterated slots remain OCCUPIED on `self` and the
-        // already-moved ones are EMPTY, so both `self.drop_values` and
-        // `new_map.drop_values` are sound on unwind.
+        // impl), the un-iterated slots remain OCCUPIED on `old_map` and the
+        // already-moved ones are EMPTY. Its destructor visits only survivors;
+        // `self` already has exact counters for every successful insertion.
         let mut used_exceptional_placement = false;
-        for level in &mut self.levels {
+        for level in &mut old_map.levels {
             level.drain_values_and_clear(|entry| {
-                used_exceptional_placement |= new_map.insert_unique(entry.key, entry.value);
+                used_exceptional_placement |= self.insert_unique(entry.key, entry.value);
             });
         }
-        self.len = 0;
-        *self = new_map;
+        drop(old_map);
         self.epoch = prior_epoch;
         if used_exceptional_placement {
             self.epoch
@@ -1620,8 +1803,9 @@ where
         logical_index: u64,
     ) -> Option<usize> {
         let slot = self.route_prepared(level, probe, logical_index)?;
-        self.levels[level]
-            .control_at(slot)
+        // SAFETY: `route_prepared` reduces the probe into this level's exact
+        // capacity and returns `None` when the level cannot be addressed.
+        unsafe { self.levels[level].control_at(slot) }
             .is_free()
             .then_some(slot)
     }
@@ -1669,12 +1853,15 @@ where
     /// occupied slot in that level.
     #[inline]
     unsafe fn slot_ref(&self, level_idx: usize, slot_idx: usize) -> &SlotEntry<K, V> {
+        // SAFETY: the caller proves both indices select an occupied slot.
         unsafe { self.levels[level_idx].get_ref(slot_idx) }
     }
 
     /// SAFETY: same as [`Self::slot_ref`] plus caller holds exclusive access.
     #[inline]
     unsafe fn slot_mut(&mut self, level_idx: usize, slot_idx: usize) -> &mut SlotEntry<K, V> {
+        // SAFETY: the caller proves both indices select an occupied slot and
+        // holds exclusive access to the table.
         unsafe { self.levels[level_idx].get_mut(slot_idx) }
     }
 
@@ -1733,7 +1920,9 @@ where
         ) else {
             return self.find_by_full_scan(key, key_fingerprint, on_hit);
         };
-        if let Some(entry) = self.entry_if_match(0, h11_slot, key_fingerprint, key) {
+        // SAFETY: level zero exists after the empty-table guard, and routing
+        // reduced `h11_slot` into that level's exact capacity.
+        if let Some(entry) = unsafe { self.entry_if_match(0, h11_slot, key_fingerprint, key) } {
             return Some(on_hit(0, h11_slot, entry));
         }
 
@@ -1746,6 +1935,8 @@ where
                 // most 32 levels, and routes come from that level slice.
                 let level_lane = unsafe { *ELASTIC_LEVEL_LANES.get_unchecked(level) };
                 let prepared = probe.prepare_level_lane(level_lane);
+                // SAFETY: the same route proof bounds `level`; this branch runs
+                // only before its initialization bit is published.
                 unsafe { level_probes.get_unchecked_mut(level) }.write(prepared);
                 prepared_levels |= level_bit;
                 prepared
@@ -1763,7 +1954,9 @@ where
             else {
                 return self.find_by_full_scan(key, key_fingerprint, on_hit);
             };
-            if let Some(entry) = self.entry_if_match(level, slot, key_fingerprint, key) {
+            // SAFETY: every schedule route was built from the current level
+            // geometry and `slot` was reduced into that route's checked range.
+            if let Some(entry) = unsafe { self.entry_if_match(level, slot, key_fingerprint, key) } {
                 return Some(on_hit(level, slot, entry));
             }
         }
@@ -1785,7 +1978,11 @@ where
     {
         for (level_index, level) in self.levels.iter().enumerate() {
             for slot in 0..level.capacity() {
-                if let Some(entry) = self.entry_if_match(level_index, slot, key_fingerprint, key) {
+                if let Some(entry) =
+                    // SAFETY: enumeration supplies a live level index and this
+                    // loop covers exactly that level's slot extent.
+                    unsafe { self.entry_if_match(level_index, slot, key_fingerprint, key) }
+                {
                     return Some(on_hit(level_index, slot, entry));
                 }
             }
@@ -1794,7 +1991,14 @@ where
     }
 
     #[inline]
-    fn entry_if_match<'a, Q>(
+    /// Returns the entry when a validated raw table location matches `key`.
+    ///
+    /// # Safety
+    ///
+    /// `level` must index `self.levels`, and `slot` must be less than that
+    /// level's capacity. A control byte equal to `key_fingerprint` must imply
+    /// that the corresponding slot is initialized for the shared borrow.
+    unsafe fn entry_if_match<'a, Q>(
         &'a self,
         level: usize,
         slot: usize,
@@ -1805,10 +2009,17 @@ where
         Q: Equivalent<K> + ?Sized,
     {
         debug_assert!(level < self.levels.len());
+        // SAFETY: the level bound is established by the caller and checked in
+        // debug builds; avoiding a second branch is material to hit lookups.
         let level = unsafe { self.levels.get_unchecked(level) };
-        if level.control_at(slot) != key_fingerprint {
+        debug_assert!(slot < level.capacity());
+        // SAFETY: query routing and fallback scans always produce an in-bounds
+        // slot for this exact level.
+        if unsafe { level.control_at(slot) } != key_fingerprint {
             return None;
         }
+        // SAFETY: a matching nonzero fingerprint marks this in-bounds slot as
+        // initialized and immutable for the shared table borrow.
         let entry = unsafe { level.get_ref(slot) };
         key.equivalent(&entry.key).then_some(entry)
     }
@@ -1846,6 +2057,10 @@ where
 }
 
 #[cfg(test)]
+#[allow(
+    unsafe_code,
+    reason = "tests inspect raw packed-arena invariants and failure paths"
+)]
 mod tests {
     use super::*;
 
@@ -1853,16 +2068,57 @@ mod tests {
     use core::num::{NonZeroU32, NonZeroU64, NonZeroU128, NonZeroUsize};
     use core::ptr;
     use core::ptr::NonNull;
-    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use crate::common::exact::reference::{ScalarElastic, ScalarElasticCase, ScalarElasticLimits};
     use alloc::sync::Arc;
     use allocator_api2::alloc::AllocError as RawAllocError;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     #[derive(Clone, Copy)]
     struct ConstHashBuilder;
 
     struct ConstHasher;
+
+    struct PanicOnFirstDrop<'a> {
+        drops: &'a AtomicUsize,
+    }
+
+    struct PanicHashKey {
+        id: u64,
+        armed: Arc<AtomicBool>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for PanicOnFirstDrop<'_> {
+        fn drop(&mut self) {
+            assert!(
+                self.drops.fetch_add(1, Ordering::SeqCst) != 0,
+                "first value drop"
+            );
+        }
+    }
+
+    impl PartialEq for PanicHashKey {
+        fn eq(&self, other: &Self) -> bool {
+            self.id == other.id
+        }
+    }
+
+    impl Eq for PanicHashKey {}
+
+    impl Hash for PanicHashKey {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            assert!(!self.armed.load(Ordering::SeqCst), "armed key hash");
+            state.write_u64(self.id);
+        }
+    }
+
+    impl Drop for PanicHashKey {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     impl Hasher for ConstHasher {
         fn finish(&self) -> u64 {
@@ -1895,6 +2151,8 @@ mod tests {
         fail: Arc<AtomicBool>,
     }
 
+    // SAFETY: successful allocation and every deallocation are delegated unchanged to
+    // `Global`; the failure toggle does not alter allocation identity or layout.
     unsafe impl Allocator for ToggleAllocator {
         fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, RawAllocError> {
             if self.fail.load(Ordering::Relaxed) {
@@ -1905,6 +2163,8 @@ mod tests {
         }
 
         unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+            // SAFETY: the caller upholds `Allocator::deallocate`'s contract, and successful
+            // allocations from this wrapper always come from `Global`.
             unsafe { Global.deallocate(ptr, layout) };
         }
     }
@@ -2135,6 +2395,121 @@ mod tests {
     }
 
     #[test]
+    fn clear_marks_each_elastic_slot_empty_before_dropping_its_value() {
+        let drops = AtomicUsize::new(0);
+        let mut table = ElasticTable::<u64, PanicOnFirstDrop<'_>, IdentityBuildHasher>::
+            try_with_slots_and_reserve_fraction_and_hasher_in(
+                31,
+                ReserveFraction::from_exponent(4).unwrap(),
+                IdentityBuildHasher,
+                Global,
+            )
+            .unwrap();
+        for key in 0..3 {
+            table.insert_for_vacant_entry(key, PanicOnFirstDrop { drops: &drops }, key);
+        }
+
+        let result = catch_unwind(AssertUnwindSafe(|| table.clear()));
+        assert!(result.is_err());
+        assert_eq!(
+            table.len,
+            table
+                .levels
+                .iter()
+                .map(|level| level.len as usize)
+                .sum::<usize>()
+        );
+        assert_eq!(
+            table.len,
+            table
+                .levels
+                .iter()
+                .map(|level| {
+                    (0..level.capacity())
+                        // SAFETY: the iterator spans this level's exact control extent.
+                        .filter(|&slot| unsafe { level.control_at(slot) }.is_occupied())
+                        .count()
+                })
+                .sum::<usize>()
+        );
+
+        table.clear();
+        assert_eq!(table.len, 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn failed_fallible_resize_leaves_a_valid_table() {
+        let armed = Arc::new(AtomicBool::new(false));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let reserve = ReserveFraction::from_exponent(4).unwrap();
+        let mut table = ElasticTable::<PanicHashKey, u64, IdentityBuildHasher>::
+            try_with_slots_and_reserve_fraction_and_hasher_in(
+                31,
+                reserve,
+                IdentityBuildHasher,
+                Global,
+            )
+            .unwrap();
+        for id in 0..3 {
+            let key = PanicHashKey {
+                id,
+                armed: armed.clone(),
+                drops: drops.clone(),
+            };
+            assert_eq!(
+                <ElasticTable<_, _, _, _> as map::TableBackend<_, _>>::insert(
+                    &mut table, key, id, id,
+                ),
+                None
+            );
+        }
+
+        armed.store(true, Ordering::SeqCst);
+        let result = catch_unwind(AssertUnwindSafe(|| table.try_resize(63)));
+        assert!(result.is_err());
+        let live_controls = table
+            .levels
+            .iter()
+            .map(|level| {
+                (0..level.capacity())
+                    // SAFETY: the iterator spans this level's exact control extent.
+                    .filter(|&slot| unsafe { level.control_at(slot) }.is_occupied())
+                    .count()
+            })
+            .sum::<usize>();
+        assert_eq!(table.len, live_controls);
+        assert_eq!(
+            table.len,
+            table
+                .levels
+                .iter()
+                .map(|level| level.len as usize)
+                .sum::<usize>()
+        );
+        assert_eq!(table.len, 0);
+
+        armed.store(false, Ordering::SeqCst);
+        let replacement = PanicHashKey {
+            id: 99,
+            armed: armed.clone(),
+            drops: drops.clone(),
+        };
+        assert_eq!(
+            <ElasticTable<_, _, _, _> as map::TableBackend<_, _>>::insert(
+                &mut table,
+                replacement,
+                99,
+                99,
+            ),
+            None
+        );
+        assert_eq!(table.len, 1);
+        drop(table);
+        assert_eq!(drops.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
     fn query_schedule_never_reallocates_within_an_epoch() {
         let mut table = ElasticTable::<u64, u64, IdentityBuildHasher>::
             try_with_slots_and_reserve_fraction_and_hasher_in(
@@ -2242,10 +2617,10 @@ mod tests {
                 Global,
             );
         let layout = elastic_arena_layout::<OverAligned, OverAligned>(table.total_slots).unwrap();
-        assert_eq!(
-            table.membership_ptr().addr(),
-            unsafe { table.arena.as_ptr().add(layout.membership_offset) }.addr()
-        );
+        // SAFETY: the arena was allocated with `layout`, so its membership offset is in bounds.
+        let expected_membership =
+            unsafe { table.arena.as_ptr().add(layout.membership_offset) }.addr();
+        assert_eq!(table.membership_ptr().addr(), expected_membership);
         assert_eq!(table.membership_ptr().addr() % mem::align_of::<u64>(), 0);
         assert_eq!(
             table.levels[0].data_ptr().addr() % mem::align_of::<OverAligned>(),
@@ -2317,6 +2692,8 @@ mod tests {
 
         table.record_membership(0);
 
+        // SAFETY: `membership_ptr` points to the arena's initialized membership region, whose
+        // allocated length is exactly `membership_words`.
         let membership = unsafe {
             core::slice::from_raw_parts(table.membership_ptr(), table.membership_words())
         };
@@ -2472,15 +2849,20 @@ mod tests {
                 break;
             }
             let slot = table.route_exact(0, 0, logical_index).unwrap();
-            if table.levels[0].control_at(slot).is_free() {
-                table.levels[0].write_with_control(
-                    slot,
-                    SlotEntry {
-                        key: next_key,
-                        value: next_key,
-                    },
-                    fingerprint,
-                );
+            // SAFETY: `route_exact` only returns a slot inside level zero.
+            if unsafe { table.levels[0].control_at(slot) }.is_free() {
+                // SAFETY: the routed slot is in bounds and its control byte was just observed
+                // to be free, so no initialized entry is overwritten.
+                unsafe {
+                    table.levels[0].write_with_control(
+                        slot,
+                        SlotEntry {
+                            key: next_key,
+                            value: next_key,
+                        },
+                        fingerprint,
+                    );
+                }
                 table.levels[0].len += 1;
                 table.len += 1;
                 next_key += 1;
@@ -2544,6 +2926,7 @@ mod tests {
             let direct = table
                 .find_entry_with_hash(&key, hash, fingerprint)
                 .expect("inserted key must have an entry reference");
+            // SAFETY: `find_slot_indices_with_hash` returns an occupied slot inside this table.
             let resolved = unsafe { table.slot_ref(location.0, location.1) };
             assert!(ptr::eq(direct, resolved), "key {key} returned a new slot");
         }

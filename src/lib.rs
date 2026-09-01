@@ -9,11 +9,19 @@
 //! comparison backends. They are explicit alternatives, not the placement
 //! algorithm behind the primary `PackedGen` maps.
 
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("packedgen currently supports only 64-bit targets");
+
 mod arena;
 mod atomic_value;
 mod bucket_map;
+mod cache;
+mod cache_arena;
+mod cache_value;
 mod concurrent_map;
 mod config;
+mod direct_epoch_protocol;
+mod dynamic_entry;
 mod fixed32_map;
 mod frozen_map;
 mod generation_hash;
@@ -25,15 +33,29 @@ mod kphf_map;
 mod lockfree_hybrid;
 mod lockfree_map;
 mod map;
+mod mutable_segment_cache;
 mod overlay_cell;
 mod packed_map;
 mod route_cache;
+mod segment_cache;
 mod segmented_map;
 mod swiss_map;
 
 pub use arena::{ArenaError, PackedKeyArena, PackedKeyRef};
 pub use atomic_value::{NonMaxU64, NonMaxU64Error};
 pub use bucket_map::{BucketBuildError, BucketMapError, BucketMapStats, BucketPackedMap};
+#[cfg(feature = "prepared-keys")]
+pub use cache::DirectCachePreparedReplacementBatch;
+#[cfg(feature = "cache-diagnostics")]
+pub use cache::DirectCacheReclamationStats;
+pub use cache::{
+    CacheAdmissionOutcome, CacheBuildError, CacheConfig, CacheConfigError, CacheGuard,
+    CacheInsertError, CacheInsertOutcome, CacheMaintenance, CacheMaintenanceResult, CacheStats,
+    CacheValue, CacheWriteOutcome, DirectAdaptiveAdmission, DirectCacheAdmissionBatch,
+    DirectCacheBulkAdmissionBatch, DirectCacheGuard, DirectCacheRemovalBatch,
+    DirectCacheReplacementBatch, DirectCacheUntrackedRemovalBatch,
+    DirectCacheUntrackedReplacementBatch, DirectCacheValue, DirectPackedCache, PackedCache,
+};
 pub use concurrent_map::{
     ConcurrentConfigError, ConcurrentMapStats, ConcurrentSwissMap, UpsertOutcome,
 };
@@ -42,10 +64,14 @@ pub use fixed32_map::{Fixed32CapacityError, Fixed32Load, Fixed32MapStats, Fixed3
 pub use frozen_map::{FrozenBuildError, FrozenIndexBackend, FrozenMapStats, FrozenPackedMap};
 #[doc(hidden)]
 pub use generation_hash::GenerationHashBuilder;
+#[cfg(feature = "prepared-batch-gate")]
+pub use generation_map::AtomicOperationGuard;
 #[cfg(feature = "prepared-keys")]
 pub use generation_map::AtomicPreparedKey;
 pub use generation_map::{
-    AtomicGenerationBaseFilter, AtomicGenerationOverlay, GenerationMapStats, GenerationRebuild,
+    AdaptiveOverlayPhase, AdaptiveOverlayStats, AdaptiveRebuildPolicy,
+    AdaptiveRebuildRecommendation, AtomicEntry, AtomicGenerationBaseFilter,
+    AtomicGenerationOverlay, AtomicVacantEntry, GenerationMapStats, GenerationRebuild,
     LockFreeAtomicU64GenerationMap, LockFreeGenerationMap,
 };
 pub use hybrid_map::{HybridBuildError, HybridFilterMode, HybridMapStats, HybridPackedMap};
@@ -55,10 +81,19 @@ pub use kphf_map::{KPhfAtomicU64Map, KPhfFrozenStats, PtrHashAtomicU64Map};
 pub use lockfree_hybrid::{LockFreeHybridMap, LockFreeHybridStats};
 pub use lockfree_map::LockFreeBinaryMap;
 pub use map::{CapacityError, FixedElasticMap, InsertOutcome, MapStats};
+pub use mutable_segment_cache::{
+    MutableSegmentCache, MutableSegmentCacheBuildError, MutableSegmentCacheGuard,
+    OnlineMutableSegmentCache, OnlineMutableSegmentCacheGuard, OnlineMutableSegmentWriterGuard,
+    OnlineSegmentCacheCompactionStats, SegmentCacheCompactionStats, SegmentCacheWriteOutcome,
+};
 pub use opthash::{EpochSnapshot, EpochTransition, ReserveFraction};
 pub use packed_map::{
     MaintenanceError, MaintenanceProgress, PackedBinaryMap, PackedBuildError, PackedGeneration,
     PackedLoadError, PackedMaintenancePlan, PackedMapError, PackedMapStats,
+};
+pub use segment_cache::{
+    FrozenSegmentCache, SegmentCacheBuildError, SegmentCacheConfig, SegmentCacheStats,
+    SegmentExpiry,
 };
 pub use segmented_map::{KeyCompactionStats, SegmentedLoad, SegmentedMapStats, SegmentedSwissMap};
 pub use swiss_map::{PackedSwissMap, SwissMapStats};

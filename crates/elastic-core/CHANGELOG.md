@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-08-26
+
+### Changed
+
+- Publish PackedGen's extended implementation under the honest
+  `packedgen-opthash` package name while retaining `opthash` as the Rust library
+  import name.
+- Preserve attribution and the complete upstream history below.
+
 ## [0.10.3](https://github.com/aaron-ang/opthash-rs/compare/v0.10.2...v0.10.3) - 2026-07-05
 
 ### Added

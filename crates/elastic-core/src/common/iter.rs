@@ -226,6 +226,10 @@ impl OccupiedSlots {
 
     /// Set ctrl pointers + reset state for a new region.
     #[inline]
+    #[allow(
+        unsafe_code,
+        reason = "derives one-past control bounds from a validated region"
+    )]
     pub(crate) fn set_region<T, D: ArenaSlots<T> + ?Sized>(&mut self, region: &D) {
         self.next_ctrl = region.ctrl_ptr();
         // SAFETY: `ctrl_ptr() + capacity()` is one-past-end of the ctrl bytes.
@@ -235,6 +239,10 @@ impl OccupiedSlots {
     }
 
     #[inline]
+    #[allow(
+        unsafe_code,
+        reason = "scans only within the cursor's validated control extent"
+    )]
     pub(crate) fn step(&mut self) -> Option<usize> {
         loop {
             if let Some(bit) = self.current_mask.next() {
@@ -244,14 +252,22 @@ impl OccupiedSlots {
                 return None;
             }
             self.current_group_slot = self.current_group_slot.wrapping_add(GROUP_SIZE);
+            // SAFETY: both pointers belong to the same control allocation and
+            // `next_ctrl` never advances beyond its one-past-end pointer.
             let remaining = usize::try_from(unsafe { self.end_ctrl.offset_from(self.next_ctrl) })
                 .expect("iterator control pointers remain ordered");
             if remaining >= GROUP_SIZE {
+                // SAFETY: the remaining extent contains a complete readable
+                // control group.
                 self.current_mask = unsafe { simd::occupied_mask_group(self.next_ctrl) };
+                // SAFETY: the complete-group check proves the advanced pointer
+                // remains inside or one-past the same allocation.
                 self.next_ctrl = unsafe { self.next_ctrl.add(GROUP_SIZE) };
             } else {
                 let mut mask = 0_u64;
                 for index in 0..remaining {
+                    // SAFETY: the scalar tail iterates exactly the number of
+                    // bytes remaining before `end_ctrl`.
                     let control = unsafe { *self.next_ctrl.add(index) };
                     if control.is_occupied() {
                         let lane = u32::try_from(index).expect("control-group lane fits u32");
@@ -289,15 +305,15 @@ impl Clone for OccupiedSlots {
 /// [`OccupiedSlots`] group scanner plus the current region's cached slot
 /// pointer. Owns the per-region mechanics; each backend keeps its own region
 /// ordering and location construction.
-pub(crate) struct RegionCursor {
+pub(crate) struct RegionCursor<E> {
     cursor: OccupiedSlots,
     /// Cached `data_ptr()` of the current region, refreshed by `enter`.
-    cur_data: *mut u8,
+    cur_data: *mut E,
     /// `false` until the first `enter`, keeping a fresh cursor pointer-free.
     started: bool,
 }
 
-impl RegionCursor {
+impl<E> RegionCursor<E> {
     #[inline]
     pub(crate) fn new() -> Self {
         Self {
@@ -314,7 +330,7 @@ impl RegionCursor {
 
     /// Binds the scanner to `region` and caches its slot pointer.
     #[inline]
-    pub(crate) fn enter<T, D: ArenaSlots<T> + ?Sized>(&mut self, region: &D) {
+    pub(crate) fn enter<D: ArenaSlots<E> + ?Sized>(&mut self, region: &D) {
         self.cursor.set_region(region);
         self.cur_data = region.data_ptr().cast();
         self.started = true;
@@ -322,16 +338,20 @@ impl RegionCursor {
 
     /// Next occupied slot in the current region as `(slot pointer, index)`.
     #[inline]
-    pub(crate) fn step<E>(&mut self) -> Option<(*mut E, usize)> {
+    #[allow(
+        unsafe_code,
+        reason = "projects a validated occupied index into its slot extent"
+    )]
+    pub(crate) fn step(&mut self) -> Option<(*mut E, usize)> {
         let slot_idx = self.cursor.step()?;
         // SAFETY: `cur_data` is the current region's slot array; `slot_idx` is
         // in-bounds for it (`step` yields only valid slots).
-        let ptr = unsafe { self.cur_data.cast::<E>().add(slot_idx) };
+        let ptr = unsafe { self.cur_data.add(slot_idx) };
         Some((ptr, slot_idx))
     }
 }
 
-impl Clone for RegionCursor {
+impl<E> Clone for RegionCursor<E> {
     fn clone(&self) -> Self {
         Self {
             cursor: self.cursor.clone(),

@@ -28,6 +28,10 @@ const SWAR_ONES: u64 = 0x0101_0101_0101_0101;
 /// `ptr` must be valid to read 8 bytes.
 #[cfg(opthash_scalar_group)]
 #[inline]
+#[allow(
+    unsafe_code,
+    reason = "performs one caller-bounded unaligned SWAR load"
+)]
 unsafe fn swar_word(ptr: *const u8) -> u64 {
     #[allow(clippy::cast_ptr_alignment)]
     let raw = unsafe { ptr.cast::<u64>().read_unaligned() };
@@ -63,12 +67,19 @@ fn swar_free_mask(word: u64) -> u64 {
 /// `ptr` must be valid to read `GROUP_SIZE` bytes.
 #[inline]
 #[must_use]
+#[allow(
+    unsafe_code,
+    reason = "dispatches one caller-bounded raw control-group load"
+)]
 pub(crate) unsafe fn eq_mask_group(ptr: *const u8, target: u8) -> BitMask {
     #[cfg(opthash_neon_group)]
+    // SAFETY: the caller provides the complete group required by this backend.
     let mask = unsafe { eq_mask_8_neon(ptr, target) };
     #[cfg(opthash_x86_16_group)]
+    // SAFETY: the caller provides the complete group required by this backend.
     let mask = unsafe { eq_mask_16_sse2(ptr, target) };
     #[cfg(opthash_scalar_group)]
+    // SAFETY: the caller provides the eight readable bytes required by SWAR.
     let mask = unsafe { BitMask(swar_eq_mask(swar_word(ptr), target)) };
     mask
 }
@@ -78,12 +89,19 @@ pub(crate) unsafe fn eq_mask_group(ptr: *const u8, target: u8) -> BitMask {
 /// `ptr` must be valid to read `GROUP_SIZE` bytes.
 #[inline]
 #[must_use]
+#[allow(
+    unsafe_code,
+    reason = "dispatches one caller-bounded raw control-group load"
+)]
 pub(crate) unsafe fn free_mask_group(ptr: *const u8) -> BitMask {
     #[cfg(opthash_neon_group)]
+    // SAFETY: the caller provides the complete group required by this backend.
     let mask = unsafe { free_mask_8_neon(ptr) };
     #[cfg(opthash_x86_16_group)]
+    // SAFETY: the caller provides the complete group required by this backend.
     let mask = unsafe { free_mask_16_sse2(ptr) };
     #[cfg(opthash_scalar_group)]
+    // SAFETY: the caller provides the eight readable bytes required by SWAR.
     let mask = unsafe { BitMask(swar_free_mask(swar_word(ptr))) };
     mask
 }
@@ -95,12 +113,19 @@ pub(crate) unsafe fn free_mask_group(ptr: *const u8) -> BitMask {
 /// `ptr` must be valid to read `GROUP_SIZE` bytes.
 #[inline]
 #[must_use]
+#[allow(
+    unsafe_code,
+    reason = "dispatches one caller-bounded raw control-group load"
+)]
 pub(crate) unsafe fn occupied_mask_group(ptr: *const u8) -> BitMask {
     #[cfg(opthash_neon_group)]
+    // SAFETY: the caller provides the complete group required by this backend.
     let mask = unsafe { occupied_mask_8_neon(ptr) };
     #[cfg(opthash_x86_16_group)]
+    // SAFETY: the caller provides the complete group required by this backend.
     let mask = unsafe { occupied_mask_16_sse2(ptr) };
     #[cfg(opthash_scalar_group)]
+    // SAFETY: the caller provides the eight readable bytes required by SWAR.
     let mask = unsafe { BitMask(swar_occupied_mask(swar_word(ptr))) };
     mask
 }
@@ -109,7 +134,10 @@ pub(crate) unsafe fn occupied_mask_group(ptr: *const u8) -> BitMask {
 
 #[cfg(opthash_neon_group)]
 #[inline]
+#[allow(unsafe_code, reason = "loads one caller-bounded NEON control group")]
 unsafe fn eq_mask_8_neon(ptr: *const u8, target: u8) -> BitMask {
+    // SAFETY: this function's contract requires eight readable bytes; the
+    // vector operations do not retain the loaded pointer.
     unsafe {
         let bytes = aarch64::vld1_u8(ptr);
         let cmp = aarch64::vceq_u8(bytes, aarch64::vdup_n_u8(target));
@@ -119,7 +147,10 @@ unsafe fn eq_mask_8_neon(ptr: *const u8, target: u8) -> BitMask {
 
 #[cfg(opthash_neon_group)]
 #[inline]
+#[allow(unsafe_code, reason = "loads one caller-bounded NEON control group")]
 unsafe fn free_mask_8_neon(ptr: *const u8) -> BitMask {
+    // SAFETY: this function's contract requires eight readable bytes; the
+    // vector operations do not retain the loaded pointer.
     unsafe {
         let bytes = aarch64::vld1_u8(ptr);
         let masked = aarch64::vand_u8(bytes, aarch64::vdup_n_u8(FINGERPRINT_MASK));
@@ -133,7 +164,10 @@ unsafe fn free_mask_8_neon(ptr: *const u8) -> BitMask {
 
 #[cfg(opthash_neon_group)]
 #[inline]
+#[allow(unsafe_code, reason = "loads one caller-bounded NEON control group")]
 unsafe fn occupied_mask_8_neon(ptr: *const u8) -> BitMask {
+    // SAFETY: this function's contract requires eight readable bytes; the
+    // vector operations do not retain the loaded pointer.
     unsafe {
         let bytes = aarch64::vld1_u8(ptr);
         let occ_cmp = aarch64::vtst_u8(bytes, aarch64::vdup_n_u8(FINGERPRINT_MASK));
@@ -148,7 +182,10 @@ unsafe fn occupied_mask_8_neon(ptr: *const u8) -> BitMask {
 #[allow(clippy::cast_ptr_alignment)]
 #[cfg(opthash_x86_16_group)]
 #[inline]
+#[allow(unsafe_code, reason = "loads one caller-bounded SSE2 control group")]
 unsafe fn eq_mask_16_sse2(ptr: *const u8, target: u8) -> BitMask {
+    // SAFETY: this function's contract requires 16 readable bytes and the
+    // intrinsic performs an unaligned load.
     unsafe {
         let data = x86_64::_mm_loadu_si128(ptr.cast::<__m128i>());
         let target_vec = x86_64::_mm_set1_epi8(target.cast_signed());
@@ -161,7 +198,10 @@ unsafe fn eq_mask_16_sse2(ptr: *const u8, target: u8) -> BitMask {
 #[allow(clippy::cast_ptr_alignment)]
 #[cfg(opthash_x86_16_group)]
 #[inline]
+#[allow(unsafe_code, reason = "loads one caller-bounded SSE2 control group")]
 unsafe fn free_mask_16_sse2(ptr: *const u8) -> BitMask {
+    // SAFETY: this function's contract requires 16 readable bytes and the
+    // intrinsic performs an unaligned load.
     unsafe {
         let data = x86_64::_mm_loadu_si128(ptr.cast::<__m128i>());
         let masked =
@@ -175,7 +215,10 @@ unsafe fn free_mask_16_sse2(ptr: *const u8) -> BitMask {
 #[allow(clippy::cast_ptr_alignment)]
 #[cfg(opthash_x86_16_group)]
 #[inline]
+#[allow(unsafe_code, reason = "loads one caller-bounded SSE2 control group")]
 unsafe fn occupied_mask_16_sse2(ptr: *const u8) -> BitMask {
+    // SAFETY: this function's contract requires 16 readable bytes and the
+    // intrinsic performs an unaligned load.
     unsafe {
         let data = x86_64::_mm_loadu_si128(ptr.cast::<__m128i>());
         let masked =
@@ -187,6 +230,10 @@ unsafe fn occupied_mask_16_sse2(ptr: *const u8) -> BitMask {
 }
 
 #[cfg(all(test, opthash_neon_group))]
+#[allow(
+    unsafe_code,
+    reason = "exercises bounded NEON loads against fixed arrays"
+)]
 mod neon_tests {
     use super::*;
     use crate::common::control::{CTRL_EMPTY, CTRL_TOMBSTONE};
@@ -204,8 +251,11 @@ mod neon_tests {
             2,
         ];
 
+        // SAFETY: `controls` supplies the eight readable bytes required by the helper.
         let matches: alloc::vec::Vec<_> = unsafe { eq_mask_8_neon(controls.as_ptr(), 7) }.collect();
+        // SAFETY: `controls` supplies the eight readable bytes required by the helper.
         let free: alloc::vec::Vec<_> = unsafe { free_mask_8_neon(controls.as_ptr()) }.collect();
+        // SAFETY: `controls` supplies the eight readable bytes required by the helper.
         let occupied: alloc::vec::Vec<_> =
             unsafe { occupied_mask_8_neon(controls.as_ptr()) }.collect();
 

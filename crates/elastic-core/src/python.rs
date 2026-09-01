@@ -6,10 +6,15 @@
 // convention; the crate-wide `elided_lifetimes_in_paths` lint is waived here for
 // the same macro-reach reason as above. The rest of the crate keeps it on.
 #![allow(elided_lifetimes_in_paths)]
+#![allow(
+    unsafe_code,
+    reason = "isolates CPython-owned pointer tagging and GIL-guarded access"
+)]
 
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
+use std::num::NonZeroUsize;
 use std::ptr::NonNull;
 
 use pyo3::Borrowed;
@@ -74,6 +79,8 @@ struct HashedAny {
 
 // SAFETY: matches `Py<PyAny>` — atomic refcount, derefs only under `Python::attach`.
 unsafe impl Send for HashedAny {}
+// SAFETY: same as `Send`; shared access reaches Python objects only through an
+// attached Python context, matching PyO3's `Py<PyAny>` contract.
 unsafe impl Sync for HashedAny {}
 
 const _: () = assert!(std::mem::size_of::<HashedAny>() == 2 * std::mem::size_of::<usize>());
@@ -84,17 +91,20 @@ impl HashedAny {
     /// `PyObject*` sourced from a live `Bound::as_ptr()`.
     #[inline]
     fn pack(obj: *mut ffi::PyObject, kind: HashKind) -> NonNull<ffi::PyObject> {
-        assert!(!obj.is_null(), "PyObject pointer must be non-null");
+        let pointer = NonNull::new(obj).expect("PyObject pointer must be non-null");
         // Runtime (not debug) assert: silent pointer corruption is worse than
         // one extra cmp+jne in this cold path.
         assert_eq!(
-            obj as usize & KIND_MASK,
+            pointer.addr().get() & KIND_MASK,
             0,
             "PyObject* low bits must be zero for tag packing"
         );
-        // `obj` non-null (asserted above) + ORing tag bits keeps it non-null.
-        NonNull::new(((obj as usize) | (kind as usize)) as *mut ffi::PyObject)
-            .expect("tagged PyObject* non-null")
+        // Keep the original allocation provenance while changing only address
+        // bits that CPython's alignment contract leaves unused.
+        pointer.map_addr(|address| {
+            NonZeroUsize::new(address.get() | kind as usize)
+                .expect("tagged PyObject* remains non-null")
+        })
     }
 
     #[inline]
@@ -138,21 +148,25 @@ impl HashedAny {
     /// Object pointer with tag bits stripped.
     #[inline]
     fn obj_ptr(&self) -> *mut ffi::PyObject {
-        ((self.tagged.as_ptr() as usize) & !KIND_MASK) as *mut ffi::PyObject
+        self.tagged
+            .map_addr(|address| {
+                NonZeroUsize::new(address.get() & !KIND_MASK)
+                    .expect("owned PyObject* remains non-null after untagging")
+            })
+            .as_ptr()
     }
 
     /// Decoded `HashKind`. Exhaustive arms (not catch-all) so a new variant
     /// can't silently alias `Other`.
     #[inline]
     fn kind(&self) -> HashKind {
-        match (self.tagged.as_ptr() as usize) & KIND_MASK {
+        match self.tagged.addr().get() & KIND_MASK {
             x if x == HashKind::Other as usize => HashKind::Other,
             x if x == HashKind::Str as usize => HashKind::Str,
             x if x == HashKind::Int as usize => HashKind::Int,
-            // SAFETY: `KIND_MASK == 0b11` and every `HashKind` discriminant
-            // in [0, 3] has an arm above. A new variant overlapping the
-            // mask must add an arm here.
-            _ => unsafe { std::hint::unreachable_unchecked() },
+            // Only constructors in this module create the tag. Keep corrupt
+            // state safe even if that invariant is broken by a future change.
+            invalid => unreachable!("invalid Python object kind tag {invalid}"),
         }
     }
 
@@ -175,8 +189,11 @@ impl HashedAny {
 
 impl Drop for HashedAny {
     fn drop(&mut self) {
-        // `Py_DECREF` needs the GIL — per-slot attach matches `Py<T>::drop`.
-        Python::attach(|_py| {
+        // Destructors can run while CPython is shutting down or traversing GC,
+        // where `Python::attach` may panic. A failed best-effort attachment
+        // deliberately leaves the final reference to process teardown rather
+        // than allowing a panic from `Drop` to abort the process.
+        let _ = Python::try_attach(|_py| {
             // SAFETY: we own one strong ref to the masked pointer.
             unsafe { ffi::Py_DECREF(self.obj_ptr()) };
         });
@@ -248,6 +265,7 @@ impl PartialEq for HashedAny {
                 // SAFETY: kind tag guarantees both are PyLong.
                 let a =
                     unsafe { ffi::PyLong_AsLongLongAndOverflow(self.obj_ptr(), &raw mut ovf_a) };
+                // SAFETY: the second object's kind tag also guarantees PyLong.
                 let b =
                     unsafe { ffi::PyLong_AsLongLongAndOverflow(other.obj_ptr(), &raw mut ovf_b) };
                 if ovf_a == 0 && ovf_b == 0 {

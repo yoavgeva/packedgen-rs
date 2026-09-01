@@ -4,17 +4,20 @@
 
 use std::alloc::System;
 use std::hint::black_box;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 
 use dashmap::DashMap;
 use flurry::HashMap as FlurryHashMap;
 use hashbrown::{DefaultHashBuilder, HashMap};
 use packedgen::{
-    AtomicGenerationBaseFilter, AtomicGenerationOverlay, BucketPackedMap, ConcurrentSwissMap,
-    ElasticConfig, FixedElasticMap, FrozenPackedMap, LockFreeAtomicU64GenerationMap,
-    LockFreeBinaryMap, LockFreeGenerationMap, LockFreeHybridMap, NonMaxU64, PackedBinaryMap,
-    PackedKeyArena, PackedKeyRef, PackedSwissMap, RouteCacheBudget, SegmentedLoad,
-    SegmentedSwissMap,
+    AtomicGenerationBaseFilter, AtomicGenerationOverlay, BucketPackedMap, CacheConfig,
+    ConcurrentSwissMap, DirectPackedCache, ElasticConfig, FixedElasticMap, FrozenPackedMap,
+    LockFreeAtomicU64GenerationMap, LockFreeBinaryMap, LockFreeGenerationMap, LockFreeHybridMap,
+    NonMaxU64, PackedBinaryMap, PackedCache, PackedKeyArena, PackedKeyRef, PackedSwissMap,
+    RouteCacheBudget, SegmentedLoad, SegmentedSwissMap,
 };
+use papaya::HashMap as PapayaHashMap;
 use parking_lot::RwLock;
 use scc::HashMap as SccHashMap;
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, Stats, StatsAlloc};
@@ -51,11 +54,20 @@ fn main() {
         "segmented-swiss-binary" => print_segmented_swiss_binary(entries),
         "concurrent-swiss-binary" => print_concurrent_swiss_binary(entries),
         "dashmap-binary" => print_dashmap_binary(entries),
+        "dashmap-sized-binary" => print_dashmap_sized_binary(entries, key_bytes),
+        "dashmap-mixed-binary" => print_dashmap_mixed_binary(entries),
+        "dashmap-mixed-churn-binary" => print_dashmap_mixed_churn(entries),
         "dashmap-delete-half-binary" => print_dashmap_after_half_delete(entries),
         "scc-binary" => print_scc_binary(entries),
+        "scc-mixed-binary" => print_scc_mixed_binary(entries),
+        "scc-mixed-churn-binary" => print_scc_mixed_churn(entries),
         "flurry-binary" => print_flurry_binary(entries),
+        "flurry-mixed-binary" => print_flurry_mixed_binary(entries),
         "rwlock-hashbrown-binary" => print_rwlock_hashbrown_binary(entries),
+        "rwlock-hashbrown-mixed-binary" => print_rwlock_hashbrown_mixed_binary(entries),
         "lockfree-binary" => print_lockfree_binary(entries),
+        "lockfree-mixed-binary" => print_lockfree_mixed_binary(entries),
+        "lockfree-mixed-churn-binary" => print_lockfree_mixed_churn(entries),
         "lockfree-hybrid-binary" => print_lockfree_hybrid_binary(entries),
         "lockfree-hybrid-churn-binary" => print_lockfree_hybrid_churn_binary(entries),
         "lockfree-generation-binary" => print_lockfree_generation(entries, false),
@@ -94,6 +106,42 @@ fn main() {
                 AtomicGenerationOverlay::AtomicFixed32,
             );
         }
+        "lockfree-atomic-overlay-atomic-short-binary" => {
+            print_lockfree_atomic_overlay(
+                entries,
+                key_bytes,
+                AtomicGenerationOverlay::AtomicUpTo32,
+            );
+        }
+        "lockfree-atomic-overlay-atomic-small-binary" => {
+            print_lockfree_atomic_overlay(
+                entries,
+                key_bytes,
+                AtomicGenerationOverlay::AtomicUpTo16,
+            );
+        }
+        "lockfree-atomic-overlay-atomic-tiny-binary" => {
+            print_lockfree_atomic_overlay(entries, key_bytes, AtomicGenerationOverlay::AtomicUpTo8);
+        }
+        "lockfree-atomic-overlay-atomic-adaptive-binary" => {
+            print_lockfree_atomic_overlay(
+                entries,
+                key_bytes,
+                AtomicGenerationOverlay::AtomicAdaptive,
+            );
+        }
+        "lockfree-atomic-overlay-adaptive-mixed-binary" => {
+            print_lockfree_atomic_overlay_mixed(entries, AtomicGenerationOverlay::AtomicAdaptive);
+        }
+        "lockfree-atomic-overlay-adaptive-mixed-churn-binary" => {
+            print_lockfree_atomic_overlay_mixed_churn(entries);
+        }
+        "lockfree-atomic-overlay-atomic32-mixed-binary" => {
+            print_lockfree_atomic_overlay_mixed(entries, AtomicGenerationOverlay::AtomicUpTo32);
+        }
+        "lockfree-atomic-overlay-papaya-mixed-binary" => {
+            print_lockfree_atomic_overlay_mixed(entries, AtomicGenerationOverlay::Papaya);
+        }
         "lockfree-atomic-overlay-papaya-binary" => {
             print_lockfree_atomic_overlay(entries, key_bytes, AtomicGenerationOverlay::Papaya);
         }
@@ -103,6 +151,34 @@ fn main() {
                 key_bytes,
                 AtomicGenerationOverlay::ArcSwapFixed32,
             );
+        }
+        "packed-cache-mixed-value64" => print_packed_cache_mixed_value64(entries),
+        "direct-packed-cache-mixed-value64" => print_direct_packed_cache_mixed_value64(entries),
+        "direct-packed-cache-admission-mixed-value64" => {
+            print_direct_packed_cache_admission_mixed_value64(entries);
+        }
+        "direct-packed-cache-batch-admission-mixed-value64" => {
+            print_direct_packed_cache_batch_admission_mixed_value64(entries);
+        }
+        "direct-packed-cache-seeded-sized-value64" => {
+            print_direct_packed_cache_sized_pressure(entries, key_bytes, false, false);
+        }
+        "direct-packed-cache-pressure-sized-value64" => {
+            print_direct_packed_cache_sized_pressure(entries, key_bytes, true, false);
+        }
+        "direct-packed-cache-pressure-maintained-sized-value64" => {
+            print_direct_packed_cache_sized_pressure(entries, key_bytes, true, true);
+        }
+        "direct-pointer-cache-prototype-mixed-value64" => {
+            print_direct_pointer_cache_prototype_mixed_value64(entries);
+        }
+        "packed-cache-mixed-value64-churn" => print_packed_cache_mixed_value64_churn(entries),
+        "papaya-cache-mixed-value64" => print_papaya_cache_mixed_value64(entries),
+        "papaya-cache-compact-mixed-value64" => {
+            print_papaya_cache_compact_mixed_value64(entries);
+        }
+        "papaya-cache-inline-compact-mixed-value64" => {
+            print_papaya_cache_inline_compact_mixed_value64(entries);
         }
         "arena" => {
             print_packed_arena(entries);
@@ -116,8 +192,13 @@ fn main() {
              elastic-binary-6, hashbrown-binary, packed-binary-3, packed-binary-6, \
              packed-binary-read-6, \
              frozen-binary, bucket-binary, swiss-binary, segmented-swiss-binary, \
-             concurrent-swiss-binary, dashmap-binary, dashmap-delete-half-binary, scc-binary, \
-             flurry-binary, rwlock-hashbrown-binary, lockfree-binary, \
+             concurrent-swiss-binary, dashmap-binary, dashmap-sized-binary, \
+             dashmap-mixed-binary, dashmap-mixed-churn-binary, \
+             dashmap-delete-half-binary, scc-binary, scc-mixed-binary, \
+             scc-mixed-churn-binary, \
+             flurry-binary, flurry-mixed-binary, rwlock-hashbrown-binary, \
+             rwlock-hashbrown-mixed-binary, lockfree-binary, lockfree-mixed-binary, \
+             lockfree-mixed-churn-binary, \
              lockfree-hybrid-binary, lockfree-hybrid-churn-binary, \
              lockfree-generation-binary, lockfree-generation-churn-binary, \
              lockfree-atomic-generation-binary, lockfree-atomic-generation-churn-binary, \
@@ -127,7 +208,26 @@ fn main() {
              lockfree-atomic-generation-fingerprint-binary, \
              lockfree-atomic-overlay-compact-binary, lockfree-atomic-overlay-papaya-binary, \
              lockfree-atomic-overlay-atomic-binary, \
+             lockfree-atomic-overlay-atomic-adaptive-binary, \
+             lockfree-atomic-overlay-adaptive-mixed-binary, \
+             lockfree-atomic-overlay-adaptive-mixed-churn-binary, \
+             lockfree-atomic-overlay-atomic32-mixed-binary, \
+             lockfree-atomic-overlay-papaya-mixed-binary, \
+             lockfree-atomic-overlay-atomic-tiny-binary, \
+             lockfree-atomic-overlay-atomic-small-binary, \
+             lockfree-atomic-overlay-atomic-short-binary, \
              lockfree-atomic-overlay-arcswap-binary, \
+             packed-cache-mixed-value64, direct-packed-cache-mixed-value64, \
+             direct-packed-cache-admission-mixed-value64, \
+             direct-packed-cache-batch-admission-mixed-value64, \
+             direct-packed-cache-seeded-sized-value64, \
+             direct-packed-cache-pressure-sized-value64, \
+             direct-packed-cache-pressure-maintained-sized-value64, \
+             direct-pointer-cache-prototype-mixed-value64, \
+             packed-cache-mixed-value64-churn, \
+             papaya-cache-mixed-value64, \
+             papaya-cache-compact-mixed-value64, \
+             papaya-cache-inline-compact-mixed-value64, \
              arena, sweep, \
              packed-sweep, or all"
         ),
@@ -393,6 +493,72 @@ fn print_dashmap_binary(entries: usize) {
     black_box(&map);
 }
 
+fn print_dashmap_sized_binary(entries: usize, key_bytes: usize) {
+    const SHARDS: usize = 64;
+
+    assert!((8..=128).contains(&key_bytes));
+    let region = Region::new(GLOBAL);
+    let map =
+        DashMap::<Box<[u8]>, u64, DefaultHashBuilder>::with_capacity_and_hasher_and_shard_amount(
+            entries,
+            DefaultHashBuilder::default(),
+            SHARDS,
+        );
+    for index in 0..entries {
+        let value = u64::try_from(index).expect("entry index must fit u64");
+        let key = sized_binary_key_array(value);
+        map.insert(key[..key_bytes].into(), value);
+    }
+    let stats = region.change();
+    print_row(&format!("dashmap-boxed-binary{key_bytes}"), entries, stats);
+    black_box(&map);
+}
+
+fn print_dashmap_mixed_binary(entries: usize) {
+    const SHARDS: usize = 64;
+
+    let region = Region::new(GLOBAL);
+    let map =
+        DashMap::<Box<[u8]>, u64, DefaultHashBuilder>::with_capacity_and_hasher_and_shard_amount(
+            entries,
+            DefaultHashBuilder::default(),
+            SHARDS,
+        );
+    for index in 0..entries {
+        let value = u64::try_from(index).expect("entry index must fit u64");
+        let key = sized_binary_key_array(value);
+        let key_bytes = mixed_key_bytes(index);
+        map.insert(key[..key_bytes].into(), value);
+    }
+    let stats = region.change();
+    print_row("dashmap-boxed-mixed-binary", entries, stats);
+    black_box(&map);
+}
+
+fn print_dashmap_mixed_churn(entries: usize) {
+    const SHARDS: usize = 64;
+    let region = Region::new(GLOBAL);
+    let map =
+        DashMap::<Box<[u8]>, u64, DefaultHashBuilder>::with_capacity_and_hasher_and_shard_amount(
+            entries.saturating_mul(2),
+            DefaultHashBuilder::default(),
+            SHARDS,
+        );
+    for index in 0..entries {
+        let value = u64::try_from(index).expect("entry index must fit u64");
+        map.insert(mixed_binary_key(index), value);
+    }
+    for index in 0..entries {
+        map.remove(mixed_binary_key(index).as_ref()).unwrap();
+        let replacement = index.saturating_add(entries);
+        let value = u64::try_from(replacement).expect("entry index must fit u64");
+        map.insert(mixed_binary_key(replacement), value);
+    }
+    let stats = region.change();
+    print_row("dashmap-boxed-mixed-after-100pct-turnover", entries, stats);
+    black_box(&map);
+}
+
 fn print_dashmap_after_half_delete(entries: usize) {
     const SHARDS: usize = 64;
 
@@ -435,6 +601,45 @@ fn print_scc_binary(entries: usize) {
     black_box(&map);
 }
 
+fn print_scc_mixed_binary(entries: usize) {
+    let region = Region::new(GLOBAL);
+    let map = SccHashMap::<Box<[u8]>, u64, DefaultHashBuilder>::with_capacity_and_hasher(
+        entries,
+        DefaultHashBuilder::default(),
+    );
+    for index in 0..entries {
+        let value = u64::try_from(index).expect("entry index must fit u64");
+        let key = sized_binary_key_array(value);
+        map.insert_sync(key[..mixed_key_bytes(index)].into(), value)
+            .unwrap();
+    }
+    let stats = region.change();
+    print_row("scc-boxed-mixed-binary", entries, stats);
+    black_box(&map);
+}
+
+fn print_scc_mixed_churn(entries: usize) {
+    let region = Region::new(GLOBAL);
+    let map = SccHashMap::<Box<[u8]>, u64, DefaultHashBuilder>::with_capacity_and_hasher(
+        entries.saturating_mul(2),
+        DefaultHashBuilder::default(),
+    );
+    for index in 0..entries {
+        let value = u64::try_from(index).expect("entry index must fit u64");
+        map.insert_sync(mixed_binary_key(index), value).unwrap();
+    }
+    for index in 0..entries {
+        map.remove_sync(mixed_binary_key(index).as_ref()).unwrap();
+        let replacement = index.saturating_add(entries);
+        let value = u64::try_from(replacement).expect("entry index must fit u64");
+        map.insert_sync(mixed_binary_key(replacement), value)
+            .unwrap();
+    }
+    let stats = region.change();
+    print_row("scc-boxed-mixed-after-100pct-turnover", entries, stats);
+    black_box(&map);
+}
+
 fn print_flurry_binary(entries: usize) {
     let region = Region::new(GLOBAL);
     let map = FlurryHashMap::<Box<[u8]>, u64, DefaultHashBuilder>::with_capacity_and_hasher(
@@ -449,6 +654,24 @@ fn print_flurry_binary(entries: usize) {
     drop(guard);
     let stats = region.change();
     print_row("flurry-boxed-binary32", entries, stats);
+    black_box(&map);
+}
+
+fn print_flurry_mixed_binary(entries: usize) {
+    let region = Region::new(GLOBAL);
+    let map = FlurryHashMap::<Box<[u8]>, u64, DefaultHashBuilder>::with_capacity_and_hasher(
+        entries,
+        DefaultHashBuilder::default(),
+    );
+    let guard = map.guard();
+    for index in 0..entries {
+        let value = u64::try_from(index).expect("entry index must fit u64");
+        let key = sized_binary_key_array(value);
+        map.insert(key[..mixed_key_bytes(index)].into(), value, &guard);
+    }
+    drop(guard);
+    let stats = region.change();
+    print_row("flurry-boxed-mixed-binary", entries, stats);
     black_box(&map);
 }
 
@@ -468,6 +691,23 @@ fn print_rwlock_hashbrown_binary(entries: usize) {
     black_box(&map);
 }
 
+fn print_rwlock_hashbrown_mixed_binary(entries: usize) {
+    let region = Region::new(GLOBAL);
+    let mut inner = HashMap::<Box<[u8]>, u64, DefaultHashBuilder>::with_capacity_and_hasher(
+        entries,
+        DefaultHashBuilder::default(),
+    );
+    for index in 0..entries {
+        let value = u64::try_from(index).expect("entry index must fit u64");
+        let key = sized_binary_key_array(value);
+        inner.insert(key[..mixed_key_bytes(index)].into(), value);
+    }
+    let map = RwLock::new(inner);
+    let stats = region.change();
+    print_row("rwlock-hashbrown-boxed-mixed-binary", entries, stats);
+    black_box(&map);
+}
+
 fn print_lockfree_binary(entries: usize) {
     let region = Region::new(GLOBAL);
     let map = LockFreeBinaryMap::with_capacity(entries);
@@ -478,6 +718,390 @@ fn print_lockfree_binary(entries: usize) {
     let stats = region.change();
     print_row("lockfree-papaya-boxed-binary32", entries, stats);
     black_box(&map);
+}
+
+fn print_lockfree_mixed_binary(entries: usize) {
+    let region = Region::new(GLOBAL);
+    let map = LockFreeBinaryMap::with_capacity(entries);
+    for index in 0..entries {
+        let value = u64::try_from(index).expect("entry index must fit u64");
+        let key = sized_binary_key_array(value);
+        map.insert(&key[..mixed_key_bytes(index)], value);
+    }
+    let stats = region.change();
+    print_row("papaya-boxed-mixed-binary", entries, stats);
+    black_box(&map);
+}
+
+fn print_lockfree_mixed_churn(entries: usize) {
+    let region = Region::new(GLOBAL);
+    let map = LockFreeBinaryMap::with_capacity(entries.saturating_mul(2));
+    for index in 0..entries {
+        let value = u64::try_from(index).expect("entry index must fit u64");
+        map.insert(&mixed_binary_key(index), value);
+    }
+    for index in 0..entries {
+        assert!(map.remove(&mixed_binary_key(index)).is_some());
+        let replacement = index.saturating_add(entries);
+        let value = u64::try_from(replacement).expect("entry index must fit u64");
+        map.insert(&mixed_binary_key(replacement), value);
+    }
+    let stats = region.change();
+    print_row("papaya-boxed-mixed-after-100pct-turnover", entries, stats);
+    black_box(&map);
+}
+
+fn print_packed_cache_mixed_value64(entries: usize) {
+    let region = Region::new(GLOBAL);
+    let cache = PackedCache::try_new(
+        CacheConfig::new(u64::MAX)
+            .with_max_entries(entries.saturating_mul(2).max(1))
+            .with_overlay_capacity(entries.max(1)),
+    )
+    .unwrap();
+    for index in 0..entries {
+        cache
+            .insert_with_options(
+                &mixed_binary_key(index),
+                [u8::try_from(index & 255).unwrap(); 64],
+                64 + u64::try_from(mixed_key_bytes(index)).unwrap(),
+                None,
+            )
+            .unwrap();
+    }
+    let stats = region.change();
+    print_row("packed-cache-mixed-value64", entries, stats);
+    black_box(&cache);
+}
+
+fn print_direct_packed_cache_mixed_value64(entries: usize) {
+    let region = Region::new(GLOBAL);
+    let cache = DirectPackedCache::try_new(
+        CacheConfig::new(u64::MAX)
+            .with_max_entries(entries.saturating_mul(2).max(1))
+            .with_overlay_capacity(entries.max(1)),
+    )
+    .unwrap();
+    for index in 0..entries {
+        cache
+            .insert_discard_with_options(
+                &mixed_binary_key(index),
+                [u8::try_from(index & 255).unwrap(); 64],
+                64 + u64::try_from(mixed_key_bytes(index)).unwrap(),
+                None,
+            )
+            .unwrap();
+    }
+    let stats = region.change();
+    print_row("direct-packed-cache-mixed-value64", entries, stats);
+    black_box(&cache);
+}
+
+fn print_direct_packed_cache_admission_mixed_value64(entries: usize) {
+    let region = Region::new(GLOBAL);
+    let cache = DirectPackedCache::try_new(
+        CacheConfig::new(u64::MAX)
+            .with_max_entries(entries.saturating_mul(2).max(1))
+            .with_overlay_capacity(entries.max(1)),
+    )
+    .unwrap();
+    let guard = cache.pin();
+    for index in 0..entries {
+        guard
+            .insert_if_absent_with_options(
+                &mixed_binary_key(index),
+                [u8::try_from(index & 255).unwrap(); 64],
+                64 + u64::try_from(mixed_key_bytes(index)).unwrap(),
+                None,
+            )
+            .unwrap();
+    }
+    drop(guard);
+    let stats = region.change();
+    print_row(
+        "direct-packed-cache-admission-mixed-value64",
+        entries,
+        stats,
+    );
+    black_box(&cache);
+}
+
+fn print_direct_packed_cache_batch_admission_mixed_value64(entries: usize) {
+    let region = Region::new(GLOBAL);
+    let cache = DirectPackedCache::try_new(
+        CacheConfig::new(u64::MAX)
+            .with_max_entries(entries.saturating_mul(2).max(1))
+            .with_overlay_capacity(entries.max(1)),
+    )
+    .unwrap();
+    let mut guard = cache.pin();
+    for begin in (0..entries).step_by(32) {
+        let mut batch = guard.admission_batch();
+        for index in begin..(begin + 32).min(entries) {
+            batch
+                .insert_if_absent_with_options(
+                    &mixed_binary_key(index),
+                    [u8::try_from(index & 255).unwrap(); 64],
+                    64 + u64::try_from(mixed_key_bytes(index)).unwrap(),
+                    None,
+                )
+                .unwrap();
+        }
+    }
+    drop(guard);
+    let stats = region.change();
+    print_row(
+        "direct-packed-cache-batch-admission-mixed-value64",
+        entries,
+        stats,
+    );
+    black_box(&cache);
+}
+
+fn print_direct_packed_cache_sized_pressure(
+    entries: usize,
+    key_bytes: usize,
+    pressure: bool,
+    maintained: bool,
+) {
+    assert!(
+        key_bytes <= 128,
+        "sized cache probe supports up to 128-byte keys"
+    );
+    let admissions = entries.saturating_mul(2);
+    let keys = (0..entries.saturating_add(admissions))
+        .map(|index| {
+            let key = sized_binary_key_array(u64::try_from(index).expect("entry index fits u64"));
+            Box::<[u8]>::from(&key[..key_bytes])
+        })
+        .collect::<Vec<_>>();
+    let region = Region::new(GLOBAL);
+    let cache = DirectPackedCache::try_new(
+        CacheConfig::new(u64::MAX)
+            .with_max_entries(entries)
+            .with_overlay_capacity(keys.len().max(1)),
+    )
+    .unwrap();
+    for (index, key) in keys.iter().take(entries).enumerate() {
+        cache
+            .insert_discard_with_options(key, [u8::try_from(index & 255).unwrap(); 64], 64, None)
+            .unwrap();
+    }
+    cache.maintain().unwrap();
+    if pressure {
+        let mut guard = cache.pin();
+        let mut batch = guard.admission_batch();
+        for (offset, key) in keys.iter().skip(entries).enumerate() {
+            batch
+                .insert_if_absent_with_options(
+                    key,
+                    [u8::try_from(offset & 255).unwrap(); 64],
+                    64,
+                    None,
+                )
+                .unwrap();
+        }
+    }
+    if maintained {
+        cache.maintain().unwrap();
+    }
+    let stats = region.change();
+    let phase = match (pressure, maintained) {
+        (true, true) => "pressure-maintained",
+        (true, false) => "pressure",
+        (false, _) => "seeded",
+    };
+    print_row(
+        &format!("direct-packed-cache-{phase}-key{key_bytes}-value64"),
+        entries,
+        stats,
+    );
+    black_box(&cache);
+}
+
+#[repr(C)]
+struct DirectPointerCacheValue64 {
+    value: [u8; 64],
+    metadata: AtomicU64,
+}
+
+fn print_direct_pointer_cache_prototype_mixed_value64(entries: usize) {
+    let region = Region::new(GLOBAL);
+    let index = LockFreeAtomicU64GenerationMap::try_from_entries_with_options(
+        std::iter::empty::<(Box<[u8]>, NonMaxU64)>(),
+        entries.max(1),
+        AtomicGenerationOverlay::AtomicAdaptive,
+        AtomicGenerationBaseFilter::EmbeddedFingerprint,
+    )
+    .unwrap();
+    for entry_index in 0..entries {
+        let key = mixed_binary_key(entry_index);
+        let weight = 64 + u64::try_from(key.len()).unwrap();
+        let entry = Box::new(DirectPointerCacheValue64 {
+            value: [u8::try_from(entry_index & 255).unwrap(); 64],
+            metadata: AtomicU64::new(weight | (u64::from(u32::MAX) << 32)),
+        });
+        let pointer = Box::into_raw(entry);
+        let encoded = NonMaxU64::new(pointer as usize as u64).unwrap();
+        assert_eq!(index.get_or_insert(&key, encoded), encoded);
+    }
+    let stats = region.change();
+    print_row(
+        "direct-pointer-cache-prototype-mixed-value64",
+        entries,
+        stats,
+    );
+    // This process-isolated memory probe intentionally leaves the prototype
+    // entries live. Production integration requires epoch retirement before
+    // direct pointers can replace the generational arena handles.
+    black_box(&index);
+}
+
+fn print_packed_cache_mixed_value64_churn(entries: usize) {
+    let region = Region::new(GLOBAL);
+    let cache = PackedCache::try_new(
+        CacheConfig::new(u64::MAX)
+            .with_max_entries(entries.saturating_mul(2).max(1))
+            .with_overlay_capacity(entries.max(1)),
+    )
+    .unwrap();
+    for index in 0..entries {
+        let key = mixed_binary_key(index);
+        cache
+            .insert_with_options(
+                &key,
+                [u8::try_from(index & 255).unwrap(); 64],
+                64 + u64::try_from(key.len()).unwrap(),
+                None,
+            )
+            .unwrap();
+    }
+    for index in 0..entries {
+        let key = mixed_binary_key(index);
+        cache
+            .insert_discard_with_options(
+                &key,
+                [u8::try_from((index + 1) & 255).unwrap(); 64],
+                64 + u64::try_from(key.len()).unwrap(),
+                None,
+            )
+            .unwrap();
+    }
+    let stats = region.change();
+    print_row("packed-cache-mixed-value64-churn", entries, stats);
+    black_box(&cache);
+}
+
+struct PapayaCacheValue64 {
+    value: [u8; 64],
+    weight: u64,
+    expires_at: u64,
+    last_access: AtomicU64,
+}
+
+fn print_papaya_cache_mixed_value64(entries: usize) {
+    let region = Region::new(GLOBAL);
+    let cache = PapayaHashMap::<
+        Box<[u8]>,
+        Arc<PapayaCacheValue64>,
+        DefaultHashBuilder,
+    >::with_capacity_and_hasher(entries, DefaultHashBuilder::default());
+    let guard = cache.pin();
+    for index in 0..entries {
+        guard.insert(
+            mixed_binary_key(index),
+            Arc::new(PapayaCacheValue64 {
+                value: [u8::try_from(index & 255).unwrap(); 64],
+                weight: 64 + u64::try_from(mixed_key_bytes(index)).unwrap(),
+                expires_at: u64::MAX,
+                last_access: AtomicU64::new(u64::try_from(index).unwrap()),
+            }),
+        );
+    }
+    let stats = region.change();
+    print_row("papaya-cache-mixed-value64", entries, stats);
+    let checksum = guard.iter().fold(0_u64, |sum, (_, value)| {
+        sum.wrapping_add(u64::from(value.value[0]))
+            .wrapping_add(value.weight)
+            .wrapping_add(value.expires_at)
+            .wrapping_add(value.last_access.load(std::sync::atomic::Ordering::Relaxed))
+    });
+    black_box((&cache, checksum));
+}
+
+struct PapayaCompactCacheValue64 {
+    value: [u8; 64],
+    weight: u32,
+    expires_at: AtomicU32,
+    accessed: AtomicBool,
+}
+
+fn print_papaya_cache_compact_mixed_value64(entries: usize) {
+    let region = Region::new(GLOBAL);
+    let cache = PapayaHashMap::<
+        Box<[u8]>,
+        Arc<PapayaCompactCacheValue64>,
+        DefaultHashBuilder,
+    >::with_capacity_and_hasher(entries, DefaultHashBuilder::default());
+    let guard = cache.pin();
+    for index in 0..entries {
+        guard.insert(
+            mixed_binary_key(index),
+            Arc::new(PapayaCompactCacheValue64 {
+                value: [u8::try_from(index & 255).unwrap(); 64],
+                weight: 64 + u32::try_from(mixed_key_bytes(index)).unwrap(),
+                expires_at: AtomicU32::new(u32::MAX),
+                accessed: AtomicBool::new(false),
+            }),
+        );
+    }
+    let stats = region.change();
+    print_row("papaya-cache-compact-mixed-value64", entries, stats);
+    let checksum = guard.iter().fold(0_u64, |sum, (_, value)| {
+        sum.wrapping_add(u64::from(value.value[0]))
+            .wrapping_add(u64::from(value.weight))
+            .wrapping_add(u64::from(
+                value.expires_at.load(std::sync::atomic::Ordering::Relaxed),
+            ))
+            .wrapping_add(u64::from(
+                value.accessed.load(std::sync::atomic::Ordering::Relaxed),
+            ))
+    });
+    black_box((&cache, checksum));
+}
+
+fn print_papaya_cache_inline_compact_mixed_value64(entries: usize) {
+    let region = Region::new(GLOBAL);
+    let cache = PapayaHashMap::<
+        Box<[u8]>,
+        PapayaCompactCacheValue64,
+        DefaultHashBuilder,
+    >::with_capacity_and_hasher(entries, DefaultHashBuilder::default());
+    let guard = cache.pin();
+    for index in 0..entries {
+        guard.insert(
+            mixed_binary_key(index),
+            PapayaCompactCacheValue64 {
+                value: [u8::try_from(index & 255).unwrap(); 64],
+                weight: 64 + u32::try_from(mixed_key_bytes(index)).unwrap(),
+                expires_at: AtomicU32::new(u32::MAX),
+                accessed: AtomicBool::new(false),
+            },
+        );
+    }
+    let stats = region.change();
+    print_row("papaya-cache-inline-compact-mixed-value64", entries, stats);
+    let checksum = guard.iter().fold(0_u64, |sum, (_, value)| {
+        sum.wrapping_add(u64::from(value.value[0]))
+            .wrapping_add(u64::from(value.weight))
+            .wrapping_add(u64::from(
+                value.expires_at.load(std::sync::atomic::Ordering::Relaxed),
+            ))
+            .wrapping_add(u64::from(
+                value.accessed.load(std::sync::atomic::Ordering::Relaxed),
+            ))
+    });
+    black_box((&cache, checksum));
 }
 
 fn print_lockfree_hybrid_binary(entries: usize) {
@@ -687,6 +1311,10 @@ fn print_lockfree_atomic_overlay(
     let stats = region.change();
     let strategy = match overlay {
         AtomicGenerationOverlay::AtomicFixed32 => "atomic32",
+        AtomicGenerationOverlay::AtomicUpTo8 => "atomic-up-to8",
+        AtomicGenerationOverlay::AtomicUpTo16 => "atomic-up-to16",
+        AtomicGenerationOverlay::AtomicAdaptive => "atomic-adaptive",
+        AtomicGenerationOverlay::AtomicUpTo32 => "atomic-up-to32",
         AtomicGenerationOverlay::CompactFixed32 | AtomicGenerationOverlay::CompactSized { .. } => {
             "inline-sized"
         }
@@ -695,6 +1323,67 @@ fn print_lockfree_atomic_overlay(
     };
     print_row(
         &format!("lockfree-atomic-overlay-{strategy}-binary{key_bytes}"),
+        entries,
+        stats,
+    );
+    black_box(&map);
+}
+
+fn print_lockfree_atomic_overlay_mixed(entries: usize, overlay: AtomicGenerationOverlay) {
+    let region = Region::new(GLOBAL);
+    let map = LockFreeAtomicU64GenerationMap::try_from_entries_with_overlay(
+        std::iter::empty::<([u8; 32], NonMaxU64)>(),
+        entries,
+        overlay,
+    )
+    .unwrap();
+    for index in 0..entries {
+        let value = u64::try_from(index).expect("entry index fits u64");
+        let key = sized_binary_key_array(value);
+        map.insert(
+            &key[..mixed_key_bytes(index)],
+            NonMaxU64::new(value).unwrap(),
+        );
+    }
+    let stats = region.change();
+    let strategy = match overlay {
+        AtomicGenerationOverlay::AtomicAdaptive => "atomic-adaptive",
+        AtomicGenerationOverlay::AtomicUpTo32 => "atomic-up-to32",
+        AtomicGenerationOverlay::Papaya => "boxed-papaya",
+        _ => unreachable!("mixed allocation probe has an explicit strategy set"),
+    };
+    print_row(
+        &format!("lockfree-atomic-overlay-{strategy}-mixed-binary"),
+        entries,
+        stats,
+    );
+    black_box(&map);
+}
+
+fn print_lockfree_atomic_overlay_mixed_churn(entries: usize) {
+    let region = Region::new(GLOBAL);
+    let map = LockFreeAtomicU64GenerationMap::try_from_entries_with_overlay(
+        std::iter::empty::<([u8; 32], NonMaxU64)>(),
+        entries.saturating_mul(2),
+        AtomicGenerationOverlay::AtomicAdaptive,
+    )
+    .unwrap();
+    for index in 0..entries {
+        let value = u64::try_from(index).expect("entry index fits u64");
+        map.insert(&mixed_binary_key(index), NonMaxU64::new(value).unwrap());
+    }
+    for index in 0..entries {
+        map.remove(&mixed_binary_key(index)).unwrap();
+        let replacement = index.saturating_add(entries);
+        let value = u64::try_from(replacement).expect("entry index fits u64");
+        map.insert(
+            &mixed_binary_key(replacement),
+            NonMaxU64::new(value).unwrap(),
+        );
+    }
+    let stats = region.change();
+    print_row(
+        "lockfree-atomic-overlay-atomic-adaptive-mixed-after-100pct-turnover",
         entries,
         stats,
     );
@@ -798,4 +1487,20 @@ fn sized_binary_key_array(index: u64) -> [u8; 128] {
         chunk.copy_from_slice(&state.to_le_bytes());
     }
     key
+}
+
+fn mixed_binary_key(index: usize) -> Box<[u8]> {
+    let value = u64::try_from(index).expect("entry index fits u64");
+    let key = sized_binary_key_array(value);
+    key[..mixed_key_bytes(index)].into()
+}
+
+fn mixed_key_bytes(index: usize) -> usize {
+    match index % 100 {
+        0..=39 => 8,
+        40..=64 => 16,
+        65..=79 => 24,
+        80..=89 => 32,
+        _ => 48,
+    }
 }

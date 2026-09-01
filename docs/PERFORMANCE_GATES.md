@@ -61,9 +61,17 @@ but do not satisfy dynamic insert/delete or portable-performance requirements.
 ## Correctness gates
 
 - Differential agreement with `HashMap` across mixed operations.
+- Full-cache differential agreement across insert, replace, insert-if-absent,
+  read, miss, delete, touch, immediate expiry, maintenance, entry count, and
+  caller-accounted weight.
+- Concurrent mixed-width writes during repeated adaptive maintenance must
+  preserve exact final values and accounting.
 - No false negatives from membership filters.
 - Exact behavior at configured capacity, including replacement at capacity.
 - Fallible allocation for service-controlled growth.
 - Miri and sanitizer-clean unsafe code once the owned core is introduced.
 - Loom models for concurrent publication and generation reclamation before
   lock-free readers are exposed.
+
+The executable cache proof protocol and current status are documented in
+[`CACHE_PROOF.md`](CACHE_PROOF.md).

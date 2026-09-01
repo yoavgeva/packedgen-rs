@@ -268,8 +268,9 @@ faster-than-SwissTable claim because insertion and hot-key results still lose. S
 ### 13. Exact prepared handles and batched hot operations
 
 Implicit shared and thread-local exact slot caches were both implemented and
-removed after losing hot-read throughput. Explicit 24-byte handles instead let
-the caller identify the hot 1% for 0.24 byte per total key. They retain exact
+removed after losing hot-read throughput. Explicit handles originally used 24
+bytes; the current packed form uses 16 bytes and lets the caller identify the
+hot 1% for 0.16 byte per total key. They retain exact
 key verification and safely fall back across wrong keys, maps, overlays,
 deletes, and rebuilds.
 
@@ -314,6 +315,37 @@ Decision: reject a new general SIMD key-equality feature and remove the scalar
 replacement. Keep native equality, the existing successful SIMD tag scans,
 SWAR atomic controls, and hardware-accelerated hashing. Re-run the standalone
 probe on AVX2/AVX-512 machines before making an architecture-specific decision.
+
+### 15. Native adaptive cache sample and fair Papaya boundary
+
+The adaptive startup sample is no longer a permanent Papaya pocket. It uses
+the same native append-only stable-cell representation as arbitrary-length
+residual keys, remains physically sampleable after class publication, and can
+return exact 16-byte prepared read handles. Prepared-disabled realistic mixes
+improved 7.9% at one thread and 5.8% at eight; lazy completion of the separate
+frozen digest lane added another 4.3% at the measured 8-thread median.
+
+The direct cache now reuses an `AtomicVacantEntry` route/absence proof for new
+admission and uses an adaptive guard-local read certificate for delete misses.
+Interim pin-after-hit and long-lived-arena-pin variants were rejected because
+they regressed successful deletion. Current requested memory is 105.471
+B/entry and 1,009,401 allocation calls versus inline Papaya's 133.693 and
+2,000,006 for one million mixed keys and 64-byte values.
+
+A seven-sample alternating 200K-entry/8-thread matrix measured Direct/Papaya at
+422.762/466.979 Mops/s for read miss, 44.518/63.141 for insert, 22.696/24.261
+for delete hit, 465.610/465.016 for delete miss, 187.662/126.774 for prepared
+hot read, 13.724/10.255 for prepared hot replacement, and 146.559/173.761 for
+prepared hot touch. The corrected 95%-read trace was 170.718/130.871 at eight
+threads and 23.077/18.707 at one, with identical final population. Higher is
+better. Several eight-thread p05 values were unstable, so Linux pinning remains
+the release gate.
+
+Decision: keep the native sample, lazy frozen digest, carried vacancy, adaptive
+delete, and bounded miss fixture. The cache is now a strong density/read-heavy
+candidate, not a universal primitive winner: new-key insertion is still 29.5%
+behind Papaya, ordinary misses 9.5% behind, and touch lost 15.7% in this paired
+run.
 
 ## Honest current conclusion
 

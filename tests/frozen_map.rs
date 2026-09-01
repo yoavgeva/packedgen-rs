@@ -34,7 +34,27 @@ fn exact_hits_and_unknown_keys_are_distinguished() {
     let stats = map.stats();
     assert_eq!(stats.len, 1_000);
     assert_eq!(stats.arena_key_bytes, 32_000);
+    #[cfg(not(feature = "miss-optimized-frozen"))]
+    assert_eq!(stats.slot_bytes, 16_000);
+    #[cfg(feature = "miss-optimized-frozen")]
+    assert_eq!(stats.slot_bytes, 14_000);
     assert!(stats.index_bits_per_entry > 0.0);
+}
+
+#[test]
+fn arbitrary_misses_never_reach_an_unmapped_ptrhash_tail() {
+    for len in 9..256_u64 {
+        let entries: Vec<(Vec<u8>, u64)> =
+            (0..len).map(|index| (binary_key(index), index)).collect();
+        let map = FrozenPackedMap::try_from_entries(
+            entries.iter().map(|(key, value)| (key.as_slice(), *value)),
+        )
+        .unwrap();
+
+        for index in 1_000..20_000_u64 {
+            assert_eq!(map.get(&binary_key(index)), None);
+        }
+    }
 }
 
 #[test]
@@ -46,6 +66,19 @@ fn empty_and_binary_keys_round_trip() {
     assert_eq!(map.get(b""), Some(&1));
     assert_eq!(map.get(&[0, 255, 128, 1]), Some(&2));
     assert_eq!(map.get(b"absent"), None);
+}
+
+#[test]
+fn empty_key_after_a_full_arena_segment_round_trips() {
+    let full_segment = vec![0x5a; 1 << 16];
+    let map = FrozenPackedMap::try_from_entries([
+        (full_segment.as_slice(), 1_u64),
+        (b"".as_slice(), 2_u64),
+    ])
+    .unwrap();
+
+    assert_eq!(map.get(&full_segment), Some(&1));
+    assert_eq!(map.get(b""), Some(&2));
 }
 
 #[test]
@@ -85,6 +118,37 @@ fn batched_lookup_preserves_order_and_exact_miss_semantics() {
         results.map(Option::<&u64>::copied),
         [Some(19), None, Some(0), Some(31)]
     );
+}
+
+#[test]
+fn thirty_two_key_batch_preserves_duplicates_hits_and_misses() {
+    let entries: Vec<(Vec<u8>, u64)> = (0..64_u64)
+        .map(|index| (binary_key(index), index))
+        .collect();
+    let map = FrozenPackedMap::try_from_entries(
+        entries.iter().map(|(key, value)| (key.as_slice(), *value)),
+    )
+    .unwrap();
+    let queries: Vec<Vec<u8>> = (0..32_u64)
+        .map(|position| {
+            if position % 3 == 0 {
+                binary_key(1_000 + position)
+            } else {
+                binary_key(position % 11)
+            }
+        })
+        .collect();
+    let query_refs: [&[u8]; 32] = core::array::from_fn(|position| queries[position].as_slice());
+
+    let results = map.get_many(query_refs);
+
+    for (position, result) in results.into_iter().enumerate() {
+        if position % 3 == 0 {
+            assert_eq!(result, None);
+        } else {
+            assert_eq!(result, Some(&((position as u64) % 11)));
+        }
+    }
 }
 
 #[test]

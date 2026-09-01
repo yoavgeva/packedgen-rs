@@ -1,12 +1,12 @@
-# opthash
+# packedgen-opthash
 
-[![Crates.io](https://img.shields.io/crates/v/opthash?logo=rust&label=crates.io)](https://crates.io/crates/opthash)
-[![PyPI](https://img.shields.io/pypi/v/opthash?logo=pypi&logoColor=white&label=pypi)](https://pypi.org/project/opthash/)
-[![MSRV](https://img.shields.io/crates/msrv/opthash?logo=rust)](https://crates.io/crates/opthash)
-[![Python](https://img.shields.io/pypi/pyversions/opthash?logo=python&logoColor=white)](https://pypi.org/project/opthash/)
-[![CI](https://github.com/aaron-ang/opthash-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/aaron-ang/opthash-rs/actions/workflows/ci.yml)
-[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://codspeed.io/aaron-ang/opthash-rs?utm_source=badge)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+This is PackedGen's maintained companion fork of Aaron Ang's Apache-2.0
+[`opthash`](https://github.com/aaron-ang/opthash-rs). The crates.io package is
+named `packedgen-opthash`; its Rust library name remains `opthash` so downstream
+code can use the established module path. PackedGen owns the additional epoch,
+reserve, prehashed-location, and fallible-build APIs used by its retained
+Elastic Hashing research backends instead of claiming compatibility with the
+upstream `opthash 0.10.3` release.
 
 Rust hash maps and sets implementing the finite Elastic Hashing and Funnel
 Hashing placement algorithms from _Optimal Bounds for Open Addressing Without
@@ -78,7 +78,7 @@ Elastic's membership filter uses a separate SplitMix64-derived mix.[^splitmix64]
 ## Rust usage
 
 ```bash
-cargo add opthash
+cargo add packedgen-opthash --rename opthash
 ```
 
 ```rust

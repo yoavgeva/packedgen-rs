@@ -231,10 +231,31 @@ forward_args=("$@")
 if [[ "${#forward_args[@]}" -gt 0 && "${forward_args[0]}" == "--" ]]; then
 	forward_args=("${forward_args[@]:1}")
 fi
-echo "info: forwarding args: ${forward_args[*]}" >&2
+if [[ "${#forward_args[@]}" -gt 0 ]]; then
+	echo "info: forwarding args: ${forward_args[*]}" >&2
+else
+	echo "info: forwarding args:" >&2
+fi
 
 for target in "${bench_targets[@]}"; do
-	cmd=("${numa_wrapper[@]}" "${pin_wrapper[@]}" env "${criterion_env_args[@]}"
-		cargo bench --bench "$target" -- "${criterion_args[@]}" "${forward_args[@]}")
-	"${launcher[@]}" "${cmd[@]}"
+	cmd=()
+	if [[ "${#numa_wrapper[@]}" -gt 0 ]]; then
+		cmd+=("${numa_wrapper[@]}")
+	fi
+	if [[ "${#pin_wrapper[@]}" -gt 0 ]]; then
+		cmd+=("${pin_wrapper[@]}")
+	fi
+	cmd+=(env)
+	if [[ "${#criterion_env_args[@]}" -gt 0 ]]; then
+		cmd+=("${criterion_env_args[@]}")
+	fi
+	cmd+=(cargo bench --bench "$target" -- "${criterion_args[@]}")
+	if [[ "${#forward_args[@]}" -gt 0 ]]; then
+		cmd+=("${forward_args[@]}")
+	fi
+	if [[ "${#launcher[@]}" -gt 0 ]]; then
+		"${launcher[@]}" "${cmd[@]}"
+	else
+		"${cmd[@]}"
+	fi
 done

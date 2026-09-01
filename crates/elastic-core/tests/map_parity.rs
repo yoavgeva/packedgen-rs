@@ -1103,11 +1103,15 @@ macro_rules! clone_alloc_suite {
                 }
             }
 
+            // SAFETY: every allocation operation is delegated unchanged to `Global`; the
+            // wrapper only owns independent test bookkeeping state.
             unsafe impl Allocator for MyAlloc {
                 fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
                     Global.allocate(layout)
                 }
                 unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+                    // SAFETY: the caller upholds `Allocator::deallocate`'s contract, and every
+                    // pointer returned by this allocator was allocated by `Global`.
                     unsafe { Global.deallocate(ptr, layout) };
                 }
             }

@@ -148,6 +148,17 @@ fn measure(
                         Workload::UpdateHot => {
                             map.update(&keys[0], increment).unwrap();
                         }
+                        Workload::UpsertHit => {
+                            let key = &keys[mix(operation as u64) as usize % keys.len()];
+                            black_box(map.upsert(key, value(operation as u64), increment));
+                        }
+                        Workload::UpsertMiss => {
+                            black_box(map.upsert(
+                                &misses[operation],
+                                value(operation as u64),
+                                increment,
+                            ));
+                        }
                         Workload::DeleteHit => {
                             black_box(map.remove(&keys[operation]).unwrap());
                         }
@@ -199,12 +210,14 @@ enum Workload {
     UpdateHit,
     UpdateMiss,
     UpdateHot,
+    UpsertHit,
+    UpsertMiss,
     DeleteHit,
     DeleteMiss,
 }
 
 impl Workload {
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 15] = [
         Self::ReadHit,
         Self::ReadMiss,
         Self::Read95Hit,
@@ -216,6 +229,8 @@ impl Workload {
         Self::UpdateHit,
         Self::UpdateMiss,
         Self::UpdateHot,
+        Self::UpsertHit,
+        Self::UpsertMiss,
         Self::DeleteHit,
         Self::DeleteMiss,
     ];
@@ -245,6 +260,8 @@ impl Workload {
             Self::UpdateHit => "update_hit",
             Self::UpdateMiss => "update_miss",
             Self::UpdateHot => "update_hot_key",
+            Self::UpsertHit => "upsert_hit",
+            Self::UpsertMiss => "upsert_miss",
             Self::DeleteHit => "delete_hit",
             Self::DeleteMiss => "delete_miss",
         }

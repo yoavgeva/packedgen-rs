@@ -1,23 +1,23 @@
 [package]
-name = "opthash"
-version = "0.10.3"
+name = "packedgen-opthash"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Rust implementations of Elastic Hashing and Funnel Hashing"
+description = "PackedGen's maintained Elastic Hashing and Funnel Hashing implementation"
 readme = "README.md"
-repository = "https://github.com/aaron-ang/opthash-rs"
+repository = "https://github.com/yoavgeva/packedgen-rs"
 license = "Apache-2.0"
 keywords = ["hashmap", "open_addressing", "elastic_hashing", "funnel_hashing", "no_std"]
 categories = ["algorithms", "data-structures", "no-std"]
 exclude = [
     "/.github/",
     "/.vscode/",
-    "/benches/",
+    "/benches/python/",
     "/ci/",
     "/opthash/",
     "/paper/",
     "/scripts/",
-    "/tests/",
+    "/tests/python/",
     "/.gitattributes",
     "/.gitignore",
     "/.pre-commit-config.yaml",
@@ -28,6 +28,7 @@ exclude = [
 ]
 
 [lib]
+name = "opthash"
 crate-type = ["cdylib", "rlib"]
 
 [package.metadata.docs.rs]
@@ -57,12 +58,13 @@ criterion = { version = "4", package = "codspeed-criterion-compat", default-feat
 hashbrown = "0.17"
 
 [lints.rust]
-unsafe_op_in_unsafe_fn = "warn"
+unsafe_op_in_unsafe_fn = "deny"
 elided_lifetimes_in_paths = "warn"
 unused_extern_crates = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(codspeed)'] }
 
 [lints.clippy]
+undocumented_unsafe_blocks = "deny"
 borrow_as_ptr = "warn"
 ptr_as_ptr = "warn"
 ptr_cast_constness = "warn"

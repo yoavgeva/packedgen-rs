@@ -1,4 +1,5 @@
 use std::fmt;
+use std::hint::spin_loop;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::frozen_map::{Digest, key_digest};
@@ -16,6 +17,14 @@ static NEXT_PREPARED_BASE_ID: AtomicU64 = AtomicU64::new(1);
 pub(crate) enum DirectMutation<T> {
     NotMember,
     Handled(T),
+}
+
+pub(crate) enum AtomicFrozenProbe {
+    NotMember,
+    Member {
+        slot: usize,
+        value: Option<NonMaxU64>,
+    },
 }
 
 /// A `u64` value that can be stored directly in an atomic generation cell.
@@ -77,8 +86,7 @@ pub(crate) struct AtomicU64Cell {
 }
 
 pub(crate) struct AtomicU64FrozenMap {
-    keys: FrozenPackedMap<()>,
-    values: Box<[AtomicU64]>,
+    entries: FrozenPackedMap<AtomicU64>,
     #[cfg(feature = "prepared-keys")]
     base_id: u64,
 }
@@ -119,8 +127,7 @@ impl AtomicU64FrozenMap {
         I: IntoIterator<Item = (K, NonMaxU64)>,
         K: AsRef<[u8]>,
     {
-        let staged = entries.into_iter().collect::<Vec<_>>();
-        Self::try_from_staged(&staged, policy, index_backend, key_digest)
+        Self::try_from_entries_with_digest(entries, policy, index_backend, key_digest)
     }
 
     pub(crate) fn try_from_entries_with_policy_index_and_hash<I, K>(
@@ -133,52 +140,44 @@ impl AtomicU64FrozenMap {
         I: IntoIterator<Item = (K, NonMaxU64)>,
         K: AsRef<[u8]>,
     {
-        let staged = entries.into_iter().collect::<Vec<_>>();
-        Self::try_from_staged(&staged, policy, index_backend, |key| {
+        Self::try_from_entries_with_digest(entries, policy, index_backend, |key| {
             GenerationKeyHash::new(hash_builder, key)
                 .frozen()
                 .unwrap_or_else(|| key_digest(key))
         })
     }
 
-    fn try_from_staged<K>(
-        staged: &[(K, NonMaxU64)],
+    fn try_from_entries_with_digest<I, K>(
+        entries: I,
         policy: AtomicGenerationBaseFilter,
         index_backend: FrozenIndexBackend,
         mut digest: impl FnMut(&[u8]) -> Digest,
     ) -> Result<Self, FrozenBuildError>
     where
+        I: IntoIterator<Item = (K, NonMaxU64)>,
         K: AsRef<[u8]>,
     {
-        let key_entries = || staged.iter().map(|(key, _)| (key.as_ref(), ()));
-        let keys = match policy {
+        let atomic_entries = entries
+            .into_iter()
+            .map(|(key, value)| (key, AtomicU64::new(value.get())));
+        let entries = match policy {
             AtomicGenerationBaseFilter::EmbeddedFingerprint => {
                 FrozenPackedMap::try_from_entries_with_embedded_key_tag_index_and_digest(
-                    key_entries(),
+                    atomic_entries,
                     index_backend,
                     &mut digest,
                 )?
             }
             AtomicGenerationBaseFilter::Disabled | AtomicGenerationBaseFilter::OneBytePerEntry => {
                 FrozenPackedMap::try_from_entries_with_index_backend_and_digest(
-                    key_entries(),
+                    atomic_entries,
                     index_backend,
                     &mut digest,
                 )?
             }
         };
-        let mut values = (0..staged.len())
-            .map(|_| AtomicU64::new(DELETED))
-            .collect::<Vec<_>>();
-        for (key, value) in staged {
-            let (slot, ()) = keys
-                .get_indexed_with_digest(key.as_ref(), digest(key.as_ref()))
-                .expect("every staged atomic key must resolve after construction");
-            values[slot] = AtomicU64::new(value.get());
-        }
         Ok(Self {
-            keys,
-            values: values.into_boxed_slice(),
+            entries,
             #[cfg(feature = "prepared-keys")]
             base_id: NEXT_PREPARED_BASE_ID.fetch_add(1, Ordering::Relaxed),
         })
@@ -200,15 +199,24 @@ impl AtomicU64FrozenMap {
     ) -> R {
         let value = self
             .slot_hashed(key, digest)
-            .and_then(|slot| NonMaxU64::new(self.values[slot].load(Ordering::Acquire)));
+            .and_then(|slot| NonMaxU64::new(self.value(slot).load(Ordering::Acquire)));
         read(value.as_ref())
+    }
+
+    pub(crate) fn get_hashed_protected(
+        &self,
+        key: &[u8],
+        digest: Option<Digest>,
+    ) -> Option<NonMaxU64> {
+        let slot = self.slot_hashed(key, digest)?;
+        NonMaxU64::new(self.value(slot).load(Ordering::SeqCst))
     }
 
     #[cfg(feature = "prepared-keys")]
     pub(crate) fn prepare_slot(&self, key: &[u8], digest: Digest) -> Option<AtomicPreparedSlot> {
-        self.keys
+        self.entries
             .get_indexed_with_digest(key, digest)
-            .map(|(slot, ())| AtomicPreparedSlot {
+            .map(|(slot, _)| AtomicPreparedSlot {
                 base_id: self.base_id,
                 slot,
             })
@@ -221,10 +229,10 @@ impl AtomicU64FrozenMap {
         prepared: AtomicPreparedSlot,
         read: impl FnOnce(Option<&NonMaxU64>) -> R,
     ) -> DirectMutation<R> {
-        if prepared.base_id != self.base_id || !self.keys.slot_matches(prepared.slot, key) {
+        if prepared.base_id != self.base_id || !self.entries.slot_matches(prepared.slot, key) {
             return DirectMutation::NotMember;
         }
-        let value = NonMaxU64::new(self.values[prepared.slot].load(Ordering::Acquire));
+        let value = NonMaxU64::new(self.value(prepared.slot).load(Ordering::Acquire));
         DirectMutation::Handled(read(value.as_ref()))
     }
 
@@ -235,10 +243,23 @@ impl AtomicU64FrozenMap {
         prepared: AtomicPreparedSlot,
         update: &impl Fn(&NonMaxU64) -> NonMaxU64,
     ) -> DirectMutation<Option<NonMaxU64>> {
-        if prepared.base_id != self.base_id || !self.keys.slot_matches(prepared.slot, key) {
+        if prepared.base_id != self.base_id || !self.entries.slot_matches(prepared.slot, key) {
             return DirectMutation::NotMember;
         }
-        DirectMutation::Handled(update_atomic(&self.values[prepared.slot], update))
+        DirectMutation::Handled(update_atomic(self.value(prepared.slot), update))
+    }
+
+    #[cfg(feature = "prepared-keys")]
+    pub(crate) fn replace_prepared(
+        &self,
+        key: &[u8],
+        prepared: AtomicPreparedSlot,
+        value: NonMaxU64,
+    ) -> DirectMutation<Option<NonMaxU64>> {
+        if prepared.base_id != self.base_id || !self.entries.slot_matches(prepared.slot, key) {
+            return DirectMutation::NotMember;
+        }
+        DirectMutation::Handled(replace_existing_atomic(self.value(prepared.slot), value))
     }
 
     #[cfg(feature = "prepared-keys")]
@@ -248,10 +269,12 @@ impl AtomicU64FrozenMap {
         prepared: AtomicPreparedSlot,
         value: NonMaxU64,
     ) -> DirectMutation<InsertOutcome<NonMaxU64>> {
-        if prepared.base_id != self.base_id || !self.keys.slot_matches(prepared.slot, key) {
+        if prepared.base_id != self.base_id || !self.entries.slot_matches(prepared.slot, key) {
             return DirectMutation::NotMember;
         }
-        let previous = self.values[prepared.slot].swap(value.get(), Ordering::AcqRel);
+        let previous = self
+            .value(prepared.slot)
+            .swap(value.get(), Ordering::AcqRel);
         DirectMutation::Handled(
             NonMaxU64::new(previous).map_or(InsertOutcome::Inserted, InsertOutcome::Replaced),
         )
@@ -263,11 +286,11 @@ impl AtomicU64FrozenMap {
         key: &[u8],
         prepared: AtomicPreparedSlot,
     ) -> DirectMutation<Option<NonMaxU64>> {
-        if prepared.base_id != self.base_id || !self.keys.slot_matches(prepared.slot, key) {
+        if prepared.base_id != self.base_id || !self.entries.slot_matches(prepared.slot, key) {
             return DirectMutation::NotMember;
         }
         DirectMutation::Handled(NonMaxU64::new(
-            self.values[prepared.slot].swap(DELETED, Ordering::AcqRel),
+            self.value(prepared.slot).swap(DELETED, Ordering::AcqRel),
         ))
     }
 
@@ -278,7 +301,7 @@ impl AtomicU64FrozenMap {
         value: NonMaxU64,
     ) -> Option<InsertOutcome<NonMaxU64>> {
         let slot = self.slot_hashed(key, digest)?;
-        let previous = self.values[slot].swap(value.get(), Ordering::AcqRel);
+        let previous = self.value(slot).swap(value.get(), Ordering::AcqRel);
         Some(NonMaxU64::new(previous).map_or(InsertOutcome::Inserted, InsertOutcome::Replaced))
     }
 
@@ -290,10 +313,45 @@ impl AtomicU64FrozenMap {
     ) -> Option<bool> {
         let slot = self.slot_hashed(key, digest)?;
         Some(
-            self.values[slot]
+            self.value(slot)
                 .compare_exchange(DELETED, value.get(), Ordering::AcqRel, Ordering::Acquire)
                 .is_ok(),
         )
+    }
+
+    pub(crate) fn get_or_insert_hashed(
+        &self,
+        key: &[u8],
+        digest: Option<Digest>,
+        value: NonMaxU64,
+    ) -> Option<(NonMaxU64, bool)> {
+        let slot = self.slot_hashed(key, digest)?;
+        Some(self.get_or_insert_slot(slot, value))
+    }
+
+    pub(crate) fn probe_hashed(&self, key: &[u8], digest: Option<Digest>) -> AtomicFrozenProbe {
+        let Some(slot) = self.slot_hashed(key, digest) else {
+            return AtomicFrozenProbe::NotMember;
+        };
+        AtomicFrozenProbe::Member {
+            slot,
+            value: NonMaxU64::new(self.value(slot).load(Ordering::Acquire)),
+        }
+    }
+
+    pub(crate) fn insert_slot(&self, slot: usize, value: NonMaxU64) -> InsertOutcome<NonMaxU64> {
+        let previous = self.value(slot).swap(value.get(), Ordering::AcqRel);
+        NonMaxU64::new(previous).map_or(InsertOutcome::Inserted, InsertOutcome::Replaced)
+    }
+
+    pub(crate) fn insert_new_slot(&self, slot: usize, value: NonMaxU64) -> bool {
+        self.value(slot)
+            .compare_exchange(DELETED, value.get(), Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn get_or_insert_slot(&self, slot: usize, value: NonMaxU64) -> (NonMaxU64, bool) {
+        get_or_insert_atomic(self.value(slot), value)
     }
 
     pub(crate) fn update_hashed(
@@ -305,7 +363,7 @@ impl AtomicU64FrozenMap {
         let Some(slot) = self.slot_hashed(key, digest) else {
             return DirectMutation::NotMember;
         };
-        DirectMutation::Handled(update_atomic(&self.values[slot], update))
+        DirectMutation::Handled(update_atomic(self.value(slot), update))
     }
 
     pub(crate) fn upsert_hashed(
@@ -316,7 +374,7 @@ impl AtomicU64FrozenMap {
         update: &impl Fn(&NonMaxU64) -> NonMaxU64,
     ) -> Option<(NonMaxU64, bool)> {
         let slot = self.slot_hashed(key, digest)?;
-        Some(upsert_atomic(&self.values[slot], insert_value, update))
+        Some(upsert_atomic(self.value(slot), insert_value, update))
     }
 
     pub(crate) fn remove_if_hashed(
@@ -328,36 +386,77 @@ impl AtomicU64FrozenMap {
         let Some(slot) = self.slot_hashed(key, digest) else {
             return DirectMutation::NotMember;
         };
-        DirectMutation::Handled(remove_atomic(&self.values[slot], predicate))
+        DirectMutation::Handled(remove_atomic(self.value(slot), predicate))
+    }
+
+    pub(crate) fn remove_hashed(
+        &self,
+        key: &[u8],
+        digest: Option<Digest>,
+    ) -> DirectMutation<Option<NonMaxU64>> {
+        let Some(slot) = self.slot_hashed(key, digest) else {
+            return DirectMutation::NotMember;
+        };
+        DirectMutation::Handled(NonMaxU64::new(
+            self.value(slot).swap(DELETED, Ordering::AcqRel),
+        ))
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.values.len()
+        self.entries.len()
     }
 
     pub(crate) fn for_each_entry(&self, visit: &mut dyn FnMut(&[u8], &NonMaxU64)) {
-        self.keys.for_each_indexed_entry(|slot, key, ()| {
-            if let Some(value) = NonMaxU64::new(self.values[slot].load(Ordering::Acquire)) {
+        self.entries.for_each_entry(|key, atomic| {
+            if let Some(value) = NonMaxU64::new(atomic.load(Ordering::Acquire)) {
                 visit(key, &value);
             }
         });
     }
 
+    pub(crate) fn sample_entry(
+        &self,
+        seed: u64,
+        visit: &mut dyn FnMut(&[u8], &NonMaxU64) -> bool,
+    ) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+        let start = usize::try_from(seed % self.entries.len() as u64)
+            .expect("frozen sample slot fits usize");
+        for attempt in 0..8 {
+            let slot = (start + attempt) % self.entries.len();
+            let (key, atomic) = self
+                .entries
+                .indexed_entry(slot)
+                .expect("sample slot is below frozen length");
+            let Some(value) = NonMaxU64::new(atomic.load(Ordering::Acquire)) else {
+                continue;
+            };
+            if visit(key, &value) {
+                return true;
+            }
+        }
+        false
+    }
+
     pub(crate) fn stats(&self) -> FrozenMapStats {
-        let mut stats = self.keys.stats();
-        stats.slot_bytes = stats
-            .slot_bytes
-            .saturating_add(size_of_val(self.values.as_ref()));
-        stats
+        self.entries.stats()
     }
 
     fn slot_hashed(&self, key: &[u8], digest: Option<Digest>) -> Option<usize> {
         digest
             .map_or_else(
-                || self.keys.get_indexed(key),
-                |digest| self.keys.get_indexed_with_digest(key, digest),
+                || self.entries.get_indexed(key),
+                |digest| self.entries.get_indexed_with_digest(key, digest),
             )
-            .map(|(slot, ())| slot)
+            .map(|(slot, _)| slot)
+    }
+
+    fn value(&self, slot: usize) -> &AtomicU64 {
+        self.entries
+            .indexed_value(slot)
+            .expect("atomic frozen slot is in bounds")
     }
 }
 
@@ -415,18 +514,74 @@ impl GenerationCell<NonMaxU64> for AtomicU64Cell {
     }
 }
 
+impl AtomicU64Cell {
+    pub(crate) fn get_protected(&self) -> Option<NonMaxU64> {
+        NonMaxU64::new(self.value.load(Ordering::SeqCst))
+    }
+
+    pub(crate) fn get_or_insert(&self, value: NonMaxU64) -> (NonMaxU64, bool) {
+        get_or_insert_atomic(&self.value, value)
+    }
+
+    pub(crate) fn remove(&self) -> Option<NonMaxU64> {
+        NonMaxU64::new(self.value.swap(DELETED, Ordering::AcqRel))
+    }
+}
+
+fn get_or_insert_atomic(value: &AtomicU64, insert_value: NonMaxU64) -> (NonMaxU64, bool) {
+    match value.compare_exchange(
+        DELETED,
+        insert_value.get(),
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => (insert_value, true),
+        Err(current) => (
+            NonMaxU64::new(current).expect("deleted compare-exchange observed a live value"),
+            false,
+        ),
+    }
+}
+
+#[cfg(feature = "prepared-keys")]
+fn replace_existing_atomic(value: &AtomicU64, replacement: NonMaxU64) -> Option<NonMaxU64> {
+    let mut current = value.load(Ordering::Acquire);
+    loop {
+        let previous = NonMaxU64::new(current)?;
+        match value.compare_exchange_weak(
+            current,
+            replacement.get(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(previous),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 fn update_atomic(
     value: &AtomicU64,
     update: &impl Fn(&NonMaxU64) -> NonMaxU64,
 ) -> Option<NonMaxU64> {
     let mut current = value.load(Ordering::Acquire);
+    let mut backoff = 1;
     loop {
         let current_value = NonMaxU64::new(current)?;
         let next = update(&current_value);
         match value.compare_exchange_weak(current, next.get(), Ordering::AcqRel, Ordering::Acquire)
         {
             Ok(_) => return Some(next),
-            Err(observed) => current = observed,
+            Err(observed) => {
+                current = observed;
+                // Let the current cache-line owner complete under contention.
+                // The cap preserves distributed-update throughput while
+                // preventing a hot key from becoming an unbounded CAS storm.
+                for _ in 0..backoff {
+                    spin_loop();
+                }
+                backoff = (backoff * 2).min(8);
+            }
         }
     }
 }

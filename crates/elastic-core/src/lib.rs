@@ -6,6 +6,7 @@
 //! Disable them for a `core`-only build where callers supply their own hasher.
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(feature = "nightly", feature(allocator_api))]
+#![deny(unsafe_code)]
 // Library-API lints, scoped here rather than in `Cargo.toml [lints]` so they
 // govern only the library and not benches/tests/build-script.
 #![warn(missing_docs)]

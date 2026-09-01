@@ -4,6 +4,7 @@
     missing_docs,
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
+    clippy::too_many_arguments,
     clippy::too_many_lines,
     clippy::trivially_copy_pass_by_ref
 )]
@@ -14,12 +15,14 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use hashbrown::DefaultHashBuilder;
 use packedgen::{AtomicPreparedKey, LockFreeAtomicU64GenerationMap, NonMaxU64};
+use papaya::HashMap as PapayaHashMap;
 
 const BATCH_SIZES: [usize; 8] = [2, 4, 8, 16, 32, 64, 128, 256];
 const ACCESS_PATTERN: usize = 65_536;
 
 type Atomic = LockFreeAtomicU64GenerationMap;
 type Dash = DashMap<[u8; 32], u64, DefaultHashBuilder>;
+type Papaya = PapayaHashMap<Box<[u8]>, u64, DefaultHashBuilder>;
 
 fn main() {
     let mut arguments = std::env::args().skip(1);
@@ -40,9 +43,13 @@ fn main() {
     )
     .unwrap();
     let dash = Dash::with_capacity_and_hasher(entries, DefaultHashBuilder::default());
+    let papaya = Papaya::with_capacity_and_hasher(entries, DefaultHashBuilder::default());
+    let papaya_guard = papaya.guard();
     for (index, key) in keys.iter().enumerate() {
         dash.insert(*key, index as u64);
+        papaya.insert(key.as_slice().into(), index as u64, &papaya_guard);
     }
+    drop(papaya_guard);
 
     let handles = keys[..hot_entries]
         .iter()
@@ -71,6 +78,7 @@ fn main() {
                 operation,
                 &atomic,
                 &dash,
+                &papaya,
                 &access_keys,
                 &access_handles,
                 operations,
@@ -86,15 +94,16 @@ fn main() {
         operations,
     );
     let dash_ns = ns_per_operation(median(&measurements[Strategy::Dash.index()]), operations);
+    let papaya_ns = ns_per_operation(median(&measurements[Strategy::Papaya.index()]), operations);
 
     println!(
-        "operation,strategy,batch_size,entries,hot_entries,operations,samples,median_ns,ns_per_operation,throughput_mops,vs_scalar_prepared_pct,vs_dash_pct"
+        "operation,strategy,batch_size,entries,hot_entries,operations,samples,median_ns,ns_per_operation,throughput_mops,vs_scalar_prepared_pct,vs_dash_pct,vs_papaya_pct"
     );
     for (strategy, samples) in strategies.into_iter().zip(measurements) {
         let duration = median(&samples);
         let ns = ns_per_operation(duration, operations);
         println!(
-            "{},{},{},{entries},{hot_entries},{operations},{},{},{ns:.3},{:.3},{:.3},{:.3}",
+            "{},{},{},{entries},{hot_entries},{operations},{},{},{ns:.3},{:.3},{:.3},{:.3},{:.3}",
             operation.name(),
             strategy.name(),
             strategy.batch_size(),
@@ -103,6 +112,7 @@ fn main() {
             1_000.0 / ns,
             (scalar_ns / ns - 1.0) * 100.0,
             (dash_ns / ns - 1.0) * 100.0,
+            (papaya_ns / ns - 1.0) * 100.0,
         );
     }
 }
@@ -111,6 +121,7 @@ fn main() {
 enum Operation {
     Read,
     Update,
+    Replace,
     Insert,
 }
 
@@ -119,8 +130,11 @@ impl Operation {
         match value {
             None | Some("read") => Self::Read,
             Some("update") => Self::Update,
+            Some("replace") => Self::Replace,
             Some("insert") => Self::Insert,
-            Some(value) => panic!("operation must be read, update, or insert, got {value}"),
+            Some(value) => {
+                panic!("operation must be read, update, replace, or insert, got {value}")
+            }
         }
     }
 
@@ -128,6 +142,7 @@ impl Operation {
         match self {
             Self::Read => "read",
             Self::Update => "update",
+            Self::Replace => "replace",
             Self::Insert => "insert",
         }
     }
@@ -139,10 +154,11 @@ enum Strategy {
     Prepared,
     Batch(usize),
     Dash,
+    Papaya,
 }
 
 impl Strategy {
-    const fn all() -> [Self; 11] {
+    const fn all() -> [Self; 12] {
         [
             Self::Normal,
             Self::Prepared,
@@ -155,6 +171,7 @@ impl Strategy {
             Self::Batch(BATCH_SIZES[6]),
             Self::Batch(BATCH_SIZES[7]),
             Self::Dash,
+            Self::Papaya,
         ]
     }
 
@@ -170,6 +187,7 @@ impl Strategy {
                 index + 2
             }
             Self::Dash => 10,
+            Self::Papaya => 11,
         }
     }
 
@@ -179,13 +197,14 @@ impl Strategy {
             Self::Prepared => "atomic-prepared-scalar",
             Self::Batch(_) => "atomic-prepared-batch",
             Self::Dash => "dashmap",
+            Self::Papaya => "papaya-0.2.4-direct",
         }
     }
 
     const fn batch_size(self) -> usize {
         match self {
             Self::Batch(size) => size,
-            Self::Normal | Self::Prepared | Self::Dash => 1,
+            Self::Normal | Self::Prepared | Self::Dash | Self::Papaya => 1,
         }
     }
 }
@@ -195,12 +214,14 @@ fn measure(
     operation_kind: Operation,
     atomic: &Atomic,
     dash: &Dash,
+    papaya: &Papaya,
     access_keys: &[&[u8]],
     access_handles: &[AtomicPreparedKey],
     operations: usize,
 ) -> Duration {
     let mut values = [None; BATCH_SIZES[BATCH_SIZES.len() - 1]];
     let mut inserted = [non_max(0); BATCH_SIZES[BATCH_SIZES.len() - 1]];
+    let papaya_guard = papaya.guard();
     let started = Instant::now();
     match strategy {
         Strategy::Normal => {
@@ -212,6 +233,10 @@ fn measure(
                     }
                     Operation::Update => {
                         black_box(atomic.update(access_keys[index], increment));
+                    }
+                    Operation::Replace => {
+                        let replacement = non_max(operation as u64);
+                        black_box(atomic.update(access_keys[index], |_| replacement));
                     }
                     Operation::Insert => {
                         black_box(atomic.insert(access_keys[index], non_max(operation as u64)));
@@ -231,6 +256,14 @@ fn measure(
                             access_keys[index],
                             &access_handles[index],
                             increment,
+                        ));
+                    }
+                    Operation::Replace => {
+                        let replacement = non_max(operation as u64);
+                        black_box(atomic.update_prepared(
+                            access_keys[index],
+                            &access_handles[index],
+                            |_| replacement,
                         ));
                     }
                     Operation::Insert => {
@@ -265,6 +298,12 @@ fn measure(
                         &mut values[..count],
                         increment,
                     ),
+                    Operation::Replace => atomic.replace_prepared_batch(
+                        &access_keys[pattern_index..pattern_index + count],
+                        &access_handles[pattern_index..pattern_index + count],
+                        &inserted[..count],
+                        &mut values[..count],
+                    ),
                     Operation::Insert => atomic.insert_prepared_batch(
                         &access_keys[pattern_index..pattern_index + count],
                         &access_handles[pattern_index..pattern_index + count],
@@ -290,11 +329,42 @@ fn measure(
                         *value += 1;
                         black_box(value);
                     }
-                    Operation::Insert => {
+                    Operation::Replace | Operation::Insert => {
                         let key: [u8; 32] = access_keys[index]
                             .try_into()
                             .expect("benchmark keys are exactly 32 bytes");
                         black_box(dash.insert(key, operation as u64));
+                    }
+                }
+            }
+        }
+        Strategy::Papaya => {
+            for operation in 0..operations {
+                let index = operation % access_keys.len();
+                match operation_kind {
+                    Operation::Read => {
+                        black_box(papaya.get(access_keys[index], &papaya_guard).copied());
+                    }
+                    Operation::Update => {
+                        black_box(papaya.update(
+                            access_keys[index].into(),
+                            |value| value + 1,
+                            &papaya_guard,
+                        ));
+                    }
+                    Operation::Replace => {
+                        black_box(papaya.update(
+                            access_keys[index].into(),
+                            |_| operation as u64,
+                            &papaya_guard,
+                        ));
+                    }
+                    Operation::Insert => {
+                        black_box(papaya.insert(
+                            access_keys[index].into(),
+                            operation as u64,
+                            &papaya_guard,
+                        ));
                     }
                 }
             }

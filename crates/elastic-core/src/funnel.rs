@@ -1,4 +1,5 @@
 //! Paper-exact Funnel placement with explicit dynamic-map epoch extensions.
+
 use core::hash::{BuildHasher, Hash};
 use core::mem::{self, MaybeUninit};
 
@@ -174,10 +175,30 @@ struct FlatStorage<T> {
     capacity: usize,
 }
 
+#[allow(
+    unsafe_code,
+    reason = "the descriptor carries table-owned arena pointers"
+)]
+// SAFETY: the descriptor owns no allocation; its pointers target the arena
+// owned by the containing table. Moving it is sound when `T` is `Send`.
 unsafe impl<T: Send> Send for FlatStorage<T> {}
+#[allow(
+    unsafe_code,
+    reason = "shared descriptor access is read-only and T is Sync"
+)]
+// SAFETY: shared storage access reads initialized entries only. Mutation
+// requires exclusive access to the containing table and `T: Sync` permits
+// shared entry references across threads.
 unsafe impl<T: Sync> Sync for FlatStorage<T> {}
 
-impl<T> ArenaSlots<T> for FlatStorage<T> {
+#[allow(
+    unsafe_code,
+    reason = "binds flat storage to its validated arena extents"
+)]
+// SAFETY: `FunnelTable` constructs this descriptor from the checked arena
+// layout. Its pointers cover exactly `capacity` initialized control bytes and
+// aligned slots, and all value initialization follows the control protocol.
+unsafe impl<T> ArenaSlots<T> for FlatStorage<T> {
     #[inline]
     fn ctrl_ptr(&self) -> *mut u8 {
         self.ctrl_ptr
@@ -200,6 +221,10 @@ impl<T> arena::RegionSet for FlatStorage<T> {
     }
 }
 
+#[allow(
+    unsafe_code,
+    reason = "stamps the checked slot extent inside one allocated arena"
+)]
 fn try_allocate_storage<K, V, A: Allocator>(
     n: usize,
     alloc: &A,
@@ -208,6 +233,8 @@ fn try_allocate_storage<K, V, A: Allocator>(
     let arena = Arena::try_allocate_with_ctrl_zeroed(layout, control_bytes, alloc)?;
     let storage = FlatStorage {
         ctrl_ptr: arena.as_ptr(),
+        // SAFETY: `funnel_layout` places the aligned slot extent at
+        // `data_offset` inside this allocation.
         data_ptr: unsafe {
             arena
                 .as_ptr()
@@ -252,6 +279,10 @@ enum BucketScanResult<T> {
 /// `ctrl_ptr.add(start)` must be readable through `length + GROUP_SIZE - 1`
 /// bytes, and every slot passed to `inspect_match` must be a valid logical
 /// slot for the corresponding data arena.
+#[allow(
+    unsafe_code,
+    reason = "performs bounded SIMD reads under the documented raw-extent contract"
+)]
 unsafe fn scan_funnel_bucket<T>(
     ctrl_ptr: *const u8,
     start: usize,
@@ -264,14 +295,20 @@ unsafe fn scan_funnel_bucket<T>(
     let mut position = start;
     while position < end {
         let logical_lanes = GROUP_SIZE.min(end - position);
+        // SAFETY: the function contract covers every padded group beginning in
+        // the logical `[start, end)` scan range.
         let group = unsafe { ctrl_ptr.add(position) };
+        // SAFETY: the same contract provides a complete readable SIMD group.
         let mut events = unsafe { simd::free_mask_group(group) };
+        // SAFETY: the same contract provides a complete readable SIMD group.
         events.0 |= unsafe { simd::eq_mask_group(group, fingerprint) }.0;
         for lane in events {
             if lane >= logical_lanes {
                 break;
             }
             let slot = position + lane;
+            // SAFETY: lanes are restricted to the logical bucket length, which
+            // the function contract places inside the control allocation.
             let control = unsafe { *ctrl_ptr.add(slot) };
             if control == CTRL_TOMBSTONE {
                 first_tombstone.get_or_insert(slot);
@@ -293,6 +330,10 @@ unsafe fn scan_funnel_bucket<T>(
 ///
 /// The bounds requirements are identical to [`scan_funnel_bucket`], and the
 /// logical table must contain no tombstones.
+#[allow(
+    unsafe_code,
+    reason = "performs bounded SIMD reads under the documented clean-epoch contract"
+)]
 unsafe fn scan_clean_funnel_bucket<T>(
     ctrl_ptr: *const u8,
     start: usize,
@@ -304,8 +345,12 @@ unsafe fn scan_clean_funnel_bucket<T>(
     let mut position = start;
     while position < end {
         let logical_lanes = GROUP_SIZE.min(end - position);
+        // SAFETY: the function contract covers every padded group beginning in
+        // the logical `[start, end)` scan range.
         let group = unsafe { ctrl_ptr.add(position) };
+        // SAFETY: the same contract provides a complete readable SIMD group.
         let matches = unsafe { simd::eq_mask_group(group, fingerprint) };
+        // SAFETY: the same contract provides a complete readable SIMD group.
         let first_empty = unsafe { simd::free_mask_group(group) }
             .into_iter()
             .find(|&lane| lane < logical_lanes);
@@ -344,19 +389,39 @@ pub struct FunnelTable<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Glob
     exceptional_placement: bool,
 }
 
+#[allow(
+    unsafe_code,
+    reason = "all cached pointers target the stable table-owned arena"
+)]
+// SAFETY: cached storage pointers target the table-owned heap arena, whose
+// address is stable when the table moves. All owned components are `Send`.
 unsafe impl<K: Send, V: Send, S: Send, A: Allocator + Clone + Send> Send
     for FunnelTable<K, V, S, A>
 {
 }
+#[allow(
+    unsafe_code,
+    reason = "shared access is read-only and all components are Sync"
+)]
+// SAFETY: shared methods only read controls and initialized entries. Structural
+// mutation requires `&mut self`; all referenced components are `Sync`.
 unsafe impl<K: Sync, V: Sync, S: Sync, A: Allocator + Clone + Sync> Sync
     for FunnelTable<K, V, S, A>
 {
 }
 
+#[allow(
+    unsafe_code,
+    reason = "drop visits initialized arena slots before matching deallocation"
+)]
 impl<K, V, S, A: Allocator + Clone> Drop for FunnelTable<K, V, S, A> {
     fn drop(&mut self) {
         let storage = &mut self.storage;
-        self.arena.drop_table(&self.alloc, || storage.drop_values());
+        // SAFETY: `self.alloc` created `self.arena`, and the flat descriptor
+        // covers every initialized value in that allocation.
+        unsafe {
+            self.arena.drop_table(&self.alloc, || storage.drop_values());
+        }
     }
 }
 
@@ -401,6 +466,10 @@ macros::declare_backend_aliases! {
     },
 }
 
+#[allow(
+    unsafe_code,
+    reason = "implements packed funnel probing and mutation inside the owned arena"
+)]
 impl<K, V, S, A> FunnelTable<K, V, S, A>
 where
     K: Eq + Hash,
@@ -461,15 +530,27 @@ where
     }
 
     #[inline]
-    fn inspect_slot<Q>(&self, slot: usize, key_fingerprint: u8, key: &Q) -> Option<bool>
+    /// Inspects a validated raw Funnel slot.
+    ///
+    /// # Safety
+    ///
+    /// `slot` must be less than `self.shape.n`. A control byte equal to
+    /// `key_fingerprint` must imply that the corresponding slot is initialized
+    /// for the shared borrow.
+    unsafe fn inspect_slot<Q>(&self, slot: usize, key_fingerprint: u8, key: &Q) -> Option<bool>
     where
         Q: Equivalent<K> + ?Sized,
     {
-        let ctrl = self.storage.control_at(slot);
+        debug_assert!(slot < self.shape.n);
+        // SAFETY: every caller derives `slot` from this table's checked Funnel
+        // geometry; the debug assertion keeps that proof visible in tests.
+        let ctrl = unsafe { self.storage.control_at(slot) };
         if ctrl == CTRL_EMPTY {
             return Some(false);
         }
         if ctrl == key_fingerprint {
+            // SAFETY: a matching occupied control byte proves this in-bounds
+            // slot contains an initialized entry.
             let entry = unsafe { self.storage.get_ref(slot) };
             if key.equivalent(&entry.key) {
                 return Some(true);
@@ -520,6 +601,8 @@ where
             };
             let start = level.offset + bucket * self.shape.beta;
             let scan = if clean_epoch {
+                // SAFETY: validated Funnel geometry includes SIMD padding after
+                // every ordinary bucket; clean_epoch proves no tombstones.
                 unsafe {
                     scan_clean_funnel_bucket(
                         self.storage.ctrl_ptr(),
@@ -533,6 +616,8 @@ where
                     )
                 }
             } else {
+                // SAFETY: validated Funnel geometry includes SIMD padding after
+                // every ordinary bucket and the callback sees logical slots.
                 unsafe {
                     scan_funnel_bucket(
                         self.storage.ctrl_ptr(),
@@ -566,11 +651,15 @@ where
                 return SearchResult::RangeFailure;
             };
             let slot = self.shape.primary_offset + local;
-            if self.storage.control_at(slot) == CTRL_TOMBSTONE {
+            // SAFETY: `local` was reduced into the primary range, whose offset
+            // and length are part of this table's validated shape.
+            if unsafe { self.storage.control_at(slot) } == CTRL_TOMBSTONE {
                 first_tombstone.get_or_insert(slot);
                 continue;
             }
-            match self.inspect_slot(slot, key_fingerprint, key) {
+            // SAFETY: `local` is reduced into the validated primary range and
+            // its offset is part of this table's checked Funnel geometry.
+            match unsafe { self.inspect_slot(slot, key_fingerprint, key) } {
                 Some(true) => return SearchResult::Hit(slot),
                 Some(false) => return SearchResult::Vacant(first_tombstone.unwrap_or(slot)),
                 None => {}
@@ -596,11 +685,15 @@ where
                 let slot = self.shape.fallback_offset
                     + bucket * self.shape.fallback_bucket_width
                     + slot_in_bucket;
-                if self.storage.control_at(slot) == CTRL_TOMBSTONE {
+                // SAFETY: both bucket and lane are inside the validated
+                // fallback geometry, so their combined slot is in-bounds.
+                if unsafe { self.storage.control_at(slot) } == CTRL_TOMBSTONE {
                     first_tombstone.get_or_insert(slot);
                     continue;
                 }
-                match self.inspect_slot(slot, key_fingerprint, key) {
+                // SAFETY: both the bucket and lane are bounded by the current
+                // validated fallback geometry.
+                match unsafe { self.inspect_slot(slot, key_fingerprint, key) } {
                     Some(true) => return SearchResult::Hit(slot),
                     Some(false) => {
                         return SearchResult::Vacant(first_tombstone.unwrap_or(slot));
@@ -617,7 +710,8 @@ where
         Q: Equivalent<K> + ?Sized,
     {
         (0..self.shape.n).find(|&slot| {
-            self.storage.control_at(slot) == key_fingerprint
+            // SAFETY: the full scan iterates the storage's exact slot extent.
+            (unsafe { self.storage.control_at(slot) }) == key_fingerprint
                 && key.equivalent(&unsafe { self.storage.get_ref(slot) }.key)
         })
     }
@@ -643,14 +737,24 @@ where
         Q: Equivalent<K> + ?Sized,
     {
         let slot = self.find_location(key, key_hash, key_fingerprint)?;
+        // SAFETY: successful exact lookup returns an occupied in-bounds slot.
         Some(unsafe { self.storage.get_ref(slot) })
     }
 
     fn first_free_global(&self) -> Option<usize> {
-        (0..self.shape.n).find(|&slot| self.storage.control_at(slot).is_free())
+        (0..self.shape.n).find(|&slot| {
+            // SAFETY: the full scan iterates the storage's exact slot extent.
+            unsafe { self.storage.control_at(slot) }.is_free()
+        })
     }
 
-    fn place_new_entry(
+    /// Writes a new value into a validated free Funnel slot.
+    ///
+    /// # Safety
+    ///
+    /// `slot` must be less than `self.shape.n`, and its control byte must mark
+    /// an uninitialized free slot in this table.
+    unsafe fn place_new_entry(
         &mut self,
         slot: usize,
         key: K,
@@ -658,9 +762,16 @@ where
         key_fingerprint: u8,
         exceptional: bool,
     ) -> usize {
-        let was_tombstone = self.storage.control_at(slot) == CTRL_TOMBSTONE;
-        self.storage
-            .write_with_control(slot, SlotEntry { key, value }, key_fingerprint);
+        debug_assert!(slot < self.shape.n);
+        // SAFETY: exact search or the bounded global fallback returns an
+        // in-bounds free slot; the debug assertion guards that invariant.
+        let was_tombstone = unsafe { self.storage.control_at(slot) } == CTRL_TOMBSTONE;
+        // SAFETY: the same search proof establishes that the destination is
+        // free and therefore uninitialized.
+        unsafe {
+            self.storage
+                .write_with_control(slot, SlotEntry { key, value }, key_fingerprint);
+        }
         self.len += 1;
         if was_tombstone {
             self.tombstones -= 1;
@@ -684,7 +795,9 @@ where
             ),
             SearchResult::Hit(_) => unreachable!("rebuild input contains duplicate keys"),
         };
-        self.place_new_entry(slot, key, value, key_fingerprint, exceptional);
+        // SAFETY: exact search returns a free in-bounds slot; the fallback is
+        // the result of scanning the complete validated logical slot extent.
+        unsafe { self.place_new_entry(slot, key, value, key_fingerprint, exceptional) };
         exceptional
     }
 
@@ -726,7 +839,10 @@ where
                 true,
             ),
         };
-        let location = self.place_new_entry(slot, key, value, key_fingerprint, exceptional);
+        // SAFETY: exact search returns a free in-bounds slot; the fallback is
+        // the result of scanning the complete validated logical slot extent.
+        let location =
+            unsafe { self.place_new_entry(slot, key, value, key_fingerprint, exceptional) };
         if exceptional {
             self.epoch.start_placement_recovery(self.len);
         }
@@ -757,7 +873,10 @@ where
         self.tombstones = 0;
         self.exceptional_placement = false;
 
-        let mut guard = arena::ArenaDropGuard::new(old_arena, old_storage, self.alloc.clone());
+        // SAFETY: the old arena and descriptor came from this table and were
+        // allocated with `self.alloc`.
+        let mut guard =
+            unsafe { arena::ArenaDropGuard::new(old_arena, old_storage, self.alloc.clone()) };
         let mut recovered = false;
         guard.regions_mut().drain_values_and_clear(|entry| {
             recovered |= self.insert_unique(entry.key, entry.value);
@@ -801,7 +920,15 @@ where
 }
 
 #[allow(private_interfaces)]
-impl<K, V, S, A> map::TableBackend<K, V> for FunnelTable<K, V, S, A>
+#[allow(
+    unsafe_code,
+    reason = "implements the audited raw backend contract over funnel storage"
+)]
+// SAFETY: FunnelTable locations are checked in-bounds occupied slots. Its scan
+// advances monotonically over the flat arena and yields each slot at most once,
+// while all lifecycle operations keep control bytes synchronized with value
+// initialization and destruction.
+unsafe impl<K, V, S, A> map::TableBackend<K, V> for FunnelTable<K, V, S, A>
 where
     K: Eq + Hash,
     S: BuildHasher,
@@ -848,16 +975,20 @@ where
 
     #[inline]
     unsafe fn slot_ref(&self, slot: usize) -> &SlotEntry<K, V> {
+        // SAFETY: `TableBackend::slot_ref` requires a live in-bounds location.
         unsafe { self.storage.get_ref(slot) }
     }
 
     #[inline]
     unsafe fn slot_ptr(&self, slot: usize) -> *mut SlotEntry<K, V> {
-        self.storage.slot_ptr(slot)
+        // SAFETY: `TableBackend::slot_ptr` requires a live in-bounds location.
+        unsafe { self.storage.slot_ptr(slot) }
     }
 
     #[inline]
     fn replace_value(&mut self, slot: usize, value: V) -> V {
+        // SAFETY: `TableBackend` supplies a live location and `&mut self`
+        // provides exclusive access to its value.
         let entry = unsafe { self.storage.get_mut(slot) };
         mem::replace(&mut entry.value, value)
     }
@@ -903,9 +1034,15 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        if slot >= self.shape.n || self.storage.control_at(slot) != fingerprint {
+        if slot >= self.shape.n {
             return None;
         }
+        // SAFETY: the explicit range check above proves `slot` is in-bounds.
+        if unsafe { self.storage.control_at(slot) } != fingerprint {
+            return None;
+        }
+        // SAFETY: the matching nonzero control byte proves this checked slot is
+        // initialized for the shared table borrow.
         let entry = unsafe { self.storage.get_ref(slot) };
         key.equivalent(&entry.key).then_some(entry)
     }
@@ -928,7 +1065,9 @@ where
             }
             SearchResult::Hit(_) => unreachable!("known-absent Funnel insertion found a key"),
         };
-        Ok(self.place_new_entry(slot, key, value, fingerprint, exceptional))
+        // SAFETY: exact search returns a free in-bounds slot; the fallback is
+        // the result of scanning the complete validated logical slot extent.
+        Ok(unsafe { self.place_new_entry(slot, key, value, fingerprint, exceptional) })
     }
 
     fn insert(&mut self, key: K, value: V, hash: u64) -> Option<V>
@@ -938,12 +1077,16 @@ where
         let fingerprint = control::control_fingerprint(hash);
         let mut exact = self.search_exact_for_insert(&key, hash, fingerprint);
         if let SearchResult::Hit(slot) = exact {
+            // SAFETY: exact search returns an occupied in-bounds slot and
+            // `&mut self` provides exclusive access.
             let entry = unsafe { self.storage.get_mut(slot) };
             return Some(mem::replace(&mut entry.value, value));
         }
         if self.exceptional_placement
             && let Some(slot) = self.find_by_full_scan(&key, fingerprint)
         {
+            // SAFETY: the full scan returns an occupied in-bounds slot and
+            // `&mut self` provides exclusive access.
             let entry = unsafe { self.storage.get_mut(slot) };
             return Some(mem::replace(&mut entry.value, value));
         }
@@ -955,8 +1098,11 @@ where
     }
 
     fn remove(&mut self, slot: usize) -> (K, V) {
+        // SAFETY: `TableBackend` requires `slot` to be a live location.
         let entry = unsafe { self.storage.take(slot) };
-        self.storage.mark_tombstone(slot);
+        // SAFETY: the same live location remains in-bounds after moving out its
+        // value and must be marked before the storage can reuse it.
+        unsafe { self.storage.mark_tombstone(slot) };
         self.len -= 1;
         self.tombstones += 1;
         self.epoch.note_delete();
@@ -967,8 +1113,11 @@ where
     }
 
     fn remove_deferred(&mut self, slot: usize) -> (K, V) {
+        // SAFETY: `TableBackend` requires `slot` to be a live location.
         let entry = unsafe { self.storage.take(slot) };
-        self.storage.mark_tombstone(slot);
+        // SAFETY: the same live location remains in-bounds after moving out its
+        // value and must be marked before the storage can reuse it.
+        unsafe { self.storage.mark_tombstone(slot) };
         self.len -= 1;
         self.tombstones += 1;
         self.epoch.note_delete();
@@ -977,12 +1126,14 @@ where
 
     #[inline]
     fn tombstone_slot(&mut self, slot: usize) {
-        self.storage.mark_tombstone(slot);
+        // SAFETY: `TableBackend` requires `slot` to be a live location.
+        unsafe { self.storage.mark_tombstone(slot) };
     }
 
     #[inline]
     fn extract_finish(&mut self, slot: usize) {
-        self.storage.mark_tombstone(slot);
+        // SAFETY: the extraction iterator supplies an occupied in-bounds slot.
+        unsafe { self.storage.mark_tombstone(slot) };
         self.len -= 1;
         self.tombstones += 1;
         self.epoch.note_delete();
@@ -994,6 +1145,20 @@ where
         }
     }
 
+    #[inline(always)]
+    fn finish_deferred_removals_on_drop(&mut self) {
+        #[cfg(feature = "std")]
+        {
+            if self.tombstones > capacity::tombstone_cleanup_threshold(self.shape.n)
+                && !std::thread::panicking()
+            {
+                self.resize_with_transition(self.shape.n, EpochTransition::TombstoneCleanup);
+            }
+        }
+        #[cfg(not(feature = "std"))]
+        let _ = self;
+    }
+
     #[inline]
     fn scan(&self) -> usize {
         0
@@ -1003,8 +1168,11 @@ where
         while *scan < self.shape.n {
             let slot = *scan;
             *scan += 1;
-            if self.storage.control_at(slot).is_occupied() {
-                return Some((self.storage.slot_ptr(slot), slot));
+            // SAFETY: the loop condition proves `slot < shape.n`, the exact
+            // storage capacity.
+            if unsafe { self.storage.control_at(slot) }.is_occupied() {
+                // SAFETY: the same loop bound proves that `slot` is in-bounds.
+                return Some((unsafe { self.storage.slot_ptr(slot) }, slot));
             }
         }
         None
@@ -1062,14 +1230,18 @@ where
 
     fn clear(&mut self) {
         for slot in 0..self.shape.n {
-            if self.storage.control_at(slot) == CTRL_TOMBSTONE {
-                self.storage.set_control(slot, CTRL_EMPTY);
+            // SAFETY: the loop spans the storage's exact slot/control extent.
+            if unsafe { self.storage.control_at(slot) } == CTRL_TOMBSTONE {
+                // SAFETY: the same loop bound proves `slot` is in-bounds.
+                unsafe { self.storage.set_control(slot, CTRL_EMPTY) };
             }
         }
         self.tombstones = 0;
         let len = &mut self.len;
         self.storage.clear_occupied_slots_with(|slot| {
             *len -= 1;
+            // SAFETY: the arena callback yields each initialized slot exactly
+            // once after clearing its control byte.
             unsafe { core::ptr::drop_in_place(slot) };
         });
         debug_assert_eq!(self.len, 0);
@@ -1083,6 +1255,24 @@ where
         self.tombstones = 0;
         self.exceptional_placement = false;
         self.epoch.start(EpochTransition::Clear, 0);
+    }
+
+    #[cold]
+    fn repair_after_failed_drain(&mut self, original_len: usize) {
+        let mut live = 0_usize;
+        let mut tombstones = 0_usize;
+        for slot in 0..self.shape.n {
+            // SAFETY: the loop spans the flat storage's exact control extent
+            // and reads control metadata only.
+            let control = unsafe { self.storage.control_at(slot) };
+            live += usize::from(control.is_occupied());
+            tombstones += usize::from(control == CTRL_TOMBSTONE);
+        }
+        self.len = live;
+        self.tombstones = tombstones;
+        for _ in live..original_len {
+            self.epoch.note_delete();
+        }
     }
 
     fn clone_table(&self) -> Self
@@ -1099,12 +1289,19 @@ where
         )
         .unwrap_or_else(|error| panic!("Funnel clone allocation failed: {error}"));
         for slot in 0..self.shape.n {
-            let ctrl = self.storage.control_at(slot);
+            // SAFETY: source and destination share the validated shape and this
+            // loop spans its exact storage extent.
+            let ctrl = unsafe { self.storage.control_at(slot) };
             if ctrl.is_occupied() {
+                // SAFETY: an occupied control byte proves this in-bounds source
+                // slot is initialized.
                 let entry = unsafe { self.storage.get_ref(slot) }.clone();
-                cloned.storage.write_with_control(slot, entry, ctrl);
+                // SAFETY: the equal-shape destination slot is in-bounds and
+                // remains free until this write publishes its control byte.
+                unsafe { cloned.storage.write_with_control(slot, entry, ctrl) };
             } else if ctrl == CTRL_TOMBSTONE {
-                cloned.storage.mark_tombstone(slot);
+                // SAFETY: the equal-shape destination slot is in-bounds.
+                unsafe { cloned.storage.mark_tombstone(slot) };
             }
         }
         cloned.len = self.len;
@@ -1116,6 +1313,10 @@ where
 }
 
 #[cfg(test)]
+#[allow(
+    unsafe_code,
+    reason = "tests inspect raw funnel-arena invariants and failure paths"
+)]
 mod tests {
     use core::hash::{BuildHasher, Hasher};
     use core::mem::ManuallyDrop;
@@ -1153,6 +1354,8 @@ mod tests {
         deallocations: Arc<AtomicUsize>,
     }
 
+    // SAFETY: successful allocation and every deallocation are delegated unchanged to
+    // `Global`; counters and the failure toggle do not change allocation semantics.
     unsafe impl Allocator for ToggleAllocator {
         fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, RawAllocError> {
             if self.fail.load(Ordering::SeqCst) {
@@ -1166,6 +1369,8 @@ mod tests {
 
         unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
             self.deallocations.fetch_add(1, Ordering::SeqCst);
+            // SAFETY: the caller upholds `Allocator::deallocate`'s contract, and successful
+            // allocations from this wrapper always come from `Global`.
             unsafe { Global.deallocate(ptr, layout) };
         }
     }
@@ -1301,7 +1506,9 @@ mod tests {
                     .find_location(&identity, identity, control::control_fingerprint(identity))
                     .unwrap();
                 assert_eq!(actual, expected.global_slot(), "n={n} key={identity}");
-                locations.push((identity, actual, table.storage.slot_ptr(actual) as usize));
+                // SAFETY: `find_location` returns an occupied in-bounds storage slot.
+                let pointer = unsafe { table.storage.slot_ptr(actual) } as usize;
+                locations.push((identity, actual, pointer));
                 assert_eq!(
                     table.find_location(
                         &identity,
@@ -1322,7 +1529,10 @@ mod tests {
                     Some(location),
                     "moved n={n} key={identity}"
                 );
-                assert_eq!(table.storage.slot_ptr(location) as usize, pointer);
+                // SAFETY: every stored location was returned by `find_location` for this live
+                // table and the assertion above confirms that it remains occupied.
+                let actual_pointer = unsafe { table.storage.slot_ptr(location) } as usize;
+                assert_eq!(actual_pointer, pointer);
             }
 
             let duplicate = config.target_insertions() as u64 / 2;
@@ -1376,10 +1586,17 @@ mod tests {
             key: u64,
             fingerprint: u8,
         ) {
-            if table.storage.control_at(slot).is_free() {
-                table
-                    .storage
-                    .write_with_control(slot, SlotEntry { key, value: key }, fingerprint);
+            assert!(slot < table.shape.n);
+            // SAFETY: the assertion above proves that `slot` is within storage.
+            if unsafe { table.storage.control_at(slot) }.is_free() {
+                // SAFETY: `slot` is in bounds and its control byte was just observed free.
+                unsafe {
+                    table.storage.write_with_control(
+                        slot,
+                        SlotEntry { key, value: key },
+                        fingerprint,
+                    );
+                }
                 table.len += 1;
             }
         }
@@ -1504,7 +1721,8 @@ mod tests {
         );
         assert_eq!(
             direct,
-            table.storage.slot_ptr(second_bucket_slot_one).cast_const()
+            // SAFETY: `occupy` validated and initialized this slot above.
+            unsafe { table.storage.slot_ptr(second_bucket_slot_one) }.cast_const()
         );
     }
 
@@ -1606,24 +1824,30 @@ mod tests {
             );
         }
         let first_occupied = (0..table.shape.n)
-            .find(|&slot| table.storage.control_at(slot).is_occupied())
+            // SAFETY: the iterator yields only slots below the storage length `shape.n`.
+            .find(|&slot| unsafe { table.storage.control_at(slot) }.is_occupied())
             .unwrap();
 
         let result = catch_unwind(AssertUnwindSafe(|| {
             <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::clear(&mut table);
         }));
         assert!(result.is_err());
-        assert_eq!(table.storage.control_at(first_occupied), CTRL_EMPTY);
+        // SAFETY: `first_occupied` came from the in-bounds scan above.
+        let first_control = unsafe { table.storage.control_at(first_occupied) };
+        assert_eq!(first_control, CTRL_EMPTY);
         assert_eq!(
             table.len,
             (0..table.shape.n)
-                .filter(|&slot| table.storage.control_at(slot).is_occupied())
+                // SAFETY: the iterator yields only slots below the storage length `shape.n`.
+                .filter(|&slot| unsafe { table.storage.control_at(slot) }.is_occupied())
                 .count()
         );
 
         <FunnelTable<_, _, _, _> as map::TableBackend<_, _>>::clear(&mut table);
         assert_eq!(table.len, 0);
         assert_eq!(drops.load(Ordering::SeqCst), 3);
+        // SAFETY: `table` remains initialized after the deliberately panicking clear, and this
+        // manually performs the one drop suppressed by `ManuallyDrop`.
         unsafe { ManuallyDrop::drop(&mut table) };
     }
 
@@ -1664,7 +1888,8 @@ mod tests {
         assert_eq!(
             table.len,
             (0..table.shape.n)
-                .filter(|&slot| table.storage.control_at(slot).is_occupied())
+                // SAFETY: the iterator yields only slots below the storage length `shape.n`.
+                .filter(|&slot| unsafe { table.storage.control_at(slot) }.is_occupied())
                 .count()
         );
 
@@ -1686,7 +1911,8 @@ mod tests {
         assert_eq!(
             table.len,
             (0..table.shape.n)
-                .filter(|&slot| table.storage.control_at(slot).is_occupied())
+                // SAFETY: the iterator yields only slots below the storage length `shape.n`.
+                .filter(|&slot| unsafe { table.storage.control_at(slot) }.is_occupied())
                 .count()
         );
         drop(table);
@@ -1804,6 +2030,8 @@ mod tests {
 
                 let mut actual_first_tombstone = None;
                 let mut actual_compared = Vec::new();
+                // SAFETY: `controls` includes `WIDTH + GROUP_SIZE` readable bytes, the scan
+                // starts at zero, and the callback only observes logical slots.
                 let actual = unsafe {
                     scan_funnel_bucket(
                         controls.as_ptr(),
@@ -1829,6 +2057,8 @@ mod tests {
 
                 if !controls[..WIDTH].contains(&CTRL_TOMBSTONE) {
                     let mut clean_compared = Vec::new();
+                    // SAFETY: the buffer satisfies the padded bounds above, and this branch
+                    // establishes the clean scan's no-tombstone precondition.
                     let clean = unsafe {
                         scan_clean_funnel_bucket(controls.as_ptr(), 0, WIDTH, FP, |slot| {
                             clean_compared.push(slot);
@@ -1906,6 +2136,8 @@ mod tests {
                 let expected = scalar(&controls, start, width, Some(hit), existing_tombstone);
                 let mut actual_first_tombstone = existing_tombstone;
                 let mut actual_compared = Vec::new();
+                // SAFETY: the padded test buffer remains readable for a full SIMD group past
+                // every logical position, and `start..start + width` is in bounds.
                 let actual = unsafe {
                     scan_funnel_bucket(
                         controls.as_ptr(),
@@ -1936,6 +2168,8 @@ mod tests {
                 );
                 let mut actual_first_tombstone = existing_tombstone;
                 let mut actual_compared = Vec::new();
+                // SAFETY: the padded test buffer remains readable for a full SIMD group past
+                // every logical position, and `start..start + width` is in bounds.
                 let actual = unsafe {
                     scan_funnel_bucket(
                         controls.as_ptr(),

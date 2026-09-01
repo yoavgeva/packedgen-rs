@@ -8,7 +8,24 @@ permissions:
   contents: read
 
 jobs:
+  msrv:
+    name: Rust 1.88 minimum version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - name: Check every PackedGen target and feature
+        run: cargo check -p packedgen --all-targets --all-features
+      - name: Check the paper-reference crate's stable feature set
+        run: cargo check -p packedgen-opthash --all-targets
+      - name: Check the no-std core as an rlib
+        run: cargo rustc -p packedgen-opthash --no-default-features --lib --crate-type rlib
+
   test:
+    name: Stable tests and lints
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,5 +37,101 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Tests
         run: cargo test --workspace --all-targets
+      - name: Root runtime tests with every feature
+        run: cargo test -p packedgen --all-targets --all-features
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy -p packedgen --all-targets --all-features -- -D warnings
+      - name: Clippy for the paper-reference crate
+        run: cargo clippy -p packedgen-opthash --all-targets -- -D warnings
+      - name: Clippy for the Python extension feature
+        run: cargo clippy -p packedgen-opthash --features python --all-targets -- -D warnings
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+          fallback: none
+      - name: Dependency security audit
+        run: scripts/security_audit.sh
+      - name: Verify publishable package chain
+        run: scripts/package_release.sh
+
+  memory-safety:
+    name: Loom, Miri, and sanitizers
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri,rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: memory-safety
+      - name: Exhaustive concurrency models
+        run: cargo test --release --test cache_concurrency_model
+      - name: Focused interpreter checks
+        run: scripts/cache_proof.sh --miri
+      - name: Address and thread sanitizers
+        run: scripts/cache_proof.sh --sanitizers
+
+  companion-miri:
+    name: Companion strict-provenance Miri
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri,rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: companion-miri
+      - name: Strict-provenance interpreter checks
+        working-directory: crates/elastic-core
+        run: ci/miri.sh
+
+  companion-asan:
+    name: Companion address sanitizer
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: companion-asan
+      - name: Address sanitizer
+        working-directory: crates/elastic-core
+        env:
+          # The parity suite deliberately requests an impossible allocation to
+          # verify fallible reserve. Let Rust observe null instead of having
+          # ASan abort before the allocator can return `AllocError`.
+          ASAN_OPTIONS: allocator_may_return_null=1
+        run: |
+          target="$(rustc +nightly -vV | awk '/^host:/ { print $2 }')"
+          RUSTFLAGS="-Zsanitizer=address" RUSTDOCFLAGS="-Zsanitizer=address" \
+            cargo +nightly test -Zbuild-std --target "$target"
+
+  python-runtime:
+    name: Python binding runtime tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: python-runtime
+      - name: Build the extension wheel
+        working-directory: crates/elastic-core
+        run: uvx maturin build --release --features python --out dist
+      - name: Run Python parity and ownership tests
+        working-directory: crates/elastic-core
+        run: |
+          uv venv --python 3.13
+          uv pip install dist/*.whl pytest hypothesis pytest-benchmark
+          .venv/bin/pytest tests/python/

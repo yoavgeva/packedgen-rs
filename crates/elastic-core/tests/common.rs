@@ -2,11 +2,45 @@ macro_rules! common_suite {
     ($mod_name:ident, $TestMap:ident, $Entry:ident) => {
         mod $mod_name {
             use std::collections::HashSet;
+            use std::hash::{Hash, Hasher};
+            use std::panic::{AssertUnwindSafe, catch_unwind};
             use std::sync::Arc;
-            use std::sync::atomic::{AtomicUsize, Ordering};
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
             use opthash::$Entry as Entry;
             use opthash::$TestMap as HashMap;
+
+            struct PanicOnFirstDrop {
+                armed: Arc<AtomicBool>,
+                drops: Arc<AtomicUsize>,
+            }
+
+            struct CountingHashKey {
+                value: usize,
+                calls: Arc<AtomicUsize>,
+            }
+
+            impl PartialEq for CountingHashKey {
+                fn eq(&self, other: &Self) -> bool {
+                    self.value == other.value
+                }
+            }
+
+            impl Eq for CountingHashKey {}
+
+            impl Hash for CountingHashKey {
+                fn hash<H: Hasher>(&self, state: &mut H) {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    self.value.hash(state);
+                }
+            }
+
+            impl Drop for PanicOnFirstDrop {
+                fn drop(&mut self) {
+                    self.drops.fetch_add(1, Ordering::SeqCst);
+                    assert!(!self.armed.swap(false, Ordering::SeqCst), "first drop");
+                }
+            }
 
             #[test]
             fn entry_and_modify_runs_on_occupied() {
@@ -293,6 +327,45 @@ macro_rules! common_suite {
             }
 
             #[test]
+            fn panicking_drain_drop_repairs_map_bookkeeping() {
+                let armed = Arc::new(AtomicBool::new(false));
+                let drops = Arc::new(AtomicUsize::new(0));
+                let mut map: HashMap<i32, PanicOnFirstDrop> = HashMap::with_capacity(256);
+                for key in 0..60 {
+                    map.insert(
+                        key,
+                        PanicOnFirstDrop {
+                            armed: armed.clone(),
+                            drops: drops.clone(),
+                        },
+                    );
+                }
+
+                let result = {
+                    let mut drain = map.drain();
+                    drop(drain.next().expect("first drained entry"));
+                    drop(drain.next().expect("second drained entry"));
+                    armed.store(true, Ordering::SeqCst);
+                    catch_unwind(AssertUnwindSafe(|| drop(drain)))
+                };
+                assert!(result.is_err());
+                assert_eq!(map.len(), 57);
+                assert_eq!(map.iter().count(), 57);
+
+                map.insert(
+                    999,
+                    PanicOnFirstDrop {
+                        armed: armed.clone(),
+                        drops: drops.clone(),
+                    },
+                );
+                assert_eq!(map.len(), 58);
+                map.clear();
+                assert!(map.is_empty());
+                assert_eq!(drops.load(Ordering::SeqCst), 61);
+            }
+
+            #[test]
             fn drain_yields_all_entries_then_empties_map() {
                 let mut map: HashMap<i32, i32> = HashMap::with_capacity(256);
                 for i in 0..60 {
@@ -325,6 +398,52 @@ macro_rules! common_suite {
                 assert_eq!(map.len(), original_len - extracted_count);
                 let remaining: Vec<i32> = map.iter().map(|(&k, _)| k).collect();
                 assert_eq!(remaining.len(), original_len - extracted_count);
+            }
+
+            #[test]
+            fn extract_if_predicate_panic_does_not_rehash_while_unwinding() {
+                let hash_calls = Arc::new(AtomicUsize::new(0));
+                let mut map: HashMap<CountingHashKey, usize> = HashMap::with_capacity(512);
+                for value in 0..300 {
+                    map.insert(
+                        CountingHashKey {
+                            value,
+                            calls: Arc::clone(&hash_calls),
+                        },
+                        value,
+                    );
+                }
+                let calls_before_extract = hash_calls.load(Ordering::SeqCst);
+                let mut visits = 0_usize;
+
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    let mut extracted = map.extract_if(|_, _| {
+                        visits += 1;
+                        assert!(visits < 300, "predicate panic");
+                        true
+                    });
+                    while extracted.next().is_some() {}
+                }));
+
+                assert!(result.is_err());
+                assert_eq!(visits, 300);
+                assert_eq!(
+                    hash_calls.load(Ordering::SeqCst),
+                    calls_before_extract,
+                    "ExtractIf::drop must not invoke user Hash during unwinding"
+                );
+                assert_eq!(map.len(), 1);
+                assert_eq!(map.iter().count(), 1);
+
+                map.insert(
+                    CountingHashKey {
+                        value: 999,
+                        calls: Arc::clone(&hash_calls),
+                    },
+                    999,
+                );
+                assert_eq!(map.len(), 2);
+                assert_eq!(map.iter().count(), 2);
             }
 
             #[test]

@@ -5,9 +5,10 @@ Date: 2026-07-15
 This is the direct external comparison for `LockFreeAtomicU64GenerationMap`.
 It uses 100,000 preloaded 32-byte keys, 300,000 requested operations, 64
 DashMap shards, 15 alternating samples, identical operation traces, a cloned
-FoldHash state, and identical untimed hit/miss warmup. Results are unpinned
-Apple M4 Max development measurements, so small differences need pinned
-confirmation.
+FoldHash state, and identical untimed hit/miss warmup. These tables predate the
+current two-lane Rapidhash default and remain historical evidence until the
+full matrix is rerun. Results are unpinned Apple M4 Max development
+measurements, so small differences need pinned confirmation.
 
 ## How to read the tables
 
@@ -78,7 +79,7 @@ generation is not currently a single-core replacement for DashMap.
 | Insert new key | 30.868 | **51.320** | -39.9% | DashMap |
 | Update hit | **64.203** | 55.529 | +15.6% | PackedGen |
 | Update miss | 78.167 | **83.097** | -5.9% | DashMap |
-| Update one hot key | 4.134 | **58.872** | -93.0% | DashMap |
+| Update one hot key | 6.012 exact / 8.532 one-byte | **58.755** | -89.8% exact / -85.5% one-byte | DashMap |
 | Delete hit | 43.628 | **50.263** | -13.2% | DashMap |
 | Delete miss | 79.504 | **89.723** | -11.4% | DashMap |
 | Cache mix: 90% read hit | **134.627** | 87.813 | +53.3% | PackedGen |
@@ -103,8 +104,92 @@ These are explicit workload choices rather than the ordinary default:
 
 The embedded fingerprint costs zero extra retained bytes. The one-byte filter
 adds exactly one byte per frozen entry; it is justified only when read misses
-are unusually frequent. Even the best PackedGen policy does not beat DashMap
-for new-key insertion in this test.
+are unusually frequent. In this pre-writer-accounting run, even the best
+PackedGen policy did not beat DashMap for new-key insertion.
+
+## Latest writer-accounting pass
+
+Length deltas now share the existing writer-stripe words instead of using a
+separate 64-way padded counter bank. This removes 4,096 requested bytes per
+generation and eliminates the main multicore contention found on successful
+insert/delete accounting.
+
+In the July 16, 2026 unpinned M4 Max smoke run, **higher throughput is better**:
+
+| Eight-thread workload | PackedGen exact | PackedGen one-byte | DashMap |
+|---|---:|---:|---:|
+| Insert new key | 49.614 | **51.230** | 49.363 |
+| Delete hit | **61.813** | 60.018 | 52.694 |
+
+Two separate 31-sample insertion runs measured exact PackedGen at
+46.688-48.716, the one-byte policy at 48.506-52.282, and DashMap at
+50.129-50.809 Mops/s. Both PackedGen policies straddled DashMap across these
+unpinned runs, so this is a tie within local noise rather than a stable win.
+Single-thread new-key insertion still lost materially: approximately
+10-11 exact and 15-16 one-byte versus DashMap at 20-21 Mops/s.
+
+## New-key fusion and combined writer release
+
+The next pass added `AtomicEntry`/`AtomicVacantEntry` for cache-style
+miss-then-insert flows. A vacant handle carries the route hash and the exact
+result of the first frozen lookup. It also pins that key's writer stripe, so a
+concurrent rebuild cannot invalidate the absence proof. Concurrent inserts
+still race through the same atomic frozen slot or overlay cell; the handle
+never creates a second logical location.
+
+Successful `insert`, `insert_new`, `upsert`, delete, and single prepared-slot
+operations now also publish their signed
+length delta while releasing the writer count in one compare-and-swap on the
+already packed stripe word. Previously those were two separate read-modify-
+write operations on the same word. This changes no retained layout.
+
+The focused July 17 probe used 100,000 frozen 32-byte keys, 200,000 distinct
+new keys, 64 DashMap shards, 21 alternating samples, and the production
+`gxhash` configuration. **Higher Mops/s is better.**
+
+| New-key path | 1 thread | 8 threads | Frozen-filter RAM cost |
+|---|---:|---:|---:|
+| PackedGen `insert_new`, exact | 12.220 | 46.760 | 0 B/key |
+| PackedGen `insert_new`, embedded fingerprint | 18.247 | **50.364** | **0 B/key** |
+| PackedGen `insert_new`, one-byte filter | 20.655 | **51.547** | 1 B/key |
+| DashMap `insert` | **21.145** | 48.328 | n/a |
+| DashMap `entry` | 20.643 | 47.354 | n/a |
+
+For an actual read-miss followed by conditional insertion:
+
+| Miss-then-insert path | 1 thread | 8 threads |
+|---|---:|---:|
+| PackedGen `get` then `insert_new`, embedded | 10.899 | 41.099 |
+| PackedGen `entry` then `insert_new`, embedded | 12.669 | 44.586 |
+| PackedGen `entry` then `insert_new`, one-byte | 12.976 | 45.693 |
+| PackedGen fused `get_or_insert`, embedded | 17.075 | **50.813** |
+| PackedGen fused `get_or_insert`, one-byte | **19.412** | **51.201** |
+| DashMap `get` then `insert` | 18.699 | 45.975 |
+| DashMap `entry` | **20.643** | 47.354 |
+
+The fused one-byte operation is 49.6%/12.1% faster than PackedGen's entry
+composition at 1/8 threads. DashMap remains 6.3% faster at one thread, while
+PackedGen is 8.1% faster at eight. The embedded policy gives nearly the same
+eight-thread result without adding frozen bytes. These unpinned results are
+local smoke measurements, not a universal result for arbitrary key widths or
+overflow-heavy overlays.
+
+With the optional `operation-batch` feature, one short-lived operation guard is
+reused per worker, matching the way Papaya's benchmark guard is reused. The
+guard exposes read, insert, insert-new, fused get-or-insert, update, upsert,
+remove, and conditional remove, plus a bounded `get_or_insert_batch` wrapper.
+It adds about 1 KiB per generation and zero per-entry bytes. In the later
+21-sample run, **higher is better**:
+
+| Conditional new-key path | 1 thread | 8 threads |
+|---|---:|---:|
+| PackedGen point `get_or_insert`, one-byte | 20.393 | 51.574 |
+| **PackedGen guarded `get_or_insert`, one-byte** | **24.817** | **57.593** |
+| DashMap entry | 22.937 | 49.234 |
+| Papaya `get_or_insert` | 21.443 | **69.488** |
+
+The guard improves PackedGen by 21.7%/11.7%, beats DashMap at both points, and
+beats Papaya at one thread. Papaya remains 20.7% faster at eight threads.
 
 ## Delete and reclamation lifecycle
 

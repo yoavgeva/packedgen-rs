@@ -758,6 +758,10 @@ fn large_binary_key_lookups(criterion: &mut Criterion) {
     for (index, key) in corpus.iter().enumerate() {
         segmented.try_insert(key, index as u64).unwrap();
     }
+    let batch_misses: Vec<Box<[u8]>> = (LARGE_BINARY_ENTRIES as u64
+        ..LARGE_BINARY_ENTRIES as u64 + 8_192)
+        .map(|index| binary_key(index, BINARY_KEY_BYTES))
+        .collect();
 
     let mut group = criterion.benchmark_group("successful_lookup_binary_32_large_1m");
     group.throughput(Throughput::Elements(1));
@@ -823,6 +827,38 @@ fn large_binary_key_lookups(criterion: &mut Criterion) {
             black_box(core::array::from_fn::<_, LOOKUP_BATCH, _>(|offset| {
                 hashbrown.get(corpus[cursor + offset].as_ref())
             }))
+        });
+    });
+    let mut cursor = 0_usize;
+    group.bench_function("frozen-ptrhash", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(LOOKUP_BATCH) % (LARGE_BINARY_ENTRIES - LOOKUP_BATCH);
+            let keys: [&[u8]; LOOKUP_BATCH] =
+                core::array::from_fn(|offset| corpus[cursor + offset].as_ref());
+            black_box(frozen.get_many(keys))
+        });
+    });
+    let mut cursor = 0_usize;
+    group.bench_function("frozen-ptrhash-miss", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(LOOKUP_BATCH) % (batch_misses.len() - LOOKUP_BATCH);
+            let keys: [&[u8]; LOOKUP_BATCH] =
+                core::array::from_fn(|offset| batch_misses[cursor + offset].as_ref());
+            black_box(frozen.get_many(keys))
+        });
+    });
+    let mut cursor = 0_usize;
+    group.bench_function("frozen-ptrhash-mixed", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(LOOKUP_BATCH) % (batch_misses.len() - LOOKUP_BATCH);
+            let keys: [&[u8]; LOOKUP_BATCH] = core::array::from_fn(|offset| {
+                if offset & 1 == 0 {
+                    corpus[cursor + offset].as_ref()
+                } else {
+                    batch_misses[cursor + offset].as_ref()
+                }
+            });
+            black_box(frozen.get_many(keys))
         });
     });
     group.finish();

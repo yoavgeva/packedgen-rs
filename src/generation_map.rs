@@ -1,3 +1,6 @@
+#[cfg(feature = "prepared-keys")]
+use std::cell::Cell;
+use std::cell::RefCell;
 use std::hint::spin_loop;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -5,18 +8,27 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Orderin
 use std::thread;
 use std::time::{Duration, Instant};
 
+use arc_swap::cache::Cache as ArcSwapCache;
 use arc_swap::{ArcSwap, ArcSwapOption, Guard};
 use parking_lot::Mutex;
 
 #[cfg(feature = "prepared-keys")]
 use crate::atomic_value::AtomicPreparedSlot;
-use crate::atomic_value::{AtomicU64Cell, AtomicU64FrozenMap, DirectMutation, NonMaxU64};
+use crate::atomic_value::{
+    AtomicFrozenProbe, AtomicU64Cell, AtomicU64FrozenMap, DirectMutation, NonMaxU64,
+};
 use crate::frozen_map::Digest;
 #[cfg(feature = "prepared-keys")]
 use crate::frozen_map::key_digest;
 use crate::generation_hash::{GenerationHashBuilder, GenerationKeyHash};
-use crate::generation_overlay::{GenerationOverlay, GenerationOverlayMode, OverlayInsert};
-use crate::overlay_cell::{GenerationCell, OverlayCell};
+#[cfg(all(feature = "operation-batch", not(feature = "shared-gx")))]
+use crate::generation_overlay::AtomicEncodedAdmissionKey;
+#[cfg(feature = "prepared-keys")]
+use crate::generation_overlay::AtomicOverlayPreparedSlot;
+use crate::generation_overlay::{
+    AdaptiveOverlaySnapshot, GenerationOverlay, GenerationOverlayMode, OverlayInsert,
+};
+use crate::overlay_cell::{GenerationCell, OverlayCell, StableCell};
 use crate::{
     FrozenBuildError, FrozenIndexBackend, FrozenMapStats, FrozenPackedMap, InsertOutcome,
     LockFreeHybridMap, LockFreeHybridStats,
@@ -82,6 +94,8 @@ trait GenerationFrozen<V>: Sized {
 
     fn for_each_entry(&self, visit: &mut dyn FnMut(&[u8], &V));
 
+    fn sample_entry(&self, seed: u64, visit: &mut dyn FnMut(&[u8], &V) -> bool) -> bool;
+
     fn stats(&self) -> FrozenMapStats;
 
     #[cfg(feature = "prepared-keys")]
@@ -105,6 +119,16 @@ trait GenerationFrozen<V>: Sized {
         _key: &[u8],
         _prepared: AtomicPreparedSlot,
         _update: &impl Fn(&V) -> V,
+    ) -> DirectMutation<Option<V>> {
+        DirectMutation::NotMember
+    }
+
+    #[cfg(feature = "prepared-keys")]
+    fn replace_prepared(
+        &self,
+        _key: &[u8],
+        _prepared: AtomicPreparedSlot,
+        _value: &V,
     ) -> DirectMutation<Option<V>> {
         DirectMutation::NotMember
     }
@@ -206,6 +230,18 @@ impl<V> GenerationFrozen<V> for FrozenPackedMap<V> {
         self.for_each_entry(visit);
     }
 
+    fn sample_entry(&self, seed: u64, visit: &mut dyn FnMut(&[u8], &V) -> bool) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        let slot =
+            usize::try_from(seed % self.len() as u64).expect("frozen sample slot fits usize");
+        let (key, value) = self
+            .indexed_entry(slot)
+            .expect("sample slot is below frozen length");
+        visit(key, value)
+    }
+
     fn stats(&self) -> FrozenMapStats {
         self.stats()
     }
@@ -285,6 +321,10 @@ impl GenerationFrozen<NonMaxU64> for AtomicU64FrozenMap {
         self.for_each_entry(visit);
     }
 
+    fn sample_entry(&self, seed: u64, visit: &mut dyn FnMut(&[u8], &NonMaxU64) -> bool) -> bool {
+        self.sample_entry(seed, visit)
+    }
+
     fn stats(&self) -> FrozenMapStats {
         self.stats()
     }
@@ -312,6 +352,16 @@ impl GenerationFrozen<NonMaxU64> for AtomicU64FrozenMap {
         update: &impl Fn(&NonMaxU64) -> NonMaxU64,
     ) -> DirectMutation<Option<NonMaxU64>> {
         self.update_prepared(key, prepared, update)
+    }
+
+    #[cfg(feature = "prepared-keys")]
+    fn replace_prepared(
+        &self,
+        key: &[u8],
+        prepared: AtomicPreparedSlot,
+        value: &NonMaxU64,
+    ) -> DirectMutation<Option<NonMaxU64>> {
+        self.replace_prepared(key, prepared, *value)
     }
 
     #[cfg(feature = "prepared-keys")]
@@ -537,22 +587,558 @@ pub struct LockFreeAtomicU64GenerationMap {
     inner: GenerationMapCore<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap>,
 }
 
-/// Prepared routing and frozen-slot metadata for one repeatedly accessed key.
+pub(crate) struct AtomicReadGuard<'map> {
+    map: &'map LockFreeAtomicU64GenerationMap,
+    generation: PinnedGeneration<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap>,
+    stable_base: Option<Arc<GenerationBase<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap>>>,
+}
+
+type AtomicGenerationLayer = GenerationLayer<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap>;
+type AtomicGenerationBase = GenerationBase<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap>;
+type AtomicCurrentCache<'map> =
+    ArcSwapCache<&'map ArcSwap<AtomicGenerationLayer>, Arc<AtomicGenerationLayer>>;
+
+struct AtomicReadCacheState<'map> {
+    current: AtomicCurrentCache<'map>,
+    base_generation: Arc<AtomicGenerationLayer>,
+    base: Arc<AtomicGenerationBase>,
+}
+
+pub(crate) struct AtomicReadCache<'map> {
+    map: &'map LockFreeAtomicU64GenerationMap,
+    state: RefCell<AtomicReadCacheState<'map>>,
+}
+
+impl AtomicReadCache<'_> {
+    pub(crate) fn get_protected(&self, key: &[u8]) -> Option<NonMaxU64> {
+        #[cfg(feature = "shared-gx")]
+        let key_hash = GenerationKeyHash::new(&self.map.inner.writer_hash_builder, key);
+        #[cfg(feature = "shared-gx")]
+        let route_hash = key_hash.route();
+        #[cfg(not(feature = "shared-gx"))]
+        let route_hash = GenerationKeyHash::route_for(&self.map.inner.writer_hash_builder, key);
+        let stripe_mask = u64::try_from(WRITER_STRIPES - 1).expect("writer stripe mask fits u64");
+        let stripe =
+            usize::try_from(route_hash & stripe_mask).expect("masked writer stripe fits usize");
+        let mut state = self.state.borrow_mut();
+        let AtomicReadCacheState {
+            current,
+            base_generation,
+            base,
+        } = &mut *state;
+        let generation = current.load();
+        if !Arc::ptr_eq(base_generation, generation) {
+            *base_generation = Arc::clone(generation);
+            *base = generation.base.load_full();
+        } else if matches!(base.as_ref(), GenerationBase::Previous(_))
+            && generation.writer_stripes[stripe].load(Ordering::Acquire) & WRITER_STRIPE_DIRECT_BASE
+                != 0
+        {
+            // A generation changes its base at most once: an immutable
+            // predecessor is replaced by an equivalent frozen map before any
+            // stripe can enable direct frozen-cell mutation. Observing that
+            // enable bit therefore proves the cached predecessor must be
+            // refreshed before this read can observe later direct updates.
+            *base = generation.base.load_full();
+        }
+        #[cfg(feature = "shared-gx")]
+        {
+            generation.get_atomic_protected_with_base(base, key, key_hash, stripe)
+        }
+        #[cfg(not(feature = "shared-gx"))]
+        generation.get_atomic_protected_with_base_route(
+            base,
+            key,
+            route_hash,
+            stripe,
+            &self.map.inner.writer_hash_builder,
+        )
+    }
+
+    #[cfg(feature = "prepared-keys")]
+    pub(crate) fn get_prepared(
+        &self,
+        key: &[u8],
+        prepared: &AtomicPreparedKey,
+    ) -> Option<NonMaxU64> {
+        let prepared = *prepared;
+        let stripe_mask = u64::try_from(WRITER_STRIPES - 1).expect("writer stripe mask fits u64");
+        let prepared_stripe = usize::try_from(prepared.route_hash() & stripe_mask)
+            .expect("masked writer stripe fits usize");
+        let mut cache = self.state.borrow_mut();
+        let AtomicReadCacheState {
+            current,
+            base_generation,
+            base,
+        } = &mut *cache;
+        let generation = current.load();
+        if !Arc::ptr_eq(base_generation, generation) {
+            *base_generation = Arc::clone(generation);
+            *base = generation.base.load_full();
+        }
+
+        if let Some(slot) = prepared.prepared_overlay_slot()
+            && let Some(value) =
+                generation
+                    .overlay
+                    .with_prepared_atomic(key, slot, AtomicU64Cell::get_protected)
+        {
+            return value;
+        }
+
+        let prepared_stripe_state =
+            generation.writer_stripes[prepared_stripe].load(Ordering::Acquire);
+        if matches!(base.as_ref(), GenerationBase::Previous(_))
+            && prepared_stripe_state & WRITER_STRIPE_DIRECT_BASE != 0
+        {
+            *base = generation.base.load_full();
+        }
+        if let Some(slot) = prepared.prepared_slot()
+            && prepared_stripe_state & WRITER_STRIPE_DIRECT_BASE != 0
+            && prepared_stripe_state & WRITER_STRIPE_OVERLAY_BASE == 0
+            && let DirectMutation::Handled(value) =
+                base.with_prepared_value(key, slot, copy_optional_non_max)
+        {
+            return value;
+        }
+
+        #[cfg(feature = "shared-gx")]
+        let key_hash = GenerationKeyHash::new(&self.map.inner.writer_hash_builder, key);
+        #[cfg(feature = "shared-gx")]
+        let route_hash = key_hash.route();
+        #[cfg(not(feature = "shared-gx"))]
+        let route_hash = GenerationKeyHash::route_for(&self.map.inner.writer_hash_builder, key);
+        let key_stripe =
+            usize::try_from(route_hash & stripe_mask).expect("masked writer stripe fits usize");
+        if key_stripe != prepared_stripe
+            && matches!(base.as_ref(), GenerationBase::Previous(_))
+            && generation.writer_stripes[key_stripe].load(Ordering::Acquire)
+                & WRITER_STRIPE_DIRECT_BASE
+                != 0
+        {
+            *base = generation.base.load_full();
+        }
+        #[cfg(feature = "shared-gx")]
+        {
+            generation.get_atomic_protected_with_base(base, key, key_hash, key_stripe)
+        }
+        #[cfg(not(feature = "shared-gx"))]
+        generation.get_atomic_protected_with_base_route(
+            base,
+            key,
+            route_hash,
+            key_stripe,
+            &self.map.inner.writer_hash_builder,
+        )
+    }
+
+    pub(crate) fn refresh(&self) {
+        let mut state = self.state.borrow_mut();
+        let AtomicReadCacheState {
+            current,
+            base_generation,
+            base,
+        } = &mut *state;
+        let generation = current.load();
+        *base_generation = Arc::clone(generation);
+        *base = generation.base.load_full();
+    }
+}
+
+impl AtomicReadGuard<'_> {
+    #[cfg(test)]
+    pub(crate) fn get_protected(&self, key: &[u8]) -> Option<NonMaxU64> {
+        let (stripe, key_hash) = self.map.inner.writer_route(key);
+        self.stable_base.as_ref().map_or_else(
+            || self.generation.get_atomic_protected(key, key_hash, stripe),
+            |base| {
+                self.generation
+                    .get_atomic_protected_with_base(base, key, key_hash, stripe)
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn refresh(&mut self) {
+        *self = self.map.read_guard();
+    }
+
+    pub(crate) fn get_or_insert(&self, key: &[u8], value: NonMaxU64) -> NonMaxU64 {
+        let (current, deferred_stripe) = self.get_or_insert_deferred_len(key, value);
+        if let Some(stripe) = deferred_stripe {
+            self.generation.adjust_len(stripe, 1);
+        }
+        current
+    }
+
+    pub(crate) fn get_or_insert_deferred_len(
+        &self,
+        key: &[u8],
+        value: NonMaxU64,
+    ) -> (NonMaxU64, Option<usize>) {
+        if self.stable_base.is_none() {
+            return (self.map.get_or_insert(key, value), None);
+        }
+        #[cfg(not(feature = "shared-gx"))]
+        if self.generation.base_is_empty {
+            // This stable generation cannot consume the independent frozen
+            // digest, so compute only the mutable writer route.
+            return self.get_or_insert_deferred_len_route_only(key, value);
+        }
+        let (stripe, key_hash) = self.map.inner.writer_route(key);
+        // This guard owns one `read_batches` reservation. Rebuild closes and
+        // drains those reservations before it can close writer stripes, so a
+        // stable guarded write does not need a second per-operation writer
+        // reservation merely to keep this generation open.
+        let state = self.generation.writer_stripes[stripe].load(Ordering::Acquire);
+        debug_assert_eq!(state & WRITER_STRIPE_CLOSED, 0);
+        let route = GenerationWriteRoute {
+            stripe,
+            direct_base: state & WRITER_STRIPE_DIRECT_BASE != 0,
+            overlay_may_shadow_base: state & WRITER_STRIPE_OVERLAY_BASE != 0,
+            key_hash,
+        };
+        let (current, inserted) = self.generation.get_or_insert_atomic_with_base(
+            self.stable_base
+                .as_ref()
+                .expect("stable guarded writes retain a base"),
+            key,
+            value,
+            route,
+        );
+        (current, inserted.then_some(stripe))
+    }
+
+    #[cfg(not(feature = "shared-gx"))]
+    pub(crate) fn uses_route_only_admission(&self) -> bool {
+        self.stable_base.is_some() && self.generation.base_is_empty
+    }
+
+    #[cfg(not(feature = "shared-gx"))]
+    pub(crate) fn get_or_insert_deferred_len_route_only(
+        &self,
+        key: &[u8],
+        value: NonMaxU64,
+    ) -> (NonMaxU64, Option<usize>) {
+        debug_assert!(self.uses_route_only_admission());
+        // A mutable-only generation needs just the routing lane used by the
+        // writer stripe and overlay. Defer the independent frozen-map digest
+        // lane until a generation actually has a frozen base.
+        let route_hash = GenerationKeyHash::route_for(&self.map.inner.writer_hash_builder, key);
+        let stripe_mask = u64::try_from(WRITER_STRIPES - 1).expect("writer stripe mask fits u64");
+        let stripe =
+            usize::try_from(route_hash & stripe_mask).expect("masked writer stripe fits usize");
+        let state = self.generation.writer_stripes[stripe].load(Ordering::Acquire);
+        debug_assert_eq!(state & WRITER_STRIPE_CLOSED, 0);
+        let (current, inserted) = self
+            .generation
+            .get_or_insert_atomic_empty_base(key, value, route_hash);
+        (current, inserted.then_some(stripe))
+    }
+
+    #[cfg(all(feature = "operation-batch", not(feature = "shared-gx")))]
+    pub(crate) fn get_or_insert_deferred_len_route_only_encoded(
+        &self,
+        key: &[u8],
+        value: NonMaxU64,
+    ) -> (NonMaxU64, Option<usize>) {
+        debug_assert!(self.uses_route_only_admission());
+        let route_hash = GenerationKeyHash::route_for(&self.map.inner.writer_hash_builder, key);
+        let stripe_mask = u64::try_from(WRITER_STRIPES - 1).expect("writer stripe mask fits u64");
+        let stripe =
+            usize::try_from(route_hash & stripe_mask).expect("masked writer stripe fits usize");
+        let state = self.generation.writer_stripes[stripe].load(Ordering::Acquire);
+        debug_assert_eq!(state & WRITER_STRIPE_CLOSED, 0);
+        let encoded = AtomicEncodedAdmissionKey::prepare(key)
+            .expect("encoded bulk admission receives a non-boundary short key");
+        let (current, inserted) = self
+            .generation
+            .get_or_insert_atomic_empty_base_encoded(key, &encoded, value, route_hash);
+        (current, inserted.then_some(stripe))
+    }
+
+    pub(crate) fn flush_deferred_insert_len(&self, stripe: usize, amount: u16) {
+        debug_assert!(self.stable_base.is_some());
+        self.generation.adjust_len(
+            stripe,
+            isize::try_from(amount).expect("deferred insert count fits isize"),
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove(&self, key: &[u8]) -> Option<NonMaxU64> {
+        let (removed, deferred_stripe) = self.remove_deferred_len(key);
+        if let Some(stripe) = deferred_stripe {
+            self.generation.adjust_len(stripe, -1);
+        }
+        removed
+    }
+
+    pub(crate) fn remove_deferred_len(&self, key: &[u8]) -> (Option<NonMaxU64>, Option<usize>) {
+        if self.stable_base.is_none() {
+            return (self.map.remove(key), None);
+        }
+        let (stripe, key_hash) = self.map.inner.writer_route(key);
+        // As with guarded conditional admission, the read-batch reservation
+        // keeps this generation and its writer stripes open through removal.
+        let state = self.generation.writer_stripes[stripe].load(Ordering::Acquire);
+        debug_assert_eq!(state & WRITER_STRIPE_CLOSED, 0);
+        let route = GenerationWriteRoute {
+            stripe,
+            direct_base: state & WRITER_STRIPE_DIRECT_BASE != 0,
+            overlay_may_shadow_base: state & WRITER_STRIPE_OVERLAY_BASE != 0,
+            key_hash,
+        };
+        let removed = self.generation.remove_atomic_with_base(
+            self.stable_base
+                .as_ref()
+                .expect("stable guarded writes retain a base"),
+            key,
+            route,
+        );
+        let deferred_stripe = removed.map(|_| stripe);
+        (removed, deferred_stripe)
+    }
+
+    #[cfg(feature = "prepared-keys")]
+    pub(crate) fn remove_prepared_deferred_len(
+        &self,
+        key: &[u8],
+        prepared: &AtomicPreparedKey,
+    ) -> (Option<NonMaxU64>, Option<usize>) {
+        if self.stable_base.is_none() {
+            return (self.map.remove_prepared(key, prepared), None);
+        }
+        let Some(slot) = prepared.prepared_slot() else {
+            return self.remove_deferred_len(key);
+        };
+        let stripe_mask = u64::try_from(WRITER_STRIPES - 1).expect("writer stripe mask fits u64");
+        let stripe = usize::try_from(prepared.route_hash() & stripe_mask)
+            .expect("masked writer stripe fits usize");
+        let state = self.generation.writer_stripes[stripe].load(Ordering::Acquire);
+        debug_assert_eq!(state & WRITER_STRIPE_CLOSED, 0);
+        if state & WRITER_STRIPE_DIRECT_BASE != 0 && state & WRITER_STRIPE_OVERLAY_BASE == 0 {
+            match self
+                .stable_base
+                .as_ref()
+                .expect("stable guarded writes retain a base")
+                .remove_prepared(key, slot)
+            {
+                DirectMutation::Handled(removed) => {
+                    let deferred_stripe = removed.map(|_| stripe);
+                    return (removed, deferred_stripe);
+                }
+                DirectMutation::NotMember => {}
+            }
+        }
+        self.remove_deferred_len(key)
+    }
+
+    pub(crate) fn flush_deferred_remove_len(&self, stripe: usize, amount: u16) {
+        debug_assert!(self.stable_base.is_some());
+        self.generation.adjust_len(
+            stripe,
+            -isize::try_from(amount).expect("deferred removal count fits isize"),
+        );
+    }
+}
+
+impl Drop for AtomicReadGuard<'_> {
+    fn drop(&mut self) {
+        let previous = self.generation.read_batches.fetch_sub(1, Ordering::Release);
+        debug_assert!(previous & WRITER_STRIPE_COUNT_MASK > 0);
+    }
+}
+
+/// Reusable writer-generation guard for a sequence of atomic map operations.
+///
+/// The guard amortizes generation handoff protection across many keys. Keep it
+/// scoped to one request or worker batch: a live guard can delay an online
+/// rebuild from closing its generation, in the same way that a retained vacant
+/// entry delays one writer stripe.
+#[cfg(feature = "prepared-batch-gate")]
+#[must_use]
+pub struct AtomicOperationGuard<'map> {
+    map: &'map LockFreeAtomicU64GenerationMap,
+    writer: AtomicPreparedBatchWriter,
+}
+
+#[cfg(feature = "prepared-batch-gate")]
+impl AtomicOperationGuard<'_> {
+    /// Reads through the pinned generation.
+    #[must_use]
+    pub fn get(&self, key: &[u8]) -> Option<NonMaxU64> {
+        self.map.inner.get_in_batch(&self.writer, key)
+    }
+
+    /// Inserts or replaces a value without a per-call writer pin.
+    #[must_use]
+    pub fn insert(&self, key: &[u8], value: NonMaxU64) -> InsertOutcome<NonMaxU64> {
+        self.map.inner.insert_in_batch(&self.writer, key, value)
+    }
+
+    /// Inserts only while the logical key is absent.
+    #[must_use]
+    pub fn insert_new(&self, key: &[u8], value: NonMaxU64) -> bool {
+        self.map.inner.insert_new_in_batch(&self.writer, key, value)
+    }
+
+    /// Returns the existing value or inserts `value` through the pinned
+    /// generation without pinning and releasing a writer stripe per call.
+    #[must_use]
+    pub fn get_or_insert(&self, key: &[u8], value: NonMaxU64) -> NonMaxU64 {
+        self.map
+            .inner
+            .get_or_insert_in_batch(&self.writer, key, value)
+    }
+
+    /// Atomically transforms an existing value without a per-call writer pin.
+    pub fn update(
+        &self,
+        key: &[u8],
+        update: impl Fn(&NonMaxU64) -> NonMaxU64,
+    ) -> Option<NonMaxU64> {
+        self.map.inner.update_in_batch(&self.writer, key, update)
+    }
+
+    /// Atomically updates an existing value or inserts `insert_value`.
+    pub fn upsert(
+        &self,
+        key: &[u8],
+        insert_value: NonMaxU64,
+        update: impl Fn(&NonMaxU64) -> NonMaxU64,
+    ) -> NonMaxU64 {
+        self.map
+            .inner
+            .upsert_in_batch(&self.writer, key, insert_value, update)
+    }
+
+    /// Removes and returns the latest logical value.
+    #[must_use]
+    pub fn remove(&self, key: &[u8]) -> Option<NonMaxU64> {
+        self.remove_if(key, |_| true)
+    }
+
+    /// Removes a value accepted by a retry-safe predicate.
+    #[must_use]
+    pub fn remove_if(
+        &self,
+        key: &[u8],
+        predicate: impl Fn(&NonMaxU64) -> bool,
+    ) -> Option<NonMaxU64> {
+        self.map
+            .inner
+            .remove_if_in_batch(&self.writer, key, predicate)
+    }
+}
+
+/// Result of one exact atomic-map entry probe.
+///
+/// Unlike a lock-based entry guard, an occupied value is a snapshot and may be
+/// changed immediately by another writer. A vacant handle pins only the key's
+/// writer stripe until it is consumed or dropped.
+#[must_use]
+pub enum AtomicEntry<'map, 'key> {
+    /// The key was live when probed.
+    Occupied(NonMaxU64),
+    /// The key was absent and can be inserted without hashing or probing the
+    /// frozen base a second time.
+    Vacant(AtomicVacantEntry<'map, 'key>),
+}
+
+/// One-shot proof that an atomic-map key was absent during an exact probe.
+///
+/// The handle carries the precomputed route and keeps the relevant writer
+/// stripe open across a concurrent rebuild. Dropping it without inserting is
+/// harmless. Handles should be short-lived because a retained handle can delay
+/// rebuild progress for its stripe.
+#[must_use]
+pub struct AtomicVacantEntry<'map, 'key> {
+    _map: &'map LockFreeAtomicU64GenerationMap,
+    key: &'key [u8],
+    writer: GenerationWriter<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap>,
+    target: AtomicVacantTarget,
+}
+
+enum AtomicVacantTarget {
+    FrozenSlot {
+        map: Arc<AtomicU64FrozenMap>,
+        slot: usize,
+    },
+    Overlay {
+        mark_base_shadow: bool,
+    },
+}
+
+enum AtomicEntryProbe {
+    Occupied(NonMaxU64),
+    Vacant(AtomicVacantTarget),
+}
+
+enum AtomicBaseProbe {
+    NotMember,
+    Member {
+        map: Arc<AtomicU64FrozenMap>,
+        slot: usize,
+        value: Option<NonMaxU64>,
+    },
+    Logical(Option<NonMaxU64>),
+}
+
+enum AtomicOverlayProbe {
+    NotMember,
+    Member(Option<NonMaxU64>),
+}
+
+impl AtomicVacantEntry<'_, '_> {
+    /// Returns the exact key bytes associated with this vacancy proof.
+    #[must_use]
+    pub fn key(&self) -> &[u8] {
+        self.key
+    }
+
+    /// Inserts or replaces after the earlier miss without repeating its hash
+    /// or frozen-base lookup.
+    ///
+    /// Another writer can win the key between the probe and this call. In that
+    /// case this operation replaces its value and returns
+    /// [`InsertOutcome::Replaced`].
+    #[must_use]
+    pub fn insert(self, value: NonMaxU64) -> InsertOutcome<NonMaxU64> {
+        self.writer.insert_vacant(self.key, value, self.target)
+    }
+
+    /// Inserts only if the key is still absent.
+    ///
+    /// Returns `false` when another writer made the key live after the entry
+    /// probe. The carried hash and frozen-base proof are still reused.
+    #[must_use]
+    pub fn insert_new(self, value: NonMaxU64) -> bool {
+        self.writer.insert_new_vacant(self.key, value, self.target)
+    }
+}
+
+/// Prepared routing and native-slot metadata for one repeatedly accessed key.
 ///
 /// The handle never weakens exact key semantics. Callers still supply the key
-/// bytes, which are verified before a dense slot is used. Rebuilds and
-/// overlay-shadowed stripes automatically fall back to the ordinary lookup.
+/// bytes, which are verified before a frozen or native-overlay slot is used.
+/// Rebuilds and overlay-shadowed frozen stripes automatically fall back to the
+/// ordinary lookup.
 #[cfg(feature = "prepared-keys")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AtomicPreparedKey {
-    route_hash: u64,
-    base_id: u64,
-    slot: u64,
+    owner_id: u64,
+    route_and_slot: u64,
 }
 
 #[cfg(feature = "prepared-keys")]
 impl AtomicPreparedKey {
-    const NO_SLOT: u64 = u64::MAX;
+    const STRIPE_BITS: u32 = WRITER_STRIPES.trailing_zeros();
+    const TARGET_BITS: u32 = 3;
+    const SLOT_BITS: u32 = u64::BITS - Self::STRIPE_BITS - Self::TARGET_BITS;
+    const SLOT_MASK: u64 = (1_u64 << Self::SLOT_BITS) - 1;
+    const TARGET_MASK: u64 = (1_u64 << Self::TARGET_BITS) - 1;
+    const STRIPE_SHIFT: u32 = Self::SLOT_BITS + Self::TARGET_BITS;
 
     /// Creates an exact ordinary-lookup marker for a mixed prepared batch.
     ///
@@ -562,31 +1148,73 @@ impl AtomicPreparedKey {
     #[must_use]
     pub const fn fallback() -> Self {
         Self {
-            route_hash: 0,
-            base_id: 0,
-            slot: Self::NO_SLOT,
+            owner_id: 0,
+            route_and_slot: 0,
         }
     }
 
     fn new(route_hash: u64, prepared: Option<AtomicPreparedSlot>) -> Self {
-        let (base_id, slot) = prepared.map_or((0, Self::NO_SLOT), |prepared| {
-            (
-                prepared.base_id,
-                u64::try_from(prepared.slot).unwrap_or(Self::NO_SLOT),
-            )
-        });
+        let Some(prepared) = prepared else {
+            return Self::fallback();
+        };
+        let Ok(slot) = u64::try_from(prepared.slot) else {
+            return Self::fallback();
+        };
+        if prepared.base_id == 0 || slot > Self::SLOT_MASK {
+            return Self::fallback();
+        }
+        let stripe_mask = u64::try_from(WRITER_STRIPES - 1).expect("writer stripe mask fits u64");
+        let stripe = route_hash & stripe_mask;
         Self {
-            route_hash,
-            base_id,
-            slot,
+            owner_id: prepared.base_id,
+            route_and_slot: stripe << Self::STRIPE_SHIFT | slot,
         }
     }
 
+    fn new_overlay(route_hash: u64, prepared: AtomicOverlayPreparedSlot) -> Self {
+        let Ok(slot) = u64::try_from(prepared.slot) else {
+            return Self::fallback();
+        };
+        if prepared.owner_id == 0 || slot > Self::SLOT_MASK {
+            return Self::fallback();
+        }
+        let target = u64::from(prepared.class) + 1;
+        if target > Self::TARGET_MASK {
+            return Self::fallback();
+        }
+        let stripe_mask = u64::try_from(WRITER_STRIPES - 1).expect("writer stripe mask fits u64");
+        let stripe = route_hash & stripe_mask;
+        Self {
+            owner_id: prepared.owner_id,
+            route_and_slot: stripe << Self::STRIPE_SHIFT | target << Self::SLOT_BITS | slot,
+        }
+    }
+
+    const fn target(self) -> u64 {
+        self.route_and_slot >> Self::SLOT_BITS & Self::TARGET_MASK
+    }
+
     fn prepared_slot(self) -> Option<AtomicPreparedSlot> {
-        (self.base_id != 0 && self.slot != Self::NO_SLOT).then(|| AtomicPreparedSlot {
-            base_id: self.base_id,
-            slot: usize::try_from(self.slot).expect("prepared slot originated as usize"),
+        (self.owner_id != 0 && self.target() == 0).then(|| AtomicPreparedSlot {
+            base_id: self.owner_id,
+            slot: usize::try_from(self.route_and_slot & Self::SLOT_MASK)
+                .expect("prepared slot originated as usize"),
         })
+    }
+
+    #[inline]
+    fn prepared_overlay_slot(self) -> Option<AtomicOverlayPreparedSlot> {
+        let target = self.target();
+        (self.owner_id != 0 && target != 0).then(|| AtomicOverlayPreparedSlot {
+            owner_id: self.owner_id,
+            class: u8::try_from(target - 1).expect("prepared overlay class fits u8"),
+            slot: usize::try_from(self.route_and_slot & Self::SLOT_MASK)
+                .expect("prepared slot originated as usize"),
+        })
+    }
+
+    fn route_hash(self) -> u64 {
+        self.route_and_slot >> Self::STRIPE_SHIFT
     }
 
     /// Returns whether preparation captured a candidate direct frozen slot.
@@ -596,16 +1224,44 @@ impl AtomicPreparedKey {
     /// but takes the ordinary lookup path until prepared again.
     #[must_use]
     pub const fn has_direct_slot(self) -> bool {
-        self.base_id != 0 && self.slot != Self::NO_SLOT
+        self.owner_id != 0 && self.target() == 0
+    }
+
+    /// Returns whether preparation captured either a frozen or native-overlay slot.
+    ///
+    /// Native overlay slots accelerate reads but intentionally remain outside
+    /// [`Self::has_direct_slot`], which continues to identify slots that also
+    /// support the frozen-base prepared mutation path.
+    #[must_use]
+    pub const fn has_native_slot(self) -> bool {
+        self.owner_id != 0
     }
 }
 
 /// Mutable-overlay implementation used by [`LockFreeAtomicU64GenerationMap`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AtomicGenerationOverlay {
-    /// Fixed-capacity, allocation-free atomic slots for 32-byte keys with a
-    /// dynamic Papaya overflow map.
+    /// Elastic allocation-free atomic slots for 32-byte keys with a lazily
+    /// published packed overflow tier and residual dynamic Papaya fallback.
     AtomicFixed32,
+    /// Elastic allocation-free atomic slots for variable keys from zero
+    /// through 8 bytes. This uses one atomic key word per slot and is the
+    /// densest choice for integer-sized cache keys.
+    AtomicUpTo8,
+    /// Elastic allocation-free atomic slots for variable keys from zero
+    /// through 16 bytes. This uses two atomic key words per slot and is the
+    /// compact choice for small cache keys.
+    AtomicUpTo16,
+    /// Learns the observed key-length distribution before publishing
+    /// proportionally sized 8, 16, 24, and 32-byte atomic tables plus an exact
+    /// inline 48-byte concurrent table. Other widths remain exact in the
+    /// dynamic fallback.
+    AtomicAdaptive,
+    /// Elastic allocation-free atomic slots for variable keys from zero
+    /// through 32 bytes. Short-key length is encoded into the 32nd key byte;
+    /// disjoint control tags distinguish short encodings from full-width keys,
+    /// so this has the same slot size and exact semantics as `AtomicFixed32`.
+    AtomicUpTo32,
     /// Lock-free nodes with inline 32-byte keys, with a dynamic boxed-key
     /// fallback for other key sizes.
     CompactFixed32,
@@ -622,6 +1278,185 @@ pub enum AtomicGenerationOverlay {
     /// Papaya's fully dynamic lock-free table, retained as a control and as a
     /// useful choice when keys are rarely 32 bytes long.
     Papaya,
+}
+
+/// Lifecycle state of an adaptive mutable overlay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdaptiveOverlayPhase {
+    /// Exact keys are still being sampled in the dynamic fallback.
+    Sampling,
+    /// The learned atomic key-class tables have been published.
+    Ready,
+}
+
+/// Thresholds used to recommend adaptive-generation maintenance.
+///
+/// Ratios use basis points: `10_000` is 100%, `1_500` is 15%.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdaptiveRebuildPolicy {
+    /// Recommend rebuild after this share of non-reclaimable overlay slots has
+    /// been consumed.
+    pub max_slot_utilization_bps: u16,
+    /// Minimum learned insertions before drift and spill checks activate.
+    pub min_learned_insertions: usize,
+    /// Maximum total-variation distance from the sampled key-length mix.
+    pub max_distribution_drift_bps: u16,
+    /// Maximum share of learned short keys that spilled into the dynamic
+    /// fallback after their planned atomic class filled.
+    pub max_short_key_spill_bps: u16,
+}
+
+impl Default for AdaptiveRebuildPolicy {
+    fn default() -> Self {
+        Self {
+            max_slot_utilization_bps: 7_500,
+            min_learned_insertions: 256,
+            max_distribution_drift_bps: 1_500,
+            max_short_key_spill_bps: 500,
+        }
+    }
+}
+
+/// Reasons an adaptive generation should be rebuilt.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AdaptiveRebuildRecommendation {
+    /// Non-reclaimable overlay slots crossed the configured utilization.
+    pub capacity_pressure: bool,
+    /// Learned key lengths moved too far from the initial sample.
+    pub distribution_drift: bool,
+    /// Too many short keys spilled out of their packed atomic class.
+    pub short_key_spill: bool,
+}
+
+impl AdaptiveRebuildRecommendation {
+    /// Returns whether any maintenance reason is active.
+    #[must_use]
+    pub const fn is_recommended(self) -> bool {
+        self.capacity_pressure || self.distribution_drift || self.short_key_spill
+    }
+}
+
+/// Maintenance snapshot describing the current adaptive mutable overlay.
+///
+/// Key-class arrays use `0..=8`, `9..=16`, `17..=24`, `25..=32`, exact
+/// `48`, and residual-width buckets. Planned inline capacities omit the final
+/// dynamic bucket. The snapshot scans immutable key metadata, so collecting
+/// it is proportional to occupied overlay slots but adds no work to foreground
+/// mutations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdaptiveOverlayStats {
+    /// Sampling or learned-table state.
+    pub phase: AdaptiveOverlayPhase,
+    /// Configured physical-record budget for this generation.
+    pub capacity: usize,
+    /// Exact insertion sample requested before learning.
+    pub sample_target: usize,
+    /// Unique physical records observed during sampling.
+    pub sampled_records: usize,
+    /// Sample key-length counts in the six documented buckets.
+    pub sample_key_classes: [usize; 6],
+    /// Unique physical records inserted after table publication.
+    pub learned_insertions: usize,
+    /// Learned key-length counts in the six documented buckets.
+    pub learned_key_classes: [usize; 6],
+    /// Slot budgets learned for four packed atomic classes and exact-width 48.
+    pub planned_atomic_capacities: [usize; 5],
+    /// Learned inline keys forced into the dynamic fallback by class pressure.
+    pub short_key_fallback_insertions: usize,
+    /// Sampling plus learned physical records; deletes do not reduce this.
+    pub occupied_slots: usize,
+    /// Occupied slots divided by capacity, in basis points.
+    pub slot_utilization_bps: u16,
+    /// Total-variation distance between sampled and learned distributions.
+    pub distribution_drift_bps: u16,
+    /// Inline-key fallback insertions divided by learned inline-key insertions.
+    pub short_key_spill_bps: u16,
+}
+
+impl AdaptiveOverlayStats {
+    /// Evaluates this snapshot against a maintenance policy.
+    #[must_use]
+    pub fn recommendation(self, policy: AdaptiveRebuildPolicy) -> AdaptiveRebuildRecommendation {
+        let enough_observations = self.learned_insertions >= policy.min_learned_insertions;
+        AdaptiveRebuildRecommendation {
+            capacity_pressure: self.slot_utilization_bps >= policy.max_slot_utilization_bps,
+            distribution_drift: enough_observations
+                && self.distribution_drift_bps >= policy.max_distribution_drift_bps,
+            short_key_spill: enough_observations
+                && self.short_key_spill_bps >= policy.max_short_key_spill_bps,
+        }
+    }
+}
+
+impl AdaptiveOverlayStats {
+    fn from_snapshot(snapshot: AdaptiveOverlaySnapshot) -> Self {
+        let occupied_slots = snapshot.sampled.saturating_add(snapshot.learned_insertions);
+        let learned_short = snapshot.learned_key_classes[..5]
+            .iter()
+            .copied()
+            .sum::<usize>();
+        Self {
+            phase: if snapshot.ready {
+                AdaptiveOverlayPhase::Ready
+            } else {
+                AdaptiveOverlayPhase::Sampling
+            },
+            capacity: snapshot.capacity,
+            sample_target: snapshot.sample_target,
+            sampled_records: snapshot.sampled,
+            sample_key_classes: snapshot.sample_key_classes,
+            learned_insertions: snapshot.learned_insertions,
+            learned_key_classes: snapshot.learned_key_classes,
+            planned_atomic_capacities: snapshot.planned_atomic_capacities,
+            short_key_fallback_insertions: snapshot.short_key_fallback_insertions,
+            occupied_slots,
+            slot_utilization_bps: ratio_bps(occupied_slots, snapshot.capacity),
+            distribution_drift_bps: distribution_drift_bps(
+                snapshot.sample_key_classes,
+                snapshot.learned_key_classes,
+            ),
+            short_key_spill_bps: ratio_bps(snapshot.short_key_fallback_insertions, learned_short),
+        }
+    }
+}
+
+fn ratio_bps(numerator: usize, denominator: usize) -> u16 {
+    if denominator == 0 {
+        return 0;
+    }
+    let scaled = (numerator as u128)
+        .saturating_mul(10_000)
+        .checked_div(denominator as u128)
+        .unwrap_or(0)
+        .min(u128::from(u16::MAX));
+    u16::try_from(scaled).unwrap_or(u16::MAX)
+}
+
+fn distribution_drift_bps<const CLASSES: usize>(
+    sample: [usize; CLASSES],
+    learned: [usize; CLASSES],
+) -> u16 {
+    let sample_total = sample.iter().copied().sum::<usize>();
+    let learned_total = learned.iter().copied().sum::<usize>();
+    if sample_total == 0 || learned_total == 0 {
+        return 0;
+    }
+    let denominator = (sample_total as u128).saturating_mul(learned_total as u128);
+    let distance =
+        sample
+            .into_iter()
+            .zip(learned)
+            .fold(0_u128, |sum, (sample_count, learned_count)| {
+                let sampled = (sample_count as u128).saturating_mul(learned_total as u128);
+                let observed = (learned_count as u128).saturating_mul(sample_total as u128);
+                sum.saturating_add(sampled.abs_diff(observed))
+            });
+    let basis_points = distance
+        .saturating_mul(5_000)
+        .checked_div(denominator)
+        .unwrap_or(0)
+        .min(u128::from(u16::MAX));
+    u16::try_from(basis_points).unwrap_or(u16::MAX)
 }
 
 /// Definite-negative policy for the immutable atomic generation.
@@ -650,6 +1485,10 @@ impl From<AtomicGenerationOverlay> for GenerationOverlayMode {
     fn from(value: AtomicGenerationOverlay) -> Self {
         match value {
             AtomicGenerationOverlay::AtomicFixed32 => Self::AtomicFixed32,
+            AtomicGenerationOverlay::AtomicUpTo8 => Self::AtomicUpTo8,
+            AtomicGenerationOverlay::AtomicUpTo16 => Self::AtomicUpTo16,
+            AtomicGenerationOverlay::AtomicAdaptive => Self::AtomicAdaptive,
+            AtomicGenerationOverlay::AtomicUpTo32 => Self::AtomicUpTo32,
             AtomicGenerationOverlay::CompactFixed32 => Self::CompactFixed32,
             AtomicGenerationOverlay::CompactSized { key_bytes } => Self::CompactSized(key_bytes),
             AtomicGenerationOverlay::ArcSwapFixed32 => Self::ArcSwapFixed32,
@@ -803,15 +1642,131 @@ impl LockFreeAtomicU64GenerationMap {
 
     /// Returns the latest value through a lock-free layered read.
     #[must_use]
+    #[inline]
     pub fn get(&self, key: &[u8]) -> Option<NonMaxU64> {
         self.inner.get_cloned(key)
     }
 
+    /// Loads a pointer-class value with the ordering required by an external
+    /// epoch collector whose guard was entered before this call.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn get_protected(&self, key: &[u8]) -> Option<NonMaxU64> {
+        self.inner.get_atomic_protected(key)
+    }
+
+    pub(crate) fn read_guard(&self) -> AtomicReadGuard<'_> {
+        loop {
+            let generation = self.inner.current.load();
+            if try_acquire_writer_stripe(&generation.read_batches).is_some() {
+                let base = generation.base.load_full();
+                let stable_base =
+                    (!matches!(base.as_ref(), GenerationBase::Previous(_))).then_some(base);
+                return AtomicReadGuard {
+                    map: self,
+                    generation: PinnedGeneration::Guard(generation),
+                    stable_base,
+                };
+            }
+            spin_loop();
+        }
+    }
+
+    pub(crate) fn read_cache(&self) -> AtomicReadCache<'_> {
+        let mut current = ArcSwapCache::new(&self.inner.current);
+        let base_generation = Arc::clone(current.load());
+        let base = base_generation.base.load_full();
+        AtomicReadCache {
+            map: self,
+            state: RefCell::new(AtomicReadCacheState {
+                current,
+                base_generation,
+                base,
+            }),
+        }
+    }
+
+    /// Probes a key once and returns either its current value or a one-shot
+    /// vacant handle for a following insertion.
+    ///
+    /// This is intended for cache-style miss-then-insert flows. The vacant
+    /// path reuses the route hash and exact absence proof, while retaining the
+    /// same lock-free race semantics as [`Self::insert`] and
+    /// [`Self::insert_new`].
+    pub fn entry<'map, 'key>(&'map self, key: &'key [u8]) -> AtomicEntry<'map, 'key> {
+        let writer = self.inner.pin_writer(key);
+        match writer.probe_entry(key) {
+            AtomicEntryProbe::Occupied(value) => AtomicEntry::Occupied(value),
+            AtomicEntryProbe::Vacant(target) => AtomicEntry::Vacant(AtomicVacantEntry {
+                _map: self,
+                key,
+                writer,
+                target,
+            }),
+        }
+    }
+
+    /// Returns the existing value or atomically inserts `value` when absent.
+    ///
+    /// This is the fused cache-miss path: it hashes and probes the key once,
+    /// pins one writer stripe, and publishes both insertion and length change
+    /// through that writer. If another writer wins the race, its value is
+    /// returned without replacing it.
+    #[must_use]
+    pub fn get_or_insert(&self, key: &[u8], value: NonMaxU64) -> NonMaxU64 {
+        self.inner.pin_writer(key).get_or_insert(key, value)
+    }
+
+    /// Pins one generation for a short sequence of atomic operations.
+    ///
+    /// This adds 16 cache-line-separated generation gates (about 1 KiB per
+    /// live generation) through the `prepared-batch-gate` feature. Reusing one
+    /// guard removes the per-operation writer pin/release pair; successful
+    /// insertions still publish exact length changes.
+    #[cfg(feature = "prepared-batch-gate")]
+    pub fn operation_guard(&self) -> AtomicOperationGuard<'_> {
+        AtomicOperationGuard {
+            map: self,
+            writer: self.inner.pin_prepared_batch_writer(0),
+        }
+    }
+
+    /// Performs a conditional-insert batch under one short-lived operation
+    /// guard.
+    ///
+    /// The three slices must have equal lengths. `results` receives the
+    /// existing or newly inserted value for each key.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `keys`, `values`, and `results` have different lengths.
+    #[cfg(feature = "prepared-batch-gate")]
+    pub fn get_or_insert_batch<K>(
+        &self,
+        keys: &[K],
+        values: &[NonMaxU64],
+        results: &mut [NonMaxU64],
+    ) where
+        K: AsRef<[u8]>,
+    {
+        assert_eq!(keys.len(), values.len(), "operation batch value mismatch");
+        assert_eq!(keys.len(), results.len(), "operation batch output mismatch");
+        if keys.is_empty() {
+            return;
+        }
+        let guard = self.operation_guard();
+        for ((key, value), result) in keys.iter().zip(values).zip(results) {
+            *result = guard.get_or_insert(key.as_ref(), *value);
+        }
+    }
+
     /// Prepares a compact exact handle for repeated reads of `key`.
     ///
-    /// Preparation performs the normal routing and frozen lookup once. The
-    /// returned handle remains safe across mutations and rebuilds; stale slot
-    /// metadata simply falls back to [`Self::get`].
+    /// Preparation performs the normal routing and captures an exact frozen or
+    /// native-overlay slot when one is stable. The returned handle remains safe
+    /// across mutations and rebuilds; stale slot metadata simply falls back to
+    /// [`Self::get`]. Native-overlay slots currently accelerate reads, while
+    /// prepared mutations continue through the ordinary exact writer route.
     #[cfg(feature = "prepared-keys")]
     #[must_use]
     pub fn prepare_key(&self, key: &[u8]) -> AtomicPreparedKey {
@@ -854,8 +1809,9 @@ impl LockFreeAtomicU64GenerationMap {
     /// every result is transparently refreshed through the new generation
     /// before this method returns.
     ///
-    /// Invalid, stale, cross-map, overlay, or wrong-key handles retain exact
-    /// semantics by taking the ordinary lookup path for that item.
+    /// Invalid, stale, cross-map, or wrong-key handles retain exact semantics
+    /// by taking the ordinary lookup path for that item. Valid native-overlay
+    /// handles use their exact stable slot directly.
     ///
     /// # Panics
     ///
@@ -912,6 +1868,31 @@ impl LockFreeAtomicU64GenerationMap {
     {
         self.inner
             .update_prepared_batch(keys, prepared, updated, update);
+    }
+
+    /// Atomically replaces existing prepared keys with caller-provided values.
+    ///
+    /// Unlike [`Self::insert_prepared_batch`], absent keys remain absent.
+    /// `previous` receives the exact old value for each successful replacement
+    /// and `None` for each absent key. Invalid or stale prepared handles fall
+    /// back to the ordinary exact update path.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `keys`, `prepared`, `values`, and `previous` have equal
+    /// lengths.
+    #[cfg(feature = "prepared-keys")]
+    pub fn replace_prepared_batch<K>(
+        &self,
+        keys: &[K],
+        prepared: &[AtomicPreparedKey],
+        values: &[NonMaxU64],
+        previous: &mut [Option<NonMaxU64>],
+    ) where
+        K: AsRef<[u8]>,
+    {
+        self.inner
+            .replace_prepared_batch(keys, prepared, values, previous);
     }
 
     /// Inserts or replaces through a prepared direct slot when valid.
@@ -1029,6 +2010,29 @@ impl LockFreeAtomicU64GenerationMap {
         self.inner.rebuild(overlay_capacity)
     }
 
+    /// Rebuilds the adaptive generation only when its lock-free counters cross
+    /// the supplied maintenance policy.
+    ///
+    /// The current generation's capacity is reused, so callers do not need to
+    /// predict the maximum cache population. This is intended for a background
+    /// maintenance worker; it may construct a frozen generation before
+    /// returning. Concurrent calls are serialized and recheck the policy after
+    /// acquiring the rebuild gate.
+    ///
+    /// Non-adaptive overlays and adaptive generations below every threshold
+    /// return `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a frozen-map construction error. The redirected generation
+    /// remains correct and usable if packing fails.
+    pub fn rebuild_adaptive_if_needed(
+        &self,
+        policy: AdaptiveRebuildPolicy,
+    ) -> Result<Option<GenerationRebuild>, FrozenBuildError> {
+        self.inner.rebuild_adaptive_if_needed(policy)
+    }
+
     /// Returns the current logical entry count.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -1051,6 +2055,57 @@ impl LockFreeAtomicU64GenerationMap {
     #[must_use]
     pub fn stats(&self) -> GenerationMapStats {
         self.inner.stats()
+    }
+
+    /// Returns adaptive learning and capacity statistics for the active layer.
+    ///
+    /// This is `None` for every non-adaptive overlay strategy. Collection scans
+    /// immutable overlay key metadata without acquiring the rebuild mutex and
+    /// should normally run on a maintenance worker.
+    #[must_use]
+    pub fn adaptive_overlay_stats(&self) -> Option<AdaptiveOverlayStats> {
+        self.inner.adaptive_overlay_stats()
+    }
+
+    pub(crate) fn adaptive_capacity_pressure(&self, maximum_bps: u16) -> bool {
+        self.inner.adaptive_capacity_pressure(maximum_bps)
+    }
+
+    pub(crate) fn scan_entries(&self, visit: &mut dyn FnMut(&[u8], NonMaxU64)) {
+        self.inner
+            .scan_entries(&mut |key, value| visit(key, *value));
+    }
+
+    pub(crate) fn fallback_len(&self) -> usize {
+        self.inner.fallback_len()
+    }
+
+    pub(crate) fn sample_atomic_entry(
+        &self,
+        seed: u64,
+        visit: &mut dyn FnMut(&[u8], NonMaxU64),
+    ) -> bool {
+        self.inner
+            .sample_atomic_entry(seed, &mut |key, value| visit(key, *value))
+    }
+
+    pub(crate) fn sample_base_entry(
+        &self,
+        seed: u64,
+        visit: &mut dyn FnMut(&[u8], NonMaxU64),
+    ) -> bool {
+        self.inner
+            .sample_base_entry(seed, &mut |key, value| visit(key, *value))
+    }
+
+    pub(crate) fn sample_fallback_entries(
+        &self,
+        seed: u64,
+        limit: usize,
+        visit: &mut dyn FnMut(&[u8], NonMaxU64),
+    ) -> usize {
+        self.inner
+            .sample_fallback_entries(seed, limit, &mut |key, value| visit(key, *value))
     }
 }
 
@@ -1203,6 +2258,7 @@ where
 
     /// Clones the latest value through a lock-free layered read.
     #[must_use]
+    #[inline]
     pub fn get_cloned(&self, key: &[u8]) -> Option<V>
     where
         V: Clone,
@@ -1212,6 +2268,7 @@ where
     }
 
     /// Runs `read` against one safely pinned generation without a lock.
+    #[inline]
     pub fn with_value<R>(&self, key: &[u8], read: impl FnOnce(Option<&V>) -> R) -> R {
         let generation = self.current.load();
         if B::DIRECT_MUTATION {
@@ -1307,6 +2364,37 @@ where
         V: Clone,
     {
         let _one_rebuild = self.rebuild_gate.lock();
+        self.rebuild_locked(overlay_capacity)
+    }
+
+    fn rebuild_adaptive_if_needed(
+        &self,
+        policy: AdaptiveRebuildPolicy,
+    ) -> Result<Option<GenerationRebuild>, FrozenBuildError>
+    where
+        V: Clone,
+    {
+        let Some(initial) = self.adaptive_overlay_stats() else {
+            return Ok(None);
+        };
+        if !initial.recommendation(policy).is_recommended() {
+            return Ok(None);
+        }
+
+        let _one_rebuild = self.rebuild_gate.lock();
+        let Some(current) = self.adaptive_overlay_stats() else {
+            return Ok(None);
+        };
+        if !current.recommendation(policy).is_recommended() {
+            return Ok(None);
+        }
+        self.rebuild_locked(current.capacity).map(Some)
+    }
+
+    fn rebuild_locked(&self, overlay_capacity: usize) -> Result<GenerationRebuild, FrozenBuildError>
+    where
+        V: Clone,
+    {
         let previous = self.current.load_full();
         let previous_stats = previous.stats();
         let next = GenerationLayer::with_base(
@@ -1319,6 +2407,7 @@ where
 
         let redirect_started = Instant::now();
         self.current.store(Arc::clone(&next));
+        previous.close_read_batches();
         #[cfg(feature = "prepared-batch-gate")]
         previous.close_prepared_batch_writers();
         previous.close_writer_stripes();
@@ -1396,6 +2485,50 @@ where
         }
     }
 
+    fn adaptive_overlay_stats(&self) -> Option<AdaptiveOverlayStats> {
+        self.current
+            .load()
+            .overlay
+            .adaptive_snapshot()
+            .map(AdaptiveOverlayStats::from_snapshot)
+    }
+
+    fn adaptive_capacity_pressure(&self, maximum_bps: u16) -> bool {
+        self.current
+            .load()
+            .overlay
+            .adaptive_capacity_pressure(maximum_bps)
+    }
+
+    fn scan_entries(&self, visit: &mut dyn FnMut(&[u8], &V)) {
+        self.current
+            .load()
+            .for_each_entry_hashed(&self.writer_hash_builder, visit);
+    }
+
+    fn sample_atomic_entry(&self, seed: u64, visit: &mut dyn FnMut(&[u8], &V)) -> bool {
+        self.current.load().sample_atomic_entry(seed, visit)
+    }
+
+    fn sample_base_entry(&self, seed: u64, visit: &mut dyn FnMut(&[u8], &V)) -> bool {
+        self.current.load().sample_base_entry(seed, visit)
+    }
+
+    fn sample_fallback_entries(
+        &self,
+        seed: u64,
+        limit: usize,
+        visit: &mut dyn FnMut(&[u8], &V),
+    ) -> usize {
+        self.current
+            .load()
+            .sample_fallback_entries(seed, limit, visit)
+    }
+
+    fn fallback_len(&self) -> usize {
+        self.current.load().fallback_len()
+    }
+
     fn from_layer(
         initial: Arc<GenerationLayer<V, C, B>>,
         overlay_mode: GenerationOverlayMode,
@@ -1452,8 +2585,147 @@ where
     }
 }
 
+impl GenerationMapCore<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap> {
+    fn get_atomic_protected(&self, key: &[u8]) -> Option<NonMaxU64> {
+        let generation = self.current.load();
+        let (stripe, key_hash) = self.writer_route(key);
+        generation.get_atomic_protected(key, key_hash, stripe)
+    }
+}
+
 #[cfg(feature = "prepared-keys")]
 impl GenerationMapCore<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap> {
+    #[cfg(feature = "prepared-batch-gate")]
+    fn batch_route(
+        &self,
+        writer: &AtomicPreparedBatchWriter,
+        key: &[u8],
+    ) -> Option<GenerationWriteRoute> {
+        let key_hash = GenerationKeyHash::new(&self.writer_hash_builder, key);
+        let stripe_mask = u64::try_from(WRITER_STRIPES - 1).expect("writer stripe mask fits u64");
+        let stripe = usize::try_from(key_hash.route() & stripe_mask)
+            .expect("masked writer stripe fits usize");
+        let state = writer.generation.writer_stripes[stripe].load(Ordering::Acquire);
+        (state & WRITER_STRIPE_CLOSED == 0).then_some(GenerationWriteRoute {
+            stripe,
+            direct_base: state & WRITER_STRIPE_DIRECT_BASE != 0,
+            overlay_may_shadow_base: state & WRITER_STRIPE_OVERLAY_BASE != 0,
+            key_hash,
+        })
+    }
+
+    #[cfg(feature = "prepared-batch-gate")]
+    fn get_in_batch(&self, writer: &AtomicPreparedBatchWriter, key: &[u8]) -> Option<NonMaxU64> {
+        let Some(route) = self.batch_route(writer, key) else {
+            return self.get_cloned(key);
+        };
+        writer.generation.with_value_in_stripe(
+            key,
+            route.key_hash,
+            route.stripe,
+            copy_optional_non_max,
+        )
+    }
+
+    #[cfg(feature = "prepared-batch-gate")]
+    fn insert_in_batch(
+        &self,
+        writer: &AtomicPreparedBatchWriter,
+        key: &[u8],
+        value: NonMaxU64,
+    ) -> InsertOutcome<NonMaxU64> {
+        let Some(route) = self.batch_route(writer, key) else {
+            return self.insert(key, value);
+        };
+        let outcome = writer.generation.insert(key, value, route);
+        if matches!(outcome, InsertOutcome::Inserted) {
+            writer.generation.adjust_len(route.stripe, 1);
+        }
+        outcome
+    }
+
+    #[cfg(feature = "prepared-batch-gate")]
+    fn insert_new_in_batch(
+        &self,
+        writer: &AtomicPreparedBatchWriter,
+        key: &[u8],
+        value: NonMaxU64,
+    ) -> bool {
+        let Some(route) = self.batch_route(writer, key) else {
+            return self.insert_new(key, value);
+        };
+        let inserted = writer.generation.insert_new(key, value, route);
+        if inserted {
+            writer.generation.adjust_len(route.stripe, 1);
+        }
+        inserted
+    }
+
+    #[cfg(feature = "prepared-batch-gate")]
+    fn get_or_insert_in_batch(
+        &self,
+        writer: &AtomicPreparedBatchWriter,
+        key: &[u8],
+        value: NonMaxU64,
+    ) -> NonMaxU64 {
+        let Some(route) = self.batch_route(writer, key) else {
+            return self.pin_writer(key).get_or_insert(key, value);
+        };
+        let (current, inserted) = writer.generation.get_or_insert_atomic(key, value, route);
+        if inserted {
+            writer.generation.adjust_len(route.stripe, 1);
+        }
+        current
+    }
+
+    #[cfg(feature = "prepared-batch-gate")]
+    fn update_in_batch(
+        &self,
+        writer: &AtomicPreparedBatchWriter,
+        key: &[u8],
+        update: impl Fn(&NonMaxU64) -> NonMaxU64,
+    ) -> Option<NonMaxU64> {
+        let Some(route) = self.batch_route(writer, key) else {
+            return self.update(key, update);
+        };
+        writer.generation.update(key, update, route)
+    }
+
+    #[cfg(feature = "prepared-batch-gate")]
+    fn upsert_in_batch(
+        &self,
+        writer: &AtomicPreparedBatchWriter,
+        key: &[u8],
+        insert_value: NonMaxU64,
+        update: impl Fn(&NonMaxU64) -> NonMaxU64,
+    ) -> NonMaxU64 {
+        let Some(route) = self.batch_route(writer, key) else {
+            return self.upsert(key, insert_value, update);
+        };
+        let (value, inserted) = writer.generation.upsert(key, insert_value, update, route);
+        if inserted {
+            writer.generation.adjust_len(route.stripe, 1);
+        }
+        value
+    }
+
+    #[cfg(feature = "prepared-batch-gate")]
+    fn remove_if_in_batch(
+        &self,
+        writer: &AtomicPreparedBatchWriter,
+        key: &[u8],
+        predicate: impl Fn(&NonMaxU64) -> bool,
+    ) -> Option<NonMaxU64> {
+        let Some(route) = self.batch_route(writer, key) else {
+            return self.remove_if(key, predicate);
+        };
+        let removed = writer.generation.remove_if(key, predicate, route);
+        if removed.is_some() {
+            writer.generation.adjust_len(route.stripe, -1);
+        }
+        removed
+    }
+
     fn prepare_key(&self, key: &[u8]) -> AtomicPreparedKey {
         let generation = self.current.load();
         self.prepare_key_in_generation(&generation, key)
@@ -1496,6 +2768,9 @@ impl GenerationMapCore<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap> {
         let stripe_mask = u64::try_from(WRITER_STRIPES - 1).expect("writer stripe mask fits u64");
         let stripe =
             usize::try_from(route_hash & stripe_mask).expect("masked writer stripe fits usize");
+        if let Some(prepared) = generation.overlay.prepare_atomic(key, route_hash) {
+            return AtomicPreparedKey::new_overlay(route_hash, prepared);
+        }
         let prepared = generation.prepare_slot(key, route_hash, digest, stripe);
         AtomicPreparedKey::new(route_hash, prepared)
     }
@@ -1526,8 +2801,23 @@ impl GenerationMapCore<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap> {
         );
 
         let generation = self.current.load();
+        let base = generation.base.load();
+        let stripe_mask = u64::try_from(WRITER_STRIPES - 1).expect("writer stripe mask fits u64");
         for ((key, prepared), value) in keys.iter().zip(prepared).zip(values.iter_mut()) {
-            *value = self.get_prepared_in_generation(&generation, key.as_ref(), *prepared);
+            let key = key.as_ref();
+            let stripe = usize::try_from(prepared.route_hash() & stripe_mask)
+                .expect("masked writer stripe fits usize");
+            let state = generation.writer_stripes[stripe].load(Ordering::Acquire);
+            if let Some(slot) = prepared.prepared_slot()
+                && state & WRITER_STRIPE_DIRECT_BASE != 0
+                && state & WRITER_STRIPE_OVERLAY_BASE == 0
+                && let DirectMutation::Handled(prepared_value) =
+                    base.with_prepared_value(key, slot, copy_optional_non_max)
+            {
+                *value = prepared_value;
+            } else {
+                *value = self.get_prepared_in_generation(&generation, key, *prepared);
+            }
         }
 
         let current = self.current.load();
@@ -1549,8 +2839,16 @@ impl GenerationMapCore<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap> {
         prepared: AtomicPreparedKey,
     ) -> Option<NonMaxU64> {
         let stripe_mask = u64::try_from(WRITER_STRIPES - 1).expect("writer stripe mask fits u64");
-        let stripe = usize::try_from(prepared.route_hash & stripe_mask)
+        let stripe = usize::try_from(prepared.route_hash() & stripe_mask)
             .expect("masked writer stripe fits usize");
+        if let Some(slot) = prepared.prepared_overlay_slot()
+            && let Some(value) =
+                generation
+                    .overlay
+                    .with_prepared_atomic(key, slot, AtomicU64Cell::get_protected)
+        {
+            return value;
+        }
         if let Some(slot) = prepared.prepared_slot()
             && let DirectMutation::Handled(value) =
                 generation.with_prepared_value(key, slot, stripe, copy_optional_non_max)
@@ -1571,7 +2869,7 @@ impl GenerationMapCore<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap> {
         update: impl Fn(&NonMaxU64) -> NonMaxU64,
     ) -> Option<NonMaxU64> {
         if let Some(slot) = prepared.prepared_slot() {
-            let writer = self.pin_prepared_writer(prepared.route_hash);
+            let writer = self.pin_prepared_writer(prepared.route_hash());
             if writer.direct_base && !writer.overlay_may_shadow_base {
                 match writer
                     .generation
@@ -1642,7 +2940,7 @@ impl GenerationMapCore<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap> {
             return DirectMutation::NotMember;
         };
         let Some(writer) =
-            AtomicPreparedBorrowedWriter::try_pin(generation, predecessor, prepared.route_hash)
+            AtomicPreparedBorrowedWriter::try_pin(generation, predecessor, prepared.route_hash())
         else {
             return DirectMutation::NotMember;
         };
@@ -1656,6 +2954,91 @@ impl GenerationMapCore<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap> {
             .update_prepared(key, slot, update)
     }
 
+    #[cfg(not(feature = "prepared-batch-gate"))]
+    fn replace_prepared_batch<K>(
+        &self,
+        keys: &[K],
+        prepared: &[AtomicPreparedKey],
+        values: &[NonMaxU64],
+        previous: &mut [Option<NonMaxU64>],
+    ) where
+        K: AsRef<[u8]>,
+    {
+        assert_eq!(
+            keys.len(),
+            prepared.len(),
+            "prepared key batch length mismatch"
+        );
+        assert_eq!(
+            keys.len(),
+            values.len(),
+            "prepared value batch length mismatch"
+        );
+        assert_eq!(
+            keys.len(),
+            previous.len(),
+            "prepared replacement output batch length mismatch"
+        );
+
+        let generation = self.current.load();
+        let predecessor = generation
+            .write_predecessor_active
+            .load(Ordering::Acquire)
+            .then(|| generation.write_predecessor.load_full())
+            .flatten();
+        for (((key, prepared), value), previous) in keys
+            .iter()
+            .zip(prepared)
+            .zip(values)
+            .zip(previous.iter_mut())
+        {
+            let key = key.as_ref();
+            match Self::replace_prepared_in_snapshot(
+                &generation,
+                predecessor.as_deref(),
+                key,
+                *prepared,
+                *value,
+            ) {
+                DirectMutation::Handled(value) => *previous = value,
+                DirectMutation::NotMember => {
+                    let displaced = Cell::new(None);
+                    let updated = self.update(key, |current| {
+                        displaced.set(Some(*current));
+                        *value
+                    });
+                    *previous = updated.and(displaced.get());
+                }
+            }
+        }
+    }
+
+    #[cfg(not(feature = "prepared-batch-gate"))]
+    fn replace_prepared_in_snapshot(
+        generation: &GenerationLayer<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap>,
+        predecessor: Option<&GenerationLayer<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap>>,
+        key: &[u8],
+        prepared: AtomicPreparedKey,
+        value: NonMaxU64,
+    ) -> DirectMutation<Option<NonMaxU64>> {
+        let Some(slot) = prepared.prepared_slot() else {
+            return DirectMutation::NotMember;
+        };
+        let Some(writer) =
+            AtomicPreparedBorrowedWriter::try_pin(generation, predecessor, prepared.route_hash())
+        else {
+            return DirectMutation::NotMember;
+        };
+        if !writer.direct_base || writer.overlay_may_shadow_base {
+            return DirectMutation::NotMember;
+        }
+        writer
+            .generation
+            .base
+            .load()
+            .replace_prepared(key, slot, &value)
+    }
+
     fn insert_prepared(
         &self,
         key: &[u8],
@@ -1663,7 +3046,7 @@ impl GenerationMapCore<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap> {
         value: NonMaxU64,
     ) -> InsertOutcome<NonMaxU64> {
         if let Some(slot) = prepared.prepared_slot() {
-            let writer = self.pin_prepared_writer(prepared.route_hash);
+            let mut writer = self.pin_prepared_writer(prepared.route_hash());
             if writer.direct_base && !writer.overlay_may_shadow_base {
                 match writer
                     .generation
@@ -1672,9 +3055,10 @@ impl GenerationMapCore<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap> {
                     .insert_prepared(key, slot, &value)
                 {
                     DirectMutation::Handled(outcome) => {
-                        if matches!(outcome, InsertOutcome::Inserted) {
-                            writer.generation.adjust_len(writer.stripe, 1);
-                        }
+                        writer.release_with_len(isize::from(matches!(
+                            outcome,
+                            InsertOutcome::Inserted
+                        )));
                         return outcome;
                     }
                     DirectMutation::NotMember => {}
@@ -1752,8 +3136,8 @@ impl GenerationMapCore<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap> {
         let Some(slot) = prepared.prepared_slot() else {
             return DirectMutation::NotMember;
         };
-        let Some(writer) =
-            AtomicPreparedBorrowedWriter::try_pin(generation, predecessor, prepared.route_hash)
+        let Some(mut writer) =
+            AtomicPreparedBorrowedWriter::try_pin(generation, predecessor, prepared.route_hash())
         else {
             return DirectMutation::NotMember;
         };
@@ -1767,9 +3151,7 @@ impl GenerationMapCore<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap> {
             .insert_prepared(key, slot, &value)
         {
             DirectMutation::Handled(outcome) => {
-                if matches!(outcome, InsertOutcome::Inserted) {
-                    writer.generation.adjust_len(writer.stripe, 1);
-                }
+                writer.release_with_len(isize::from(matches!(outcome, InsertOutcome::Inserted)));
                 DirectMutation::Handled(outcome)
             }
             DirectMutation::NotMember => DirectMutation::NotMember,
@@ -1804,11 +3186,12 @@ impl GenerationMapCore<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap> {
             .iter()
             .copied()
             .find(|prepared| prepared.has_direct_slot())
-            .map_or(0, |prepared| prepared.route_hash);
+            .map_or(0, AtomicPreparedKey::route_hash);
         let writer = self.pin_prepared_batch_writer(route_hash);
+        let base = writer.generation.base.load();
         for ((key, prepared), updated) in keys.iter().zip(prepared).zip(updated.iter_mut()) {
             let key = key.as_ref();
-            match Self::update_prepared_in_batch_writer(&writer, key, *prepared, &update) {
+            match Self::update_prepared_in_batch_writer(&writer, &base, key, *prepared, &update) {
                 DirectMutation::Handled(value) => *updated = value,
                 DirectMutation::NotMember => *updated = self.update(key, &update),
             }
@@ -1818,6 +3201,7 @@ impl GenerationMapCore<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap> {
     #[cfg(feature = "prepared-batch-gate")]
     fn update_prepared_in_batch_writer(
         writer: &AtomicPreparedBatchWriter,
+        base: &GenerationBase<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap>,
         key: &[u8],
         prepared: AtomicPreparedKey,
         update: &impl Fn(&NonMaxU64) -> NonMaxU64,
@@ -1825,11 +3209,78 @@ impl GenerationMapCore<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap> {
         let Some((slot, _stripe)) = Self::prepared_batch_direct_slot(writer, prepared) else {
             return DirectMutation::NotMember;
         };
-        writer
-            .generation
-            .base
-            .load()
-            .update_prepared(key, slot, update)
+        base.update_prepared(key, slot, update)
+    }
+
+    #[cfg(feature = "prepared-batch-gate")]
+    fn replace_prepared_batch<K>(
+        &self,
+        keys: &[K],
+        prepared: &[AtomicPreparedKey],
+        values: &[NonMaxU64],
+        previous: &mut [Option<NonMaxU64>],
+    ) where
+        K: AsRef<[u8]>,
+    {
+        assert_eq!(
+            keys.len(),
+            prepared.len(),
+            "prepared key batch length mismatch"
+        );
+        assert_eq!(
+            keys.len(),
+            values.len(),
+            "prepared value batch length mismatch"
+        );
+        assert_eq!(
+            keys.len(),
+            previous.len(),
+            "prepared replacement output batch length mismatch"
+        );
+        if keys.is_empty() {
+            return;
+        }
+
+        let route_hash = prepared
+            .iter()
+            .copied()
+            .find(|prepared| prepared.has_direct_slot())
+            .map_or(0, AtomicPreparedKey::route_hash);
+        let writer = self.pin_prepared_batch_writer(route_hash);
+        let base = writer.generation.base.load();
+        for (((key, prepared), value), previous) in keys
+            .iter()
+            .zip(prepared)
+            .zip(values)
+            .zip(previous.iter_mut())
+        {
+            let key = key.as_ref();
+            match Self::replace_prepared_in_batch_writer(&writer, &base, key, *prepared, *value) {
+                DirectMutation::Handled(value) => *previous = value,
+                DirectMutation::NotMember => {
+                    let displaced = Cell::new(None);
+                    let updated = self.update(key, |current| {
+                        displaced.set(Some(*current));
+                        *value
+                    });
+                    *previous = updated.and(displaced.get());
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "prepared-batch-gate")]
+    fn replace_prepared_in_batch_writer(
+        writer: &AtomicPreparedBatchWriter,
+        base: &GenerationBase<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap>,
+        key: &[u8],
+        prepared: AtomicPreparedKey,
+        value: NonMaxU64,
+    ) -> DirectMutation<Option<NonMaxU64>> {
+        let Some((slot, _stripe)) = Self::prepared_batch_direct_slot(writer, prepared) else {
+            return DirectMutation::NotMember;
+        };
+        base.replace_prepared(key, slot, &value)
     }
 
     #[cfg(feature = "prepared-batch-gate")]
@@ -1865,8 +3316,9 @@ impl GenerationMapCore<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap> {
             .iter()
             .copied()
             .find(|prepared| prepared.has_direct_slot())
-            .map_or(0, |prepared| prepared.route_hash);
+            .map_or(0, AtomicPreparedKey::route_hash);
         let writer = self.pin_prepared_batch_writer(route_hash);
+        let base = writer.generation.base.load();
         for (((key, prepared), value), previous) in keys
             .iter()
             .zip(prepared)
@@ -1875,7 +3327,8 @@ impl GenerationMapCore<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap> {
         {
             let key = key.as_ref();
             let outcome =
-                match Self::insert_prepared_in_batch_writer(&writer, key, *prepared, *value) {
+                match Self::insert_prepared_in_batch_writer(&writer, &base, key, *prepared, *value)
+                {
                     DirectMutation::Handled(outcome) => outcome,
                     DirectMutation::NotMember => self.insert(key, *value),
                 };
@@ -1889,6 +3342,7 @@ impl GenerationMapCore<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap> {
     #[cfg(feature = "prepared-batch-gate")]
     fn insert_prepared_in_batch_writer(
         writer: &AtomicPreparedBatchWriter,
+        base: &GenerationBase<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap>,
         key: &[u8],
         prepared: AtomicPreparedKey,
         value: NonMaxU64,
@@ -1896,12 +3350,7 @@ impl GenerationMapCore<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap> {
         let Some((slot, stripe)) = Self::prepared_batch_direct_slot(writer, prepared) else {
             return DirectMutation::NotMember;
         };
-        match writer
-            .generation
-            .base
-            .load()
-            .insert_prepared(key, slot, &value)
-        {
+        match base.insert_prepared(key, slot, &value) {
             DirectMutation::Handled(outcome) => {
                 if matches!(outcome, InsertOutcome::Inserted) {
                     writer.generation.adjust_len(stripe, 1);
@@ -1919,7 +3368,7 @@ impl GenerationMapCore<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap> {
     ) -> Option<(AtomicPreparedSlot, usize)> {
         let slot = prepared.prepared_slot()?;
         let stripe_mask = u64::try_from(WRITER_STRIPES - 1).expect("writer stripe mask fits u64");
-        let stripe = usize::try_from(prepared.route_hash & stripe_mask)
+        let stripe = usize::try_from(prepared.route_hash() & stripe_mask)
             .expect("masked writer stripe fits usize");
         let state = writer.generation.writer_stripes[stripe].load(Ordering::Acquire);
         (state & WRITER_STRIPE_CLOSED == 0
@@ -1930,13 +3379,11 @@ impl GenerationMapCore<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap> {
 
     fn remove_prepared(&self, key: &[u8], prepared: &AtomicPreparedKey) -> Option<NonMaxU64> {
         if let Some(slot) = prepared.prepared_slot() {
-            let writer = self.pin_prepared_writer(prepared.route_hash);
+            let mut writer = self.pin_prepared_writer(prepared.route_hash());
             if writer.direct_base && !writer.overlay_may_shadow_base {
                 match writer.generation.base.load().remove_prepared(key, slot) {
                     DirectMutation::Handled(removed) => {
-                        if removed.is_some() {
-                            writer.generation.adjust_len(writer.stripe, -1);
-                        }
+                        writer.release_with_len(if removed.is_some() { -1 } else { 0 });
                         return removed;
                     }
                     DirectMutation::NotMember => {}
@@ -1984,7 +3431,6 @@ impl GenerationMapCore<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap> {
     }
 }
 
-#[cfg(feature = "prepared-keys")]
 fn copy_optional_non_max(value: Option<&NonMaxU64>) -> Option<NonMaxU64> {
     value.copied()
 }
@@ -1995,6 +3441,7 @@ struct AtomicPreparedWriter {
     stripe: usize,
     direct_base: bool,
     overlay_may_shadow_base: bool,
+    released: bool,
 }
 
 #[cfg(feature = "prepared-keys")]
@@ -2018,38 +3465,31 @@ impl AtomicPreparedWriter {
         stripe: usize,
     ) -> Option<Self> {
         let counter = &generation.writer_stripes[stripe];
-        let mut state = counter.load(Ordering::Acquire);
-        loop {
-            if state & WRITER_STRIPE_CLOSED != 0 {
-                return None;
-            }
-            assert!(
-                state & WRITER_STRIPE_COUNT_MASK < WRITER_STRIPE_COUNT_MASK,
-                "writer stripe counter overflow"
-            );
-            match counter.compare_exchange_weak(
-                state,
-                state + 1,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    return Some(Self {
-                        generation,
-                        stripe,
-                        direct_base: state & WRITER_STRIPE_DIRECT_BASE != 0,
-                        overlay_may_shadow_base: state & WRITER_STRIPE_OVERLAY_BASE != 0,
-                    });
-                }
-                Err(observed) => state = observed,
-            }
-        }
+        let state = try_acquire_writer_stripe(counter)?;
+        Some(Self {
+            generation,
+            stripe,
+            direct_base: state & WRITER_STRIPE_DIRECT_BASE != 0,
+            overlay_may_shadow_base: state & WRITER_STRIPE_OVERLAY_BASE != 0,
+            released: false,
+        })
+    }
+
+    fn release_with_len(&mut self, amount: isize) {
+        release_writer_stripe(
+            &self.generation.writer_stripes[self.stripe],
+            amount,
+            &mut self.released,
+        );
     }
 }
 
 #[cfg(feature = "prepared-keys")]
 impl Drop for AtomicPreparedWriter {
     fn drop(&mut self) {
+        if self.released {
+            return;
+        }
         let previous = self.generation.writer_stripes[self.stripe].fetch_sub(1, Ordering::Release);
         debug_assert!(previous & WRITER_STRIPE_CLOSED == 0);
         debug_assert!(previous & WRITER_STRIPE_COUNT_MASK > 0);
@@ -2062,6 +3502,7 @@ struct AtomicPreparedBorrowedWriter<'a> {
     stripe: usize,
     direct_base: bool,
     overlay_may_shadow_base: bool,
+    released: bool,
 }
 
 #[cfg(all(feature = "prepared-keys", not(feature = "prepared-batch-gate")))]
@@ -2084,38 +3525,31 @@ impl<'a> AtomicPreparedBorrowedWriter<'a> {
         stripe: usize,
     ) -> Option<Self> {
         let counter = &generation.writer_stripes[stripe];
-        let mut state = counter.load(Ordering::Acquire);
-        loop {
-            if state & WRITER_STRIPE_CLOSED != 0 {
-                return None;
-            }
-            assert!(
-                state & WRITER_STRIPE_COUNT_MASK < WRITER_STRIPE_COUNT_MASK,
-                "writer stripe counter overflow"
-            );
-            match counter.compare_exchange_weak(
-                state,
-                state + 1,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    return Some(Self {
-                        generation,
-                        stripe,
-                        direct_base: state & WRITER_STRIPE_DIRECT_BASE != 0,
-                        overlay_may_shadow_base: state & WRITER_STRIPE_OVERLAY_BASE != 0,
-                    });
-                }
-                Err(observed) => state = observed,
-            }
-        }
+        let state = try_acquire_writer_stripe(counter)?;
+        Some(Self {
+            generation,
+            stripe,
+            direct_base: state & WRITER_STRIPE_DIRECT_BASE != 0,
+            overlay_may_shadow_base: state & WRITER_STRIPE_OVERLAY_BASE != 0,
+            released: false,
+        })
+    }
+
+    fn release_with_len(&mut self, amount: isize) {
+        release_writer_stripe(
+            &self.generation.writer_stripes[self.stripe],
+            amount,
+            &mut self.released,
+        );
     }
 }
 
 #[cfg(all(feature = "prepared-keys", not(feature = "prepared-batch-gate")))]
 impl Drop for AtomicPreparedBorrowedWriter<'_> {
     fn drop(&mut self) {
+        if self.released {
+            return;
+        }
         let previous = self.generation.writer_stripes[self.stripe].fetch_sub(1, Ordering::Release);
         debug_assert!(previous & WRITER_STRIPE_CLOSED == 0);
         debug_assert!(previous & WRITER_STRIPE_COUNT_MASK > 0);
@@ -2153,25 +3587,8 @@ impl AtomicPreparedBatchWriter {
         let gate = usize::try_from(route_hash & gate_mask)
             .expect("masked prepared batch writer gate fits usize");
         let counter = &generation.prepared_batch_writers[gate].0;
-        let mut state = counter.load(Ordering::Acquire);
-        loop {
-            if state & WRITER_STRIPE_CLOSED != 0 {
-                return None;
-            }
-            assert!(
-                state & WRITER_STRIPE_COUNT_MASK < WRITER_STRIPE_COUNT_MASK,
-                "prepared batch writer counter overflow"
-            );
-            match counter.compare_exchange_weak(
-                state,
-                state + 1,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Some(Self { generation, gate }),
-                Err(observed) => state = observed,
-            }
-        }
+        try_acquire_writer_stripe(counter)?;
+        Some(Self { generation, gate })
     }
 }
 
@@ -2188,6 +3605,7 @@ impl Drop for AtomicPreparedBatchWriter {
 struct GenerationWriter<V, C, B> {
     generation: PinnedGeneration<V, C, B>,
     route: GenerationWriteRoute,
+    released: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -2221,35 +3639,17 @@ impl<V, C, B> GenerationWriter<V, C, B> {
         key_hash: GenerationKeyHash,
     ) -> Option<Self> {
         let counter = &generation.writer_stripes[stripe];
-        let mut state = counter.load(Ordering::Acquire);
-        loop {
-            if state & WRITER_STRIPE_CLOSED != 0 {
-                return None;
-            }
-            assert!(
-                state & WRITER_STRIPE_COUNT_MASK < WRITER_STRIPE_COUNT_MASK,
-                "writer stripe counter overflow"
-            );
-            match counter.compare_exchange_weak(
-                state,
-                state + 1,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    return Some(Self {
-                        generation,
-                        route: GenerationWriteRoute {
-                            stripe,
-                            direct_base: state & WRITER_STRIPE_DIRECT_BASE != 0,
-                            overlay_may_shadow_base: state & WRITER_STRIPE_OVERLAY_BASE != 0,
-                            key_hash,
-                        },
-                    });
-                }
-                Err(observed) => state = observed,
-            }
-        }
+        let state = try_acquire_writer_stripe(counter)?;
+        Some(Self {
+            generation,
+            route: GenerationWriteRoute {
+                stripe,
+                direct_base: state & WRITER_STRIPE_DIRECT_BASE != 0,
+                overlay_may_shadow_base: state & WRITER_STRIPE_OVERLAY_BASE != 0,
+                key_hash,
+            },
+            released: false,
+        })
     }
 }
 
@@ -2258,18 +3658,22 @@ where
     C: GenerationCell<V>,
     B: GenerationFrozen<V>,
 {
-    fn insert(&self, key: &[u8], value: V) -> InsertOutcome<V>
+    fn insert(mut self, key: &[u8], value: V) -> InsertOutcome<V>
     where
         V: Clone,
     {
-        self.generation.insert(key, value, self.route)
+        let outcome = self.generation.insert(key, value, self.route);
+        self.release_with_len(isize::from(matches!(outcome, InsertOutcome::Inserted)));
+        outcome
     }
 
-    fn insert_new(&self, key: &[u8], value: V) -> bool
+    fn insert_new(mut self, key: &[u8], value: V) -> bool
     where
         V: Clone,
     {
-        self.generation.insert_new(key, value, self.route)
+        let inserted = self.generation.insert_new(key, value, self.route);
+        self.release_with_len(isize::from(inserted));
+        inserted
     }
 
     fn update(&self, key: &[u8], update: impl Fn(&V) -> V) -> Option<V>
@@ -2279,26 +3683,111 @@ where
         self.generation.update(key, update, self.route)
     }
 
-    fn upsert(&self, key: &[u8], insert_value: V, update: impl Fn(&V) -> V) -> V
+    fn upsert(mut self, key: &[u8], insert_value: V, update: impl Fn(&V) -> V) -> V
     where
         V: Clone,
     {
-        self.generation
-            .upsert(key, insert_value, update, self.route)
+        let (value, inserted) = self
+            .generation
+            .upsert(key, insert_value, update, self.route);
+        self.release_with_len(isize::from(inserted));
+        value
     }
 
-    fn remove(&self, key: &[u8]) -> Option<V>
+    fn remove(self, key: &[u8]) -> Option<V>
     where
         V: Clone,
     {
         self.remove_if(key, |_| true)
     }
 
-    fn remove_if(&self, key: &[u8], predicate: impl Fn(&V) -> bool) -> Option<V>
+    fn remove_if(mut self, key: &[u8], predicate: impl Fn(&V) -> bool) -> Option<V>
     where
         V: Clone,
     {
-        self.generation.remove_if(key, predicate, self.route)
+        let removed = self.generation.remove_if(key, predicate, self.route);
+        self.release_with_len(if removed.is_some() { -1 } else { 0 });
+        removed
+    }
+
+    fn release_with_len(&mut self, amount: isize) {
+        release_writer_stripe(
+            &self.generation.writer_stripes[self.route.stripe],
+            amount,
+            &mut self.released,
+        );
+    }
+}
+
+impl GenerationWriter<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap> {
+    fn probe_entry(&self, key: &[u8]) -> AtomicEntryProbe {
+        self.generation.probe_atomic_entry(key, self.route)
+    }
+
+    fn get_or_insert(mut self, key: &[u8], value: NonMaxU64) -> NonMaxU64 {
+        let (current, inserted) = self.generation.get_or_insert_atomic(key, value, self.route);
+        self.release_with_len(isize::from(inserted));
+        current
+    }
+
+    fn insert_vacant(
+        mut self,
+        key: &[u8],
+        value: NonMaxU64,
+        target: AtomicVacantTarget,
+    ) -> InsertOutcome<NonMaxU64> {
+        let outcome = match target {
+            AtomicVacantTarget::FrozenSlot { map, slot } => map.insert_slot(slot, value),
+            AtomicVacantTarget::Overlay { mark_base_shadow } => {
+                if mark_base_shadow {
+                    self.mark_overlay_may_shadow_base(self.route.stripe);
+                } else {
+                    self.mark_overlay_touched();
+                }
+                match self.overlay.insert_or_visit_prehashed(
+                    key,
+                    self.route.key_hash.route(),
+                    AtomicU64Cell::present(value),
+                    |current| current.replace(value),
+                ) {
+                    OverlayInsert::Inserted => InsertOutcome::Inserted,
+                    OverlayInsert::Occupied(previous) => {
+                        previous.map_or(InsertOutcome::Inserted, InsertOutcome::Replaced)
+                    }
+                }
+            }
+        };
+        self.release_with_len(isize::from(matches!(outcome, InsertOutcome::Inserted)));
+        outcome
+    }
+
+    fn insert_new_vacant(
+        mut self,
+        key: &[u8],
+        value: NonMaxU64,
+        target: AtomicVacantTarget,
+    ) -> bool {
+        let inserted = match target {
+            AtomicVacantTarget::FrozenSlot { map, slot } => map.insert_new_slot(slot, value),
+            AtomicVacantTarget::Overlay { mark_base_shadow } => {
+                if mark_base_shadow {
+                    self.mark_overlay_may_shadow_base(self.route.stripe);
+                } else {
+                    self.mark_overlay_touched();
+                }
+                match self.overlay.insert_or_visit_prehashed(
+                    key,
+                    self.route.key_hash.route(),
+                    AtomicU64Cell::present(value),
+                    |current| current.insert_new(value),
+                ) {
+                    OverlayInsert::Inserted => true,
+                    OverlayInsert::Occupied(inserted) => inserted,
+                }
+            }
+        };
+        self.release_with_len(isize::from(inserted));
+        inserted
     }
 }
 
@@ -2328,6 +3817,9 @@ impl<V, C, B> Deref for GenerationWriter<V, C, B> {
 
 impl<V, C, B> Drop for GenerationWriter<V, C, B> {
     fn drop(&mut self) {
+        if self.released {
+            return;
+        }
         let previous =
             self.generation.writer_stripes[self.route.stripe].fetch_sub(1, Ordering::Release);
         debug_assert!(previous & WRITER_STRIPE_CLOSED == 0);
@@ -2337,12 +3829,14 @@ impl<V, C, B> Drop for GenerationWriter<V, C, B> {
 
 struct GenerationLayer<V, C, B> {
     base: ArcSwap<GenerationBase<V, C, B>>,
+    base_is_empty: bool,
     write_predecessor: ArcSwapOption<GenerationLayer<V, C, B>>,
     write_predecessor_active: AtomicBool,
     overlay: GenerationOverlay<C>,
+    overlay_touched: AtomicBool,
     initial_len: AtomicIsize,
-    len_deltas: Box<[PaddedAtomicIsize]>,
     writer_stripes: Box<[AtomicUsize]>,
+    read_batches: AtomicUsize,
     #[cfg(feature = "prepared-batch-gate")]
     prepared_batch_writers: Box<[PaddedAtomicUsize]>,
 }
@@ -2359,6 +3853,10 @@ where
         overlay_mode: GenerationOverlayMode,
         overlay_hash_builder: GenerationHashBuilder,
     ) -> Arc<Self> {
+        let base_is_empty = matches!(
+            &base,
+            GenerationBase::Frozen { map, .. } if map.len() == 0
+        );
         let (write_predecessor, write_predecessor_active) = match &base {
             GenerationBase::Previous(previous) => (Some(Arc::clone(previous)), true),
             GenerationBase::Frozen { .. } | GenerationBase::StableHybrid(_) => (None, false),
@@ -2366,6 +3864,7 @@ where
         let direct_base = matches!(&base, GenerationBase::Frozen { .. }) && B::DIRECT_MUTATION;
         Arc::new(Self {
             base: ArcSwap::from_pointee(base),
+            base_is_empty,
             write_predecessor: ArcSwapOption::from(write_predecessor),
             write_predecessor_active: AtomicBool::new(write_predecessor_active),
             overlay: GenerationOverlay::with_capacity(
@@ -2373,15 +3872,18 @@ where
                 overlay_mode,
                 overlay_hash_builder,
             ),
+            overlay_touched: AtomicBool::new(false),
             initial_len: AtomicIsize::new(isize::try_from(len).unwrap_or(isize::MAX)),
-            len_deltas: (0..LEN_STRIPES)
-                .map(|_| PaddedAtomicIsize(AtomicIsize::new(0)))
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
             writer_stripes: (0..WRITER_STRIPES)
-                .map(|_| AtomicUsize::new(usize::from(direct_base) * WRITER_STRIPE_DIRECT_BASE))
+                .map(|_| {
+                    AtomicUsize::new(
+                        (usize::from(direct_base) * WRITER_STRIPE_DIRECT_BASE)
+                            | WRITER_STRIPE_LEN_ZERO,
+                    )
+                })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
+            read_batches: AtomicUsize::new(0),
             #[cfg(feature = "prepared-batch-gate")]
             prepared_batch_writers: (0..PREPARED_BATCH_WRITER_GATES)
                 .map(|_| PaddedAtomicUsize(AtomicUsize::new(0)))
@@ -2413,6 +3915,14 @@ where
         stripe: usize,
         read: impl FnOnce(Option<&V>) -> R,
     ) -> R {
+        if self.base_is_empty {
+            return self
+                .overlay
+                .with_cell_prehashed(key, key_hash.route(), |cell| match cell {
+                    Some(cell) => cell.with_value(read),
+                    None => read(None),
+                });
+        }
         let state = self.writer_stripes[stripe].load(Ordering::Acquire);
         let mut read = Some(read);
         if state & WRITER_STRIPE_DIRECT_BASE != 0 && state & WRITER_STRIPE_OVERLAY_BASE == 0 {
@@ -2421,6 +3931,9 @@ where
             });
             if let Some(value) = base_value {
                 return value;
+            }
+            if !self.overlay_touched.load(Ordering::Acquire) {
+                return read.take().expect("generation read callback runs once")(None);
             }
             return self
                 .overlay
@@ -2483,31 +3996,38 @@ where
     where
         V: Clone,
     {
-        let direct_first = route.direct_base && !route.overlay_may_shadow_base;
-        if direct_first
-            && let Some(outcome) = self.base.load().direct_insert(key, route.key_hash, &value)
-        {
-            if matches!(outcome, InsertOutcome::Inserted) {
-                self.adjust_len(route.stripe, 1);
-            }
-            return outcome;
-        }
-        if direct_first {
+        if self.base_is_empty {
             return match self.overlay.probe_or_insert_prehashed(
                 key,
                 route.key_hash.route(),
                 C::present(value.clone()),
                 |current| current.replace(value),
             ) {
-                OverlayInsert::Inserted => {
-                    self.adjust_len(route.stripe, 1);
-                    InsertOutcome::Inserted
+                OverlayInsert::Inserted => InsertOutcome::Inserted,
+                OverlayInsert::Occupied(previous) => {
+                    previous.map_or(InsertOutcome::Inserted, InsertOutcome::Replaced)
                 }
+            };
+        }
+        let direct_first = route.direct_base && !route.overlay_may_shadow_base;
+        if direct_first
+            && let Some(outcome) = self.base.load().direct_insert(key, route.key_hash, &value)
+        {
+            return outcome;
+        }
+        if direct_first {
+            self.mark_overlay_touched();
+            return match self.overlay.probe_or_insert_prehashed(
+                key,
+                route.key_hash.route(),
+                C::present(value.clone()),
+                |current| current.replace(value),
+            ) {
+                OverlayInsert::Inserted => InsertOutcome::Inserted,
                 OverlayInsert::Occupied(previous) => {
                     if let Some(previous) = previous {
                         InsertOutcome::Replaced(previous)
                     } else {
-                        self.adjust_len(route.stripe, 1);
                         InsertOutcome::Inserted
                     }
                 }
@@ -2522,7 +4042,6 @@ where
             return if let Some(previous) = previous {
                 InsertOutcome::Replaced(previous)
             } else {
-                self.adjust_len(route.stripe, 1);
                 InsertOutcome::Inserted
             };
         }
@@ -2530,9 +4049,6 @@ where
             && !direct_first
             && let Some(outcome) = self.base.load().direct_insert(key, route.key_hash, &value)
         {
-            if matches!(outcome, InsertOutcome::Inserted) {
-                self.adjust_len(route.stripe, 1);
-            }
             return outcome;
         }
         let base_value = if route.direct_base {
@@ -2542,6 +4058,8 @@ where
         };
         if base_value.is_some() {
             self.mark_overlay_may_shadow_base(route.stripe);
+        } else {
+            self.mark_overlay_touched();
         }
         match self.overlay.insert_or_visit_prehashed(
             key,
@@ -2549,18 +4067,13 @@ where
             C::present(value.clone()),
             |current| current.replace(value),
         ) {
-            OverlayInsert::Inserted => base_value.map_or_else(
-                || {
-                    self.adjust_len(route.stripe, 1);
-                    InsertOutcome::Inserted
-                },
-                InsertOutcome::Replaced,
-            ),
+            OverlayInsert::Inserted => {
+                base_value.map_or(InsertOutcome::Inserted, InsertOutcome::Replaced)
+            }
             OverlayInsert::Occupied(previous) => {
                 if let Some(previous) = previous {
                     InsertOutcome::Replaced(previous)
                 } else {
-                    self.adjust_len(route.stripe, 1);
                     InsertOutcome::Inserted
                 }
             }
@@ -2571,6 +4084,17 @@ where
     where
         V: Clone,
     {
+        if self.base_is_empty {
+            return match self.overlay.probe_or_insert_prehashed(
+                key,
+                route.key_hash.route(),
+                C::present(value.clone()),
+                |current| current.insert_new(value),
+            ) {
+                OverlayInsert::Inserted => true,
+                OverlayInsert::Occupied(inserted) => inserted,
+            };
+        }
         let direct_first = route.direct_base && !route.overlay_may_shadow_base;
         if direct_first
             && let Some(inserted) = self
@@ -2578,28 +4102,18 @@ where
                 .load()
                 .direct_insert_new(key, route.key_hash, &value)
         {
-            if inserted {
-                self.adjust_len(route.stripe, 1);
-            }
             return inserted;
         }
         if direct_first {
+            self.mark_overlay_touched();
             return match self.overlay.probe_or_insert_prehashed(
                 key,
                 route.key_hash.route(),
                 C::present(value.clone()),
                 |current| current.insert_new(value),
             ) {
-                OverlayInsert::Inserted => {
-                    self.adjust_len(route.stripe, 1);
-                    true
-                }
-                OverlayInsert::Occupied(inserted) => {
-                    if inserted {
-                        self.adjust_len(route.stripe, 1);
-                    }
-                    inserted
-                }
+                OverlayInsert::Inserted => true,
+                OverlayInsert::Occupied(inserted) => inserted,
             };
         }
         if let Some(inserted) =
@@ -2608,9 +4122,6 @@ where
                     cell.map(|cell| cell.insert_new(value.clone()))
                 })
         {
-            if inserted {
-                self.adjust_len(route.stripe, 1);
-            }
             return inserted;
         }
         if route.direct_base
@@ -2620,30 +4131,20 @@ where
                 .load()
                 .direct_insert_new(key, route.key_hash, &value)
         {
-            if inserted {
-                self.adjust_len(route.stripe, 1);
-            }
             return inserted;
         }
         if !route.direct_base && self.base.load().contains_key_hashed(key, route.key_hash) {
             return false;
         }
+        self.mark_overlay_touched();
         match self.overlay.insert_or_visit_prehashed(
             key,
             route.key_hash.route(),
             C::present(value.clone()),
             |current| current.insert_new(value),
         ) {
-            OverlayInsert::Inserted => {
-                self.adjust_len(route.stripe, 1);
-                true
-            }
-            OverlayInsert::Occupied(inserted) => {
-                if inserted {
-                    self.adjust_len(route.stripe, 1);
-                }
-                inserted
-            }
+            OverlayInsert::Inserted => true,
+            OverlayInsert::Occupied(inserted) => inserted,
         }
     }
 
@@ -2651,6 +4152,13 @@ where
     where
         V: Clone,
     {
+        if self.base_is_empty {
+            return self
+                .overlay
+                .with_cell_prehashed(key, route.key_hash.route(), |cell| {
+                    cell.and_then(|cell| cell.update(&update))
+                });
+        }
         let direct_first = route.direct_base && !route.overlay_may_shadow_base;
         if direct_first {
             match self.base.load().direct_update(key, route.key_hash, &update) {
@@ -2692,10 +4200,21 @@ where
         insert_value: V,
         update: impl Fn(&V) -> V,
         route: GenerationWriteRoute,
-    ) -> V
+    ) -> (V, bool)
     where
         V: Clone,
     {
+        if self.base_is_empty {
+            return match self.overlay.probe_or_insert_prehashed(
+                key,
+                route.key_hash.route(),
+                C::present(insert_value.clone()),
+                |current| current.upsert(&insert_value, &update),
+            ) {
+                OverlayInsert::Inserted => (insert_value, true),
+                OverlayInsert::Occupied(result) => result,
+            };
+        }
         let direct_first = route.direct_base && !route.overlay_may_shadow_base;
         if direct_first
             && let Some((value, became_live)) =
@@ -2703,28 +4222,18 @@ where
                     .load()
                     .direct_upsert(key, route.key_hash, &insert_value, &update)
         {
-            if became_live {
-                self.adjust_len(route.stripe, 1);
-            }
-            return value;
+            return (value, became_live);
         }
         if direct_first {
+            self.mark_overlay_touched();
             return match self.overlay.probe_or_insert_prehashed(
                 key,
                 route.key_hash.route(),
                 C::present(insert_value.clone()),
                 |current| current.upsert(&insert_value, &update),
             ) {
-                OverlayInsert::Inserted => {
-                    self.adjust_len(route.stripe, 1);
-                    insert_value
-                }
-                OverlayInsert::Occupied((value, became_live)) => {
-                    if became_live {
-                        self.adjust_len(route.stripe, 1);
-                    }
-                    value
-                }
+                OverlayInsert::Inserted => (insert_value, true),
+                OverlayInsert::Occupied(result) => result,
             };
         }
         if let Some((value, became_live)) =
@@ -2733,10 +4242,7 @@ where
                     cell.map(|cell| cell.upsert(&insert_value, &update))
                 })
         {
-            if became_live {
-                self.adjust_len(route.stripe, 1);
-            }
-            return value;
+            return (value, became_live);
         }
         if route.direct_base
             && !direct_first
@@ -2745,10 +4251,7 @@ where
                     .load()
                     .direct_upsert(key, route.key_hash, &insert_value, &update)
         {
-            if became_live {
-                self.adjust_len(route.stripe, 1);
-            }
-            return value;
+            return (value, became_live);
         }
         let base_value = if route.direct_base {
             None
@@ -2757,6 +4260,8 @@ where
         };
         if base_value.is_some() {
             self.mark_overlay_may_shadow_base(route.stripe);
+        } else {
+            self.mark_overlay_touched();
         }
         let next = base_value
             .as_ref()
@@ -2767,18 +4272,8 @@ where
             C::present(next.clone()),
             |current| current.upsert(&insert_value, &update),
         ) {
-            OverlayInsert::Inserted => {
-                if base_value.is_none() {
-                    self.adjust_len(route.stripe, 1);
-                }
-                next
-            }
-            OverlayInsert::Occupied((value, became_live)) => {
-                if became_live {
-                    self.adjust_len(route.stripe, 1);
-                }
-                value
-            }
+            OverlayInsert::Inserted => (next, base_value.is_none()),
+            OverlayInsert::Occupied(result) => result,
         }
     }
 
@@ -2791,6 +4286,13 @@ where
     where
         V: Clone,
     {
+        if self.base_is_empty {
+            return self
+                .overlay
+                .with_cell_prehashed(key, route.key_hash.route(), |cell| {
+                    cell.and_then(|cell| cell.remove_if(&predicate))
+                });
+        }
         let direct_first = route.direct_base && !route.overlay_may_shadow_base;
         if direct_first {
             match self
@@ -2798,12 +4300,7 @@ where
                 .load()
                 .direct_remove_if(key, route.key_hash, &predicate)
             {
-                DirectMutation::Handled(removed) => {
-                    if removed.is_some() {
-                        self.adjust_len(route.stripe, -1);
-                    }
-                    return removed;
-                }
+                DirectMutation::Handled(removed) => return removed,
                 DirectMutation::NotMember => {}
             }
         }
@@ -2813,9 +4310,6 @@ where
                     cell.map(|cell| cell.remove_if(&predicate))
                 })
         {
-            if removed.is_some() {
-                self.adjust_len(route.stripe, -1);
-            }
             return removed;
         }
         if route.direct_base && !direct_first {
@@ -2827,9 +4321,6 @@ where
                 DirectMutation::Handled(removed) => removed,
                 DirectMutation::NotMember => None,
             };
-            if removed.is_some() {
-                self.adjust_len(route.stripe, -1);
-            }
             return removed;
         }
         let base_value = self
@@ -2838,7 +4329,7 @@ where
             .get_cloned_hashed(key, route.key_hash)
             .filter(|value| predicate(value))?;
         self.mark_overlay_may_shadow_base(route.stripe);
-        let removed = match self.overlay.insert_or_visit_prehashed(
+        match self.overlay.insert_or_visit_prehashed(
             key,
             route.key_hash.route(),
             C::deleted(),
@@ -2846,20 +4337,14 @@ where
         ) {
             OverlayInsert::Inserted => Some(base_value),
             OverlayInsert::Occupied(removed) => removed,
-        };
-        if removed.is_some() {
-            self.adjust_len(route.stripe, -1);
         }
-        removed
     }
 
     fn len(&self) -> usize {
-        let len = self
-            .len_deltas
-            .iter()
-            .fold(self.initial_len.load(Ordering::Acquire), |len, delta| {
-                len.saturating_add(delta.0.load(Ordering::Acquire))
-            });
+        let delta = self.writer_stripes.iter().fold(0_i128, |delta, stripe| {
+            delta + writer_stripe_len_delta(stripe.load(Ordering::Acquire)) as i128
+        });
+        let len = self.initial_len.load(Ordering::Acquire) as i128 + delta;
         usize::try_from(len.max(0)).unwrap_or(usize::MAX)
     }
 
@@ -2902,12 +4387,42 @@ where
     where
         V: Clone,
     {
-        let mut entries = Vec::<(Box<[u8]>, V)>::new();
+        // Stage key bytes contiguously. Rebuild used to allocate one temporary
+        // Box per live key, only for the frozen builder to copy those bytes
+        // into its packed arena and immediately free every Box. Keeping the
+        // temporary ownership in one byte buffer removes O(n) allocator calls
+        // while retaining the same fallible construction boundary.
+        let expected_entries = self.len();
+        // End offsets are sufficient because keys are appended without gaps;
+        // this keeps staging metadata to one machine word plus the value.
+        let mut entries = Vec::<(usize, V)>::new();
         entries
-            .try_reserve(self.len())
+            .try_reserve(expected_entries)
             .map_err(|_| FrozenBuildError::AllocationFailed)?;
+        let mut key_bytes = Vec::<u8>::new();
+        key_bytes
+            .try_reserve(expected_entries.saturating_mul(16))
+            .map_err(|_| FrozenBuildError::AllocationFailed)?;
+        let mut allocation_failed = false;
         self.for_each_entry_hashed(hash_builder, &mut |key, value| {
-            entries.push((key.into(), value.clone()));
+            if allocation_failed {
+                return;
+            }
+            if key_bytes.try_reserve(key.len()).is_err() {
+                allocation_failed = true;
+                return;
+            }
+            key_bytes.extend_from_slice(key);
+            entries.push((key_bytes.len(), value.clone()));
+        });
+        if allocation_failed {
+            return Err(FrozenBuildError::AllocationFailed);
+        }
+        let mut key_begin = 0;
+        let entries = entries.into_iter().map(|(key_end, value)| {
+            let key = &key_bytes[key_begin..key_end];
+            key_begin = key_end;
+            (key, value)
         });
         B::try_from_entries_with_policy_index_and_hash(entries, policy, index_backend, hash_builder)
     }
@@ -2940,6 +4455,58 @@ where
         });
     }
 
+    fn sample_atomic_entry(&self, seed: u64, visit: &mut dyn FnMut(&[u8], &V)) -> bool {
+        self.overlay.sample_atomic(seed, &mut |key, cell| {
+            cell.with_value(|value| {
+                value.is_some_and(|value| {
+                    visit(key, value);
+                    true
+                })
+            })
+        })
+    }
+
+    fn sample_base_entry(&self, seed: u64, visit: &mut dyn FnMut(&[u8], &V)) -> bool {
+        let base = self.base.load();
+        base.sample_entry(seed, &mut |key, base_value| {
+            self.overlay.with_cell(key, |cell| {
+                if let Some(cell) = cell {
+                    cell.with_value(|value| {
+                        if let Some(value) = value {
+                            visit(key, value);
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                } else {
+                    visit(key, base_value);
+                    true
+                }
+            })
+        })
+    }
+
+    fn sample_fallback_entries(
+        &self,
+        seed: u64,
+        limit: usize,
+        visit: &mut dyn FnMut(&[u8], &V),
+    ) -> usize {
+        self.overlay.sample_fallback(seed, limit, &mut |key, cell| {
+            cell.with_value(|value| {
+                value.is_some_and(|value| {
+                    visit(key, value);
+                    true
+                })
+            })
+        })
+    }
+
+    fn fallback_len(&self) -> usize {
+        self.overlay.fallback_len()
+    }
+
     fn close_writer_stripes(&self) {
         for counter in &self.writer_stripes {
             let mut spins = 0_u32;
@@ -2951,7 +4518,7 @@ where
                 if state & WRITER_STRIPE_COUNT_MASK == 0 {
                     match counter.compare_exchange_weak(
                         state,
-                        WRITER_STRIPE_CLOSED,
+                        state | WRITER_STRIPE_CLOSED,
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     ) {
@@ -2966,6 +4533,25 @@ where
                     thread::yield_now();
                     state = counter.load(Ordering::Acquire);
                 }
+            }
+        }
+    }
+
+    fn close_read_batches(&self) {
+        let previous = self
+            .read_batches
+            .fetch_or(WRITER_STRIPE_CLOSED, Ordering::AcqRel);
+        if previous & WRITER_STRIPE_COUNT_MASK == 0 {
+            return;
+        }
+
+        let mut spins = 0_u32;
+        while self.read_batches.load(Ordering::Acquire) & WRITER_STRIPE_COUNT_MASK != 0 {
+            if spins < 64 {
+                spin_loop();
+                spins += 1;
+            } else {
+                thread::yield_now();
             }
         }
     }
@@ -3036,27 +4622,525 @@ where
     }
 
     fn adjust_len(&self, stripe: usize, amount: isize) {
-        self.len_deltas[stripe & (LEN_STRIPES - 1)]
-            .0
-            .fetch_add(amount, Ordering::Relaxed);
+        if amount == 0 {
+            return;
+        }
+        let counter = &self.writer_stripes[stripe];
+        if usize::BITS >= 64 {
+            let magnitude = amount.unsigned_abs();
+            let adjustment = WRITER_STRIPE_LEN_UNIT
+                .checked_mul(magnitude)
+                .expect("writer stripe length adjustment fits usize");
+            let previous = if amount > 0 {
+                counter.fetch_add(adjustment, Ordering::Relaxed)
+            } else {
+                counter.fetch_sub(adjustment, Ordering::Relaxed)
+            };
+            let raw = (previous & WRITER_STRIPE_LEN_MASK) >> WRITER_STRIPE_LEN_SHIFT;
+            debug_assert!(amount < 0 || raw <= WRITER_STRIPE_LEN_VALUE_MASK - magnitude);
+            debug_assert!(amount > 0 || raw >= magnitude);
+            return;
+        }
+        let mut state = counter.load(Ordering::Relaxed);
+        loop {
+            let next_delta = writer_stripe_len_delta(state)
+                .checked_add(amount)
+                .expect("writer stripe length delta overflow");
+            let next = (state & !WRITER_STRIPE_LEN_MASK) | writer_stripe_len_bits(next_delta);
+            match counter.compare_exchange_weak(state, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(observed) => state = observed,
+            }
+        }
     }
 
     fn mark_overlay_may_shadow_base(&self, stripe: usize) {
+        self.mark_overlay_touched();
         self.writer_stripes[stripe].fetch_or(WRITER_STRIPE_OVERLAY_BASE, Ordering::Release);
+    }
+
+    fn mark_overlay_touched(&self) {
+        self.overlay_touched.store(true, Ordering::Release);
     }
 }
 
-#[repr(align(64))]
-struct PaddedAtomicIsize(AtomicIsize);
+impl GenerationLayer<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap> {
+    fn get_atomic_protected(
+        &self,
+        key: &[u8],
+        key_hash: GenerationKeyHash,
+        stripe: usize,
+    ) -> Option<NonMaxU64> {
+        if self.base_is_empty {
+            return self
+                .overlay
+                .with_cell_prehashed(key, key_hash.route(), |cell| {
+                    cell.and_then(AtomicU64Cell::get_protected)
+                });
+        }
+        let state = self.writer_stripes[stripe].load(Ordering::Acquire);
+        let direct_first =
+            state & WRITER_STRIPE_DIRECT_BASE != 0 && state & WRITER_STRIPE_OVERLAY_BASE == 0;
+        if direct_first && let Some(value) = self.base.load().get_atomic_protected(key, key_hash) {
+            return Some(value);
+        }
+        if direct_first {
+            if !self.overlay_touched.load(Ordering::Acquire) {
+                return None;
+            }
+            return self
+                .overlay
+                .with_cell_prehashed(key, key_hash.route(), |cell| {
+                    cell.and_then(AtomicU64Cell::get_protected)
+                });
+        }
+        if let Some(value) = self
+            .overlay
+            .with_cell_prehashed(key, key_hash.route(), |cell| {
+                cell.map(AtomicU64Cell::get_protected)
+            })
+        {
+            return value;
+        }
+        self.base.load().get_atomic_protected(key, key_hash)
+    }
 
-const WRITER_STRIPES: usize = 4_096;
+    #[cfg(any(test, feature = "shared-gx"))]
+    fn get_atomic_protected_with_base(
+        &self,
+        base: &GenerationBase<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap>,
+        key: &[u8],
+        key_hash: GenerationKeyHash,
+        stripe: usize,
+    ) -> Option<NonMaxU64> {
+        if self.base_is_empty {
+            return self
+                .overlay
+                .with_cell_prehashed(key, key_hash.route(), |cell| {
+                    cell.and_then(AtomicU64Cell::get_protected)
+                });
+        }
+        let state = self.writer_stripes[stripe].load(Ordering::Acquire);
+        let direct_first =
+            state & WRITER_STRIPE_DIRECT_BASE != 0 && state & WRITER_STRIPE_OVERLAY_BASE == 0;
+        if direct_first && matches!(base, GenerationBase::Previous(_)) {
+            // Direct mutation is enabled only after the authoritative base has
+            // changed from Previous to Frozen. A cached reader can observe the
+            // enable bit immediately after its own earlier revalidation, so a
+            // predecessor passed here must never service that direct read.
+            return self.get_atomic_protected(key, key_hash, stripe);
+        }
+        if direct_first && let Some(value) = base.get_atomic_protected(key, key_hash) {
+            return Some(value);
+        }
+        if direct_first {
+            if !self.overlay_touched.load(Ordering::Acquire) {
+                return None;
+            }
+            return self
+                .overlay
+                .with_cell_prehashed(key, key_hash.route(), |cell| {
+                    cell.and_then(AtomicU64Cell::get_protected)
+                });
+        }
+        if let Some(value) = self
+            .overlay
+            .with_cell_prehashed(key, key_hash.route(), |cell| {
+                cell.map(AtomicU64Cell::get_protected)
+            })
+        {
+            return value;
+        }
+        base.get_atomic_protected(key, key_hash)
+    }
+
+    #[cfg(not(feature = "shared-gx"))]
+    fn get_atomic_protected_with_base_route(
+        &self,
+        base: &GenerationBase<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap>,
+        key: &[u8],
+        route_hash: u64,
+        stripe: usize,
+        hash_builder: &GenerationHashBuilder,
+    ) -> Option<NonMaxU64> {
+        if self.base_is_empty {
+            return self.overlay.with_cell_prehashed(key, route_hash, |cell| {
+                cell.and_then(AtomicU64Cell::get_protected)
+            });
+        }
+        let state = self.writer_stripes[stripe].load(Ordering::Acquire);
+        let direct_first =
+            state & WRITER_STRIPE_DIRECT_BASE != 0 && state & WRITER_STRIPE_OVERLAY_BASE == 0;
+        if direct_first && matches!(base, GenerationBase::Previous(_)) {
+            let key_hash = GenerationKeyHash::from_verified_route(hash_builder, key, route_hash);
+            return self.get_atomic_protected(key, key_hash, stripe);
+        }
+        if direct_first {
+            let key_hash = GenerationKeyHash::from_verified_route(hash_builder, key, route_hash);
+            if let Some(value) = base.get_atomic_protected(key, key_hash) {
+                return Some(value);
+            }
+            if !self.overlay_touched.load(Ordering::Acquire) {
+                return None;
+            }
+            return self.overlay.with_cell_prehashed(key, route_hash, |cell| {
+                cell.and_then(AtomicU64Cell::get_protected)
+            });
+        }
+        if let Some(value) = self.overlay.with_cell_prehashed(key, route_hash, |cell| {
+            cell.map(AtomicU64Cell::get_protected)
+        }) {
+            return value;
+        }
+        let key_hash = GenerationKeyHash::from_verified_route(hash_builder, key, route_hash);
+        base.get_atomic_protected(key, key_hash)
+    }
+
+    fn get_or_insert_atomic(
+        &self,
+        key: &[u8],
+        value: NonMaxU64,
+        route: GenerationWriteRoute,
+    ) -> (NonMaxU64, bool) {
+        let base = self.base.load();
+        self.get_or_insert_atomic_with_base(&base, key, value, route)
+    }
+
+    fn get_or_insert_atomic_with_base(
+        &self,
+        base: &GenerationBase<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap>,
+        key: &[u8],
+        value: NonMaxU64,
+        route: GenerationWriteRoute,
+    ) -> (NonMaxU64, bool) {
+        if self.base_is_empty {
+            return match self.overlay.probe_or_insert_prehashed(
+                key,
+                route.key_hash.route(),
+                AtomicU64Cell::present(value),
+                |current| current.get_or_insert(value),
+            ) {
+                OverlayInsert::Inserted => (value, true),
+                OverlayInsert::Occupied(result) => result,
+            };
+        }
+        let direct_first = route.direct_base && !route.overlay_may_shadow_base;
+        if direct_first
+            && let Some(result) = base.direct_get_or_insert_atomic(key, route.key_hash, value)
+        {
+            return result;
+        }
+        if direct_first {
+            self.mark_overlay_touched();
+            return match self.overlay.probe_or_insert_prehashed(
+                key,
+                route.key_hash.route(),
+                AtomicU64Cell::present(value),
+                |current| current.get_or_insert(value),
+            ) {
+                OverlayInsert::Inserted => (value, true),
+                OverlayInsert::Occupied(result) => result,
+            };
+        }
+        if let Some(result) =
+            self.overlay
+                .with_cell_prehashed(key, route.key_hash.route(), |cell| {
+                    cell.map(|cell| cell.get_or_insert(value))
+                })
+        {
+            return result;
+        }
+        if route.direct_base
+            && let Some(result) = base.direct_get_or_insert_atomic(key, route.key_hash, value)
+        {
+            return result;
+        }
+        if !route.direct_base
+            && let Some(current) = base.get_cloned_hashed(key, route.key_hash)
+        {
+            return (current, false);
+        }
+        self.mark_overlay_touched();
+        match self.overlay.insert_or_visit_prehashed(
+            key,
+            route.key_hash.route(),
+            AtomicU64Cell::present(value),
+            |current| current.get_or_insert(value),
+        ) {
+            OverlayInsert::Inserted => (value, true),
+            OverlayInsert::Occupied(result) => result,
+        }
+    }
+
+    #[cfg(not(feature = "shared-gx"))]
+    fn get_or_insert_atomic_empty_base(
+        &self,
+        key: &[u8],
+        value: NonMaxU64,
+        route_hash: u64,
+    ) -> (NonMaxU64, bool) {
+        debug_assert!(self.base_is_empty);
+        match self.overlay.probe_or_insert_prehashed(
+            key,
+            route_hash,
+            AtomicU64Cell::present(value),
+            |current| current.get_or_insert(value),
+        ) {
+            OverlayInsert::Inserted => (value, true),
+            OverlayInsert::Occupied(result) => result,
+        }
+    }
+
+    #[cfg(all(feature = "operation-batch", not(feature = "shared-gx")))]
+    fn get_or_insert_atomic_empty_base_encoded(
+        &self,
+        key: &[u8],
+        encoded: &AtomicEncodedAdmissionKey,
+        value: NonMaxU64,
+        route_hash: u64,
+    ) -> (NonMaxU64, bool) {
+        debug_assert!(self.base_is_empty);
+        match self.overlay.probe_or_insert_encoded_prehashed(
+            key,
+            encoded,
+            route_hash,
+            AtomicU64Cell::present(value),
+            |current| current.get_or_insert(value),
+        ) {
+            OverlayInsert::Inserted => (value, true),
+            OverlayInsert::Occupied(result) => result,
+        }
+    }
+
+    fn probe_atomic_entry(&self, key: &[u8], route: GenerationWriteRoute) -> AtomicEntryProbe {
+        if self.base_is_empty {
+            return match self.probe_atomic_overlay(key, route.key_hash.route()) {
+                AtomicOverlayProbe::Member(Some(value)) => AtomicEntryProbe::Occupied(value),
+                AtomicOverlayProbe::NotMember | AtomicOverlayProbe::Member(None) => {
+                    AtomicEntryProbe::Vacant(AtomicVacantTarget::Overlay {
+                        mark_base_shadow: false,
+                    })
+                }
+            };
+        }
+        let direct_first = route.direct_base && !route.overlay_may_shadow_base;
+        if direct_first {
+            match self.base.load().probe_atomic(key, route.key_hash) {
+                AtomicBaseProbe::Member {
+                    value: Some(value), ..
+                } => return AtomicEntryProbe::Occupied(value),
+                AtomicBaseProbe::Member {
+                    map,
+                    slot,
+                    value: None,
+                } => {
+                    return AtomicEntryProbe::Vacant(AtomicVacantTarget::FrozenSlot { map, slot });
+                }
+                AtomicBaseProbe::Logical(Some(value)) => {
+                    return AtomicEntryProbe::Occupied(value);
+                }
+                AtomicBaseProbe::NotMember | AtomicBaseProbe::Logical(None) => {}
+            }
+            return match self.probe_atomic_overlay(key, route.key_hash.route()) {
+                AtomicOverlayProbe::Member(Some(value)) => AtomicEntryProbe::Occupied(value),
+                AtomicOverlayProbe::NotMember | AtomicOverlayProbe::Member(None) => {
+                    AtomicEntryProbe::Vacant(AtomicVacantTarget::Overlay {
+                        mark_base_shadow: false,
+                    })
+                }
+            };
+        }
+
+        match self.probe_atomic_overlay(key, route.key_hash.route()) {
+            AtomicOverlayProbe::Member(Some(value)) => return AtomicEntryProbe::Occupied(value),
+            AtomicOverlayProbe::Member(None) => {
+                return AtomicEntryProbe::Vacant(AtomicVacantTarget::Overlay {
+                    mark_base_shadow: false,
+                });
+            }
+            AtomicOverlayProbe::NotMember => {}
+        }
+
+        match self.base.load().probe_atomic(key, route.key_hash) {
+            AtomicBaseProbe::Member {
+                value: Some(value), ..
+            }
+            | AtomicBaseProbe::Logical(Some(value)) => AtomicEntryProbe::Occupied(value),
+            AtomicBaseProbe::Member {
+                map,
+                slot,
+                value: None,
+            } if route.direct_base => {
+                AtomicEntryProbe::Vacant(AtomicVacantTarget::FrozenSlot { map, slot })
+            }
+            AtomicBaseProbe::Member { value: None, .. } => {
+                AtomicEntryProbe::Vacant(AtomicVacantTarget::Overlay {
+                    mark_base_shadow: true,
+                })
+            }
+            AtomicBaseProbe::NotMember | AtomicBaseProbe::Logical(None) => {
+                AtomicEntryProbe::Vacant(AtomicVacantTarget::Overlay {
+                    mark_base_shadow: false,
+                })
+            }
+        }
+    }
+
+    fn probe_atomic_overlay(&self, key: &[u8], route_hash: u64) -> AtomicOverlayProbe {
+        self.overlay
+            .with_cell_prehashed(key, route_hash, |cell| match cell {
+                Some(cell) => AtomicOverlayProbe::Member(cell.with_value(copy_optional_non_max)),
+                None => AtomicOverlayProbe::NotMember,
+            })
+    }
+
+    fn remove_atomic_with_base(
+        &self,
+        base: &GenerationBase<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap>,
+        key: &[u8],
+        route: GenerationWriteRoute,
+    ) -> Option<NonMaxU64> {
+        if self.base_is_empty {
+            return self.remove_atomic_empty_base(key, route.key_hash.route());
+        }
+        let direct_first = route.direct_base && !route.overlay_may_shadow_base;
+        if direct_first {
+            match base.direct_remove_atomic(key, route.key_hash) {
+                DirectMutation::Handled(removed) => return removed,
+                DirectMutation::NotMember => {}
+            }
+        }
+        if let Some(removed) =
+            self.overlay
+                .with_cell_prehashed(key, route.key_hash.route(), |cell| {
+                    cell.map(AtomicU64Cell::remove)
+                })
+        {
+            return removed;
+        }
+        if route.direct_base && !direct_first {
+            return match base.direct_remove_atomic(key, route.key_hash) {
+                DirectMutation::Handled(removed) => removed,
+                DirectMutation::NotMember => None,
+            };
+        }
+        let base_value = base.get_cloned_hashed(key, route.key_hash)?;
+        self.mark_overlay_may_shadow_base(route.stripe);
+        match self.overlay.insert_or_visit_prehashed(
+            key,
+            route.key_hash.route(),
+            AtomicU64Cell::deleted(),
+            AtomicU64Cell::remove,
+        ) {
+            OverlayInsert::Inserted => Some(base_value),
+            OverlayInsert::Occupied(removed) => removed,
+        }
+    }
+
+    fn remove_atomic_empty_base(&self, key: &[u8], route_hash: u64) -> Option<NonMaxU64> {
+        debug_assert!(self.base_is_empty);
+        self.overlay
+            .with_cell_prehashed(key, route_hash, |cell| cell.and_then(AtomicU64Cell::remove))
+    }
+}
+
+pub(crate) const WRITER_STRIPES: usize = 4_096;
 #[cfg(feature = "prepared-batch-gate")]
 const PREPARED_BATCH_WRITER_GATES: usize = 16;
-const LEN_STRIPES: usize = 64;
 const WRITER_STRIPE_CLOSED: usize = 1 << (usize::BITS - 1);
 const WRITER_STRIPE_DIRECT_BASE: usize = WRITER_STRIPE_CLOSED >> 1;
 const WRITER_STRIPE_OVERLAY_BASE: usize = WRITER_STRIPE_DIRECT_BASE >> 1;
-const WRITER_STRIPE_COUNT_MASK: usize = WRITER_STRIPE_OVERLAY_BASE - 1;
+const WRITER_STRIPE_COUNT_BITS: u32 = if usize::BITS >= 64 { 16 } else { 8 };
+const WRITER_STRIPE_COUNT_MASK: usize = (1 << WRITER_STRIPE_COUNT_BITS) - 1;
+const WRITER_STRIPE_LEN_SHIFT: u32 = WRITER_STRIPE_COUNT_BITS;
+const WRITER_STRIPE_LEN_BITS: u32 = usize::BITS - 3 - WRITER_STRIPE_COUNT_BITS;
+const WRITER_STRIPE_LEN_VALUE_MASK: usize = (1 << WRITER_STRIPE_LEN_BITS) - 1;
+const WRITER_STRIPE_LEN_MASK: usize = WRITER_STRIPE_LEN_VALUE_MASK << WRITER_STRIPE_LEN_SHIFT;
+const WRITER_STRIPE_LEN_BIAS: usize = 1 << (WRITER_STRIPE_LEN_BITS - 1);
+const WRITER_STRIPE_LEN_UNIT: usize = 1 << WRITER_STRIPE_LEN_SHIFT;
+const WRITER_STRIPE_LEN_ZERO: usize = WRITER_STRIPE_LEN_BIAS << WRITER_STRIPE_LEN_SHIFT;
+
+#[inline]
+fn try_acquire_writer_stripe(counter: &AtomicUsize) -> Option<usize> {
+    let mut state = counter.load(Ordering::Relaxed);
+    loop {
+        if state & WRITER_STRIPE_CLOSED != 0 {
+            return None;
+        }
+        assert_ne!(
+            state & WRITER_STRIPE_COUNT_MASK,
+            WRITER_STRIPE_COUNT_MASK,
+            "writer stripe counter overflow"
+        );
+        match counter.compare_exchange_weak(state, state + 1, Ordering::Acquire, Ordering::Relaxed)
+        {
+            Ok(_) => return Some(state),
+            Err(observed) => state = observed,
+        }
+    }
+}
+
+fn release_writer_stripe(counter: &AtomicUsize, amount: isize, released: &mut bool) {
+    if amount == 0 {
+        let previous = counter.fetch_sub(1, Ordering::Release);
+        debug_assert!(previous & WRITER_STRIPE_CLOSED == 0);
+        debug_assert!(previous & WRITER_STRIPE_COUNT_MASK > 0);
+        *released = true;
+        return;
+    }
+
+    if usize::BITS >= 64 {
+        let previous = match amount {
+            1 => counter.fetch_add(WRITER_STRIPE_LEN_UNIT - 1, Ordering::Release),
+            -1 => counter.fetch_sub(WRITER_STRIPE_LEN_UNIT + 1, Ordering::Release),
+            _ => panic!("writer stripe release length must be one entry"),
+        };
+        debug_assert!(previous & WRITER_STRIPE_CLOSED == 0);
+        debug_assert!(previous & WRITER_STRIPE_COUNT_MASK > 0);
+        let raw = (previous & WRITER_STRIPE_LEN_MASK) >> WRITER_STRIPE_LEN_SHIFT;
+        debug_assert!(amount != 1 || raw < WRITER_STRIPE_LEN_VALUE_MASK);
+        debug_assert!(amount != -1 || raw > 0);
+        *released = true;
+        return;
+    }
+
+    let mut state = counter.load(Ordering::Relaxed);
+    loop {
+        debug_assert!(state & WRITER_STRIPE_CLOSED == 0);
+        debug_assert!(state & WRITER_STRIPE_COUNT_MASK > 0);
+        let next_delta = writer_stripe_len_delta(state)
+            .checked_add(amount)
+            .expect("writer stripe length delta overflow");
+        let next = ((state & !WRITER_STRIPE_LEN_MASK) | writer_stripe_len_bits(next_delta)) - 1;
+        match counter.compare_exchange_weak(state, next, Ordering::Release, Ordering::Relaxed) {
+            Ok(_) => {
+                *released = true;
+                return;
+            }
+            Err(observed) => state = observed,
+        }
+    }
+}
+
+fn writer_stripe_len_delta(state: usize) -> isize {
+    let raw = (state & WRITER_STRIPE_LEN_MASK) >> WRITER_STRIPE_LEN_SHIFT;
+    isize::try_from(raw).expect("writer stripe length field fits isize")
+        - isize::try_from(WRITER_STRIPE_LEN_BIAS).expect("writer stripe bias fits isize")
+}
+
+fn writer_stripe_len_bits(delta: isize) -> usize {
+    let raw = isize::try_from(WRITER_STRIPE_LEN_BIAS)
+        .expect("writer stripe bias fits isize")
+        .checked_add(delta)
+        .and_then(|raw| usize::try_from(raw).ok())
+        .expect("writer stripe length delta exceeds packed range");
+    assert!(
+        raw <= WRITER_STRIPE_LEN_VALUE_MASK
+            && writer_stripe_len_delta(raw << WRITER_STRIPE_LEN_SHIFT) == delta,
+        "writer stripe length delta exceeds packed range"
+    );
+    raw << WRITER_STRIPE_LEN_SHIFT
+}
 
 #[cfg(feature = "prepared-batch-gate")]
 #[repr(align(64))]
@@ -3207,6 +5291,19 @@ where
     }
 
     #[cfg(feature = "prepared-keys")]
+    fn replace_prepared(
+        &self,
+        key: &[u8],
+        prepared: AtomicPreparedSlot,
+        value: &V,
+    ) -> DirectMutation<Option<V>> {
+        match self {
+            Self::Frozen { map, .. } => map.replace_prepared(key, prepared, value),
+            Self::StableHybrid(_) | Self::Previous(_) => DirectMutation::NotMember,
+        }
+    }
+
+    #[cfg(feature = "prepared-keys")]
     fn update_prepared(
         &self,
         key: &[u8],
@@ -3252,6 +5349,9 @@ where
     ) -> Option<R> {
         match self {
             Self::Frozen { map, membership } => {
+                if map.len() == 0 {
+                    return None;
+                }
                 if !membership.may_contain_hash(key_hash.route()) {
                     return None;
                 }
@@ -3368,6 +5468,13 @@ where
         }
     }
 
+    fn sample_entry(&self, seed: u64, visit: &mut dyn FnMut(&[u8], &V) -> bool) -> bool {
+        match self {
+            Self::Frozen { map, .. } => map.sample_entry(seed, visit),
+            Self::StableHybrid(_) | Self::Previous(_) => false,
+        }
+    }
+
     fn stats(&self) -> LayerBaseStats {
         match self {
             Self::Frozen { map, membership } => LayerBaseStats {
@@ -3396,6 +5503,90 @@ where
                     layer_depth: stats.layer_depth,
                     base_filter_bytes: stats.base_filter_bytes,
                 }
+            }
+        }
+    }
+}
+
+impl GenerationBase<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap> {
+    fn get_atomic_protected(&self, key: &[u8], key_hash: GenerationKeyHash) -> Option<NonMaxU64> {
+        match self {
+            Self::Frozen { map, membership } => membership
+                .may_contain_hash(key_hash.route())
+                .then(|| map.get_hashed_protected(key, key_hash.frozen()))
+                .flatten(),
+            Self::StableHybrid(map) => map.with_value(key, copy_optional_non_max),
+            Self::Previous(map) => {
+                let stripe_mask =
+                    u64::try_from(WRITER_STRIPES - 1).expect("writer stripe mask fits u64");
+                let stripe = usize::try_from(key_hash.route() & stripe_mask)
+                    .expect("masked writer stripe fits usize");
+                map.get_atomic_protected(key, key_hash, stripe)
+            }
+        }
+    }
+
+    fn direct_get_or_insert_atomic(
+        &self,
+        key: &[u8],
+        key_hash: GenerationKeyHash,
+        value: NonMaxU64,
+    ) -> Option<(NonMaxU64, bool)> {
+        match self {
+            Self::Frozen { map, membership } => membership
+                .may_contain_hash(key_hash.route())
+                .then(|| map.get_or_insert_hashed(key, key_hash.frozen(), value))
+                .flatten(),
+            Self::StableHybrid(_) | Self::Previous(_) => None,
+        }
+    }
+
+    fn direct_remove_atomic(
+        &self,
+        key: &[u8],
+        key_hash: GenerationKeyHash,
+    ) -> DirectMutation<Option<NonMaxU64>> {
+        match self {
+            Self::Frozen { map, membership } => {
+                if membership.may_contain_hash(key_hash.route()) {
+                    map.remove_hashed(key, key_hash.frozen())
+                } else {
+                    DirectMutation::NotMember
+                }
+            }
+            Self::StableHybrid(_) | Self::Previous(_) => DirectMutation::NotMember,
+        }
+    }
+
+    fn probe_atomic(&self, key: &[u8], key_hash: GenerationKeyHash) -> AtomicBaseProbe {
+        match self {
+            Self::Frozen { map, membership } => {
+                if !membership.may_contain_hash(key_hash.route()) {
+                    return AtomicBaseProbe::NotMember;
+                }
+                match map.probe_hashed(key, key_hash.frozen()) {
+                    AtomicFrozenProbe::NotMember => AtomicBaseProbe::NotMember,
+                    AtomicFrozenProbe::Member { slot, value } => AtomicBaseProbe::Member {
+                        map: Arc::clone(map),
+                        slot,
+                        value,
+                    },
+                }
+            }
+            Self::StableHybrid(map) => {
+                AtomicBaseProbe::Logical(map.with_value(key, copy_optional_non_max))
+            }
+            Self::Previous(map) => {
+                let stripe_mask =
+                    u64::try_from(WRITER_STRIPES - 1).expect("writer stripe mask fits u64");
+                let stripe = usize::try_from(key_hash.route() & stripe_mask)
+                    .expect("masked writer stripe fits usize");
+                AtomicBaseProbe::Logical(map.with_value_in_stripe(
+                    key,
+                    key_hash,
+                    stripe,
+                    copy_optional_non_max,
+                ))
             }
         }
     }
@@ -3452,4 +5643,512 @@ pub struct GenerationMapStats {
     pub active_writers: usize,
     /// Bytes retained by definite-negative filters across active frozen bases.
     pub base_filter_bytes: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_cache_revalidates_across_mutations_and_rebuild() {
+        let map = LockFreeAtomicU64GenerationMap::try_from_entries(
+            (0..64_u64).map(|value| (value.to_le_bytes(), NonMaxU64::new(value + 1).unwrap())),
+            128,
+        )
+        .unwrap();
+        let cached = map.read_cache();
+        let existing = 7_u64.to_le_bytes();
+        let inserted = 1_001_u64.to_le_bytes();
+        let inserted_value = NonMaxU64::new(1_002).unwrap();
+
+        assert_eq!(cached.get_protected(&existing), map.get(&existing));
+        assert_eq!(
+            map.insert(&inserted, inserted_value),
+            InsertOutcome::Inserted
+        );
+        assert_eq!(cached.get_protected(&inserted), Some(inserted_value));
+
+        map.rebuild(128).unwrap();
+        cached.refresh();
+        assert_eq!(cached.get_protected(&existing), map.get(&existing));
+        assert_eq!(cached.get_protected(&inserted), Some(inserted_value));
+
+        let existing_value = map.get(&existing);
+        assert_eq!(map.remove(&existing), existing_value);
+        assert_eq!(cached.get_protected(&existing), None);
+    }
+
+    #[test]
+    fn read_cache_replaces_a_transitional_base_before_direct_updates() {
+        let map = Arc::new(
+            LockFreeAtomicU64GenerationMap::try_from_entries(
+                std::iter::once((b"counter".as_slice(), NonMaxU64::new(1).unwrap())),
+                64,
+            )
+            .unwrap(),
+        );
+        let cached = map.read_cache();
+        let old_generation = map.inner.current.load_full();
+        let blocker = map.read_guard();
+        let rebuilding = Arc::clone(&map);
+        let join = std::thread::spawn(move || rebuilding.rebuild(64).unwrap());
+
+        while Arc::ptr_eq(&old_generation, &map.inner.current.load_full()) {
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            map.inner.current.load().base.load().as_ref(),
+            GenerationBase::Previous(_)
+        ));
+        assert_eq!(cached.get_protected(b"counter").unwrap().get(), 1);
+
+        drop(blocker);
+        join.join().unwrap();
+        assert_eq!(
+            map.update(b"counter", |_| NonMaxU64::new(2).unwrap()),
+            Some(NonMaxU64::new(2).unwrap())
+        );
+        assert_eq!(cached.get_protected(b"counter").unwrap().get(), 2);
+    }
+
+    #[test]
+    fn protected_read_rejects_a_stale_predecessor_after_direct_base_enable() {
+        let map = Arc::new(
+            LockFreeAtomicU64GenerationMap::try_from_entries(
+                std::iter::once((b"counter".as_slice(), NonMaxU64::new(1).unwrap())),
+                64,
+            )
+            .unwrap(),
+        );
+        let old_generation = map.inner.current.load_full();
+        let blocker = map.read_guard();
+        let rebuilding = Arc::clone(&map);
+        let join = std::thread::spawn(move || rebuilding.rebuild(64).unwrap());
+
+        let generation = loop {
+            let generation = map.inner.current.load_full();
+            if !Arc::ptr_eq(&old_generation, &generation) {
+                break generation;
+            }
+            std::thread::yield_now();
+        };
+        let stale_base = generation.base.load_full();
+        assert!(matches!(stale_base.as_ref(), GenerationBase::Previous(_)));
+
+        drop(blocker);
+        join.join().unwrap();
+        assert_eq!(
+            map.update(b"counter", |_| NonMaxU64::new(2).unwrap()),
+            Some(NonMaxU64::new(2).unwrap())
+        );
+        let (stripe, key_hash) = map.inner.writer_route(b"counter");
+        assert_eq!(
+            generation
+                .get_atomic_protected_with_base(&stale_base, b"counter", key_hash, stripe)
+                .unwrap()
+                .get(),
+            2
+        );
+    }
+
+    #[cfg(feature = "prepared-keys")]
+    #[test]
+    fn prepared_read_cache_falls_back_exactly_across_rebuild_publication() {
+        let map = Arc::new(
+            LockFreeAtomicU64GenerationMap::try_from_entries(
+                std::iter::once((b"counter".as_slice(), NonMaxU64::new(1).unwrap())),
+                64,
+            )
+            .unwrap(),
+        );
+        let prepared = map.prepare_key(b"counter");
+        let cached = map.read_cache();
+        assert_eq!(cached.get_prepared(b"counter", &prepared).unwrap().get(), 1);
+
+        let old_generation = map.inner.current.load_full();
+        let blocker = map.read_guard();
+        let rebuilding = Arc::clone(&map);
+        let join = std::thread::spawn(move || rebuilding.rebuild(64).unwrap());
+        while Arc::ptr_eq(&old_generation, &map.inner.current.load_full()) {
+            std::thread::yield_now();
+        }
+        assert_eq!(cached.get_prepared(b"counter", &prepared).unwrap().get(), 1);
+
+        drop(blocker);
+        join.join().unwrap();
+        assert_eq!(
+            map.update(b"counter", |_| NonMaxU64::new(2).unwrap()),
+            Some(NonMaxU64::new(2).unwrap())
+        );
+        assert_eq!(cached.get_prepared(b"counter", &prepared).unwrap().get(), 2);
+        let refreshed = map.prepare_key(b"counter");
+        assert_eq!(
+            cached.get_prepared(b"counter", &refreshed).unwrap().get(),
+            2
+        );
+    }
+
+    #[cfg(feature = "prepared-keys")]
+    #[test]
+    fn prepared_read_cache_recomputes_a_wrong_handles_writer_stripe() {
+        let map = Arc::new(
+            LockFreeAtomicU64GenerationMap::try_from_entries(
+                (0..128_u64).map(|value| (value.to_le_bytes(), NonMaxU64::new(value + 1).unwrap())),
+                256,
+            )
+            .unwrap(),
+        );
+        let source = 0_u64.to_le_bytes();
+        let source_stripe = map.inner.writer_route(&source).0;
+        let target = (1..128_u64)
+            .map(u64::to_le_bytes)
+            .find(|key| map.inner.writer_route(key).0 != source_stripe)
+            .expect("test keys cover more than one writer stripe");
+        let prepared_for_source = map.prepare_key(&source);
+        let cached = map.read_cache();
+
+        let old_generation = map.inner.current.load_full();
+        let blocker = map.read_guard();
+        let rebuilding = Arc::clone(&map);
+        let join = std::thread::spawn(move || rebuilding.rebuild(256).unwrap());
+        while Arc::ptr_eq(&old_generation, &map.inner.current.load_full()) {
+            std::thread::yield_now();
+        }
+
+        let updated = NonMaxU64::new(10_000).unwrap();
+        assert_eq!(map.update(&target, |_| updated), Some(updated));
+        drop(blocker);
+        join.join().unwrap();
+
+        assert_eq!(
+            cached.get_prepared(&target, &prepared_for_source),
+            Some(updated)
+        );
+        assert_eq!(
+            cached.get_prepared(&target, &prepared_for_source),
+            map.get(&target)
+        );
+    }
+
+    #[test]
+    fn read_cache_never_moves_backward_across_repeated_rebuilds() {
+        const UPDATES: usize = 100_000;
+        const REBUILDS: usize = 8;
+
+        let map = LockFreeAtomicU64GenerationMap::try_from_entries(
+            std::iter::once((b"counter".as_slice(), NonMaxU64::new(0).unwrap())),
+            64,
+        )
+        .unwrap();
+        let start = std::sync::Barrier::new(3);
+        let updating = AtomicBool::new(true);
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                start.wait();
+                for _ in 0..UPDATES {
+                    map.update(b"counter", |value| NonMaxU64::new(value.get() + 1).unwrap())
+                        .unwrap();
+                }
+                updating.store(false, Ordering::Release);
+            });
+
+            scope.spawn(|| {
+                let cached = map.read_cache();
+                start.wait();
+                let mut previous = 0;
+                while updating.load(Ordering::Acquire) {
+                    let current = cached.get_protected(b"counter").unwrap().get();
+                    assert!(current >= previous);
+                    previous = current;
+                }
+                assert!(cached.get_protected(b"counter").unwrap().get() >= previous);
+            });
+
+            start.wait();
+            for _ in 0..REBUILDS {
+                map.rebuild(64).unwrap();
+            }
+        });
+
+        assert_eq!(map.get(b"counter").unwrap().get(), UPDATES as u64);
+    }
+
+    #[test]
+    fn read_guard_delays_cutover_and_refreshes_to_the_next_generation() {
+        let map = Arc::new(
+            LockFreeAtomicU64GenerationMap::try_from_entries(
+                (0..64_u64).map(|value| (value.to_le_bytes(), NonMaxU64::new(value + 1).unwrap())),
+                128,
+            )
+            .unwrap(),
+        );
+        let key = 7_u64.to_le_bytes();
+        let mut guard = map.read_guard();
+        assert_eq!(guard.get_protected(&key), map.get(&key));
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let rebuilding = Arc::clone(&map);
+        let join = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = rebuilding.rebuild(128);
+            done_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        let inserted_key = 1_001_u64.to_le_bytes();
+        let inserted_value = NonMaxU64::new(1_002).unwrap();
+        assert_eq!(
+            guard.get_or_insert(&inserted_key, inserted_value),
+            inserted_value
+        );
+        let removed_key = 8_u64.to_le_bytes();
+        let removed_value = NonMaxU64::new(9).unwrap();
+        assert_eq!(guard.remove(&removed_key), Some(removed_value));
+        guard.refresh();
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        join.join().unwrap();
+
+        assert_eq!(guard.get_protected(&key), map.get(&key));
+        assert_eq!(guard.get_protected(&inserted_key), Some(inserted_value));
+        assert_eq!(guard.get_protected(&removed_key), None);
+        assert_eq!(map.len(), 64);
+    }
+
+    #[test]
+    fn frozen_misses_skip_an_untouched_overlay_until_the_first_overlay_write() {
+        let map = LockFreeAtomicU64GenerationMap::try_from_entries(
+            (0..64_u64).map(|value| (value.to_le_bytes(), NonMaxU64::new(value + 1).unwrap())),
+            128,
+        )
+        .unwrap();
+        let missing = 1_001_u64.to_le_bytes();
+        let inserted = NonMaxU64::new(1_002).unwrap();
+
+        assert!(
+            !map.inner
+                .current
+                .load()
+                .overlay_touched
+                .load(Ordering::Acquire)
+        );
+        assert_eq!(map.get_protected(&missing), None);
+        assert!(
+            !map.inner
+                .current
+                .load()
+                .overlay_touched
+                .load(Ordering::Acquire)
+        );
+
+        assert_eq!(map.get_or_insert(&missing, inserted), inserted);
+        assert!(
+            map.inner
+                .current
+                .load()
+                .overlay_touched
+                .load(Ordering::Acquire)
+        );
+        assert_eq!(map.get_protected(&missing), Some(inserted));
+
+        map.rebuild(128).unwrap();
+        assert!(
+            !map.inner
+                .current
+                .load()
+                .overlay_touched
+                .load(Ordering::Acquire)
+        );
+        assert_eq!(map.get_protected(&missing), Some(inserted));
+    }
+
+    #[test]
+    fn guarded_insert_length_can_be_published_after_the_index_value() {
+        let map = LockFreeAtomicU64GenerationMap::try_from_entries(
+            std::iter::empty::<([u8; 8], NonMaxU64)>(),
+            128,
+        )
+        .unwrap();
+        let guard = map.read_guard();
+        let key = 7_u64.to_le_bytes();
+        let value = NonMaxU64::new(11).unwrap();
+
+        let (current, stripe) = guard.get_or_insert_deferred_len(&key, value);
+        assert_eq!(current, value);
+        let stripe = stripe.expect("the first guarded insertion is deferred");
+        assert_eq!(guard.get_protected(&key), Some(value));
+        assert_eq!(map.len(), 0);
+
+        let (current, duplicate_stripe) = guard.get_or_insert_deferred_len(&key, value);
+        assert_eq!(current, value);
+        assert_eq!(duplicate_stripe, None);
+
+        guard.flush_deferred_insert_len(stripe, 1);
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn guarded_removal_length_can_be_published_after_key_absence() {
+        let key = 7_u64.to_le_bytes();
+        let value = NonMaxU64::new(11).unwrap();
+        let map = LockFreeAtomicU64GenerationMap::try_from_entries([(key, value)], 128).unwrap();
+        let guard = map.read_guard();
+
+        let (removed, stripe) = guard.remove_deferred_len(&key);
+        assert_eq!(removed, Some(value));
+        let stripe = stripe.expect("the guarded removal length is deferred");
+        assert_eq!(guard.get_protected(&key), None);
+        assert_eq!(map.len(), 1);
+
+        let (removed, duplicate_stripe) = guard.remove_deferred_len(&key);
+        assert_eq!(removed, None);
+        assert_eq!(duplicate_stripe, None);
+
+        guard.flush_deferred_remove_len(stripe, 1);
+        assert_eq!(map.len(), 0);
+    }
+
+    #[cfg(feature = "prepared-keys")]
+    #[test]
+    fn prepared_guarded_removal_falls_back_exactly_after_rebuild() {
+        let first = 7_u64.to_le_bytes();
+        let second = 9_u64.to_le_bytes();
+        let first_value = NonMaxU64::new(11).unwrap();
+        let second_value = NonMaxU64::new(13).unwrap();
+        let map = LockFreeAtomicU64GenerationMap::try_from_entries(
+            [(first, first_value), (second, second_value)],
+            128,
+        )
+        .unwrap();
+        let stale = map.prepare_key(&first);
+        map.rebuild(128).unwrap();
+        let guard = map.read_guard();
+
+        let (removed, first_stripe) = guard.remove_prepared_deferred_len(&first, &stale);
+        assert_eq!(removed, Some(first_value));
+        let first_stripe = first_stripe.expect("stale prepared removal still defers length");
+        assert_eq!(guard.get_protected(&first), None);
+        assert_eq!(guard.get_protected(&second), Some(second_value));
+        assert_eq!(map.len(), 2);
+
+        let (removed, second_stripe) = guard.remove_prepared_deferred_len(&second, &stale);
+        assert_eq!(removed, Some(second_value));
+        assert!(second_stripe.is_some());
+        guard.flush_deferred_remove_len(first_stripe, 2);
+        assert_eq!(map.len(), 0);
+    }
+
+    #[cfg(not(feature = "shared-gx"))]
+    #[test]
+    fn mutable_only_guarded_insert_automatically_uses_route_hash_and_preserves_length() {
+        let map = LockFreeAtomicU64GenerationMap::try_from_entries(
+            std::iter::empty::<([u8; 8], NonMaxU64)>(),
+            128,
+        )
+        .unwrap();
+        let guard = map.read_guard();
+        let key = 19_u64.to_le_bytes();
+        let value = NonMaxU64::new(23).unwrap();
+
+        assert!(guard.uses_route_only_admission());
+        let (current, stripe) = guard.get_or_insert_deferred_len(&key, value);
+        assert_eq!(current, value);
+        let stripe = stripe.expect("the first route-only insertion is deferred");
+        assert_eq!(map.len(), 0);
+
+        let (current, duplicate_stripe) = guard.get_or_insert_deferred_len(&key, value);
+        assert_eq!(current, value);
+        assert_eq!(duplicate_stripe, None);
+
+        guard.flush_deferred_insert_len(stripe, 1);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&key), Some(value));
+    }
+
+    #[test]
+    fn deferred_insert_length_balances_a_removal_before_flush() {
+        let map = LockFreeAtomicU64GenerationMap::try_from_entries(
+            std::iter::empty::<([u8; 8], NonMaxU64)>(),
+            128,
+        )
+        .unwrap();
+        let guard = map.read_guard();
+        let retained_key = 13_u64.to_le_bytes();
+        let retained_value = NonMaxU64::new(17).unwrap();
+        let (_, retained_stripe) = guard.get_or_insert_deferred_len(&retained_key, retained_value);
+        let retained_stripe = retained_stripe.unwrap();
+        let removed_key = (14_u64..=u64::MAX)
+            .map(u64::to_le_bytes)
+            .find(|key| map.inner.writer_route(key).0 != retained_stripe)
+            .unwrap();
+        let removed_value = NonMaxU64::new(19).unwrap();
+        let (_, removed_stripe) = guard.get_or_insert_deferred_len(&removed_key, removed_value);
+        assert_ne!(removed_stripe, Some(retained_stripe));
+
+        assert_eq!(guard.remove(&removed_key), Some(removed_value));
+        assert_eq!(guard.get_protected(&removed_key), None);
+        guard.flush_deferred_insert_len(retained_stripe, 2);
+        assert_eq!(map.len(), 1);
+        assert_eq!(guard.get_protected(&retained_key), Some(retained_value));
+    }
+
+    #[test]
+    fn checked_writer_acquire_counts_open_stripes_and_never_publishes_overflow() {
+        let counter = AtomicUsize::new(WRITER_STRIPE_LEN_ZERO);
+
+        assert_eq!(
+            try_acquire_writer_stripe(&counter),
+            Some(WRITER_STRIPE_LEN_ZERO)
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), WRITER_STRIPE_LEN_ZERO + 1);
+
+        let mut released = false;
+        release_writer_stripe(&counter, 0, &mut released);
+        assert!(released);
+        assert_eq!(counter.load(Ordering::Relaxed), WRITER_STRIPE_LEN_ZERO);
+
+        let closed = WRITER_STRIPE_LEN_ZERO | WRITER_STRIPE_CLOSED;
+        counter.store(closed, Ordering::Relaxed);
+        assert_eq!(try_acquire_writer_stripe(&counter), None);
+        assert_eq!(counter.load(Ordering::Relaxed), closed);
+
+        let full = WRITER_STRIPE_LEN_ZERO | WRITER_STRIPE_COUNT_MASK;
+        counter.store(full, Ordering::Relaxed);
+        assert!(
+            std::panic::catch_unwind(|| try_acquire_writer_stripe(&counter)).is_err(),
+            "a full stripe must reject another guard"
+        );
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            full,
+            "overflow rejection must never expose a zero active count or alter packed length bits"
+        );
+    }
+
+    #[test]
+    fn writer_stripe_length_delta_round_trips_without_touching_route_state() {
+        let maximum =
+            isize::try_from(WRITER_STRIPE_LEN_BIAS - 1).expect("packed positive delta fits isize");
+        let minimum =
+            -isize::try_from(WRITER_STRIPE_LEN_BIAS).expect("packed negative delta fits isize");
+        let route_state =
+            WRITER_STRIPE_DIRECT_BASE | WRITER_STRIPE_OVERLAY_BASE | WRITER_STRIPE_COUNT_MASK;
+
+        for delta in [minimum, -1, 0, 1, maximum] {
+            let state = route_state | writer_stripe_len_bits(delta);
+            assert_eq!(writer_stripe_len_delta(state), delta);
+            assert_eq!(
+                state
+                    & (WRITER_STRIPE_CLOSED
+                        | WRITER_STRIPE_DIRECT_BASE
+                        | WRITER_STRIPE_OVERLAY_BASE
+                        | WRITER_STRIPE_COUNT_MASK),
+                route_state
+            );
+        }
+    }
 }

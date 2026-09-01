@@ -24,9 +24,20 @@ use crate::epoch::EpochSnapshot;
 
 /// The backend contract behind [`HashMap`]: storage, lookup, insert, iteration,
 /// and lifecycle, grouped into sections below.
+///
+/// # Safety
+///
+/// Implementations must uphold every location, initialization, pointer
+/// uniqueness, allocator, and lifecycle requirement documented by the methods
+/// below. In particular, `scan_next` must never repeat a live slot because the
+/// safe iterator shell may turn its pointers into distinct mutable references.
 // This crate-private contract intentionally exposes `SlotEntry`.
 #[allow(private_interfaces)]
-pub trait TableBackend<K, V>: Sized {
+#[allow(
+    unsafe_code,
+    reason = "defines the audited raw storage contract for sealed table backends"
+)]
+pub unsafe trait TableBackend<K, V>: Sized {
     // -- Storage: metadata + direct slot access --
 
     /// Identify an occupied slot in this table.
@@ -182,6 +193,10 @@ pub trait TableBackend<K, V>: Sized {
     /// Complete maintenance deferred while a bulk-removal scan was active.
     fn finish_deferred_removals(&mut self);
 
+    /// Complete deferred maintenance from an early iterator drop, but never
+    /// allocate, hash, or invoke user code while a panic is unwinding.
+    fn finish_deferred_removals_on_drop(&mut self);
+
     // -- Iterate: scan occupied slots without retaining pointers --
 
     /// Track scan progress by index so a consumed table can move safely.
@@ -284,6 +299,13 @@ pub trait TableBackend<K, V>: Sized {
 
     /// Clear control bytes and counters after [`Drain::drop`] moves out values.
     fn wipe_all(&mut self);
+
+    /// Rebuild counters after a draining iterator was interrupted by a user
+    /// destructor panic.
+    ///
+    /// This is an unwind-only path. Implementations must inspect only their own
+    /// control metadata: they must not allocate, hash keys, or invoke user code.
+    fn repair_after_failed_drain(&mut self, original_len: usize);
 
     /// Clone storage, hash builder, allocator, and entries.
     fn clone_table(&self) -> Self
@@ -504,7 +526,10 @@ where
     /// # Safety
     /// `loc` must be a live location from this table.
     #[inline]
+    #[allow(unsafe_code, reason = "unwraps a live backend location")]
     unsafe fn slot_entry(&self, loc: P::Location) -> &SlotEntry<K, V> {
+        // SAFETY: the caller supplies the live-location proof required by the
+        // backend contract.
         unsafe { self.table.slot_ref(loc) }
     }
 
@@ -515,7 +540,10 @@ where
     /// aliasing rules for the returned slot.
     #[inline]
     #[allow(clippy::mut_from_ref)]
+    #[allow(unsafe_code, reason = "unwraps an exclusive live backend location")]
     unsafe fn slot_entry_mut(&self, loc: P::Location) -> &mut SlotEntry<K, V> {
+        // SAFETY: the caller supplies a live location and is responsible for
+        // preventing another reference to the same slot.
         unsafe { &mut *self.table.slot_ptr(loc) }
     }
 
@@ -584,11 +612,17 @@ where
 
     /// Returns a mutable value using a caller-supplied hash and equivalence
     /// query.
+    #[allow(
+        unsafe_code,
+        reason = "turns a lookup-proven live slot into an exclusive value"
+    )]
     pub fn get_mut_prehashed<Q>(&mut self, hash: u64, key: &Q) -> Option<&mut V>
     where
         Q: Equivalent<K> + ?Sized,
     {
         let location = self.table.find(key, hash, fingerprint(hash))?;
+        // SAFETY: `find` returned a live location, and `&mut self` guarantees
+        // exclusive access to its value.
         Some(unsafe { &mut self.slot_entry_mut(location).value })
     }
 
@@ -627,8 +661,14 @@ where
     /// Calling this for an equivalent key already in the map creates a logical
     /// duplicate. Use [`contains_prehashed`](Self::contains_prehashed) first
     /// unless absence is guaranteed by a higher-level index contract.
+    #[allow(
+        unsafe_code,
+        reason = "turns a freshly inserted slot into an exclusive value"
+    )]
     pub fn insert_unique_prehashed(&mut self, hash: u64, key: K, value: V) -> &mut V {
         let location = self.table.insert_for_vacant(key, value, hash);
+        // SAFETY: insertion returns the newly initialized live location, and
+        // `&mut self` prevents mutable aliasing.
         unsafe { &mut self.slot_entry_mut(location).value }
     }
 
@@ -649,6 +689,10 @@ where
 
     /// In-place prehashed insertion that also returns its epoch-stable slot
     /// location for a higher-level routing accelerator.
+    #[allow(
+        unsafe_code,
+        reason = "turns a freshly inserted slot into an exclusive value"
+    )]
     pub fn try_insert_unique_prehashed_in_place_with_location(
         &mut self,
         hash: u64,
@@ -657,6 +701,8 @@ where
     ) -> Result<(PrehashedLocation, &mut V), (K, V)> {
         let location = self.table.insert_for_vacant_in_place(key, value, hash)?;
         let retained = PrehashedLocation::from_bits(P::location_bits(location));
+        // SAFETY: successful insertion returns a newly initialized live
+        // location, and `&mut self` prevents mutable aliasing.
         Ok((retained, unsafe {
             &mut self.slot_entry_mut(location).value
         }))
@@ -689,6 +735,10 @@ where
     /// if absent, in one hit-path probe. The `Copy` location from
     /// [`TableBackend::find`] frees the borrow before the key ref is re-derived —
     /// the naive `get`-then-insert needs Polonius. Backs set `get_or_insert_with`.
+    #[allow(
+        unsafe_code,
+        reason = "reborrows a key from a lookup- or insertion-proven slot"
+    )]
     pub(crate) fn get_or_insert_key_with<Q, F>(&mut self, key: &Q, value: V, f: F) -> &K
     where
         Q: Hash + Equivalent<K> + ?Sized,
@@ -705,6 +755,10 @@ where
     }
 
     /// Returns a mutable reference to the value for `key`.
+    #[allow(
+        unsafe_code,
+        reason = "turns a lookup-proven live slot into an exclusive value"
+    )]
     pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
     where
         Q: Hash + Equivalent<K> + ?Sized,
@@ -744,6 +798,10 @@ where
     ///
     /// # Panics
     /// If two input keys resolve to the same slot.
+    #[allow(
+        unsafe_code,
+        reason = "materializes references after checking all hit slots are disjoint"
+    )]
     pub fn get_disjoint_mut<Q, const N: usize>(&mut self, keys: [&Q; N]) -> [Option<&mut V>; N]
     where
         Q: Hash + Equivalent<K> + ?Sized,
@@ -762,6 +820,10 @@ where
     ///
     /// # Panics
     /// If two input keys resolve to the same slot.
+    #[allow(
+        unsafe_code,
+        reason = "materializes references after checking all hit slots are disjoint"
+    )]
     pub fn get_disjoint_key_value_mut<Q, const N: usize>(
         &mut self,
         keys: [&Q; N],
@@ -784,6 +846,10 @@ where
     ///
     /// # Safety
     /// The keys that resolve to occupied slots must be pairwise distinct.
+    #[allow(
+        unsafe_code,
+        reason = "implements the explicitly unchecked disjoint lookup contract"
+    )]
     pub unsafe fn get_disjoint_unchecked_mut<Q, const N: usize>(
         &mut self,
         keys: [&Q; N],
@@ -812,6 +878,10 @@ where
     ///
     /// # Errors
     /// [`OccupiedError`] when `key` is already present.
+    #[allow(
+        unsafe_code,
+        reason = "turns a freshly inserted slot into an exclusive value"
+    )]
     pub fn try_insert(&mut self, key: K, value: V) -> Result<&mut V, OccupiedError<'_, K, V, P>> {
         let hash = self.table.hash(&key);
         let fp = fingerprint(hash);
@@ -937,6 +1007,10 @@ where
 {
     /// Reference to the entry's key.
     #[must_use]
+    #[allow(
+        unsafe_code,
+        reason = "occupied entries carry a lookup-proven live location"
+    )]
     pub fn key(&self) -> &K {
         // SAFETY: occupied entries store a live location from this table.
         unsafe { &self.map.slot_entry(self.loc).key }
@@ -944,12 +1018,20 @@ where
 
     /// Reference to the entry's value.
     #[must_use]
+    #[allow(
+        unsafe_code,
+        reason = "occupied entries carry a lookup-proven live location"
+    )]
     pub fn get(&self) -> &V {
         // SAFETY: occupied entries store a live location from this table.
         unsafe { &self.map.slot_entry(self.loc).value }
     }
 
     /// Mutable reference to the value, tied to `self`.
+    #[allow(
+        unsafe_code,
+        reason = "occupied entries exclusively borrow their live location"
+    )]
     pub fn get_mut(&mut self) -> &mut V {
         // SAFETY: occupied entries store a live location; `&mut self` proves exclusivity.
         unsafe { &mut self.map.slot_entry_mut(self.loc).value }
@@ -957,6 +1039,10 @@ where
 
     /// Consumes the entry, returning `&mut V` for the map's lifetime.
     #[must_use]
+    #[allow(
+        unsafe_code,
+        reason = "consuming the entry preserves the exclusive map borrow"
+    )]
     pub fn into_mut(self) -> &'a mut V {
         // SAFETY: occupied entries store a live location; consuming the entry
         // preserves the original exclusive map borrow for `'a`.
@@ -964,6 +1050,10 @@ where
     }
 
     /// Consumes the entry, returning `&K` for the map's lifetime.
+    #[allow(
+        unsafe_code,
+        reason = "occupied entries carry a lookup-proven live location"
+    )]
     pub(crate) fn into_key(self) -> &'a K {
         // SAFETY: occupied entries store a live location from this table.
         unsafe { &self.map.slot_entry(self.loc).key }
@@ -1004,6 +1094,10 @@ where
     }
 
     /// Inserts `value` for the entry's key, returning `&mut V`.
+    #[allow(
+        unsafe_code,
+        reason = "turns a freshly inserted slot into an exclusive value"
+    )]
     pub fn insert(self, value: V) -> &'a mut V {
         let loc = self.map.table.insert_for_vacant(self.key, value, self.hash);
         // SAFETY: `loc` was just inserted into this table.
@@ -1393,6 +1487,10 @@ pub struct Iter<'a, K, V, P: TableBackend<K, V>> {
     _marker: PhantomData<(&'a K, &'a V)>,
 }
 
+#[allow(
+    unsafe_code,
+    reason = "the iterator dereferences backend-validated live slot pointers"
+)]
 impl<'a, K, V, P: TableBackend<K, V>> Iterator for Iter<'a, K, V, P> {
     type Item = (&'a K, &'a V);
     fn next(&mut self) -> Option<(&'a K, &'a V)> {
@@ -1448,6 +1546,10 @@ pub struct IterMut<'a, K, V, P: TableBackend<K, V>> {
     _marker: PhantomData<(&'a K, &'a mut V)>,
 }
 
+#[allow(
+    unsafe_code,
+    reason = "the exclusive iterator dereferences distinct live slot pointers"
+)]
 impl<'a, K, V, P: TableBackend<K, V>> Iterator for IterMut<'a, K, V, P> {
     type Item = (&'a K, &'a mut V);
     fn next(&mut self) -> Option<(&'a K, &'a mut V)> {
@@ -1456,6 +1558,8 @@ impl<'a, K, V, P: TableBackend<K, V>> Iterator for IterMut<'a, K, V, P> {
         let table = unsafe { &*self.table };
         let (ptr, _loc) = table.scan_next(&mut self.scan)?;
         self.remaining -= 1;
+        // SAFETY: `scan_next` yields each initialized slot at most once, so the
+        // iterator's exclusive map borrow makes returned mutable values disjoint.
         let slot: &'a mut SlotEntry<K, V> = unsafe { &mut *ptr };
         Some((&slot.key, &mut slot.value))
     }
@@ -1478,6 +1582,10 @@ pub struct IntoIter<K, V, P: TableBackend<K, V>> {
     remaining: usize,
 }
 
+#[allow(
+    unsafe_code,
+    reason = "the consuming iterator moves values out of live slots exactly once"
+)]
 impl<K, V, P: TableBackend<K, V>> Iterator for IntoIter<K, V, P> {
     type Item = (K, V);
     fn next(&mut self) -> Option<(K, V)> {
@@ -1509,6 +1617,35 @@ pub struct Drain<'a, K, V, P: TableBackend<K, V>> {
     _marker: PhantomData<&'a mut P>,
 }
 
+/// Restores backend counters when dropping a drain is interrupted by a user
+/// destructor panic. The ordinary path disarms this guard after `wipe_all`, so
+/// it adds no per-entry bookkeeping to drain throughput.
+struct DrainUnwindGuard<K, V, P: TableBackend<K, V>> {
+    table: *mut P,
+    original_len: usize,
+    armed: bool,
+    _marker: PhantomData<fn() -> (K, V)>,
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the guard repairs the exclusively borrowed table during unwind"
+)]
+impl<K, V, P: TableBackend<K, V>> Drop for DrainUnwindGuard<K, V, P> {
+    fn drop(&mut self) {
+        if self.armed {
+            // SAFETY: the enclosing `Drain::drop` still owns the table's
+            // exclusive borrow. Backend repair touches control metadata only
+            // and cannot invoke another user destructor while unwinding.
+            unsafe { (*self.table).repair_after_failed_drain(self.original_len) };
+        }
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "drain exclusively owns and moves from each scanned live slot"
+)]
 impl<K, V, P: TableBackend<K, V>> Iterator for Drain<'_, K, V, P> {
     type Item = (K, V);
     fn next(&mut self) -> Option<(K, V)> {
@@ -1518,6 +1655,8 @@ impl<K, V, P: TableBackend<K, V>> Iterator for Drain<'_, K, V, P> {
         // SAFETY: live slot; read the entry out and mark a tombstone (counters
         // are reset wholesale by `wipe_all` on drop).
         let entry = unsafe { core::ptr::read(ptr) };
+        // SAFETY: `loc` identifies the same slot just moved out; the drain owns
+        // the table's exclusive borrow.
         unsafe { (*self.table).tombstone_slot(loc) };
         Some((entry.key, entry.value))
     }
@@ -1533,17 +1672,35 @@ impl<K, V, P: TableBackend<K, V>> ExactSizeIterator for Drain<'_, K, V, P> {
 }
 impl<K, V, P: TableBackend<K, V>> FusedIterator for Drain<'_, K, V, P> {}
 
+#[allow(
+    unsafe_code,
+    reason = "drain drop exclusively owns and finalizes the raw table"
+)]
 impl<K, V, P: TableBackend<K, V>> Drop for Drain<'_, K, V, P> {
     fn drop(&mut self) {
+        // SAFETY: the drain owns the table's exclusive borrow. Backend length
+        // still includes entries yielded before this destructor began because
+        // drain bookkeeping is intentionally committed in bulk.
+        let original_len = unsafe { (*self.table).len() };
+        let mut unwind = DrainUnwindGuard::<K, V, P> {
+            table: self.table,
+            original_len,
+            armed: true,
+            _marker: PhantomData,
+        };
         // Drain any unyielded entries so values run their `Drop`, then wipe.
         for _ in &mut *self {}
+        // SAFETY: the drain still owns the table's exclusive borrow and all
+        // initialized entries were moved out by the loop above.
         unsafe { (*self.table).wipe_all() };
+        unwind.armed = false;
     }
 }
 
 /// Iterator yielding entries removed by [`HashMap::extract_if`]. Unyielded
 /// non-matching entries are retained. Exhausting the iterator may clean
-/// accumulated tombstones after the scan is finished.
+/// accumulated tombstones after the scan is finished. Drop skips structural
+/// cleanup while a user panic is unwinding.
 pub struct ExtractIf<'a, K, V, P: TableBackend<K, V>, F> {
     table: *mut P,
     scan: P::Scan,
@@ -1552,6 +1709,10 @@ pub struct ExtractIf<'a, K, V, P: TableBackend<K, V>, F> {
     _marker: PhantomData<&'a mut P>,
 }
 
+#[allow(
+    unsafe_code,
+    reason = "extraction exclusively scans and conditionally moves live slots"
+)]
 impl<K, V, P, F> Iterator for ExtractIf<'_, K, V, P, F>
 where
     P: TableBackend<K, V>,
@@ -1573,10 +1734,13 @@ where
             };
             // SAFETY: live slot; exclusive via the `&mut` map borrow.
             let slot = unsafe { &mut *ptr };
-            if (self.pred)(&slot.key, &mut slot.value) {
+            let remove = (self.pred)(&slot.key, &mut slot.value);
+            if remove {
                 // SAFETY: matched — read the entry out, then finalize removal
                 // (tombstone + counters; the map keeps being used).
                 let entry = unsafe { core::ptr::read(ptr) };
+                // SAFETY: `loc` identifies the same slot just moved out; the
+                // extraction iterator owns the table's exclusive borrow.
                 unsafe { (*self.table).extract_finish(loc) };
                 return Some((entry.key, entry.value));
             }
@@ -1594,12 +1758,25 @@ where
 {
 }
 
+#[allow(
+    unsafe_code,
+    reason = "extract drop finalizes deferred removals through its exclusive borrow"
+)]
 impl<K, V, P: TableBackend<K, V>, F> Drop for ExtractIf<'_, K, V, P, F> {
+    #[inline(never)]
     fn drop(&mut self) {
+        #[cfg(feature = "std")]
         if !self.finished {
-            // SAFETY: the iterator still owns the map's exclusive borrow.
-            unsafe { (*self.table).finish_deferred_removals() };
+            // SAFETY: the iterator still owns the map's exclusive borrow. The
+            // backend checks its metadata threshold before querying unwind
+            // state, and never rehashes while a panic is active.
+            unsafe { (*self.table).finish_deferred_removals_on_drop() };
         }
+        // `no_std` has no portable unwinding-state query. Natural exhaustion
+        // already cleaned up in `next`; early drop leaves tombstones for a
+        // later mutation rather than risking user hashing during unwinding.
+        #[cfg(not(feature = "std"))]
+        let _ = self;
     }
 }
 
