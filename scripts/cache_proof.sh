@@ -103,6 +103,21 @@ miri() {
     cargo +nightly miri test --lib \
     generation_map::tests::mutable_only_guarded_insert_automatically_uses_route_hash_and_preserves_length -- --exact
   MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
+    cargo +nightly miri test --lib \
+    cache::tests::direct_cloned_read_releases_reclamation_without_borrowing_the_cache -- --exact
+  MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
+    cargo +nightly miri test --lib \
+    cache::tests::direct_cloned_guard_keeps_no_arena_epoch_between_reads -- --exact
+  MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
+    cargo +nightly miri test --lib \
+    cache::tests::direct_shareable_guard_automatically_bounds_its_reader_epoch -- --exact
+  # PtrHash's global Rayon pool retains worker threads through process exit and
+  # currently trips Stacked Borrows inside Crossbeam. Tree Borrows validates
+  # PackedGen's deferred-drop path; leak-ignore applies only to that global pool.
+  MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance} -Zmiri-tree-borrows -Zmiri-ignore-leaks" \
+    cargo +nightly miri test --lib \
+    generation_map::tests::deferred_generation_drop_waits_for_read_cache_and_explicit_reclaim -- --exact
+  MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
     cargo +nightly miri test --test direct_packed_cache \
     protected_value_survives_replacement_and_cache_drop -- --exact
   MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
