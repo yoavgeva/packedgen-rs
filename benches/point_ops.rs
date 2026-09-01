@@ -3,8 +3,8 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use elastichash::{ElasticConfig, FixedElasticMap};
 use hashbrown::HashMap;
+use packedgen::{ElasticConfig, FixedElasticMap};
 
 mod support;
 

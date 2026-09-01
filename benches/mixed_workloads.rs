@@ -3,8 +3,11 @@
 use std::hint::black_box;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use elastichash::{ElasticConfig, FixedElasticMap};
 use hashbrown::HashMap;
+use packedgen::{
+    BucketPackedMap, ElasticConfig, FixedElasticMap, FrozenPackedMap, MaintenanceMode,
+    PackedBinaryMap, PackedSwissMap, RouteCacheBudget, SegmentedSwissMap,
+};
 
 mod support;
 
@@ -13,6 +16,96 @@ use support::{binary_key, scramble};
 const LOOKUP_ENTRIES: usize = 1 << 17;
 const INSERT_ENTRIES: usize = 1 << 14;
 const BINARY_KEY_BYTES: usize = 32;
+const LARGE_BINARY_ENTRIES: usize = 1 << 20;
+const LOOKUP_BATCH: usize = 32;
+const CHURN_ENTRIES: usize = 1 << 14;
+const CONSTRUCTION_ENTRIES: usize = 100_000;
+const DEFERRED_LOOKUP_ENTRIES: usize = 1 << 15;
+
+fn fallible_construction(criterion: &mut Criterion) {
+    let config = ElasticConfig::new(CONSTRUCTION_ENTRIES)
+        .with_reserve_exponent(6)
+        .unwrap()
+        .with_route_cache_budget(RouteCacheBudget::ReadOptimized);
+    let mut group = criterion.benchmark_group("construct_binary_index_100k");
+    group.throughput(Throughput::Elements(CONSTRUCTION_ENTRIES as u64));
+    group.bench_function("packed-elastic", |bencher| {
+        bencher.iter(|| black_box(PackedBinaryMap::<u64>::try_new(config).unwrap()));
+    });
+    group.bench_function("hashbrown", |bencher| {
+        bencher.iter(|| {
+            black_box(HashMap::<Box<[u8]>, u64>::with_capacity(
+                CONSTRUCTION_ENTRIES,
+            ))
+        });
+    });
+    group.finish();
+}
+
+fn deferred_delete_lookup_degradation(criterion: &mut Criterion) {
+    let corpus: Vec<Box<[u8]>> = (0..DEFERRED_LOOKUP_ENTRIES as u64)
+        .map(|index| binary_key(index, BINARY_KEY_BYTES))
+        .collect();
+    let misses: Vec<Box<[u8]>> = (DEFERRED_LOOKUP_ENTRIES as u64
+        ..(DEFERRED_LOOKUP_ENTRIES * 2) as u64)
+        .map(|index| binary_key(index, BINARY_KEY_BYTES))
+        .collect();
+    let config = ElasticConfig::new(DEFERRED_LOOKUP_ENTRIES)
+        .with_reserve_exponent(6)
+        .unwrap()
+        .with_route_cache_budget(RouteCacheBudget::ReadOptimized)
+        .with_maintenance_mode(MaintenanceMode::Deferred);
+    let mut group = criterion.benchmark_group("lookup_binary_32_after_deferred_deletes");
+    group.throughput(Throughput::Elements(1));
+
+    for (label, deletes) in [
+        ("0pct", 0),
+        ("12pct", DEFERRED_LOOKUP_ENTRIES / 8),
+        ("25pct", DEFERRED_LOOKUP_ENTRIES / 4),
+        ("50pct-minus-one", DEFERRED_LOOKUP_ENTRIES / 2 - 1),
+    ] {
+        let mut packed = PackedBinaryMap::new(config);
+        let mut hashbrown = HashMap::with_capacity(DEFERRED_LOOKUP_ENTRIES);
+        for (index, key) in corpus.iter().enumerate() {
+            packed.try_insert(key, index as u64).unwrap();
+            hashbrown.insert(key.clone(), index as u64);
+        }
+        for key in &corpus[..deletes] {
+            packed.remove(key).unwrap();
+            hashbrown.remove(key.as_ref()).unwrap();
+        }
+
+        let mut cursor = deletes;
+        group.bench_function(format!("hit/packed-elastic/{label}"), |bencher| {
+            bencher.iter(|| {
+                cursor = deletes + (cursor + 1 - deletes) % (DEFERRED_LOOKUP_ENTRIES - deletes);
+                packed.get(black_box(corpus[cursor].as_ref()))
+            });
+        });
+        let mut cursor = deletes;
+        group.bench_function(format!("hit/hashbrown/{label}"), |bencher| {
+            bencher.iter(|| {
+                cursor = deletes + (cursor + 1 - deletes) % (DEFERRED_LOOKUP_ENTRIES - deletes);
+                hashbrown.get(black_box(corpus[cursor].as_ref()))
+            });
+        });
+        let mut cursor = 0;
+        group.bench_function(format!("miss/packed-elastic/{label}"), |bencher| {
+            bencher.iter(|| {
+                cursor = (cursor + 1) % DEFERRED_LOOKUP_ENTRIES;
+                packed.get(black_box(misses[cursor].as_ref()))
+            });
+        });
+        let mut cursor = 0;
+        group.bench_function(format!("miss/hashbrown/{label}"), |bencher| {
+            bencher.iter(|| {
+                cursor = (cursor + 1) % DEFERRED_LOOKUP_ENTRIES;
+                hashbrown.get(black_box(misses[cursor].as_ref()))
+            });
+        });
+    }
+    group.finish();
+}
 
 fn missing_lookups(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("missing_lookup_u64");
@@ -49,6 +142,325 @@ fn missing_lookups(criterion: &mut Criterion) {
             cursor = cursor.wrapping_add(1);
             map.get(black_box(&scramble(cursor)))
         });
+    });
+    group.finish();
+}
+
+fn binary_key_insertions(criterion: &mut Criterion) {
+    let entries = 1 << 14;
+    let corpus: Vec<Box<[u8]>> = (0..entries as u64)
+        .map(|index| binary_key(index, BINARY_KEY_BYTES))
+        .collect();
+    let mut group = criterion.benchmark_group("bulk_insert_binary_32");
+    group.throughput(Throughput::Elements(entries as u64));
+
+    for exponent in [3, 6] {
+        let config = ElasticConfig::new(entries)
+            .with_reserve_exponent(exponent)
+            .unwrap()
+            .with_route_cache_budget(RouteCacheBudget::ReadOptimized);
+        group.bench_with_input(
+            BenchmarkId::new("packed-elastic", format!("reserve_2^-{exponent}")),
+            &config,
+            |bencher, config| {
+                bencher.iter_batched(
+                    || PackedBinaryMap::new(*config),
+                    |mut map| {
+                        for (index, key) in corpus.iter().enumerate() {
+                            black_box(map.try_insert(key, index as u64).unwrap());
+                        }
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+    }
+
+    group.bench_function("hashbrown", |bencher| {
+        bencher.iter_batched(
+            || HashMap::with_capacity(entries),
+            |mut map| {
+                for (index, key) in corpus.iter().enumerate() {
+                    black_box(map.insert(key.clone(), index as u64));
+                }
+            },
+            BatchSize::LargeInput,
+        );
+    });
+    group.bench_function("cacheline-bucket", |bencher| {
+        bencher.iter_batched(
+            || BucketPackedMap::new(entries),
+            |mut map| {
+                for (index, key) in corpus.iter().enumerate() {
+                    black_box(map.try_insert(key, index as u64).unwrap());
+                }
+            },
+            BatchSize::LargeInput,
+        );
+    });
+    group.bench_function("packed-swiss", |bencher| {
+        bencher.iter_batched(
+            || {
+                PackedSwissMap::try_with_capacity_and_key_bytes(entries, entries * BINARY_KEY_BYTES)
+                    .unwrap()
+            },
+            |mut map| {
+                for (index, key) in corpus.iter().enumerate() {
+                    black_box(map.try_insert(key, index as u64).unwrap());
+                }
+            },
+            BatchSize::LargeInput,
+        );
+    });
+    group.bench_function("segmented-packed-swiss", |bencher| {
+        bencher.iter_batched(
+            || {
+                SegmentedSwissMap::try_with_capacity_and_key_bytes(
+                    entries,
+                    entries * BINARY_KEY_BYTES,
+                )
+                .unwrap()
+            },
+            |mut map| {
+                for (index, key) in corpus.iter().enumerate() {
+                    black_box(map.try_insert(key, index as u64).unwrap());
+                }
+            },
+            BatchSize::LargeInput,
+        );
+    });
+    group.finish();
+}
+
+fn batch_load_binary(criterion: &mut Criterion) {
+    let corpus: Vec<Box<[u8]>> = (0..INSERT_ENTRIES as u64)
+        .map(|index| binary_key(index, BINARY_KEY_BYTES))
+        .collect();
+    let config = ElasticConfig::new(INSERT_ENTRIES)
+        .with_reserve_exponent(6)
+        .unwrap()
+        .with_route_cache_budget(RouteCacheBudget::ReadOptimized);
+    let mut group = criterion.benchmark_group("batch_load_binary_32");
+    group.throughput(Throughput::Elements(INSERT_ENTRIES as u64));
+    group.bench_function("packed-elastic", |bencher| {
+        bencher.iter(|| {
+            black_box(
+                PackedBinaryMap::try_from_entries(
+                    config,
+                    corpus
+                        .iter()
+                        .enumerate()
+                        .map(|(index, key)| (key.as_ref(), index as u64)),
+                )
+                .unwrap(),
+            )
+        });
+    });
+    group.bench_function("hashbrown", |bencher| {
+        bencher.iter(|| {
+            black_box(
+                corpus
+                    .iter()
+                    .enumerate()
+                    .map(|(index, key)| (key.clone(), index as u64))
+                    .collect::<HashMap<_, _>>(),
+            )
+        });
+    });
+    group.bench_function("frozen-ptrhash", |bencher| {
+        bencher.iter(|| {
+            black_box(
+                FrozenPackedMap::try_from_entries(
+                    corpus
+                        .iter()
+                        .enumerate()
+                        .map(|(index, key)| (key.as_ref(), index as u64)),
+                )
+                .unwrap(),
+            )
+        });
+    });
+    group.finish();
+}
+
+fn delete_and_compact_binary(criterion: &mut Criterion) {
+    let corpus: Vec<Box<[u8]>> = (0..CHURN_ENTRIES as u64)
+        .map(|index| binary_key(index, BINARY_KEY_BYTES))
+        .collect();
+    let deletes = CHURN_ENTRIES / 4;
+    let config = ElasticConfig::new(CHURN_ENTRIES)
+        .with_reserve_exponent(6)
+        .unwrap()
+        .with_route_cache_budget(RouteCacheBudget::ReadOptimized);
+    let mut group = criterion.benchmark_group("delete_binary_32_threshold_batch");
+    group.throughput(Throughput::Elements(deletes as u64));
+
+    group.bench_function("packed-elastic/reserve_2^-6", |bencher| {
+        bencher.iter_batched(
+            || {
+                let mut map = PackedBinaryMap::new(config);
+                for (index, key) in corpus.iter().enumerate() {
+                    map.try_insert(key, index as u64).unwrap();
+                }
+                map
+            },
+            |mut map| {
+                for key in &corpus[..deletes] {
+                    black_box(map.remove(key).unwrap());
+                }
+                black_box(map.stats())
+            },
+            BatchSize::LargeInput,
+        );
+    });
+    group.bench_function("packed-elastic/deferred", |bencher| {
+        bencher.iter_batched(
+            || {
+                let mut map =
+                    PackedBinaryMap::new(config.with_maintenance_mode(MaintenanceMode::Deferred));
+                for (index, key) in corpus.iter().enumerate() {
+                    map.try_insert(key, index as u64).unwrap();
+                }
+                map
+            },
+            |mut map| {
+                for key in &corpus[..deletes] {
+                    black_box(map.remove(key).unwrap());
+                }
+                black_box(map.maintenance_due())
+            },
+            BatchSize::LargeInput,
+        );
+    });
+    group.bench_function("hashbrown", |bencher| {
+        bencher.iter_batched(
+            || {
+                let mut map = HashMap::with_capacity(CHURN_ENTRIES);
+                for (index, key) in corpus.iter().enumerate() {
+                    map.insert(key.clone(), index as u64);
+                }
+                map
+            },
+            |mut map| {
+                for key in &corpus[..deletes] {
+                    black_box(map.remove(key.as_ref()).unwrap());
+                }
+                black_box(map)
+            },
+            BatchSize::LargeInput,
+        );
+    });
+    group.finish();
+}
+
+fn maintenance_rebuild_binary(criterion: &mut Criterion) {
+    let corpus: Vec<Box<[u8]>> = (0..CHURN_ENTRIES as u64)
+        .map(|index| binary_key(index, BINARY_KEY_BYTES))
+        .collect();
+    let deletes = CHURN_ENTRIES / 4;
+    let config = ElasticConfig::new(CHURN_ENTRIES)
+        .with_reserve_exponent(6)
+        .unwrap()
+        .with_route_cache_budget(RouteCacheBudget::ReadOptimized)
+        .with_maintenance_mode(MaintenanceMode::Deferred);
+    let mut group = criterion.benchmark_group("maintenance_binary_32_rebuild");
+    group.throughput(Throughput::Elements((CHURN_ENTRIES - deletes) as u64));
+
+    group.bench_function("packed-elastic", |bencher| {
+        bencher.iter_batched(
+            || {
+                let mut map = PackedBinaryMap::new(config);
+                for (index, key) in corpus.iter().enumerate() {
+                    map.try_insert(key, index as u64).unwrap();
+                }
+                for key in &corpus[..deletes] {
+                    map.remove(key).unwrap();
+                }
+                map
+            },
+            |mut map| black_box(map.maintain()),
+            BatchSize::LargeInput,
+        );
+    });
+    group.bench_function("hashbrown-rebuild", |bencher| {
+        bencher.iter_batched(
+            || {
+                let mut map = HashMap::with_capacity(CHURN_ENTRIES);
+                for (index, key) in corpus.iter().enumerate() {
+                    map.insert(key.clone(), index as u64);
+                }
+                for key in &corpus[..deletes] {
+                    map.remove(key.as_ref()).unwrap();
+                }
+                map
+            },
+            |mut map| {
+                let mut replacement = HashMap::with_capacity(map.len());
+                replacement.extend(map.drain());
+                black_box(replacement)
+            },
+            BatchSize::LargeInput,
+        );
+    });
+    group.finish();
+}
+
+fn maintenance_prepare_step_binary(criterion: &mut Criterion) {
+    const STEP: usize = 256;
+    let corpus: Vec<Box<[u8]>> = (0..CHURN_ENTRIES as u64)
+        .map(|index| binary_key(index, BINARY_KEY_BYTES))
+        .collect();
+    let config = ElasticConfig::new(CHURN_ENTRIES)
+        .with_reserve_exponent(6)
+        .unwrap()
+        .with_maintenance_mode(MaintenanceMode::Deferred);
+    let mut group = criterion.benchmark_group("maintenance_prepare_binary_32_step_256");
+    group.throughput(Throughput::Elements(STEP as u64));
+    group.bench_function("packed-elastic", |bencher| {
+        bencher.iter_batched(
+            || {
+                let mut map = PackedBinaryMap::new(config);
+                for (index, key) in corpus.iter().enumerate() {
+                    map.try_insert(key, index as u64).unwrap();
+                }
+                for key in &corpus[..CHURN_ENTRIES / 4] {
+                    map.remove(key).unwrap();
+                }
+                let plan = map.try_begin_maintenance().unwrap();
+                (map, plan)
+            },
+            |(map, mut plan)| black_box(map.prepare_maintenance_step(&mut plan, STEP).unwrap()),
+            BatchSize::LargeInput,
+        );
+    });
+    group.finish();
+}
+
+fn maintenance_begin_binary(criterion: &mut Criterion) {
+    let corpus: Vec<Box<[u8]>> = (0..CHURN_ENTRIES as u64)
+        .map(|index| binary_key(index, BINARY_KEY_BYTES))
+        .collect();
+    let config = ElasticConfig::new(CHURN_ENTRIES)
+        .with_reserve_exponent(6)
+        .unwrap()
+        .with_maintenance_mode(MaintenanceMode::Deferred);
+    let mut group = criterion.benchmark_group("maintenance_begin_binary_32_12k");
+    group.throughput(Throughput::Elements((CHURN_ENTRIES * 3 / 4) as u64));
+    group.bench_function("packed-elastic", |bencher| {
+        bencher.iter_batched(
+            || {
+                let mut map = PackedBinaryMap::new(config);
+                for (index, key) in corpus.iter().enumerate() {
+                    map.try_insert(key, index as u64).unwrap();
+                }
+                for key in &corpus[..CHURN_ENTRIES / 4] {
+                    map.remove(key).unwrap();
+                }
+                map
+            },
+            |map| black_box(map.try_begin_maintenance().unwrap()),
+            BatchSize::LargeInput,
+        );
     });
     group.finish();
 }
@@ -92,6 +504,7 @@ fn bulk_insertions(criterion: &mut Criterion) {
     group.finish();
 }
 
+#[allow(clippy::too_many_lines)]
 fn binary_key_lookups(criterion: &mut Criterion) {
     let entries = 1 << 15;
     let corpus: Vec<Box<[u8]>> = (0..entries as u64)
@@ -103,7 +516,8 @@ fn binary_key_lookups(criterion: &mut Criterion) {
     for exponent in [3, 6] {
         let config = ElasticConfig::new(entries)
             .with_reserve_exponent(exponent)
-            .unwrap();
+            .unwrap()
+            .with_route_cache_budget(RouteCacheBudget::ReadOptimized);
         let mut map = FixedElasticMap::new(config);
         for (index, key) in corpus.iter().enumerate() {
             map.try_insert(key.clone(), index as u64).unwrap();
@@ -116,6 +530,22 @@ fn binary_key_lookups(criterion: &mut Criterion) {
                 bencher.iter(|| {
                     cursor = cursor.wrapping_add(1) % entries;
                     map.get(black_box(corpus[cursor].as_ref()))
+                });
+            },
+        );
+
+        let mut packed = PackedBinaryMap::new(config);
+        for (index, key) in corpus.iter().enumerate() {
+            packed.try_insert(key, index as u64).unwrap();
+        }
+        let mut cursor = 0_usize;
+        group.bench_with_input(
+            BenchmarkId::new("packed-elastic", format!("reserve_2^-{exponent}")),
+            &exponent,
+            |bencher, _| {
+                bencher.iter(|| {
+                    cursor = cursor.wrapping_add(1) % entries;
+                    packed.get(black_box(corpus[cursor].as_ref()))
                 });
             },
         );
@@ -132,6 +562,305 @@ fn binary_key_lookups(criterion: &mut Criterion) {
             map.get(black_box(corpus[cursor].as_ref()))
         });
     });
+    let frozen = FrozenPackedMap::try_from_entries(
+        corpus
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (key.as_ref(), index as u64)),
+    )
+    .unwrap();
+    let mut cursor = 0_usize;
+    group.bench_function("frozen-ptrhash", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % entries;
+            frozen.get(black_box(corpus[cursor].as_ref()))
+        });
+    });
+    let mut bucket = BucketPackedMap::new(entries);
+    for (index, key) in corpus.iter().enumerate() {
+        bucket.try_insert(key, index as u64).unwrap();
+    }
+    let mut cursor = 0_usize;
+    group.bench_function("cacheline-bucket", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % entries;
+            bucket.get(black_box(corpus[cursor].as_ref()))
+        });
+    });
+    let mut swiss =
+        PackedSwissMap::try_with_capacity_and_key_bytes(entries, entries * BINARY_KEY_BYTES)
+            .unwrap();
+    for (index, key) in corpus.iter().enumerate() {
+        swiss.try_insert(key, index as u64).unwrap();
+    }
+    let mut cursor = 0_usize;
+    group.bench_function("packed-swiss", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % entries;
+            swiss.get(black_box(corpus[cursor].as_ref()))
+        });
+    });
+    let mut segmented =
+        SegmentedSwissMap::try_with_capacity_and_key_bytes(entries, entries * BINARY_KEY_BYTES)
+            .unwrap();
+    for (index, key) in corpus.iter().enumerate() {
+        segmented.try_insert(key, index as u64).unwrap();
+    }
+    let mut cursor = 0_usize;
+    group.bench_function("segmented-packed-swiss", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % entries;
+            segmented.get(black_box(corpus[cursor].as_ref()))
+        });
+    });
+    group.finish();
+}
+
+fn binary_key_missing_lookups(criterion: &mut Criterion) {
+    let entries = 1 << 15;
+    let corpus: Vec<Box<[u8]>> = (0..entries as u64)
+        .map(|index| binary_key(index, BINARY_KEY_BYTES))
+        .collect();
+    let misses: Vec<Box<[u8]>> = (entries as u64..(entries * 2) as u64)
+        .map(|index| binary_key(index, BINARY_KEY_BYTES))
+        .collect();
+    let mut group = criterion.benchmark_group("missing_lookup_binary_32");
+    group.throughput(Throughput::Elements(1));
+
+    for exponent in [3, 6] {
+        let config = ElasticConfig::new(entries)
+            .with_reserve_exponent(exponent)
+            .unwrap()
+            .with_route_cache_budget(RouteCacheBudget::ReadOptimized);
+        let mut packed = PackedBinaryMap::new(config);
+        for (index, key) in corpus.iter().enumerate() {
+            packed.try_insert(key, index as u64).unwrap();
+        }
+        let mut cursor = 0_usize;
+        group.bench_with_input(
+            BenchmarkId::new("packed-elastic", format!("reserve_2^-{exponent}")),
+            &exponent,
+            |bencher, _| {
+                bencher.iter(|| {
+                    cursor = cursor.wrapping_add(1) % entries;
+                    packed.get(black_box(misses[cursor].as_ref()))
+                });
+            },
+        );
+    }
+
+    let mut map = HashMap::with_capacity(entries);
+    for (index, key) in corpus.iter().enumerate() {
+        map.insert(key.clone(), index as u64);
+    }
+    let mut cursor = 0_usize;
+    group.bench_function("hashbrown", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % entries;
+            map.get(black_box(misses[cursor].as_ref()))
+        });
+    });
+    let frozen = FrozenPackedMap::try_from_entries(
+        corpus
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (key.as_ref(), index as u64)),
+    )
+    .unwrap();
+    let mut cursor = 0_usize;
+    group.bench_function("frozen-ptrhash", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % entries;
+            frozen.get(black_box(misses[cursor].as_ref()))
+        });
+    });
+    let mut bucket = BucketPackedMap::new(entries);
+    for (index, key) in corpus.iter().enumerate() {
+        bucket.try_insert(key, index as u64).unwrap();
+    }
+    let mut cursor = 0_usize;
+    group.bench_function("cacheline-bucket", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % entries;
+            bucket.get(black_box(misses[cursor].as_ref()))
+        });
+    });
+    let mut swiss =
+        PackedSwissMap::try_with_capacity_and_key_bytes(entries, entries * BINARY_KEY_BYTES)
+            .unwrap();
+    for (index, key) in corpus.iter().enumerate() {
+        swiss.try_insert(key, index as u64).unwrap();
+    }
+    let mut cursor = 0_usize;
+    group.bench_function("packed-swiss", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % entries;
+            swiss.get(black_box(misses[cursor].as_ref()))
+        });
+    });
+    let mut segmented =
+        SegmentedSwissMap::try_with_capacity_and_key_bytes(entries, entries * BINARY_KEY_BYTES)
+            .unwrap();
+    for (index, key) in corpus.iter().enumerate() {
+        segmented.try_insert(key, index as u64).unwrap();
+    }
+    let mut cursor = 0_usize;
+    group.bench_function("segmented-packed-swiss", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % entries;
+            segmented.get(black_box(misses[cursor].as_ref()))
+        });
+    });
+    group.finish();
+}
+
+#[allow(clippy::too_many_lines)]
+fn large_binary_key_lookups(criterion: &mut Criterion) {
+    let corpus: Vec<Box<[u8]>> = (0..LARGE_BINARY_ENTRIES as u64)
+        .map(|index| binary_key(index, BINARY_KEY_BYTES))
+        .collect();
+    let config = ElasticConfig::new(LARGE_BINARY_ENTRIES)
+        .with_reserve_exponent(6)
+        .unwrap()
+        .with_route_cache_budget(RouteCacheBudget::ReadOptimized);
+    let mut packed = PackedBinaryMap::new(config);
+    for (index, key) in corpus.iter().enumerate() {
+        packed.try_insert(key, index as u64).unwrap();
+    }
+    let mut hashbrown = HashMap::with_capacity(LARGE_BINARY_ENTRIES);
+    for (index, key) in corpus.iter().enumerate() {
+        hashbrown.insert(key.clone(), index as u64);
+    }
+    let frozen = FrozenPackedMap::try_from_entries(
+        corpus
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (key.as_ref(), index as u64)),
+    )
+    .unwrap();
+    let mut bucket = BucketPackedMap::new(LARGE_BINARY_ENTRIES);
+    for (index, key) in corpus.iter().enumerate() {
+        bucket.try_insert(key, index as u64).unwrap();
+    }
+    let mut swiss = PackedSwissMap::try_with_capacity_and_key_bytes(
+        LARGE_BINARY_ENTRIES,
+        LARGE_BINARY_ENTRIES * BINARY_KEY_BYTES,
+    )
+    .unwrap();
+    for (index, key) in corpus.iter().enumerate() {
+        swiss.try_insert(key, index as u64).unwrap();
+    }
+    let mut segmented = SegmentedSwissMap::try_with_capacity_and_key_bytes(
+        LARGE_BINARY_ENTRIES,
+        LARGE_BINARY_ENTRIES * BINARY_KEY_BYTES,
+    )
+    .unwrap();
+    for (index, key) in corpus.iter().enumerate() {
+        segmented.try_insert(key, index as u64).unwrap();
+    }
+    let batch_misses: Vec<Box<[u8]>> = (LARGE_BINARY_ENTRIES as u64
+        ..LARGE_BINARY_ENTRIES as u64 + 8_192)
+        .map(|index| binary_key(index, BINARY_KEY_BYTES))
+        .collect();
+
+    let mut group = criterion.benchmark_group("successful_lookup_binary_32_large_1m");
+    group.throughput(Throughput::Elements(1));
+    let mut cursor = 0_usize;
+    group.bench_function("packed-elastic/reserve_2^-6", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % LARGE_BINARY_ENTRIES;
+            packed.get(black_box(corpus[cursor].as_ref()))
+        });
+    });
+    let mut cursor = 0_usize;
+    group.bench_function("hashbrown", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % LARGE_BINARY_ENTRIES;
+            hashbrown.get(black_box(corpus[cursor].as_ref()))
+        });
+    });
+    let mut cursor = 0_usize;
+    group.bench_function("frozen-ptrhash", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % LARGE_BINARY_ENTRIES;
+            frozen.get(black_box(corpus[cursor].as_ref()))
+        });
+    });
+    let mut cursor = 0_usize;
+    group.bench_function("cacheline-bucket", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % LARGE_BINARY_ENTRIES;
+            bucket.get(black_box(corpus[cursor].as_ref()))
+        });
+    });
+    let mut cursor = 0_usize;
+    group.bench_function("packed-swiss", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % LARGE_BINARY_ENTRIES;
+            swiss.get(black_box(corpus[cursor].as_ref()))
+        });
+    });
+    let mut cursor = 0_usize;
+    group.bench_function("segmented-packed-swiss", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(1) % LARGE_BINARY_ENTRIES;
+            segmented.get(black_box(corpus[cursor].as_ref()))
+        });
+    });
+    group.finish();
+
+    let mut group = criterion.benchmark_group("successful_lookup_binary_32_large_1m_batch_32");
+    group.throughput(Throughput::Elements(LOOKUP_BATCH as u64));
+    let mut cursor = 0_usize;
+    group.bench_function("packed-elastic/reserve_2^-6", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(LOOKUP_BATCH) % (LARGE_BINARY_ENTRIES - LOOKUP_BATCH);
+            let keys: [&[u8]; LOOKUP_BATCH] =
+                core::array::from_fn(|offset| corpus[cursor + offset].as_ref());
+            black_box(packed.get_many(keys))
+        });
+    });
+    let mut cursor = 0_usize;
+    group.bench_function("hashbrown", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(LOOKUP_BATCH) % (LARGE_BINARY_ENTRIES - LOOKUP_BATCH);
+            black_box(core::array::from_fn::<_, LOOKUP_BATCH, _>(|offset| {
+                hashbrown.get(corpus[cursor + offset].as_ref())
+            }))
+        });
+    });
+    let mut cursor = 0_usize;
+    group.bench_function("frozen-ptrhash", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(LOOKUP_BATCH) % (LARGE_BINARY_ENTRIES - LOOKUP_BATCH);
+            let keys: [&[u8]; LOOKUP_BATCH] =
+                core::array::from_fn(|offset| corpus[cursor + offset].as_ref());
+            black_box(frozen.get_many(keys))
+        });
+    });
+    let mut cursor = 0_usize;
+    group.bench_function("frozen-ptrhash-miss", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(LOOKUP_BATCH) % (batch_misses.len() - LOOKUP_BATCH);
+            let keys: [&[u8]; LOOKUP_BATCH] =
+                core::array::from_fn(|offset| batch_misses[cursor + offset].as_ref());
+            black_box(frozen.get_many(keys))
+        });
+    });
+    let mut cursor = 0_usize;
+    group.bench_function("frozen-ptrhash-mixed", |bencher| {
+        bencher.iter(|| {
+            cursor = cursor.wrapping_add(LOOKUP_BATCH) % (batch_misses.len() - LOOKUP_BATCH);
+            let keys: [&[u8]; LOOKUP_BATCH] = core::array::from_fn(|offset| {
+                if offset & 1 == 0 {
+                    corpus[cursor + offset].as_ref()
+                } else {
+                    batch_misses[cursor + offset].as_ref()
+                }
+            });
+            black_box(frozen.get_many(keys))
+        });
+    });
     group.finish();
 }
 
@@ -139,6 +868,16 @@ criterion_group!(
     benches,
     missing_lookups,
     bulk_insertions,
-    binary_key_lookups
+    binary_key_lookups,
+    binary_key_missing_lookups,
+    large_binary_key_lookups,
+    binary_key_insertions,
+    delete_and_compact_binary,
+    maintenance_rebuild_binary,
+    maintenance_prepare_step_binary,
+    maintenance_begin_binary,
+    fallible_construction,
+    batch_load_binary,
+    deferred_delete_lookup_degradation
 );
 criterion_main!(benches);

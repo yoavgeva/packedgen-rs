@@ -1,0 +1,100 @@
+[package]
+name = "packedgen-opthash"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "PackedGen's maintained Elastic Hashing and Funnel Hashing implementation"
+readme = "README.md"
+repository = "https://github.com/yoavgeva/packedgen-rs"
+license = "Apache-2.0"
+keywords = ["hashmap", "open_addressing", "elastic_hashing", "funnel_hashing", "no_std"]
+categories = ["algorithms", "data-structures", "no-std"]
+exclude = [
+    "/.github/",
+    "/.vscode/",
+    "/benches/python/",
+    "/ci/",
+    "/opthash/",
+    "/paper/",
+    "/scripts/",
+    "/tests/python/",
+    "/.gitattributes",
+    "/.gitignore",
+    "/.pre-commit-config.yaml",
+    "/AGENTS.md",
+    "/CLAUDE.md",
+    "/pyproject.toml",
+    "/uv.lock",
+]
+
+[lib]
+name = "opthash"
+crate-type = ["cdylib", "rlib"]
+
+[package.metadata.docs.rs]
+features = ["nightly"]
+rustdoc-args = ["--generate-link-to-definition"]
+
+[features]
+default = ["std", "default-hasher"]
+default-hasher = ["dep:foldhash"]
+std = ["foldhash?/std", "allocator-api2/std"]
+python = ["std", "dep:pyo3"]
+nightly = ["allocator-api2/nightly", "hashbrown/nightly", "foldhash?/nightly"]
+
+[dependencies]
+allocator-api2 = { version = "0.2", default-features = false, features = [
+    "alloc",
+] }
+equivalent = "1"
+foldhash = { version = "0.2", default-features = false, optional = true }
+pyo3 = { version = "0.29", features = [
+    "extension-module",
+    "abi3-py310",
+], optional = true }
+
+[dev-dependencies]
+criterion = { version = "4", package = "codspeed-criterion-compat", default-features = false, features = ["cargo_bench_support", "rayon"] }
+hashbrown = "0.17"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+elided_lifetimes_in_paths = "warn"
+unused_extern_crates = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(codspeed)'] }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+borrow_as_ptr = "warn"
+ptr_as_ptr = "warn"
+ptr_cast_constness = "warn"
+ref_as_ptr = "warn"
+semicolon_if_nothing_returned = "warn"
+
+[[bench]]
+name = "speedup"
+harness = false
+
+[[bench]]
+name = "load_factor"
+harness = false
+
+[[bench]]
+name = "map_api"
+harness = false
+
+[[bench]]
+name = "payload_size"
+harness = false
+
+[[bench]]
+name = "set_ops"
+harness = false
+
+[[bench]]
+name = "mean_latency"
+harness = false
+
+[[bench]]
+name = "scaled_insert"
+harness = false

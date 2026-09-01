@@ -1,0 +1,53 @@
+name: Pinned Linux endurance
+
+on:
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Wall-clock duration; the release gate is 86400 seconds
+        required: true
+        default: "86400"
+      entries:
+        description: Resident cache entries
+        required: true
+        default: "200000"
+      threads:
+        description: Writer threads
+        required: true
+        default: "16"
+      cpuset:
+        description: Dedicated Linux CPU list for taskset
+        required: true
+        default: "0-15"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packedgen-endurance
+  cancel-in-progress: false
+
+jobs:
+  endurance:
+    name: 24-hour memory and reclamation gate
+    runs-on: [self-hosted, linux, x64, packedgen-benchmark]
+    timeout-minutes: 1500
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run CPU-pinned endurance gate
+        env:
+          PACKEDGEN_PROOF_RUN_ID: linux-endurance-${{ github.run_id }}
+          PACKEDGEN_ENDURANCE_SECONDS: ${{ inputs.seconds }}
+          PACKEDGEN_ENDURANCE_ENTRIES: ${{ inputs.entries }}
+          PACKEDGEN_ENDURANCE_THREADS: ${{ inputs.threads }}
+          PACKEDGEN_ENDURANCE_CPUSET: ${{ inputs.cpuset }}
+        run: scripts/cache_proof.sh --endurance
+      - name: Upload complete evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: packedgen-linux-endurance-${{ github.run_id }}
+          path: target/cache-proof/linux-endurance-${{ github.run_id }}/
+          if-no-files-found: error

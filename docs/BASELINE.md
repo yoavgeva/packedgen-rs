@@ -22,16 +22,98 @@ overhead, so they are not RSS measurements.
 | 32-byte boxed key -> `u64` | Elastic, reserve 1/8 | 87.553 | 3.7% more |
 | 32-byte boxed key -> `u64` | Elastic, reserve 1/64 | 60.289 | **28.6% less** |
 | 32-byte boxed key -> `u64` | HashBrown | 84.429 | baseline |
+| 32-byte packed key -> `u64`, before routing cache | Packed Elastic, reserve 1/64 | 52.408 | **37.9% less** |
+| 32-byte packed key -> `u64`, accelerated (adaptive, one route slot/entry) | Packed Elastic, reserve 1/64 | 54.991 | **34.9% less** |
+| 32-byte packed key -> `u64`, accelerated (read optimized, two route slots/entry) | Packed Elastic, reserve 1/64 | 59.022 | **30.1% less** |
 
-The one-byte-per-entry service-layer negative filter is included in the elastic
-numbers. The binary-key shape still performs one allocation per key; a packed
-key arena is a future optimization.
+The core's one-byte-per-entry negative filter is included in the elastic
+numbers; the former duplicate wrapper filter has been removed. The packed shape
+stores an eight-byte reference in each table slot and uses a 64-KiB segmented
+arena by default. The accelerated shape also includes a bounded two-choice,
+four-way packed-`u32` location cache and one overflow bit per bucket. The
+adaptive policy uses one physical route slot per configured entry; the
+read-optimized policy uses two.
 
 Reproduce:
 
 ```text
 cargo run --release --example memory_probe -- all 1000000
 ```
+
+## Same requested-RAM working set
+
+The `ram_budget_probe` binary-searches the largest 32-byte-key map whose
+requested live allocations fit a fixed budget, then times deterministic
+successful lookups over each implementation's resulting working set. At a 64
+MiB budget with one million queries on the development machine:
+
+| Implementation | Entries | Live requested bytes | Budget used | Hit latency |
+| --- | ---: | ---: | ---: | ---: |
+| Packed Elastic, reserve 1/64, read optimized | 1,032,192 | 60,264,824 | 89.8% | 121.1 ns |
+| HashBrown | 917,504 | 55,574,536 | 82.8% | 39.7 ns |
+
+Packed Elastic holds 12.5% more records under this exact budget, below the 25%
+density release gate, and the latest five-sample median successful lookup was
+approximately 3.05x slower. HashBrown's
+next allocation-capacity step exceeds the budget, which explains its unused
+space and demonstrates why a fixed-budget result can differ sharply from the
+one-million-entry bytes-per-entry result. These are requested allocator bytes,
+not RSS; page residency and cache-miss behavior still require a Linux-pinned
+system run. The process-to-process timing spread is retained here rather than
+selecting the more favorable sample.
+
+Reproduce the raw smoke fixture:
+
+```text
+cargo run --release --example ram_budget_probe -- 64 1000000
+```
+
+## Frozen perfect-hash backend
+
+The experimental immutable `FrozenPackedMap` uses PtrHash 2.0.1 to assign a
+dense slot, then compares the original bytes in the packed arena. It therefore
+does not accept an unknown key merely because the perfect hash maps that key to
+a member slot.
+
+At one million 32-byte keys with `u64` values:
+
+| Implementation | Requested bytes/entry | Successful lookup |
+| --- | ---: | ---: |
+| Frozen PtrHash, `gxhash` | 49.004 | ~14.5 ns |
+| Packed Elastic, reserve 1/64, read optimized | 59.022 | ~54.8 ns |
+| HashBrown | 84.429 | ~27.1 ns |
+
+PtrHash reported 2.99 bits/entry of retained pilot and remap metadata. The
+frozen backend used 42.0% fewer requested bytes than HashBrown and was about
+1.87x faster for this million-key successful-lookup smoke run. On the 32K
+fixture it measured ~8.0 ns per hit and ~9.0 ns per miss, versus HashBrown at
+~7.5 ns and ~5.2 ns. The miss ratio is about 1.74x and remains within the
+existing 2x gate.
+
+The result depends materially on hashing. Portable XXH3-128 is the default and
+measured ~19.2 ns per hit on the 32K fixture; the faster GxHash path is opt-in
+because it requires hardware AES and has no unsupported-CPU fallback. At 16K
+entries, frozen construction measured ~1.78 ms versus HashBrown collection at
+~0.48 ms and packed Elastic loading at ~1.03 ms.
+
+Under the corrected 64 MiB requested-allocation probe, the frozen backend held
+1,376,256 entries, exactly 50% more than HashBrown's 917,504. Its larger working
+set measured ~43.0 ns per hit versus ~36.2 ns for HashBrown in the same short
+run. These raw Cargo measurements remain development-machine smoke evidence.
+
+## Mutable SwissTable comparison backends
+
+The repository keeps two deliberately non-elastic mutable baselines. The
+segmented backend splits the planned route space across power-of-two SwissTable
+segments to avoid one global capacity cliff. On the one-million 32-byte-key
+fixture, its balanced policy retained about 53.6 B/entry, versus packed
+Elastic's 54.991 B/entry adaptive layout. A recent quick sequential Criterion
+run measured about 29.1 ns for SegmentedSwiss and 54.8 ns for read-optimized
+Packed Elastic. At a 64 MiB requested budget, the balanced segmented map held
+1,252,314 records and measured 56.5 ns per hit; HashBrown held 917,504 and
+measured 39.7 ns. This is evidence for the current
+performance/memory frontier, not a claim that the paper-derived Elastic probe
+has beaten SwissTable.
 
 ## Point-operation latency
 
@@ -47,9 +129,112 @@ noisy; the scale of the differences is nevertheless clear.
 | Successful 32-byte binary lookup | ~56 ns | ~68 ns | ~8.2 ns |
 | Bulk insertion throughput | ~23.6 M/s | ~21.0 M/s | ~329 M/s |
 
-The stable negative filter reduced missing-lookup latency by roughly 94–96%
-without allowing false negatives. It sets bits on insertion, retains them on
-ordinary deletion, and rebuilds when the core starts a new allocation epoch.
+The current `FixedElasticMap` path reuses the core hash between its negative
+filter and Elastic lookup. A fresh smoke run measured successful `u64` hits at
+roughly 54 ns (reserve 1/8) and 71 ns (reserve 1/64); this is a hot-path
+improvement over the earlier double-hash wrapper, but remains slower than
+SwissTable.
+
+The first packed-key run used 20 Criterion samples with one-second warmup and a
+two-second measurement window:
+
+| Packed binary workload | Elastic 1/8 | Elastic 1/64 | HashBrown |
+| --- | ---: | ---: | ---: |
+| Successful 32-byte lookup | ~55.2 ns | ~69.8 ns | ~7.0 ns |
+| 32-byte insertion throughput | ~20.3 M/s | ~18.7 M/s | ~33.1 M/s |
+
+After adding the verified-location accelerator:
+
+| Accelerated binary workload | Elastic 1/8 | Elastic 1/64 | HashBrown |
+| --- | ---: | ---: | ---: |
+| Successful 32-byte lookup | ~24.9 ns | ~24.2 ns | ~6.8 ns |
+| Missing 32-byte lookup | ~10.5 ns | ~10.8 ns | ~4.8 ns |
+| 32-byte insertion throughput | ~18.9 M/s | ~16.3 M/s | ~37.0 M/s |
+
+At one million keys, where both indexes exceed the small in-cache fixture, the
+read-optimized `1/64` packed map most recently measured ~54.8 ns per successful
+lookup versus HashBrown's ~23–26 ns. The gap narrows from roughly 4x at 32K keys
+to about 2.1–2.4x, but
+still misses the 1.5x release gate.
+
+A paired scalar-and-batch smoke run measured fixed batches of 32 at ~54.0
+ns/key for packed ElasticHash versus ~27.9 ns/key for HashBrown, a 1.94x gap.
+In that same run scalar packed lookup was ~66.2 ns/key, so ordering independent
+route probes across the batch improved ElasticHash by 18.4% without increasing
+resident map memory. This is an API-level throughput option, not a claim that
+individual request latency improved, and it still misses the 1.5x gate.
+
+The first explicit churn smoke run filled a 16K packed map, deleted 4,096
+32-byte keys, and included the threshold-triggered table rebuild and arena
+compaction. Packed ElasticHash took ~1.68 ms for the batch (~2.43 M deletes/s)
+versus ~69 us for HashBrown (~59.2 M deletes/s). The operations are not
+equivalent—HashBrown does not compact an external key arena—but the 24x pause
+ratio demonstrates that compaction must become incremental or move off the
+request path before the churn gate can pass.
+
+With `MaintenanceMode::Deferred`, the same 4,096-delete request-path batch took
+~98.2 us (~41.7 M deletes/s), 1.41x HashBrown and 16.7x faster than synchronous
+ElasticHash maintenance. The owner must subsequently call `maintain()` to pay
+the rebuild and reclaim dead bytes; this makes the work schedulable but does not
+yet make maintenance incremental or concurrent.
+
+An isolated maintenance benchmark removes request-path deletion from the timed
+region and rebuilds the 12,288 survivors. Packed ElasticHash measured ~1.46 ms
+versus ~118 us for rebuilding HashBrown from the same owned entries, a 12.4x
+gap. `PackedMapStats` now reports completed maintenance runs, failed compaction
+staging, and cumulative allocated arena bytes reclaimed so this cost and its
+memory effect are observable in a service.
+
+The first staged-maintenance API bounds key copying by entry count. Preparing
+256 live 32-byte keys measured ~2.57 us (~99.7 M keys/s). This removes key-byte
+copying from the final cutover in caller-selected slices, but the initial live
+reference snapshot and final table rebuild are still whole-map operations; the
+1.46 ms cutover evidence therefore remains the governing p99 failure.
+
+Capturing the initial 12,288-reference maintenance snapshot measured ~35.0 us.
+Structural mutations invalidate that snapshot; allocation-safe restart has the
+same whole-snapshot cost, while value-only replacement leaves it valid. This is
+small relative to cutover but remains an unbounded-by-budget phase.
+
+Fallible construction at 100K read-optimized capacity measured ~29.8 us for
+packed ElasticHash versus ~1.33 us for pre-sized HashBrown, a 22x gap. The
+Elastic constructor eagerly initializes high-occupancy table geometry, filter,
+and route storage; the typed failure path is service-usable, but initial memory
+touch is materially more expensive.
+
+The atomic public batch loader measured ~15.6 M 32-byte entries/s at 16K keys,
+versus ~35.7 M/s for collecting owned boxed keys into HashBrown. ElasticHash is
+2.28x slower and narrowly misses the 2x insertion gate. Failure drops the
+partial map and reports the zero-based input index; duplicate keys use normal
+replacement semantics.
+
+The deferred-delete lookup sweep measured successful 32-byte hits at ~30.1 ns
+with no deletes, ~33.6 ns at 12.5%, ~35.4 ns at the 25% soft maintenance signal,
+and ~39.5 ns immediately below the forced 50% ceiling. The bounded worst case
+is therefore 31% slower than the fresh map and ~4.9x HashBrown at the same
+point. Missing lookup stayed roughly flat at ~10.1–10.8 ns because the stable
+negative filter avoids tombstone probing. Deferred mode forcibly rebuilds at
+50% deleted entries even if the owner ignores the soft signal. These defaults
+are configurable with `with_maintenance_threshold_percents`; exact rounded-up
+entry thresholds are computed once during construction, so policy selection
+does not add percentage arithmetic to the request path. A stricter hard limit
+trades more frequent rebuilds for a lower tombstone-latency ceiling.
+
+The cache is advisory: every direct location is checked against table bounds,
+control fingerprint, and original key bytes. Stale entries and tag collisions
+fall back to the exact elastic schedule. A bucket can reject an absent tag only
+when its overflow bit proves every assigned live route was cached.
+
+The first packed sweep exposed a 100,000-entry cliff. The 64-KiB arena removed
+most of that small-map waste. The current two-choice packed route cache brings
+the one-million adaptive point to 54.991 B/entry versus HashBrown's 84.429;
+read-optimized mode is 59.022 B/entry and cached every route in the measured
+fixture.
+
+The stable core negative filter reduced missing-lookup latency by roughly
+94–96% without allowing false negatives. It sets bits on insertion, retains
+them on ordinary deletion, and rebuilds when the core starts a new allocation
+epoch. Removing the wrapper's duplicate copy saved another byte per entry.
 
 Reproduce:
 
@@ -68,5 +253,9 @@ cargo bench --bench mixed_workloads
 - ElasticHash's plausible storage-engine win is fitting a larger working set in
   RAM and avoiding cold I/O. It is not currently a general-purpose HashBrown
   throughput replacement.
-- The next implementation targets are packed binary-key storage and generation
-  rebuilding. Both must preserve the measured density advantage.
+- Packed binary-key storage plus verified direct routing preserves a density
+  advantage at favorable capacities and cuts successful lookup by about 60%,
+  but the hit, miss, insertion, and median-density gates still need work.
+- Batched lookup overlaps independent route probes and improves the large-index
+  hit path, but further work must remove dependent reads from scalar and batch
+  candidate dispatch. RAM density alone is insufficient.

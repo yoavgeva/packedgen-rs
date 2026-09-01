@@ -29,9 +29,9 @@ benchmarks must report the two separately.
 
 ## Integration order
 
-1. Shadow mode: publish every keydir mutation to ETS and ElasticHash, but serve
+1. Shadow mode: publish every keydir mutation to ETS and PackedGen, but serve
    from ETS. Continuously compare sampled reads.
-2. Cold-metadata reads: serve key-to-disk locations from ElasticHash while hot
+2. Cold-metadata reads: serve key-to-disk locations from PackedGen while hot
    values remain in ETS.
 3. Native hot values: store immutable value buffers in Rust and return them as
    resource binaries, using the zero-copy pattern FerricStore already employs

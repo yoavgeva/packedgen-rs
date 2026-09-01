@@ -1,0 +1,436 @@
+#![allow(missing_docs)]
+
+use std::collections::HashMap;
+
+use packedgen::{
+    ElasticConfig, InsertOutcome, MaintenanceError, MaintenanceMode, PackedBinaryMap,
+    PackedBuildError, PackedLoadError, PackedMapError, RouteCacheBudget,
+};
+
+#[test]
+fn binary_crud_and_replacement_reuse_packed_key() {
+    let config = ElasticConfig::new(16).with_reserve_exponent(6).unwrap();
+    let mut map = PackedBinaryMap::with_key_segment_bytes(config, 128).unwrap();
+
+    assert_eq!(map.try_insert(b"key", 1), Ok(InsertOutcome::Inserted));
+    let bytes_after_insert = map.stats().arena_key_bytes;
+    assert_eq!(map.try_insert(b"key", 2), Ok(InsertOutcome::Replaced(1)));
+    assert_eq!(map.stats().arena_key_bytes, bytes_after_insert);
+    assert_eq!(map.get(b"key"), Some(&2));
+    assert_eq!(map.remove(b"key"), Some(2));
+    assert_eq!(map.get(b"key"), None);
+    assert_eq!(map.stats().dead_key_bytes(), 3);
+}
+
+#[test]
+fn empty_and_non_utf8_keys_round_trip() {
+    let mut map = PackedBinaryMap::new(ElasticConfig::new(8));
+    assert_eq!(map.try_insert(b"", 1), Ok(InsertOutcome::Inserted));
+    assert_eq!(
+        map.try_insert(&[0, 255, 128, 1], 2),
+        Ok(InsertOutcome::Inserted)
+    );
+    assert_eq!(map.get(b""), Some(&1));
+    assert_eq!(map.get(&[0, 255, 128, 1]), Some(&2));
+}
+
+#[test]
+fn fixed_capacity_rejects_new_key_but_allows_replacement() {
+    let mut map = PackedBinaryMap::new(ElasticConfig::new(2));
+    map.try_insert(b"a", 1).unwrap();
+    map.try_insert(b"b", 2).unwrap();
+
+    let error = map.try_insert(b"c", 3).unwrap_err();
+    assert!(matches!(
+        error,
+        PackedMapError::Capacity(capacity) if capacity.live_limit() == 2
+    ));
+    assert_eq!(map.try_insert(b"a", 4), Ok(InsertOutcome::Replaced(1)));
+}
+
+#[test]
+fn fallible_construction_reports_core_capacity_overflow() {
+    let error = PackedBinaryMap::<u64>::try_new(ElasticConfig::new(usize::MAX))
+        .err()
+        .unwrap();
+    assert!(matches!(
+        error,
+        PackedBuildError::Core(opthash::TryBuildError::CapacityOverflow)
+    ));
+
+    let map = PackedBinaryMap::<u64>::try_new(ElasticConfig::new(32)).unwrap();
+    assert_eq!(map.len(), 0);
+}
+
+#[test]
+fn batch_load_is_atomic_and_reports_the_failing_input_index() {
+    let map = PackedBinaryMap::try_from_entries(
+        ElasticConfig::new(2),
+        [(b"alpha".as_slice(), 1), (b"beta", 2), (b"alpha", 3)],
+    )
+    .unwrap();
+    assert_eq!(map.len(), 2);
+    assert_eq!(map.get(b"alpha"), Some(&3));
+
+    let error = PackedBinaryMap::try_from_entries(
+        ElasticConfig::new(2),
+        [(b"alpha".as_slice(), 1), (b"beta", 2), (b"gamma", 3)],
+    )
+    .err()
+    .unwrap();
+    assert!(matches!(
+        error,
+        PackedLoadError::Entry {
+            index: 2,
+            source: PackedMapError::Capacity(_)
+        }
+    ));
+}
+
+#[test]
+fn mixed_operations_match_standard_hash_map() {
+    let config = ElasticConfig::new(2_000).with_reserve_exponent(6).unwrap();
+    let mut packed = PackedBinaryMap::new(config);
+    let mut reference = HashMap::<Vec<u8>, u64>::new();
+
+    let mut state = 0x1234_5678_9abc_def0_u64;
+    for step in 0..20_000_u64 {
+        state = mix(state);
+        let key = (state % 1_500).to_le_bytes();
+        match state % 4 {
+            0 | 1 => {
+                let value = mix(state ^ step);
+                let expected = reference.insert(key.to_vec(), value);
+                let actual = packed.try_insert(&key, value).unwrap();
+                assert_eq!(
+                    actual,
+                    expected.map_or(InsertOutcome::Inserted, InsertOutcome::Replaced)
+                );
+            }
+            2 => assert_eq!(packed.get(&key), reference.get(key.as_slice())),
+            _ => assert_eq!(packed.remove(&key), reference.remove(key.as_slice())),
+        }
+        assert_eq!(packed.len(), reference.len());
+    }
+}
+
+#[test]
+fn byte_aware_rebuild_preserves_survivors_after_heavy_deletes() {
+    let capacity = 1_024;
+    let mut map = PackedBinaryMap::with_key_segment_bytes(
+        ElasticConfig::new(capacity)
+            .with_reserve_exponent(6)
+            .unwrap(),
+        128,
+    )
+    .unwrap();
+    let keys: Vec<Vec<u8>> = (0..capacity)
+        .map(|index| format!("packed-key-{index:08}").into_bytes())
+        .collect();
+
+    for (index, key) in keys.iter().enumerate() {
+        map.try_insert(key, index).unwrap();
+    }
+    let allocated_before_deletes = map.stats().arena_allocated_bytes;
+    for key in &keys[..capacity / 2] {
+        assert!(map.remove(key).is_some());
+    }
+
+    let stats = map.stats();
+    assert_eq!(stats.deletes_since_rebuild, 0);
+    assert_eq!(stats.dead_key_bytes(), 0);
+    assert_eq!(stats.arena_key_bytes, stats.live_key_bytes);
+    assert!(stats.arena_allocated_bytes < allocated_before_deletes);
+    assert_eq!(stats.maintenance_runs, 2);
+    assert_eq!(stats.compaction_failures, 0);
+    assert!(stats.arena_allocated_bytes_reclaimed > 0);
+    for (index, key) in keys.iter().enumerate().skip(capacity / 2) {
+        assert_eq!(map.get(key), Some(&index));
+    }
+}
+
+#[test]
+fn deferred_maintenance_moves_compaction_to_an_explicit_boundary() {
+    let capacity = 64;
+    let config = ElasticConfig::new(capacity).with_maintenance_mode(MaintenanceMode::Deferred);
+    let mut map = PackedBinaryMap::with_key_segment_bytes(config, 64).unwrap();
+    let keys: Vec<Vec<u8>> = (0..capacity)
+        .map(|index| format!("deferred-{index:04}").into_bytes())
+        .collect();
+    for (index, key) in keys.iter().enumerate() {
+        map.try_insert(key, index).unwrap();
+    }
+
+    for key in &keys[..capacity / 4] {
+        assert!(map.remove(key).is_some());
+    }
+    assert!(map.maintenance_due());
+    assert!(map.stats().dead_key_bytes() > 0);
+    assert!(map.maintain());
+    assert!(!map.maintenance_due());
+    assert_eq!(map.stats().dead_key_bytes(), 0);
+    assert_eq!(map.stats().maintenance_runs, 1);
+    assert!(!map.maintain());
+    for (index, key) in keys.iter().enumerate().skip(capacity / 4) {
+        assert_eq!(map.get(key), Some(&index));
+    }
+}
+
+#[test]
+fn deferred_maintenance_has_a_hard_delete_ceiling() {
+    let capacity = 64;
+    let config = ElasticConfig::new(capacity).with_maintenance_mode(MaintenanceMode::Deferred);
+    let mut map = PackedBinaryMap::new(config);
+    let keys: Vec<Vec<u8>> = (0..capacity)
+        .map(|index| format!("ceiling-{index:04}").into_bytes())
+        .collect();
+    for (index, key) in keys.iter().enumerate() {
+        map.try_insert(key, index).unwrap();
+    }
+    for key in &keys[..capacity / 2 - 1] {
+        map.remove(key).unwrap();
+    }
+    assert_eq!(map.stats().maintenance_runs, 0);
+    assert!(map.maintenance_due());
+
+    map.remove(&keys[capacity / 2 - 1]).unwrap();
+    assert_eq!(map.stats().maintenance_runs, 1);
+    assert_eq!(map.stats().deletes_since_rebuild, 0);
+    assert_eq!(map.stats().dead_key_bytes(), 0);
+    for (index, key) in keys.iter().enumerate().skip(capacity / 2) {
+        assert_eq!(map.get(key), Some(&index));
+    }
+}
+
+#[test]
+fn configured_maintenance_thresholds_use_exact_entry_counts() {
+    let config = ElasticConfig::new(10)
+        .with_maintenance_mode(MaintenanceMode::Deferred)
+        .with_maintenance_threshold_percents(20, 30)
+        .unwrap();
+    let mut map = PackedBinaryMap::new(config);
+    let keys: Vec<Vec<u8>> = (0..10)
+        .map(|index| format!("pressure-{index}").into_bytes())
+        .collect();
+    for (index, key) in keys.iter().enumerate() {
+        map.try_insert(key, index).unwrap();
+    }
+    assert_eq!(map.stats().soft_delete_threshold, 2);
+    assert_eq!(map.stats().hard_delete_threshold, 3);
+
+    map.remove(&keys[0]).unwrap();
+    assert!(!map.maintenance_due());
+    map.remove(&keys[1]).unwrap();
+    assert!(map.maintenance_due());
+    map.remove(&keys[2]).unwrap();
+    assert_eq!(map.stats().maintenance_runs, 1);
+    assert!(!map.maintenance_due());
+}
+
+#[test]
+fn maintenance_cutover_advances_the_published_generation_once() {
+    let config = ElasticConfig::new(8).with_maintenance_mode(MaintenanceMode::Deferred);
+    let mut map = PackedBinaryMap::new(config);
+    map.try_insert(b"alpha", 1).unwrap();
+    map.try_insert(b"beta", 2).unwrap();
+    let generation = map.generation();
+
+    let mut plan = map.try_begin_maintenance().unwrap();
+    assert_eq!(plan.source_generation(), generation);
+    map.prepare_maintenance_step(&mut plan, usize::MAX).unwrap();
+    assert_eq!(map.generation(), generation);
+    map.finish_maintenance(&mut plan).unwrap();
+
+    assert_eq!(map.generation().sequence(), generation.sequence() + 1);
+    assert_eq!(map.stats().generation, map.generation());
+    assert_eq!(map.get(b"alpha"), Some(&1));
+    assert_eq!(map.get(b"beta"), Some(&2));
+}
+
+#[test]
+fn staged_cutover_model_never_resurrects_across_writer_traces() {
+    const TRACE_LEN: usize = 4;
+    const OPERATIONS: usize = 4;
+
+    for encoded_trace in 0..OPERATIONS.pow(4) {
+        let config = ElasticConfig::new(8).with_maintenance_mode(MaintenanceMode::Deferred);
+        let mut map = PackedBinaryMap::new(config);
+        let mut reference = HashMap::from([(b"alpha".to_vec(), 1_u64), (b"beta".to_vec(), 2_u64)]);
+        for (key, value) in &reference {
+            map.try_insert(key, *value).unwrap();
+        }
+
+        let source_generation = map.generation();
+        let mut plan = map.try_begin_maintenance().unwrap();
+        map.prepare_maintenance_step(&mut plan, usize::MAX).unwrap();
+        let mut trace = encoded_trace;
+        let mut structurally_changed = false;
+        for step in 0..TRACE_LEN {
+            let value = 10 + u64::try_from(step).unwrap();
+            match trace % OPERATIONS {
+                0 => {
+                    map.try_insert(b"alpha", value).unwrap();
+                    reference.insert(b"alpha".to_vec(), value);
+                }
+                1 => {
+                    let inserted = map.try_insert(b"gamma", value).unwrap();
+                    structurally_changed |= inserted == InsertOutcome::Inserted;
+                    reference.insert(b"gamma".to_vec(), value);
+                }
+                2 => {
+                    structurally_changed |= map.remove(b"beta").is_some();
+                    reference.remove(b"beta".as_slice());
+                }
+                _ => {
+                    assert_eq!(map.remove(b"missing"), None);
+                }
+            }
+            trace /= OPERATIONS;
+        }
+
+        let cutover = map.finish_maintenance(&mut plan);
+        if structurally_changed {
+            assert_eq!(cutover, Err(MaintenanceError::StalePlan));
+            assert_eq!(map.generation(), source_generation);
+        } else {
+            assert_eq!(cutover, Ok(()));
+            assert_eq!(
+                map.generation().sequence(),
+                source_generation.sequence() + 1
+            );
+        }
+        assert_eq!(map.len(), reference.len());
+        for (key, value) in &reference {
+            assert_eq!(map.get(key), Some(value));
+        }
+        assert_eq!(
+            map.contains_key(b"beta"),
+            reference.contains_key(b"beta".as_slice())
+        );
+        assert_eq!(
+            map.contains_key(b"gamma"),
+            reference.contains_key(b"gamma".as_slice())
+        );
+    }
+}
+
+#[test]
+fn staged_maintenance_bounds_key_copying_before_cutover() {
+    let capacity = 32;
+    let config = ElasticConfig::new(capacity).with_maintenance_mode(MaintenanceMode::Deferred);
+    let mut map = PackedBinaryMap::with_key_segment_bytes(config, 64).unwrap();
+    let keys: Vec<Vec<u8>> = (0..capacity)
+        .map(|index| format!("staged-{index:04}").into_bytes())
+        .collect();
+    for (index, key) in keys.iter().enumerate() {
+        map.try_insert(key, index).unwrap();
+    }
+    for key in &keys[..8] {
+        map.remove(key).unwrap();
+    }
+
+    let mut plan = map.try_begin_maintenance().unwrap();
+    assert!(!plan.is_ready());
+    let idle = map.prepare_maintenance_step(&mut plan, 0).unwrap();
+    assert_eq!(idle.copied, 0);
+    assert_eq!(idle.remaining, 24);
+    assert!(matches!(
+        map.finish_maintenance(&mut plan),
+        Err(packedgen::MaintenanceError::PlanNotReady { remaining: 24 })
+    ));
+
+    while !plan.is_ready() {
+        let progress = map.prepare_maintenance_step(&mut plan, 3).unwrap();
+        assert!(progress.copied <= 3);
+    }
+    map.finish_maintenance(&mut plan).unwrap();
+    assert_eq!(map.stats().dead_key_bytes(), 0);
+    assert_eq!(map.stats().maintenance_runs, 1);
+    for (index, key) in keys.iter().enumerate().skip(8) {
+        assert_eq!(map.get(key), Some(&index));
+    }
+}
+
+#[test]
+fn staged_maintenance_detects_structural_changes_and_restarts() {
+    let config = ElasticConfig::new(16).with_maintenance_mode(MaintenanceMode::Deferred);
+    let mut map = PackedBinaryMap::new(config);
+    map.try_insert(b"alpha", 1).unwrap();
+    map.try_insert(b"beta", 2).unwrap();
+
+    let mut plan = map.try_begin_maintenance().unwrap();
+    map.try_insert(b"alpha", 10).unwrap();
+    assert!(!map.maintenance_plan_is_stale(&plan));
+    while !plan.is_ready() {
+        map.prepare_maintenance_step(&mut plan, 1).unwrap();
+    }
+    map.finish_maintenance(&mut plan).unwrap();
+    assert_eq!(map.get(b"alpha"), Some(&10));
+
+    let mut plan = map.try_begin_maintenance().unwrap();
+    map.try_insert(b"gamma", 3).unwrap();
+    assert!(map.maintenance_plan_is_stale(&plan));
+    assert_eq!(
+        map.prepare_maintenance_step(&mut plan, 1),
+        Err(packedgen::MaintenanceError::StalePlan)
+    );
+    map.try_restart_maintenance(&mut plan).unwrap();
+    assert!(!map.maintenance_plan_is_stale(&plan));
+    while !plan.is_ready() {
+        map.prepare_maintenance_step(&mut plan, 1).unwrap();
+    }
+    map.finish_maintenance(&mut plan).unwrap();
+    assert_eq!(map.get(b"gamma"), Some(&3));
+}
+
+#[test]
+fn routing_accelerator_is_bounded_and_caches_most_routes() {
+    let capacity = 10_000;
+    let mut map = PackedBinaryMap::new(
+        ElasticConfig::new(capacity).with_route_cache_budget(RouteCacheBudget::ReadOptimized),
+    );
+    for index in 0..capacity {
+        map.try_insert(format!("route-{index}").as_bytes(), index)
+            .unwrap();
+    }
+
+    let stats = map.stats();
+    assert_eq!(
+        stats.route_cache_bytes,
+        capacity * 8 + (capacity * 2).div_ceil(4).div_ceil(64) * 8
+    );
+    assert!(stats.route_cache_entries > capacity * 4 / 5, "{stats:?}");
+    assert_eq!(
+        stats.route_cache_entries + stats.route_cache_overflows,
+        capacity
+    );
+}
+
+#[test]
+fn batched_lookup_preserves_order_across_hits_and_misses() {
+    for budget in [RouteCacheBudget::Compact, RouteCacheBudget::ReadOptimized] {
+        let mut map = PackedBinaryMap::new(ElasticConfig::new(16).with_route_cache_budget(budget));
+        map.try_insert(b"alpha", 1).unwrap();
+        map.try_insert(b"beta", 2).unwrap();
+        map.try_insert(b"gamma", 3).unwrap();
+
+        assert_eq!(map.get(b"alpha"), Some(&1));
+        assert_eq!(
+            map.get_many([b"gamma".as_slice(), b"missing", b"alpha", b"beta"]),
+            [Some(&3), None, Some(&1), Some(&2)]
+        );
+        assert_eq!(map.remove(b"gamma"), Some(3));
+        assert_eq!(
+            map.get_many([b"gamma".as_slice(), b"alpha", b"missing"]),
+            [None, Some(&1), None]
+        );
+        assert_eq!(map.get_many::<0>([]), []);
+    }
+}
+
+fn mix(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
