@@ -1118,6 +1118,7 @@ pub struct DirectPackedCache<V> {
     frequency_reuse_publishing: AtomicBool,
     expiration_possible: AtomicBool,
     mutation_stripes: Box<[Mutex<()>]>,
+    maintenance_completions: AtomicU64,
     #[cfg(feature = "cache-production-diagnostics")]
     diagnostics: Box<DirectCacheDiagnosticCounters>,
 }
@@ -5026,6 +5027,7 @@ impl<V> DirectPackedCache<V> {
             mutation_stripes: std::iter::repeat_with(|| Mutex::new(()))
                 .take(MUTATION_STRIPES)
                 .collect(),
+            maintenance_completions: AtomicU64::new(0),
             #[cfg(feature = "cache-production-diagnostics")]
             diagnostics: Box::new(DirectCacheDiagnosticCounters::new(0, 0)),
         })
@@ -5167,6 +5169,7 @@ impl<V> DirectPackedCache<V> {
             frequency_reuse_publishing: AtomicBool::new(false),
             expiration_possible: AtomicBool::new(expiration_possible),
             mutation_stripes,
+            maintenance_completions: AtomicU64::new(0),
             #[cfg(feature = "cache-production-diagnostics")]
             diagnostics: Box::new(DirectCacheDiagnosticCounters::new(
                 entry_count,
@@ -6539,7 +6542,18 @@ impl<V> DirectPackedCache<V> {
     ///
     /// Returns an index construction error if adaptive rebuild fails.
     pub fn maintain(&self) -> Result<CacheMaintenanceResult, FrozenBuildError> {
+        let completion = self.maintenance_completions.load(Ordering::Acquire);
+        self.maintain_after_completion(completion)
+    }
+
+    fn maintain_after_completion(
+        &self,
+        observed_completion: u64,
+    ) -> Result<CacheMaintenanceResult, FrozenBuildError> {
         let _maintenance = self.maintenance_gate.lock();
+        if self.maintenance_completions.load(Ordering::Acquire) != observed_completion {
+            return Ok(CacheMaintenanceResult::default());
+        }
         let now = self.now();
         let expired = if self.expiration_possible.load(Ordering::Acquire) {
             self.purge_expired_locked(now)
@@ -6558,6 +6572,8 @@ impl<V> DirectPackedCache<V> {
         }
         self.arena.reclaim_retired();
         self.index.reclaim_retired_generations();
+        self.maintenance_completions
+            .store(observed_completion.wrapping_add(1), Ordering::Release);
         Ok(CacheMaintenanceResult {
             expired,
             evicted,
@@ -8491,6 +8507,30 @@ mod tests {
             16,
             "one bounded local batch publishes rotation progress"
         );
+    }
+
+    #[test]
+    fn stale_synchronous_maintenance_request_reuses_a_completed_boundary() {
+        let cache =
+            DirectPackedCache::<u64>::try_new(CacheConfig::new(u64::MAX).with_overlay_capacity(64))
+                .unwrap();
+        assert_eq!(cache.maintenance_completions.load(Ordering::Relaxed), 0);
+
+        assert_eq!(cache.maintain().unwrap(), CacheMaintenanceResult::default());
+        assert_eq!(cache.maintenance_completions.load(Ordering::Relaxed), 1);
+
+        assert_eq!(
+            cache.maintain_after_completion(0).unwrap(),
+            CacheMaintenanceResult::default()
+        );
+        assert_eq!(
+            cache.maintenance_completions.load(Ordering::Relaxed),
+            1,
+            "a boundary completed after this request began must satisfy it"
+        );
+
+        assert_eq!(cache.maintain().unwrap(), CacheMaintenanceResult::default());
+        assert_eq!(cache.maintenance_completions.load(Ordering::Relaxed), 2);
     }
 
     #[test]
