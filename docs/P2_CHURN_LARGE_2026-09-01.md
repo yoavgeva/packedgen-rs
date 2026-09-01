@@ -44,6 +44,16 @@ set, but the candidate was a content-hashed dirty worktree rather than a tag.
    epoch-retirement debt without making borrowed references unsound.
 10. The `shared-gx` feature now computes the route from its full carried digest;
     the portable build retains its cheaper route-only lane.
+11. Opt-in asynchronous caches now reserve exact entry and weight capacity
+    before publication. The configured hard ceiling is therefore an exact
+    bound under concurrent admission, replacement, failure, and duplicate-key
+    races; the synchronous safe default is unchanged.
+12. Doorkeeper rotation observations now publish from cache-line-separated
+    shards every 16 observations. This removed the shared observation atomic
+    from the common admission path without adding per-entry state.
+13. Concurrent synchronous maintenance requests now coalesce at a completed
+    maintenance boundary. A caller that waited behind a complete cycle does
+    not repeat the same eviction, rebuild, and reclamation work.
 
 ## QuickCache comparison
 
@@ -192,12 +202,79 @@ allocator-live bytes. R-0005 must capture both.
 - Full quiescence and cloned/shareable sessions remain explicit API choices;
   none silently replaces the fastest borrowed path.
 
+## Exact-cap profile follow-up — 2026-09-02
+
+The exact-cap, sharded-doorkeeper, maintenance-coalescing checkpoint was
+profiled again at 16 workers. In a long version-churn sample, source
+materialization remained the largest external cost. PackedGen's largest
+internal stacks were conditional admission, victim collection, allocator
+freeing, and session refresh. Rebuild construction still produced the rare
+multi-millisecond maximum.
+
+The retained sharded-doorkeeper change improved the preceding exact-cap
+checkpoint by about 21.3% in version churn, 49.4% in cold fill, 12.3% in
+pressure skew, and 45.8% in scan resistance in the focused paired screen.
+Resident-hot throughput and latency were neutral. The retained maintenance
+coalescing follow-up added about 1% version-churn throughput, lowered p99 about
+1.4%, and lowered p99.9 about 7.8% in its paired median.
+
+Fresh five-pair QuickCache controls from that checkpoint showed the remaining
+tradeoff clearly. Higher throughput and hit rate are better; lower latency and
+RSS are better:
+
+| Workload | PackedGen throughput | QuickCache throughput | PackedGen p99 | QuickCache p99 | Main result |
+|---|---:|---:|---:|---:|---|
+| Version churn | 7.82–7.97 Mops/s | 12.46–14.09 Mops/s | 2.709–3.043 us | 3.167–13.711 us | Quick throughput; PackedGen much better p99 |
+| Large object | 3.39–3.48 Mops/s | 3.76–3.88 Mops/s | 12.2–15.1 us | 29.2–53.2 us | Quick throughput/RSS; PackedGen much better p99 |
+
+PackedGen's version p99.9 was about 20% lower at the median and its
+large-object p99.9 about 73% lower. The maximum sample was still worse:
+roughly 1.23–3.28 ms for version churn and 8.86–14.0 ms for large objects,
+versus about 0.24–3.03 ms and 1.1–1.76 ms for QuickCache. Large-object ending
+RSS remained roughly 38% higher. These maxima and physical memory, rather than
+p99/p99.9, are now the primary tail blockers.
+
+The following exact-cap follow-ups were fully reverted:
+
+- An allocation-free 512-slot exact set replaced quadratic duplicate checks
+  in the normal 256-victim sample. Seven version-churn pairs moved about 0.8%
+  lower at the median and five large-object pairs about 1.4% lower. Exact
+  policy semantics were preserved, but the extra initialized scratch table
+  cost more than the comparisons it removed.
+- Removing the pre-removal victim lookup reused the exact conditional removal
+  as the authoritative comparison. Longer version churn improved about 1.2%
+  and p99.9 improved, but version p99 rose about 2–4% and resident-hot lost
+  6–13% in all three order-alternated pairs from code-layout spillover.
+- Raising rebuild utilization from 75% to 80%, 85%, or 90% reduced rebuilds;
+  90% improved maximum latency, but p99.9 and ending memory worsened. None was
+  a universal replacement for the safe policy.
+- Restricting the global Rayon pool to 1, 2, 4, or 8 workers moved throughput
+  by less than about 1% at the median and left p99.9/maximum inconsistent.
+- A 2x overlay improved version churn 4.6–9.2% and halved rebuilds, but lost
+  large-object throughput/hit rate and often raised RSS. A 1.25x overlay
+  improved all seven version-churn pairs by 1.2–4.4%; it still lost about 0.8%
+  median large-object throughput and 0.1–0.2 graph hit-rate point. A 1.125x
+  interpolation also lost large-object and graph performance. These remain
+  workload specializations, not an adaptive default.
+- Separating full-cycle serialization from the short capacity gate improved
+  version-churn throughput about 1.2% and reduced maximum latency in five of
+  seven pairs. Large-object throughput nevertheless lost about 1.5% at the
+  median and resident-hot produced severe negative outliers, so the extra
+  gate and test were reverted.
+- Lazy per-guard arena reservations reduced allocator calls but increased
+  ending RSS by roughly 30–50 MiB and improved guarded churn only about 1%.
+  Nonblocking maintenance requests left the cache near its hard target and
+  reached only about 7.0 Mops/s versus roughly 7.8 for synchronous boundaries;
+  bounded background slices also regressed ordinary latency. Both designs
+  were removed.
+
 ## Qualification completed in this worktree
 
-- `cargo test --lib`: 138 passed.
-- `cargo test --all-features`: 143 unit tests and all integration tests passed;
+- `cargo test -p packedgen --all-features --lib`: 145 passed.
+- `cargo test -p packedgen --all-features --test direct_packed_cache`: 78 passed.
+- The complete package all-feature integration suite passed;
   the explicitly marked long-running soak remained ignored.
-- `cargo clippy --all-targets --all-features -- -D warnings`: passed.
+- `cargo clippy -p packedgen --all-targets --all-features -- -D warnings`: passed.
 - Formatting check: passed.
 
 ## Remaining P2 blockers
