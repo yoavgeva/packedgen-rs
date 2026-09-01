@@ -107,6 +107,7 @@ const DIRECT_ADAPTIVE_EXISTING_THRESHOLD: u8 = 2;
 const DIRECT_FALLBACK_REFILL_MULTIPLIER: usize = 16;
 const DIRECT_ADMISSION_RECLAIM_INTERVAL: usize = 512;
 const DIRECT_DOORKEEPER_CLEAR_WORDS: usize = 16;
+const DIRECT_DOORKEEPER_OBSERVATION_PUBLISH_INTERVAL: u64 = 16;
 const DIRECT_ASYNC_VICTIM_SAMPLE_MAX: usize = 1_024;
 const DIRECT_DOORKEEPER_GROUP_LOCK: u64 = 1_u64 << 63;
 const DIRECT_DOORKEEPER_EPOCH_MASK: u64 = DIRECT_DOORKEEPER_GROUP_LOCK - 1;
@@ -742,6 +743,29 @@ struct CacheCounters {
 #[repr(align(64))]
 struct DirectFrequencyReuseShard {
     pending: AtomicU64,
+}
+
+#[derive(Default)]
+#[repr(align(64))]
+struct DirectDoorkeeperObservationShard {
+    pending: AtomicU64,
+}
+
+struct DirectDoorkeeperObservations {
+    published: AtomicU64,
+    shards: Box<[DirectDoorkeeperObservationShard]>,
+}
+
+impl DirectDoorkeeperObservations {
+    #[cfg(test)]
+    fn load(&self, ordering: Ordering) -> u64 {
+        self.published.load(ordering)
+    }
+
+    #[cfg(test)]
+    fn store(&self, value: u64, ordering: Ordering) {
+        self.published.store(value, ordering);
+    }
 }
 
 #[cfg(feature = "cache-production-diagnostics")]
@@ -1643,7 +1667,7 @@ struct DirectAdmissionDoorkeeper {
     filters: [Box<[AtomicU64]>; 2],
     filter_epochs: [Box<[AtomicU64]>; 2],
     generation: AtomicU64,
-    observations: AtomicU64,
+    observations: Box<DirectDoorkeeperObservations>,
     rotate_every: u64,
     frequency: Option<DirectFrequencySketch>,
     warmed: AtomicBool,
@@ -1695,11 +1719,21 @@ impl DirectAdmissionDoorkeeper {
                 .take(groups)
                 .collect::<Box<[_]>>()
         };
+        let requested_observation_shards = expected_entries.max(1).div_ceil(1_024);
+        let observation_shards = requested_observation_shards
+            .checked_next_power_of_two()
+            .unwrap_or(COUNTER_SHARDS)
+            .min(COUNTER_SHARDS);
         Self {
             filters: [make_filter(), make_filter()],
             filter_epochs: [make_epochs(0), make_epochs(DIRECT_DOORKEEPER_INVALID_EPOCH)],
             generation: AtomicU64::new(0),
-            observations: AtomicU64::new(0),
+            observations: Box::new(DirectDoorkeeperObservations {
+                published: AtomicU64::new(0),
+                shards: std::iter::repeat_with(DirectDoorkeeperObservationShard::default)
+                    .take(observation_shards)
+                    .collect(),
+            }),
             rotate_every: u64::try_from(expected_entries.max(1)).unwrap_or(u64::MAX),
             frequency: frequency_max_gate
                 .map(|maximum| DirectFrequencySketch::new(expected_entries, maximum)),
@@ -1712,19 +1746,7 @@ impl DirectAdmissionDoorkeeper {
     }
 
     fn observe_hashed(&self, hashes: [u64; 2], observe_frequency: bool) -> (bool, Option<u8>) {
-        let observation = self
-            .observations
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
-        if observation.is_multiple_of(self.rotate_every) {
-            self.generation
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
-                    Some(generation.wrapping_add(1) & DIRECT_DOORKEEPER_EPOCH_MASK)
-                })
-                .unwrap_or_else(|_| unreachable!("generation update always succeeds"));
-            #[cfg(feature = "cache-production-diagnostics")]
-            self.rotations.fetch_add(1, Ordering::Relaxed);
-        }
+        self.record_observation(hashes[0]);
         loop {
             let generation = self.generation.load(Ordering::Acquire);
             let current = usize::try_from(generation & 1).expect("one bit fits usize");
@@ -1741,6 +1763,52 @@ impl DirectAdmissionDoorkeeper {
                 .flatten();
             return (seen, frequency);
         }
+    }
+
+    fn record_observation(&self, route: u64) {
+        let shard =
+            usize::try_from(route).unwrap_or(usize::MAX) & (self.observations.shards.len() - 1);
+        let local = self.observations.shards[shard]
+            .pending
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        if !local.is_multiple_of(DIRECT_DOORKEEPER_OBSERVATION_PUBLISH_INTERVAL) {
+            return;
+        }
+        let previous = self.observations.published.fetch_add(
+            DIRECT_DOORKEEPER_OBSERVATION_PUBLISH_INTERVAL,
+            Ordering::Relaxed,
+        );
+        let next = previous.wrapping_add(DIRECT_DOORKEEPER_OBSERVATION_PUBLISH_INTERVAL);
+        let rotations = if next < previous {
+            1
+        } else {
+            next / self.rotate_every - previous / self.rotate_every
+        };
+        if rotations != 0 {
+            self.generation
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                    Some(generation.wrapping_add(rotations) & DIRECT_DOORKEEPER_EPOCH_MASK)
+                })
+                .unwrap_or_else(|_| unreachable!("generation update always succeeds"));
+            #[cfg(feature = "cache-production-diagnostics")]
+            self.rotations.fetch_add(rotations, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    fn prime_rotation_on_next_observation(&self, key: &[u8], next_total: u64) {
+        let route = Self::hashes(key)[0];
+        let shard =
+            usize::try_from(route).unwrap_or(usize::MAX) & (self.observations.shards.len() - 1);
+        self.observations.shards[shard].pending.store(
+            DIRECT_DOORKEEPER_OBSERVATION_PUBLISH_INTERVAL - 1,
+            Ordering::Relaxed,
+        );
+        self.observations.store(
+            next_total.saturating_sub(DIRECT_DOORKEEPER_OBSERVATION_PUBLISH_INTERVAL),
+            Ordering::Relaxed,
+        );
     }
 
     #[cfg(test)]
@@ -8406,14 +8474,32 @@ mod tests {
     }
 
     #[test]
+    fn doorkeeper_observations_publish_in_sharded_batches() {
+        let doorkeeper = DirectAdmissionDoorkeeper::new(50_000, None);
+        for _ in 0..15 {
+            doorkeeper.observe(b"one observation shard", false);
+        }
+        assert_eq!(
+            doorkeeper.observations.load(Ordering::Relaxed),
+            0,
+            "local observations must avoid the shared rotation counter"
+        );
+
+        doorkeeper.observe(b"one observation shard", false);
+        assert_eq!(
+            doorkeeper.observations.load(Ordering::Relaxed),
+            16,
+            "one bounded local batch publishes rotation progress"
+        );
+    }
+
+    #[test]
     fn doorkeeper_rotation_bounds_foreground_clear_work() {
         let doorkeeper = DirectAdmissionDoorkeeper::new(1_024, None);
         for word in &doorkeeper.filters[1] {
             word.store(u64::MAX, Ordering::Relaxed);
         }
-        doorkeeper
-            .observations
-            .store(doorkeeper.rotate_every - 1, Ordering::Relaxed);
+        doorkeeper.prime_rotation_on_next_observation(b"rotate", doorkeeper.rotate_every);
 
         assert_eq!(doorkeeper.observe(b"rotate", false), (false, None));
 
@@ -8437,9 +8523,7 @@ mod tests {
         assert_eq!(doorkeeper.observe(old, false), (false, None));
         assert_eq!(doorkeeper.observe(old, false), (true, None));
 
-        doorkeeper
-            .observations
-            .store(doorkeeper.rotate_every - 1, Ordering::Relaxed);
+        doorkeeper.prime_rotation_on_next_observation(b"rotate-once", doorkeeper.rotate_every);
         assert_eq!(doorkeeper.observe(b"rotate-once", false), (false, None));
         assert_eq!(
             doorkeeper.observe(recurring, false),
@@ -8447,9 +8531,7 @@ mod tests {
             "the immediately previous generation must remain visible"
         );
 
-        doorkeeper
-            .observations
-            .store(doorkeeper.rotate_every * 2 - 1, Ordering::Relaxed);
+        doorkeeper.prime_rotation_on_next_observation(b"rotate-twice", doorkeeper.rotate_every * 2);
         assert_eq!(doorkeeper.observe(b"rotate-twice", false), (false, None));
         assert_eq!(
             doorkeeper.observe(recurring, false),
@@ -8477,10 +8559,16 @@ mod tests {
             }
         });
 
-        assert_eq!(
-            doorkeeper.generation.load(Ordering::Relaxed),
-            u64::try_from(THREADS * OBSERVATIONS / 64).unwrap()
-        );
+        let expected_rotations = u64::try_from(THREADS * OBSERVATIONS / 64).unwrap();
+        let maximum_unpublished = u64::try_from(
+            doorkeeper.observations.shards.len()
+                * usize::try_from(DIRECT_DOORKEEPER_OBSERVATION_PUBLISH_INTERVAL - 1).unwrap(),
+        )
+        .unwrap();
+        let maximum_rotation_lag = maximum_unpublished.div_ceil(doorkeeper.rotate_every);
+        let generation = doorkeeper.generation.load(Ordering::Relaxed);
+        assert!(generation <= expected_rotations);
+        assert!(generation >= expected_rotations.saturating_sub(maximum_rotation_lag));
         assert!(
             doorkeeper
                 .filter_epochs
