@@ -93,6 +93,8 @@ unsafe fn removed_after_exact_index_transfer(handle: DirectHandle) -> RemovedDir
     unsafe { RemovedDirectHandle::from_exact_removal(handle) }
 }
 const ACCESS_SAMPLE_MASK: u64 = 15;
+const FREQUENCY_REUSE_MIN_LOOKUPS: u64 = 1_024;
+const FREQUENCY_REUSE_WINDOW: u64 = 16_384;
 const MUTATION_STRIPES: usize = 2_048;
 const EXPIRY_TICK_NANOS: u128 = 100_000_000;
 const DIRECT_LENGTH_IMMEDIATE_RECHECK: u8 = 64;
@@ -206,11 +208,13 @@ impl CacheConfig {
 
     /// Enables frequency admission only after the cache demonstrates reuse.
     ///
-    /// Before the cache records 1,024 lookups, or while its hit rate remains
-    /// below `minimum_hit_rate_bps`, candidates use ordinary second-sighting
-    /// admission. This avoids starving version-like workloads with little
-    /// reusable history. Borrowed guards publish their observations when they
-    /// are refreshed or dropped. `6_000` represents a 60% minimum hit rate.
+    /// Before the cache records 1,024 recent lookups, or while its rolling hit
+    /// rate remains below `minimum_hit_rate_bps`, candidates use ordinary
+    /// second-sighting admission. This avoids starving version-like workloads
+    /// with little reusable history while allowing a cache to recover from an
+    /// early cold-fill phase. The rolling estimate retains at most 16,384
+    /// lookups. Borrowed guards publish observations when refreshed or dropped.
+    /// `6_000` represents a 60% minimum hit rate.
     #[must_use]
     pub const fn with_adaptive_frequency_admission(
         mut self,
@@ -226,7 +230,7 @@ impl CacheConfig {
     /// Adds a stricter frequency tier after the cache demonstrates high reuse.
     ///
     /// The base gate becomes active at `minimum_hit_rate_bps`. The high gate
-    /// is used only after at least 1,024 lookups and a hit rate of
+    /// is used only after at least 1,024 recent lookups and a rolling hit rate of
     /// `high_reuse_hit_rate_bps`. This preserves ordinary pressure behavior
     /// while allowing high-reuse caches to protect proven residents more
     /// aggressively. The tier adds no sketch counters or per-entry metadata.
@@ -736,8 +740,7 @@ pub struct DirectPackedCache<V> {
     victim_scan_cursor: AtomicU64,
     victim_reservoir: Mutex<Vec<DirectVictimReservoirBatch>>,
     admission_doorkeeper: Option<DirectAdmissionDoorkeeper>,
-    frequency_hits: AtomicU64,
-    frequency_lookups: AtomicU64,
+    frequency_reuse: AtomicU64,
     expiration_possible: AtomicBool,
     mutation_stripes: Box<[Mutex<()>]>,
     #[cfg(feature = "cache-pressure-timing")]
@@ -3977,8 +3980,7 @@ impl<V> DirectPackedCache<V> {
             victim_scan_cursor: AtomicU64::new(0),
             victim_reservoir: Mutex::new(Vec::new()),
             admission_doorkeeper,
-            frequency_hits: AtomicU64::new(0),
-            frequency_lookups: AtomicU64::new(0),
+            frequency_reuse: AtomicU64::new(0),
             expiration_possible: AtomicBool::new(false),
             mutation_stripes: std::iter::repeat_with(|| Mutex::new(()))
                 .take(MUTATION_STRIPES)
@@ -4102,8 +4104,7 @@ impl<V> DirectPackedCache<V> {
             victim_scan_cursor: AtomicU64::new(0),
             victim_reservoir: Mutex::new(Vec::new()),
             admission_doorkeeper,
-            frequency_hits: AtomicU64::new(0),
-            frequency_lookups: AtomicU64::new(0),
+            frequency_reuse: AtomicU64::new(0),
             expiration_possible: AtomicBool::new(expiration_possible),
             mutation_stripes,
             #[cfg(feature = "cache-pressure-timing")]
@@ -5305,9 +5306,8 @@ impl<V> DirectPackedCache<V> {
         if minimum_hit_rate == 0 {
             return true;
         }
-        let hits = self.frequency_hits.load(Ordering::Relaxed);
-        let lookups = self.frequency_lookups.load(Ordering::Relaxed);
-        lookups >= 1_024
+        let (hits, lookups) = unpack_frequency_reuse(self.frequency_reuse.load(Ordering::Relaxed));
+        lookups >= FREQUENCY_REUSE_MIN_LOOKUPS
             && u128::from(hits) * 10_000 >= u128::from(lookups) * u128::from(minimum_hit_rate)
     }
 
@@ -5319,10 +5319,38 @@ impl<V> DirectPackedCache<V> {
         if lookups == 0 {
             return;
         }
-        if hits != 0 {
-            self.frequency_hits.fetch_add(hits, Ordering::Relaxed);
+        let sample_lookups = lookups.min(FREQUENCY_REUSE_WINDOW);
+        let sample_hits = if lookups <= FREQUENCY_REUSE_WINDOW {
+            hits.min(lookups)
+        } else {
+            u64::try_from(
+                u128::from(hits.min(lookups)) * u128::from(sample_lookups) / u128::from(lookups),
+            )
+            .unwrap_or(sample_lookups)
+        };
+        let mut previous = self.frequency_reuse.load(Ordering::Relaxed);
+        loop {
+            let (mut previous_hits, mut previous_lookups) = unpack_frequency_reuse(previous);
+            while previous_lookups.saturating_add(sample_lookups) > FREQUENCY_REUSE_WINDOW
+                && previous_lookups != 0
+            {
+                previous_hits /= 2;
+                previous_lookups /= 2;
+            }
+            let replacement = pack_frequency_reuse(
+                previous_hits.saturating_add(sample_hits),
+                previous_lookups.saturating_add(sample_lookups),
+            );
+            match self.frequency_reuse.compare_exchange_weak(
+                previous,
+                replacement,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(current) => previous = current,
+            }
         }
-        self.frequency_lookups.fetch_add(lookups, Ordering::Relaxed);
     }
 
     fn validate_weight(&self, key: &[u8], weight: u64) -> Result<u32, CacheInsertError> {
@@ -6301,6 +6329,17 @@ fn scale_hard_limit_usize(limit: usize, bps: u16) -> usize {
     .unwrap_or(usize::MAX)
 }
 
+fn pack_frequency_reuse(hits: u64, lookups: u64) -> u64 {
+    debug_assert!(hits <= lookups);
+    let hits = hits.min(u64::from(u32::MAX));
+    let lookups = lookups.min(u64::from(u32::MAX));
+    hits << 32 | lookups
+}
+
+fn unpack_frequency_reuse(state: u64) -> (u64, u64) {
+    (state >> 32, state & u64::from(u32::MAX))
+}
+
 /// Join handle for a cache maintenance worker.
 pub struct CacheMaintenance {
     stop: Arc<AtomicBool>,
@@ -6536,12 +6575,94 @@ mod tests {
                 .with_tiered_frequency_admission(2, 6_000, 4, 7_500),
         )
         .expect("cache constructs");
-        cache.frequency_lookups.store(1_024, Ordering::Relaxed);
-        cache.frequency_hits.store(700, Ordering::Relaxed);
+        cache
+            .frequency_reuse
+            .store(pack_frequency_reuse(700, 1_024), Ordering::Relaxed);
         assert_eq!(cache.frequency_victim_gate(), 2);
 
-        cache.frequency_hits.store(800, Ordering::Relaxed);
+        cache
+            .frequency_reuse
+            .store(pack_frequency_reuse(800, 1_024), Ordering::Relaxed);
         assert_eq!(cache.frequency_victim_gate(), 4);
+    }
+
+    #[test]
+    fn adaptive_frequency_gate_follows_recent_reuse_after_an_early_cold_phase() {
+        let cache = DirectPackedCache::<u64>::try_new(
+            CacheConfig::new(16)
+                .with_max_entries(16)
+                .with_overlay_capacity(64)
+                .with_admission_doorkeeper(16)
+                .with_adaptive_frequency_admission(2, 6_000),
+        )
+        .expect("cache constructs");
+
+        cache.record_frequency_reuse(0, 100_000);
+        assert!(!cache.frequency_admission_active());
+
+        for _ in 0..64 {
+            cache.record_frequency_reuse(512, 0);
+        }
+
+        assert!(
+            cache.frequency_admission_active(),
+            "a bounded adaptive estimate must recover from an early cold-fill phase"
+        );
+    }
+
+    #[test]
+    fn adaptive_frequency_gate_turns_off_after_reuse_disappears() {
+        let cache = DirectPackedCache::<u64>::try_new(
+            CacheConfig::new(16)
+                .with_max_entries(16)
+                .with_overlay_capacity(64)
+                .with_admission_doorkeeper(16)
+                .with_adaptive_frequency_admission(2, 6_000),
+        )
+        .expect("cache constructs");
+
+        cache.record_frequency_reuse(100_000, 0);
+        assert!(cache.frequency_admission_active());
+
+        for _ in 0..64 {
+            cache.record_frequency_reuse(0, 512);
+        }
+
+        assert!(!cache.frequency_admission_active());
+    }
+
+    #[test]
+    fn rolling_frequency_reuse_stays_bounded_during_concurrent_updates() {
+        let cache = Arc::new(
+            DirectPackedCache::<u64>::try_new(
+                CacheConfig::new(16)
+                    .with_max_entries(16)
+                    .with_overlay_capacity(64)
+                    .with_admission_doorkeeper(16)
+                    .with_adaptive_frequency_admission(2, 5_000),
+            )
+            .expect("cache constructs"),
+        );
+
+        thread::scope(|scope| {
+            for thread_index in 0..8 {
+                let cache = Arc::clone(&cache);
+                scope.spawn(move || {
+                    for _ in 0..1_000 {
+                        if thread_index % 2 == 0 {
+                            cache.record_frequency_reuse(512, 0);
+                        } else {
+                            cache.record_frequency_reuse(0, 512);
+                        }
+                    }
+                });
+            }
+        });
+
+        let (hits, lookups) = unpack_frequency_reuse(cache.frequency_reuse.load(Ordering::Relaxed));
+        assert!(hits <= lookups);
+        assert!(lookups <= FREQUENCY_REUSE_WINDOW);
+        assert!(lookups >= FREQUENCY_REUSE_MIN_LOOKUPS);
     }
 
     #[test]
