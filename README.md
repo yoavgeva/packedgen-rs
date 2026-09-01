@@ -618,13 +618,18 @@ configuration is:
 let config = CacheConfig::new(max_weight)
     .with_max_entries(expected_entries)
     .with_admission_doorkeeper(expected_entries)
-    .with_adaptive_frequency_admission(2, 6_000)
+    .with_adaptive_frequency_admission(2, 5_000)
     .with_eviction_batch(256)
     .with_async_eviction(11_000);
 
 let cache = Arc::new(DirectPackedCache::new(config));
 let maintenance = cache.spawn_maintenance(Duration::from_millis(1));
 ```
+
+This is the opt-in R-0005 tuning candidate, not the library default. Plain
+`CacheConfig::new` continues to use strict synchronous capacity enforcement,
+CLOCK admission, and no doorkeeper or frequency sketch. Do not promote the
+tuned profile to the default until R-0005 validates the immutable candidate.
 
 The async setting permits temporary growth to 110% of the soft limits and
 therefore requires keeping the returned maintenance worker alive. It is an
@@ -633,9 +638,22 @@ doorkeeper adds four to eight bytes per expected entry and can be used with
 strict synchronous eviction as well. Adaptive frequency admission adds another
 four to eight bytes per expected entry. It stays on second-sighting admission
 below the configured reuse threshold; after pressure begins, one out of every
-16 resident hits updates the frequency sketch. Exact QuickCache comparisons,
-including the workloads where PackedGen still loses, are in
+16 resident hits updates the frequency sketch. Adaptive admission uses a
+bounded rolling reuse estimate, so an early cold fill cannot permanently delay
+policy activation. Exact QuickCache comparisons, including the workloads where
+PackedGen still loses, are in
 [`docs/QUICKCACHE_GAP_EXPERIMENT_2026-08-30.md`](docs/QUICKCACHE_GAP_EXPERIMENT_2026-08-30.md).
+The same-workload rolling-reuse follow-up is in
+[`docs/ROLLING_REUSE_EXPERIMENT_2026-09-01.md`](docs/ROLLING_REUSE_EXPERIMENT_2026-09-01.md).
+
+Production telemetry is also opt-in. `cache-production-diagnostics` exposes
+capacity peaks and debt, retirement, eviction/admission policy, worker, and
+arena statistics through `DirectPackedCache::production_diagnostics`.
+`cache-pressure-timing` adds foreground/background nanosecond timing and a
+bounded p99 histogram. The default build carries neither the counters nor
+their hot-path atomic cost. Candidate scope, exact checks, and remaining R-0005
+gates are recorded in
+[`docs/R0005_CANDIDATE_2026-09-01.md`](docs/R0005_CANDIDATE_2026-09-01.md).
 
 The cache now has a direct bulk-load constructor for snapshot restore and a
 Redis-style equal-live-memory harness. On the local 64-byte-value, one-hour-TTL
