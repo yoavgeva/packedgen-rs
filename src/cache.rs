@@ -545,6 +545,8 @@ pub struct DirectCacheReclamationStats {
     pub readers: [usize; 3],
     /// Exact number of removed values still awaiting a safe epoch.
     pub retired_values: usize,
+    /// Exact caller-accounted weight still awaiting a safe epoch.
+    pub retired_bytes: u64,
     /// Retired values published to the threshold counters in 64-value groups.
     pub published_retired_values: usize,
     /// Empty value allocations retained in the prepared replacement recycler.
@@ -570,6 +572,126 @@ pub struct DirectCacheReclamationStats {
     pub victim_collection_ns: u64,
     /// Longest native victim-candidate collection in nanoseconds.
     pub max_victim_collection_ns: u64,
+}
+
+/// Feature-gated production telemetry for [`DirectPackedCache`].
+///
+/// This snapshot is available with `cache-production-diagnostics`. Enabling
+/// that feature adds relaxed atomic accounting to mutation, admission, and
+/// maintenance paths. The default build carries neither the counters nor their
+/// hot-path cost. Nanosecond timing and its p99 histogram additionally require
+/// `cache-pressure-timing`.
+#[cfg(feature = "cache-production-diagnostics")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DirectCacheProductionStats {
+    /// Current live entry count tracked by production diagnostics.
+    pub current_entries: usize,
+    /// Current caller-accounted live weight tracked by production diagnostics.
+    pub current_weight: u64,
+    /// Highest live entry count observed after a capacity mutation.
+    pub peak_entries: usize,
+    /// Highest live weight observed after a capacity mutation.
+    pub peak_weight: u64,
+    /// Highest soft-limit overshoot, in basis points of the limiting capacity.
+    pub peak_soft_limit_overshoot_bps: u64,
+    /// Current entries above the configured soft entry limit.
+    pub current_entry_debt: usize,
+    /// Current weight above the configured soft weight limit.
+    pub current_weight_debt: u64,
+    /// Highest observed entry debt above the soft limit.
+    pub peak_entry_debt: usize,
+    /// Highest observed weight debt above the soft limit.
+    pub peak_weight_debt: u64,
+    /// Exact values currently waiting for a safe reclamation epoch.
+    pub retired_entries: usize,
+    /// Exact caller-accounted weight currently waiting for reclamation.
+    pub retired_bytes: u64,
+    /// Highest concurrently retired entry count observed at retirement time.
+    pub peak_retired_entries: usize,
+    /// Highest concurrently retired caller-accounted weight observed.
+    pub peak_retired_bytes: u64,
+    /// Foreground requests that synchronously enforced the async hard limit.
+    pub foreground_hard_limit_enforcements: u64,
+    /// Total foreground hard-limit enforcement time in nanoseconds.
+    pub foreground_hard_limit_total_ns: u64,
+    /// Approximate p99 foreground enforcement time in nanoseconds.
+    pub foreground_hard_limit_p99_ns: u64,
+    /// Longest foreground hard-limit enforcement time in nanoseconds.
+    pub foreground_hard_limit_max_ns: u64,
+    /// Background passes that drained soft-limit capacity debt.
+    pub background_drains: u64,
+    /// Total background drain time in nanoseconds.
+    pub background_drain_total_ns: u64,
+    /// Longest background drain time in nanoseconds.
+    pub background_drain_max_ns: u64,
+    /// Entry debt present at the start of all background drains.
+    pub background_entry_debt_total: u64,
+    /// Weight debt present at the start of all background drains.
+    pub background_weight_debt_total: u64,
+    /// Eviction batches that examined one or more victim candidates.
+    pub victim_batches: u64,
+    /// Candidate records examined by eviction batches.
+    pub victims_examined: u64,
+    /// Candidate records successfully removed by eviction batches.
+    pub victims_removed: u64,
+    /// Largest candidate count examined by one eviction batch.
+    pub max_victims_examined_per_batch: u64,
+    /// Native candidate collections performed after the reservoir missed.
+    pub native_victim_collections: u64,
+    /// Total native victim-collection time in nanoseconds.
+    pub native_victim_collection_total_ns: u64,
+    /// Longest native victim-collection time in nanoseconds.
+    pub native_victim_collection_max_ns: u64,
+    /// Candidates rejected because their weight exceeded the cache budget.
+    pub rejected_item_too_heavy: u64,
+    /// Candidates rejected because their weight did not fit compact metadata.
+    pub rejected_weight_not_compact: u64,
+    /// Absent candidates rejected on their first doorkeeper observation.
+    pub rejected_doorkeeper_first_sighting: u64,
+    /// Repeated candidates rejected by the frequency comparison gate.
+    pub rejected_frequency: u64,
+    /// Candidates accepted by the doorkeeper after it became warm.
+    pub doorkeeper_admissions: u64,
+    /// Doorkeeper filter rotations completed.
+    pub doorkeeper_rotations: u64,
+    /// Whether reuse-sensitive frequency admission is currently active.
+    pub frequency_gate_active: bool,
+    /// Changes between active and inactive frequency-gate states.
+    pub frequency_gate_transitions: u64,
+    /// Transitions that activated reuse-sensitive frequency admission.
+    pub frequency_gate_activations: u64,
+    /// Failed compare-and-swap attempts in the rolling reuse estimator.
+    pub rolling_estimator_cas_retries: u64,
+    /// Pressure notifications that unparked a registered maintenance worker.
+    pub maintenance_worker_wakeups: u64,
+    /// Wake-driven or periodic maintenance loop iterations.
+    pub maintenance_worker_runs: u64,
+    /// Failed maintenance or rebuild attempts observed by the worker.
+    pub maintenance_worker_failures: u64,
+    /// Whether capacity work is currently queued for the worker.
+    pub maintenance_pending: bool,
+    /// Value-allocation requests served by the direct arena.
+    pub arena_allocation_requests: u64,
+    /// Out-of-line boxed value allocations requested by prepared paths.
+    pub boxed_allocation_requests: u64,
+    /// Prepared boxed allocations reused from a reclamation pool.
+    pub recycled_box_reuses: u64,
+    /// Segmented arena blocks currently allocated.
+    pub arena_blocks: usize,
+    /// Bytes reserved by currently allocated segmented arena blocks.
+    pub arena_allocated_bytes: usize,
+    /// Occupied segmented-arena slots that are not retired.
+    pub arena_active_allocations: usize,
+    /// Bytes occupied by active segmented-arena slots.
+    pub arena_active_bytes: usize,
+    /// Immediately reusable vacant segmented-arena slots.
+    pub arena_reusable_allocations: usize,
+    /// Bytes represented by immediately reusable arena slots.
+    pub arena_reusable_bytes: usize,
+    /// Segmented arena blocks allocated over the cache lifetime.
+    pub arena_block_growths: u64,
+    /// Empty segmented arena blocks returned over the cache lifetime.
+    pub arena_block_releases: u64,
 }
 
 /// Work completed by one [`PackedCache::maintain`] call.
@@ -598,19 +720,43 @@ struct CacheCounters {
     maintenance_errors: AtomicU64,
 }
 
-#[cfg(feature = "cache-pressure-timing")]
-#[derive(Default)]
+#[cfg(feature = "cache-production-diagnostics")]
 #[repr(align(64))]
 struct DirectCacheDiagnosticCounters {
+    current_entries: AtomicUsize,
+    current_weight: AtomicU64,
+    peak_entries: AtomicUsize,
+    peak_weight: AtomicU64,
+    peak_soft_limit_overshoot_bps: AtomicU64,
+    peak_entry_debt: AtomicUsize,
+    peak_weight_debt: AtomicU64,
     foreground_capacity_enforcements: AtomicU64,
     foreground_capacity_enforcement_ns: AtomicU64,
     max_foreground_capacity_enforcement_ns: AtomicU64,
+    foreground_capacity_enforcement_histogram: [AtomicU64; u64::BITS as usize],
     background_capacity_drains: AtomicU64,
     background_capacity_drain_ns: AtomicU64,
     max_background_capacity_drain_ns: AtomicU64,
+    background_entry_debt_total: AtomicU64,
+    background_weight_debt_total: AtomicU64,
     victim_collections: AtomicU64,
     victim_collection_ns: AtomicU64,
     max_victim_collection_ns: AtomicU64,
+    victim_batches: AtomicU64,
+    victims_examined: AtomicU64,
+    victims_removed: AtomicU64,
+    max_victims_examined_per_batch: AtomicU64,
+    rejected_item_too_heavy: AtomicU64,
+    rejected_weight_not_compact: AtomicU64,
+    rejected_doorkeeper_first_sighting: AtomicU64,
+    rejected_frequency: AtomicU64,
+    doorkeeper_admissions: AtomicU64,
+    frequency_gate_state: AtomicU8,
+    frequency_gate_transitions: AtomicU64,
+    frequency_gate_activations: AtomicU64,
+    rolling_estimator_cas_retries: AtomicU64,
+    maintenance_worker_wakeups: AtomicU64,
+    maintenance_worker_runs: AtomicU64,
 }
 
 #[cfg(feature = "cache-diagnostics")]
@@ -627,17 +773,170 @@ struct DirectPressureTimingSnapshot {
     max_victim_collection_ns: u64,
 }
 
-#[cfg(feature = "cache-pressure-timing")]
+#[cfg(feature = "cache-production-diagnostics")]
 impl DirectCacheDiagnosticCounters {
+    fn new(entries: usize, weight: u64) -> Self {
+        Self {
+            current_entries: AtomicUsize::new(entries),
+            current_weight: AtomicU64::new(weight),
+            peak_entries: AtomicUsize::new(entries),
+            peak_weight: AtomicU64::new(weight),
+            peak_soft_limit_overshoot_bps: AtomicU64::new(0),
+            peak_entry_debt: AtomicUsize::new(0),
+            peak_weight_debt: AtomicU64::new(0),
+            foreground_capacity_enforcements: AtomicU64::new(0),
+            foreground_capacity_enforcement_ns: AtomicU64::new(0),
+            max_foreground_capacity_enforcement_ns: AtomicU64::new(0),
+            foreground_capacity_enforcement_histogram: std::array::from_fn(|_| AtomicU64::new(0)),
+            background_capacity_drains: AtomicU64::new(0),
+            background_capacity_drain_ns: AtomicU64::new(0),
+            max_background_capacity_drain_ns: AtomicU64::new(0),
+            background_entry_debt_total: AtomicU64::new(0),
+            background_weight_debt_total: AtomicU64::new(0),
+            victim_collections: AtomicU64::new(0),
+            victim_collection_ns: AtomicU64::new(0),
+            max_victim_collection_ns: AtomicU64::new(0),
+            victim_batches: AtomicU64::new(0),
+            victims_examined: AtomicU64::new(0),
+            victims_removed: AtomicU64::new(0),
+            max_victims_examined_per_batch: AtomicU64::new(0),
+            rejected_item_too_heavy: AtomicU64::new(0),
+            rejected_weight_not_compact: AtomicU64::new(0),
+            rejected_doorkeeper_first_sighting: AtomicU64::new(0),
+            rejected_frequency: AtomicU64::new(0),
+            doorkeeper_admissions: AtomicU64::new(0),
+            frequency_gate_state: AtomicU8::new(0),
+            frequency_gate_transitions: AtomicU64::new(0),
+            frequency_gate_activations: AtomicU64::new(0),
+            rolling_estimator_cas_retries: AtomicU64::new(0),
+            maintenance_worker_wakeups: AtomicU64::new(0),
+            maintenance_worker_runs: AtomicU64::new(0),
+        }
+    }
+
+    fn note_capacity(
+        &self,
+        entries: usize,
+        weight: u64,
+        max_entries: Option<usize>,
+        max_weight: u64,
+    ) {
+        self.peak_entries.fetch_max(entries, Ordering::Relaxed);
+        self.peak_weight.fetch_max(weight, Ordering::Relaxed);
+        let entry_debt = max_entries.map_or(0, |maximum| entries.saturating_sub(maximum));
+        let weight_debt = if max_weight == u64::MAX {
+            0
+        } else {
+            weight.saturating_sub(max_weight)
+        };
+        self.peak_entry_debt
+            .fetch_max(entry_debt, Ordering::Relaxed);
+        self.peak_weight_debt
+            .fetch_max(weight_debt, Ordering::Relaxed);
+        let entry_overshoot = max_entries.map_or(0, |maximum| {
+            u64::try_from(entry_debt)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(10_000)
+                / u64::try_from(maximum).unwrap_or(u64::MAX).max(1)
+        });
+        let weight_overshoot = if max_weight == u64::MAX {
+            0
+        } else {
+            weight_debt.saturating_mul(10_000) / max_weight.max(1)
+        };
+        self.peak_soft_limit_overshoot_bps
+            .fetch_max(entry_overshoot.max(weight_overshoot), Ordering::Relaxed);
+    }
+
+    fn add_capacity(&self, weight: u64, max_entries: Option<usize>, max_weight: u64) {
+        let entries = self
+            .current_entries
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let weight = self
+            .current_weight
+            .fetch_add(weight, Ordering::Relaxed)
+            .wrapping_add(weight);
+        // An exact index publication can race the corresponding capacity
+        // bookkeeping on another thread. The wrapping totals converge once
+        // both operations finish; never mistake that short negative delta for
+        // a physical peak.
+        if entries <= usize::try_from(isize::MAX).expect("isize maximum fits usize")
+            && weight <= u64::try_from(i64::MAX).expect("i64 maximum fits u64")
+        {
+            self.note_capacity(entries, weight, max_entries, max_weight);
+        }
+    }
+
+    fn remove_capacity(&self, weight: u64) {
+        self.current_entries.fetch_sub(1, Ordering::Relaxed);
+        self.current_weight.fetch_sub(weight, Ordering::Relaxed);
+    }
+
+    fn replace_capacity(&self, previous: u64, replacement: u64, config: &CacheConfig) {
+        let weight = if replacement >= previous {
+            self.current_weight
+                .fetch_add(replacement - previous, Ordering::Relaxed)
+                .wrapping_add(replacement - previous)
+        } else {
+            self.current_weight
+                .fetch_sub(previous - replacement, Ordering::Relaxed)
+                .wrapping_sub(previous - replacement)
+        };
+        let entries = self.current_entries.load(Ordering::Relaxed);
+        if entries <= usize::try_from(isize::MAX).expect("isize maximum fits usize")
+            && weight <= u64::try_from(i64::MAX).expect("i64 maximum fits u64")
+        {
+            self.note_capacity(entries, weight, config.max_entries, config.max_weight);
+        }
+    }
+
+    fn note_frequency_gate(&self, active: bool) {
+        let next = if active { 2 } else { 1 };
+        let previous = self.frequency_gate_state.swap(next, Ordering::Relaxed);
+        if active && previous != next {
+            self.frequency_gate_activations
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if previous != 0 && previous != next {
+            self.frequency_gate_transitions
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_victim_batch(&self, examined: usize, removed: usize) {
+        if examined == 0 {
+            return;
+        }
+        self.victim_batches.fetch_add(1, Ordering::Relaxed);
+        self.victims_examined.fetch_add(
+            u64::try_from(examined).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.victims_removed.fetch_add(
+            u64::try_from(removed).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.max_victims_examined_per_batch.fetch_max(
+            u64::try_from(examined).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    #[cfg(feature = "cache-pressure-timing")]
     fn record_foreground_capacity_enforcement(&self, started: Instant) {
-        record_diagnostic_duration(
+        let elapsed_ns = record_diagnostic_duration(
             &self.foreground_capacity_enforcements,
             &self.foreground_capacity_enforcement_ns,
             &self.max_foreground_capacity_enforcement_ns,
             started,
         );
+        let bucket = usize::try_from(u64::BITS - 1 - elapsed_ns.leading_zeros())
+            .expect("u32 histogram index fits usize");
+        self.foreground_capacity_enforcement_histogram[bucket].fetch_add(1, Ordering::Relaxed);
     }
 
+    #[cfg(feature = "cache-pressure-timing")]
     fn record_background_capacity_drain(&self, started: Instant) {
         record_diagnostic_duration(
             &self.background_capacity_drains,
@@ -647,6 +946,7 @@ impl DirectCacheDiagnosticCounters {
         );
     }
 
+    #[cfg(feature = "cache-pressure-timing")]
     fn record_victim_collection(&self, started: Instant) {
         record_diagnostic_duration(
             &self.victim_collections,
@@ -663,13 +963,37 @@ fn record_diagnostic_duration(
     total_ns: &AtomicU64,
     max_ns: &AtomicU64,
     started: Instant,
-) {
+) -> u64 {
     let elapsed_ns = u64::try_from(started.elapsed().as_nanos())
         .unwrap_or(u64::MAX)
         .max(1);
     count.fetch_add(1, Ordering::Relaxed);
     total_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
     max_ns.fetch_max(elapsed_ns, Ordering::Relaxed);
+    elapsed_ns
+}
+
+#[cfg(feature = "cache-production-diagnostics")]
+fn diagnostic_histogram_percentile(
+    histogram: &[AtomicU64; u64::BITS as usize],
+    count: u64,
+    percentile: u64,
+) -> u64 {
+    if count == 0 {
+        return 0;
+    }
+    let target = count.saturating_mul(percentile).div_ceil(100).max(1);
+    let mut cumulative = 0_u64;
+    for (bucket, samples) in histogram.iter().enumerate() {
+        cumulative = cumulative.saturating_add(samples.load(Ordering::Relaxed));
+        if cumulative >= target {
+            let upper_bit = u32::try_from(bucket + 1).expect("histogram bucket fits u32");
+            return 1_u64
+                .checked_shl(upper_bit)
+                .map_or(u64::MAX, |upper| upper - 1);
+        }
+    }
+    u64::MAX
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -743,7 +1067,7 @@ pub struct DirectPackedCache<V> {
     frequency_reuse: AtomicU64,
     expiration_possible: AtomicBool,
     mutation_stripes: Box<[Mutex<()>]>,
-    #[cfg(feature = "cache-pressure-timing")]
+    #[cfg(feature = "cache-production-diagnostics")]
     diagnostics: Box<DirectCacheDiagnosticCounters>,
 }
 
@@ -1116,6 +1440,15 @@ struct DirectAdmissionDoorkeeper {
     warmed: AtomicBool,
     admitted: AtomicUsize,
     expected_entries: usize,
+    #[cfg(feature = "cache-production-diagnostics")]
+    rotations: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectAdmissionDecision {
+    Admit,
+    RejectFirstSighting,
+    RejectFrequency,
 }
 
 impl DirectAdmissionDoorkeeper {
@@ -1157,6 +1490,8 @@ impl DirectAdmissionDoorkeeper {
             warmed: AtomicBool::new(false),
             admitted: AtomicUsize::new(0),
             expected_entries,
+            #[cfg(feature = "cache-production-diagnostics")]
+            rotations: AtomicU64::new(0),
         }
     }
 
@@ -1173,6 +1508,8 @@ impl DirectAdmissionDoorkeeper {
                 word.store(0, Ordering::Relaxed);
             }
             self.current.store(next, Ordering::Release);
+            #[cfg(feature = "cache-production-diagnostics")]
+            self.rotations.fetch_add(1, Ordering::Relaxed);
         }
         let current = self.current.load(Ordering::Acquire);
         let previous = 1 - current;
@@ -1189,16 +1526,30 @@ impl DirectAdmissionDoorkeeper {
         (seen, frequency)
     }
 
-    fn should_admit(&self, key: &[u8], enforce_frequency: bool) -> bool {
+    fn admission_decision(&self, key: &[u8], enforce_frequency: bool) -> DirectAdmissionDecision {
         let (seen, frequency) = self.observe(key, enforce_frequency);
-        !self.warmed.load(Ordering::Acquire)
-            || (seen
-                && (!enforce_frequency
-                    || frequency.is_none_or(|frequency| {
-                        self.frequency
-                            .as_ref()
-                            .is_none_or(|sketch| sketch.admits(frequency))
-                    })))
+        if !self.warmed.load(Ordering::Acquire) {
+            return DirectAdmissionDecision::Admit;
+        }
+        if !seen {
+            return DirectAdmissionDecision::RejectFirstSighting;
+        }
+        if enforce_frequency
+            && frequency.is_some_and(|frequency| {
+                self.frequency
+                    .as_ref()
+                    .is_some_and(|sketch| !sketch.admits(frequency))
+            })
+        {
+            DirectAdmissionDecision::RejectFrequency
+        } else {
+            DirectAdmissionDecision::Admit
+        }
+    }
+
+    #[cfg(feature = "cache-production-diagnostics")]
+    fn rotations(&self) -> u64 {
+        self.rotations.load(Ordering::Relaxed)
     }
 
     fn victim_frequency(&self, key: &[u8]) -> u8 {
@@ -3985,8 +4336,8 @@ impl<V> DirectPackedCache<V> {
             mutation_stripes: std::iter::repeat_with(|| Mutex::new(()))
                 .take(MUTATION_STRIPES)
                 .collect(),
-            #[cfg(feature = "cache-pressure-timing")]
-            diagnostics: Box::default(),
+            #[cfg(feature = "cache-production-diagnostics")]
+            diagnostics: Box::new(DirectCacheDiagnosticCounters::new(0, 0)),
         })
     }
 
@@ -4107,8 +4458,11 @@ impl<V> DirectPackedCache<V> {
             frequency_reuse: AtomicU64::new(0),
             expiration_possible: AtomicBool::new(expiration_possible),
             mutation_stripes,
-            #[cfg(feature = "cache-pressure-timing")]
-            diagnostics: Box::default(),
+            #[cfg(feature = "cache-production-diagnostics")]
+            diagnostics: Box::new(DirectCacheDiagnosticCounters::new(
+                entry_count,
+                total_weight,
+            )),
         })
     }
 
@@ -4921,6 +5275,7 @@ impl<V> DirectPackedCache<V> {
             current_epoch: snapshot.current_epoch,
             readers: snapshot.readers,
             retired_values: snapshot.retired_values,
+            retired_bytes: snapshot.retired_bytes,
             published_retired_values: snapshot.published_retired_values,
             recyclable_allocations: snapshot.recyclable_allocations,
             foreground_capacity_enforcements: pressure.foreground_capacity_enforcements,
@@ -4932,6 +5287,195 @@ impl<V> DirectPackedCache<V> {
             victim_collections: pressure.victim_collections,
             victim_collection_ns: pressure.victim_collection_ns,
             max_victim_collection_ns: pressure.max_victim_collection_ns,
+        }
+    }
+
+    /// Captures feature-gated capacity, policy, maintenance, and arena telemetry.
+    ///
+    /// The snapshot takes the same cold retirement and arena locks as
+    /// [`Self::reclamation_stats`]. Do not call it from a request hot path.
+    #[cfg(feature = "cache-production-diagnostics")]
+    #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one explicit snapshot initializer keeps every public counter auditable"
+    )]
+    pub fn production_diagnostics(&self) -> DirectCacheProductionStats {
+        let arena = self.arena.production_snapshot();
+        let current_entries = self.len();
+        let current_weight = self.weight();
+        let current_entry_debt = self
+            .config
+            .max_entries
+            .map_or(0, |maximum| current_entries.saturating_sub(maximum));
+        let current_weight_debt = if self.config.max_weight == u64::MAX {
+            0
+        } else {
+            current_weight.saturating_sub(self.config.max_weight)
+        };
+        let current_entry_overshoot = self.config.max_entries.map_or(0, |maximum| {
+            u64::try_from(current_entry_debt)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(10_000)
+                / u64::try_from(maximum).unwrap_or(u64::MAX).max(1)
+        });
+        let current_weight_overshoot = if self.config.max_weight == u64::MAX {
+            0
+        } else {
+            current_weight_debt.saturating_mul(10_000) / self.config.max_weight.max(1)
+        };
+        let foreground_count = self
+            .diagnostics
+            .foreground_capacity_enforcements
+            .load(Ordering::Relaxed);
+        let foreground_max = self
+            .diagnostics
+            .max_foreground_capacity_enforcement_ns
+            .load(Ordering::Relaxed);
+        let maintenance_worker_failures = self.counters.iter().fold(0_u64, |total, counters| {
+            total.saturating_add(counters.maintenance_errors.load(Ordering::Relaxed))
+        });
+        DirectCacheProductionStats {
+            current_entries,
+            current_weight,
+            peak_entries: self
+                .diagnostics
+                .peak_entries
+                .load(Ordering::Relaxed)
+                .max(current_entries),
+            peak_weight: self
+                .diagnostics
+                .peak_weight
+                .load(Ordering::Relaxed)
+                .max(current_weight),
+            peak_soft_limit_overshoot_bps: self
+                .diagnostics
+                .peak_soft_limit_overshoot_bps
+                .load(Ordering::Relaxed)
+                .max(current_entry_overshoot.max(current_weight_overshoot)),
+            current_entry_debt,
+            current_weight_debt,
+            peak_entry_debt: self
+                .diagnostics
+                .peak_entry_debt
+                .load(Ordering::Relaxed)
+                .max(current_entry_debt),
+            peak_weight_debt: self
+                .diagnostics
+                .peak_weight_debt
+                .load(Ordering::Relaxed)
+                .max(current_weight_debt),
+            retired_entries: arena.retired_values,
+            retired_bytes: arena.retired_bytes,
+            peak_retired_entries: arena.peak_retired_values,
+            peak_retired_bytes: arena.peak_retired_bytes,
+            foreground_hard_limit_enforcements: foreground_count,
+            foreground_hard_limit_total_ns: self
+                .diagnostics
+                .foreground_capacity_enforcement_ns
+                .load(Ordering::Relaxed),
+            foreground_hard_limit_p99_ns: diagnostic_histogram_percentile(
+                &self.diagnostics.foreground_capacity_enforcement_histogram,
+                foreground_count,
+                99,
+            )
+            .min(foreground_max),
+            foreground_hard_limit_max_ns: foreground_max,
+            background_drains: self
+                .diagnostics
+                .background_capacity_drains
+                .load(Ordering::Relaxed),
+            background_drain_total_ns: self
+                .diagnostics
+                .background_capacity_drain_ns
+                .load(Ordering::Relaxed),
+            background_drain_max_ns: self
+                .diagnostics
+                .max_background_capacity_drain_ns
+                .load(Ordering::Relaxed),
+            background_entry_debt_total: self
+                .diagnostics
+                .background_entry_debt_total
+                .load(Ordering::Relaxed),
+            background_weight_debt_total: self
+                .diagnostics
+                .background_weight_debt_total
+                .load(Ordering::Relaxed),
+            victim_batches: self.diagnostics.victim_batches.load(Ordering::Relaxed),
+            victims_examined: self.diagnostics.victims_examined.load(Ordering::Relaxed),
+            victims_removed: self.diagnostics.victims_removed.load(Ordering::Relaxed),
+            max_victims_examined_per_batch: self
+                .diagnostics
+                .max_victims_examined_per_batch
+                .load(Ordering::Relaxed),
+            native_victim_collections: self.diagnostics.victim_collections.load(Ordering::Relaxed),
+            native_victim_collection_total_ns: self
+                .diagnostics
+                .victim_collection_ns
+                .load(Ordering::Relaxed),
+            native_victim_collection_max_ns: self
+                .diagnostics
+                .max_victim_collection_ns
+                .load(Ordering::Relaxed),
+            rejected_item_too_heavy: self
+                .diagnostics
+                .rejected_item_too_heavy
+                .load(Ordering::Relaxed),
+            rejected_weight_not_compact: self
+                .diagnostics
+                .rejected_weight_not_compact
+                .load(Ordering::Relaxed),
+            rejected_doorkeeper_first_sighting: self
+                .diagnostics
+                .rejected_doorkeeper_first_sighting
+                .load(Ordering::Relaxed),
+            rejected_frequency: self.diagnostics.rejected_frequency.load(Ordering::Relaxed),
+            doorkeeper_admissions: self
+                .diagnostics
+                .doorkeeper_admissions
+                .load(Ordering::Relaxed),
+            doorkeeper_rotations: self
+                .admission_doorkeeper
+                .as_ref()
+                .map_or(0, DirectAdmissionDoorkeeper::rotations),
+            frequency_gate_active: self
+                .diagnostics
+                .frequency_gate_state
+                .load(Ordering::Relaxed)
+                == 2,
+            frequency_gate_transitions: self
+                .diagnostics
+                .frequency_gate_transitions
+                .load(Ordering::Relaxed),
+            frequency_gate_activations: self
+                .diagnostics
+                .frequency_gate_activations
+                .load(Ordering::Relaxed),
+            rolling_estimator_cas_retries: self
+                .diagnostics
+                .rolling_estimator_cas_retries
+                .load(Ordering::Relaxed),
+            maintenance_worker_wakeups: self
+                .diagnostics
+                .maintenance_worker_wakeups
+                .load(Ordering::Relaxed),
+            maintenance_worker_runs: self
+                .diagnostics
+                .maintenance_worker_runs
+                .load(Ordering::Relaxed),
+            maintenance_worker_failures,
+            maintenance_pending: self.maintenance_pending.load(Ordering::Acquire),
+            arena_allocation_requests: arena.allocation_requests,
+            boxed_allocation_requests: arena.boxed_allocation_requests,
+            recycled_box_reuses: arena.recycled_box_reuses,
+            arena_blocks: arena.blocks,
+            arena_allocated_bytes: arena.allocated_bytes,
+            arena_active_allocations: arena.active_allocations,
+            arena_active_bytes: arena.active_bytes,
+            arena_reusable_allocations: arena.reusable_allocations,
+            arena_reusable_bytes: arena.reusable_bytes,
+            arena_block_growths: arena.block_growths,
+            arena_block_releases: arena.block_releases,
         }
     }
 
@@ -5030,6 +5574,11 @@ impl<V> DirectPackedCache<V> {
         let join = thread::spawn(move || {
             let mut next_full = Instant::now() + interval;
             while !worker_stop.load(Ordering::Acquire) {
+                #[cfg(feature = "cache-production-diagnostics")]
+                cache
+                    .diagnostics
+                    .maintenance_worker_runs
+                    .fetch_add(1, Ordering::Relaxed);
                 let removed = cache.drain_capacity();
                 if cache.rebuild_capacity_pressure().is_err() {
                     cache
@@ -5264,11 +5813,30 @@ impl<V> DirectPackedCache<V> {
 
     fn admission_precheck(&self, key: &[u8]) -> Option<CacheAdmissionOutcome> {
         let doorkeeper = self.admission_doorkeeper.as_ref()?;
-        if doorkeeper.should_admit(key, self.frequency_admission_active()) {
+        let decision = doorkeeper.admission_decision(key, self.frequency_admission_active());
+        if decision == DirectAdmissionDecision::Admit {
+            #[cfg(feature = "cache-production-diagnostics")]
+            self.diagnostics
+                .doorkeeper_admissions
+                .fetch_add(1, Ordering::Relaxed);
             return None;
         }
         if self.index.get(key).is_some() {
             return Some(CacheAdmissionOutcome::Existing);
+        }
+        #[cfg(feature = "cache-production-diagnostics")]
+        match decision {
+            DirectAdmissionDecision::RejectFirstSighting => {
+                self.diagnostics
+                    .rejected_doorkeeper_first_sighting
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            DirectAdmissionDecision::RejectFrequency => {
+                self.diagnostics
+                    .rejected_frequency
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            DirectAdmissionDecision::Admit => unreachable!("admitted candidates returned above"),
         }
         self.counters_for(key)
             .rejected
@@ -5283,10 +5851,15 @@ impl<V> DirectPackedCache<V> {
     }
 
     fn frequency_admission_active(&self) -> bool {
-        let Some(minimum_hit_rate) = self.config.frequency_admission_min_hit_rate_bps else {
-            return true;
-        };
-        self.frequency_hit_rate_at_least(minimum_hit_rate)
+        let active =
+            if let Some(minimum_hit_rate) = self.config.frequency_admission_min_hit_rate_bps {
+                self.frequency_hit_rate_at_least(minimum_hit_rate)
+            } else {
+                true
+            };
+        #[cfg(feature = "cache-production-diagnostics")]
+        self.diagnostics.note_frequency_gate(active);
+        active
     }
 
     fn frequency_victim_gate(&self) -> u8 {
@@ -5348,13 +5921,23 @@ impl<V> DirectPackedCache<V> {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => return,
-                Err(current) => previous = current,
+                Err(current) => {
+                    #[cfg(feature = "cache-production-diagnostics")]
+                    self.diagnostics
+                        .rolling_estimator_cas_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    previous = current;
+                }
             }
         }
     }
 
     fn validate_weight(&self, key: &[u8], weight: u64) -> Result<u32, CacheInsertError> {
         if weight > self.config.max_weight {
+            #[cfg(feature = "cache-production-diagnostics")]
+            self.diagnostics
+                .rejected_item_too_heavy
+                .fetch_add(1, Ordering::Relaxed);
             self.counters_for(key)
                 .rejected
                 .fetch_add(1, Ordering::Relaxed);
@@ -5364,6 +5947,10 @@ impl<V> DirectPackedCache<V> {
             });
         }
         u32::try_from(weight).map_err(|_| {
+            #[cfg(feature = "cache-production-diagnostics")]
+            self.diagnostics
+                .rejected_weight_not_compact
+                .fetch_add(1, Ordering::Relaxed);
             self.counters_for(key)
                 .rejected
                 .fetch_add(1, Ordering::Relaxed);
@@ -5372,6 +5959,12 @@ impl<V> DirectPackedCache<V> {
     }
 
     fn add_capacity(&self, key: &[u8], weight: u32) {
+        #[cfg(feature = "cache-production-diagnostics")]
+        self.diagnostics.add_capacity(
+            u64::from(weight),
+            self.config.max_entries,
+            self.config.max_weight,
+        );
         let counters = self.capacity_for(key);
         if let Some(share) = self.entry_fair_share() {
             let previous_entries = counters.entries.fetch_add(1, Ordering::Relaxed);
@@ -5395,6 +5988,8 @@ impl<V> DirectPackedCache<V> {
     }
 
     fn remove_capacity_from_shard(&self, shard: usize, weight: u64) {
+        #[cfg(feature = "cache-production-diagnostics")]
+        self.diagnostics.remove_capacity(weight);
         let counters = &self.capacity[shard];
         if let Some(share) = self.entry_fair_share() {
             let previous_entries = counters.entries.fetch_sub(1, Ordering::Relaxed);
@@ -5411,6 +6006,9 @@ impl<V> DirectPackedCache<V> {
     }
 
     fn replace_capacity(&self, key: &[u8], previous: u64, replacement: u64) {
+        #[cfg(feature = "cache-production-diagnostics")]
+        self.diagnostics
+            .replace_capacity(previous, replacement, &self.config);
         let Some(share) = self.weight_fair_share() else {
             return;
         };
@@ -5456,6 +6054,10 @@ impl<V> DirectPackedCache<V> {
             if !self.maintenance_pending.swap(true, Ordering::AcqRel)
                 && let Some(worker) = self.maintenance_worker.load_full()
             {
+                #[cfg(feature = "cache-production-diagnostics")]
+                self.diagnostics
+                    .maintenance_worker_wakeups
+                    .fetch_add(1, Ordering::Relaxed);
                 worker.unpark();
             }
             if !self.over_hard_limit() {
@@ -5488,11 +6090,39 @@ impl<V> DirectPackedCache<V> {
         #[cfg(feature = "cache-pressure-timing")]
         self.diagnostics
             .record_foreground_capacity_enforcement(started);
+        #[cfg(all(
+            feature = "cache-production-diagnostics",
+            not(feature = "cache-pressure-timing")
+        ))]
+        self.diagnostics
+            .foreground_capacity_enforcements
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn drain_capacity(&self) -> usize {
         if !self.over_limit() {
             return 0;
+        }
+        #[cfg(feature = "cache-production-diagnostics")]
+        {
+            let entries = self.len();
+            let weight = self.weight();
+            let entry_debt = self
+                .config
+                .max_entries
+                .map_or(0, |maximum| entries.saturating_sub(maximum));
+            let weight_debt = if self.config.max_weight == u64::MAX {
+                0
+            } else {
+                weight.saturating_sub(self.config.max_weight)
+            };
+            self.diagnostics.background_entry_debt_total.fetch_add(
+                u64::try_from(entry_debt).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            self.diagnostics
+                .background_weight_debt_total
+                .fetch_add(weight_debt, Ordering::Relaxed);
         }
         #[cfg(feature = "cache-pressure-timing")]
         let started = Instant::now();
@@ -5500,6 +6130,13 @@ impl<V> DirectPackedCache<V> {
         let removed = self.evict_to_limits_locked(self.now(), None, None);
         #[cfg(feature = "cache-pressure-timing")]
         self.diagnostics.record_background_capacity_drain(started);
+        #[cfg(all(
+            feature = "cache-production-diagnostics",
+            not(feature = "cache-pressure-timing")
+        ))]
+        self.diagnostics
+            .background_capacity_drains
+            .fetch_add(1, Ordering::Relaxed);
         removed
     }
 
@@ -5586,7 +6223,12 @@ impl<V> DirectPackedCache<V> {
             requested_removal_target.unwrap_or_else(|| self.proactive_eviction_target())
         };
         if !expired_only {
-            let removed = self.remove_reservoir_victims(&pin, now, protected, removal_target);
+            let reservoir_result =
+                self.remove_reservoir_victims(&pin, now, protected, removal_target);
+            let removed = reservoir_result.0;
+            #[cfg(feature = "cache-production-diagnostics")]
+            self.diagnostics
+                .record_victim_batch(reservoir_result.1, removed);
             if removed != 0 || !self.over_limit() {
                 return removed;
             }
@@ -5597,9 +6239,18 @@ impl<V> DirectPackedCache<V> {
         #[cfg(feature = "cache-pressure-timing")]
         self.diagnostics
             .record_victim_collection(collection_started);
+        #[cfg(all(
+            feature = "cache-production-diagnostics",
+            not(feature = "cache-pressure-timing")
+        ))]
+        self.diagnostics
+            .victim_collections
+            .fetch_add(1, Ordering::Relaxed);
         if batch.is_empty() {
             return 0;
         }
+        #[cfg(feature = "cache-production-diagnostics")]
+        let examined = batch.victims.len();
         batch.victims.sort_unstable_by_key(|victim| {
             (
                 u8::from(!victim.expired),
@@ -5648,6 +6299,8 @@ impl<V> DirectPackedCache<V> {
                 break;
             }
         }
+        #[cfg(feature = "cache-production-diagnostics")]
+        self.diagnostics.record_victim_batch(examined, removed);
         removed
     }
 
@@ -5974,8 +6627,9 @@ impl<V> DirectPackedCache<V> {
         now: u64,
         protected: Option<DirectHandle>,
         removal_target: usize,
-    ) -> usize {
+    ) -> (usize, usize) {
         let mut removed = 0;
+        let mut examined = 0;
         let mut reservoir = std::mem::take(&mut *self.victim_reservoir.lock());
         while removed < removal_target {
             while reservoir
@@ -5989,6 +6643,7 @@ impl<V> DirectPackedCache<V> {
             };
             let victim_index = batch.next;
             batch.next += 1;
+            examined += 1;
             let key = batch.key(victim_index);
             let Some(raw) = self.index.get_protected(key) else {
                 continue;
@@ -6038,7 +6693,7 @@ impl<V> DirectPackedCache<V> {
             reservoir.pop();
         }
         self.victim_reservoir.lock().extend(reservoir);
-        removed
+        (removed, examined)
     }
 
     fn over_limit(&self) -> bool {

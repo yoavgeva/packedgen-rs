@@ -5,6 +5,8 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "cache-production-diagnostics")]
+use packedgen::CacheInsertError;
 use packedgen::{
     CacheAdmissionOutcome, CacheBuildError, CacheConfig, CacheConfigError, CacheWriteOutcome,
     DirectPackedCache, FrozenBuildError,
@@ -402,6 +404,13 @@ fn adaptive_frequency_admission_activates_after_reuse() {
             .unwrap(),
         CacheAdmissionOutcome::Rejected
     );
+    #[cfg(feature = "cache-production-diagnostics")]
+    {
+        let diagnostics = cache.production_diagnostics();
+        assert!(diagnostics.frequency_gate_active);
+        assert!(diagnostics.frequency_gate_activations >= 1);
+        assert!(diagnostics.frequency_gate_transitions >= 1);
+    }
 }
 
 #[test]
@@ -2092,6 +2101,113 @@ fn diagnostics_attribute_foreground_hard_limit_eviction() {
     assert_eq!(diagnostics.background_capacity_drains, 0);
 }
 
+#[cfg(feature = "cache-production-diagnostics")]
+#[test]
+fn production_diagnostics_capture_capacity_debt_and_admission_reasons() {
+    const CAPACITY: usize = 128;
+    let cache = DirectPackedCache::try_new(
+        CacheConfig::new(u64::MAX)
+            .with_max_entries(CAPACITY)
+            .with_overlay_capacity(512)
+            .with_async_eviction(12_000)
+            .with_admission_doorkeeper(CAPACITY),
+    )
+    .unwrap();
+
+    for key in 0_u64..CAPACITY as u64 {
+        assert_eq!(
+            cache
+                .insert_if_absent_with_options(&key.to_le_bytes(), vec![0; 8], 1, None)
+                .unwrap(),
+            CacheAdmissionOutcome::Inserted
+        );
+    }
+    assert_eq!(
+        cache
+            .insert_if_absent_with_options(b"one-off", vec![1; 8], 1, None)
+            .unwrap(),
+        CacheAdmissionOutcome::Rejected
+    );
+    for key in CAPACITY as u64..CAPACITY as u64 + 24 {
+        cache
+            .insert_discard_with_options(&key.to_le_bytes(), vec![2; 8], 1, None)
+            .unwrap();
+    }
+
+    let diagnostics = cache.production_diagnostics();
+    assert_eq!(diagnostics.current_entries, cache.len());
+    assert_eq!(diagnostics.current_weight, cache.weight());
+    assert!(diagnostics.peak_entries >= diagnostics.current_entries);
+    assert!(diagnostics.peak_entries > CAPACITY);
+    assert!(diagnostics.peak_entry_debt > 0);
+    assert!(diagnostics.peak_soft_limit_overshoot_bps > 0);
+    assert_eq!(diagnostics.rejected_doorkeeper_first_sighting, 1);
+    assert_eq!(diagnostics.rejected_frequency, 0);
+    assert!(diagnostics.doorkeeper_rotations >= 1);
+    assert!(diagnostics.arena_allocation_requests >= CAPACITY as u64 + 24);
+    assert!(diagnostics.arena_blocks > 0);
+    assert!(diagnostics.arena_allocated_bytes > 0);
+}
+
+#[cfg(feature = "cache-production-diagnostics")]
+#[test]
+fn production_diagnostics_capture_retired_weight_and_size_rejections() {
+    let cache = DirectPackedCache::try_new(
+        CacheConfig::new(16)
+            .with_max_entries(16)
+            .with_overlay_capacity(64),
+    )
+    .unwrap();
+    cache
+        .insert_discard_with_options(b"key", vec![1; 7], 7, None)
+        .unwrap();
+    let held = cache.get(b"key").unwrap();
+    cache
+        .insert_discard_with_options(b"key", vec![2; 9], 9, None)
+        .unwrap();
+    assert!(matches!(
+        cache.insert_discard_with_options(b"large", vec![0; 17], 17, None),
+        Err(CacheInsertError::ItemTooHeavy { .. })
+    ));
+
+    let diagnostics = cache.production_diagnostics();
+    assert_eq!(diagnostics.retired_entries, 1);
+    assert_eq!(diagnostics.retired_bytes, 7);
+    assert!(diagnostics.peak_retired_entries >= 1);
+    assert!(diagnostics.peak_retired_bytes >= 7);
+    assert_eq!(diagnostics.rejected_item_too_heavy, 1);
+    assert_eq!(diagnostics.arena_active_allocations, 0);
+    drop(held);
+}
+
+#[cfg(feature = "cache-pressure-timing")]
+#[test]
+fn production_diagnostics_report_enforcement_percentiles_and_eviction_work() {
+    const CAPACITY: usize = 64;
+    let cache = DirectPackedCache::try_new(
+        CacheConfig::new(u64::MAX)
+            .with_max_entries(CAPACITY)
+            .with_overlay_capacity(256)
+            .with_async_eviction(11_000),
+    )
+    .unwrap();
+
+    for key in 0_u64..96 {
+        cache
+            .insert_discard_with_options(&key.to_le_bytes(), vec![0; 8], 1, None)
+            .unwrap();
+    }
+
+    let diagnostics = cache.production_diagnostics();
+    assert!(diagnostics.foreground_hard_limit_enforcements > 0);
+    assert!(diagnostics.foreground_hard_limit_total_ns > 0);
+    assert!(diagnostics.foreground_hard_limit_p99_ns > 0);
+    assert!(diagnostics.foreground_hard_limit_max_ns >= diagnostics.foreground_hard_limit_p99_ns);
+    assert!(diagnostics.victim_batches > 0);
+    assert!(diagnostics.victims_examined >= diagnostics.victims_removed);
+    assert!(diagnostics.max_victims_examined_per_batch > 0);
+}
+
 #[cfg(all(feature = "cache-diagnostics", not(feature = "cache-pressure-timing")))]
 #[test]
 fn pressure_timing_is_opt_in() {
@@ -2208,6 +2324,12 @@ fn diagnostics_attribute_background_capacity_drain() {
     assert!(diagnostics.background_capacity_drains > 0);
     assert!(diagnostics.background_capacity_drain_ns > 0);
     assert!(diagnostics.max_background_capacity_drain_ns > 0);
+    let production = cache.production_diagnostics();
+    assert!(production.background_drains > 0);
+    assert!(production.background_entry_debt_total > 0);
+    assert!(production.maintenance_worker_wakeups > 0);
+    assert!(production.maintenance_worker_runs > 0);
+    assert!(!production.maintenance_pending);
 }
 
 #[test]

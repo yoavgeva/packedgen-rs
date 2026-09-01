@@ -46,6 +46,8 @@ pub use atomic_value::{NonMaxU64, NonMaxU64Error};
 pub use bucket_map::{BucketBuildError, BucketMapError, BucketMapStats, BucketPackedMap};
 #[cfg(feature = "prepared-keys")]
 pub use cache::DirectCachePreparedReplacementBatch;
+#[cfg(feature = "cache-production-diagnostics")]
+pub use cache::DirectCacheProductionStats;
 #[cfg(feature = "cache-diagnostics")]
 pub use cache::DirectCacheReclamationStats;
 pub use cache::{

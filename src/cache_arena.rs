@@ -561,8 +561,30 @@ pub(crate) struct DirectArenaReclamationSnapshot {
     pub(crate) current_epoch: usize,
     pub(crate) readers: [usize; DIRECT_EPOCHS],
     pub(crate) retired_values: usize,
+    pub(crate) retired_bytes: u64,
+    #[cfg(feature = "cache-production-diagnostics")]
+    pub(crate) retired_arena_values: usize,
     pub(crate) published_retired_values: usize,
     pub(crate) recyclable_allocations: usize,
+}
+
+#[cfg(feature = "cache-production-diagnostics")]
+pub(crate) struct DirectArenaProductionSnapshot {
+    pub(crate) retired_values: usize,
+    pub(crate) retired_bytes: u64,
+    pub(crate) peak_retired_values: usize,
+    pub(crate) peak_retired_bytes: u64,
+    pub(crate) allocation_requests: u64,
+    pub(crate) boxed_allocation_requests: u64,
+    pub(crate) recycled_box_reuses: u64,
+    pub(crate) blocks: usize,
+    pub(crate) allocated_bytes: usize,
+    pub(crate) active_allocations: usize,
+    pub(crate) active_bytes: usize,
+    pub(crate) reusable_allocations: usize,
+    pub(crate) reusable_bytes: usize,
+    pub(crate) block_growths: u64,
+    pub(crate) block_releases: u64,
 }
 
 pub(crate) struct DirectArenaReservation<'arena, V> {
@@ -615,6 +637,10 @@ impl<V> DirectValueArena<V> {
         reason = "initializes one uniquely reserved direct-arena allocation"
     )]
     pub(crate) fn allocate(&self, value: V, weight: u32, expires_at: u64) -> DirectHandle {
+        #[cfg(feature = "cache-production-diagnostics")]
+        self.owner
+            .allocation_requests
+            .fetch_add(1, Ordering::Relaxed);
         let pointer = self.owner.state.allocate();
         // SAFETY: allocate returns a unique uninitialized or epoch-reclaimed
         // slot that cannot be observed until the returned handle is published.
@@ -628,6 +654,10 @@ impl<V> DirectValueArena<V> {
 
     #[allow(clippy::unused_self)]
     pub(crate) fn allocate_boxed(&self, value: V, weight: u32, expires_at: u64) -> DirectHandle {
+        #[cfg(feature = "cache-production-diagnostics")]
+        self.owner
+            .boxed_allocation_requests
+            .fetch_add(1, Ordering::Relaxed);
         DirectHandle::from_boxed_pointer(Box::into_raw(Box::new(DirectArenaEntry::new(
             value, weight, expires_at,
         ))))
@@ -734,6 +764,11 @@ impl<V> DirectValueArena<V> {
     pub(crate) fn reclamation_snapshot(&self) -> DirectArenaReclamationSnapshot {
         self.owner.reclamation_snapshot()
     }
+
+    #[cfg(feature = "cache-production-diagnostics")]
+    pub(crate) fn production_snapshot(&self) -> DirectArenaProductionSnapshot {
+        self.owner.production_snapshot()
+    }
 }
 
 impl<V> DirectArenaReservation<'_, V> {
@@ -742,6 +777,11 @@ impl<V> DirectArenaReservation<'_, V> {
         reason = "initializes one uniquely reserved direct-arena slot"
     )]
     pub(crate) fn allocate(&mut self, value: V, weight: u32, expires_at: u64) -> DirectHandle {
+        #[cfg(feature = "cache-production-diagnostics")]
+        self.arena
+            .owner
+            .allocation_requests
+            .fetch_add(1, Ordering::Relaxed);
         if self.next == self.len {
             self.arena.owner.state.reserve(&mut self.pointers);
             self.next = 0;
@@ -1400,6 +1440,7 @@ impl<V> DirectArenaPartition<V> {
         entries: &[(usize, usize)],
         block_lookup: &DirectBlockLookup,
         availability: &[AtomicU64],
+        #[cfg(feature = "cache-production-diagnostics")] block_releases: &AtomicU64,
     ) {
         let mut state = self.state.lock();
         let was_available = !state.reclaimed.is_empty();
@@ -1482,6 +1523,11 @@ impl<V> DirectArenaPartition<V> {
         if was_available != is_available {
             direct_mark_partition_available(availability, partition_index, is_available);
         }
+        #[cfg(feature = "cache-production-diagnostics")]
+        block_releases.fetch_add(
+            u64::try_from(removed.len()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         drop(state);
         drop(removed);
     }
@@ -1498,6 +1544,7 @@ impl<V> DirectArenaPartition<V> {
         offset: usize,
         block_lookup: &DirectBlockLookup,
         availability: &[AtomicU64],
+        #[cfg(feature = "cache-production-diagnostics")] block_releases: &AtomicU64,
     ) {
         let mut state = self.state.lock();
         let was_available = !state.reclaimed.is_empty();
@@ -1548,6 +1595,8 @@ impl<V> DirectArenaPartition<V> {
             .blocks
             .remove(&start)
             .expect("empty direct block remains registered");
+        #[cfg(feature = "cache-production-diagnostics")]
+        block_releases.fetch_add(1, Ordering::Relaxed);
         block_lookup.unregister(
             start,
             std::mem::size_of::<DirectArenaEntry<V>>() * DIRECT_BLOCK_SIZE,
@@ -1565,6 +1614,8 @@ struct DirectArenaState<V> {
     partitions: Box<[DirectArenaPartition<V>]>,
     availability: Box<[AtomicU64]>,
     block_lookup: DirectBlockLookup,
+    #[cfg(feature = "cache-production-diagnostics")]
+    block_releases: AtomicU64,
 }
 
 struct DirectUnwindReleaseGuard<'a, V> {
@@ -1623,6 +1674,8 @@ impl<V> Drop for DirectSingleReleaseGuard<'_, V> {
             self.offset,
             &self.state.block_lookup,
             &self.state.availability,
+            #[cfg(feature = "cache-production-diagnostics")]
+            &self.state.block_releases,
         );
     }
 }
@@ -1798,6 +1851,20 @@ struct DirectArenaOwner<V> {
     retired_count: [AtomicUsize; DIRECT_EPOCHS],
     #[cfg(feature = "prepared-keys")]
     recycled_boxes: OnceLock<Box<[Mutex<Vec<DirectHandle>>]>>,
+    #[cfg(feature = "cache-production-diagnostics")]
+    allocation_requests: AtomicU64,
+    #[cfg(feature = "cache-production-diagnostics")]
+    boxed_allocation_requests: AtomicU64,
+    #[cfg(feature = "cache-production-diagnostics")]
+    recycled_box_reuses: AtomicU64,
+    #[cfg(feature = "cache-production-diagnostics")]
+    current_retired_values: AtomicUsize,
+    #[cfg(feature = "cache-production-diagnostics")]
+    current_retired_bytes: AtomicU64,
+    #[cfg(feature = "cache-production-diagnostics")]
+    peak_retired_values: AtomicUsize,
+    #[cfg(feature = "cache-production-diagnostics")]
+    peak_retired_bytes: AtomicU64,
     reclaim_gate: Mutex<()>,
 }
 
@@ -1814,19 +1881,80 @@ impl<V> DirectArenaOwner<V> {
             retired_count: std::array::from_fn(|_| AtomicUsize::new(0)),
             #[cfg(feature = "prepared-keys")]
             recycled_boxes: OnceLock::new(),
+            #[cfg(feature = "cache-production-diagnostics")]
+            allocation_requests: AtomicU64::new(0),
+            #[cfg(feature = "cache-production-diagnostics")]
+            boxed_allocation_requests: AtomicU64::new(0),
+            #[cfg(feature = "cache-production-diagnostics")]
+            recycled_box_reuses: AtomicU64::new(0),
+            #[cfg(feature = "cache-production-diagnostics")]
+            current_retired_values: AtomicUsize::new(0),
+            #[cfg(feature = "cache-production-diagnostics")]
+            current_retired_bytes: AtomicU64::new(0),
+            #[cfg(feature = "cache-production-diagnostics")]
+            peak_retired_values: AtomicUsize::new(0),
+            #[cfg(feature = "cache-production-diagnostics")]
+            peak_retired_bytes: AtomicU64::new(0),
             reclaim_gate: Mutex::new(()),
         }
     }
 
+    #[cfg(feature = "cache-production-diagnostics")]
+    fn note_retired(&self, entries: usize, bytes: u64) {
+        let current_entries = self
+            .current_retired_values
+            .fetch_add(entries, Ordering::Relaxed)
+            .saturating_add(entries);
+        let current_bytes = self
+            .current_retired_bytes
+            .fetch_add(bytes, Ordering::Relaxed)
+            .saturating_add(bytes);
+        self.peak_retired_values
+            .fetch_max(current_entries, Ordering::Relaxed);
+        self.peak_retired_bytes
+            .fetch_max(current_bytes, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "cache-production-diagnostics")]
+    fn note_reclaimed(&self, entries: usize, bytes: u64) {
+        self.current_retired_values
+            .fetch_sub(entries, Ordering::Relaxed);
+        self.current_retired_bytes
+            .fetch_sub(bytes, Ordering::Relaxed);
+    }
+
     #[cfg(feature = "cache-diagnostics")]
+    #[allow(
+        unsafe_code,
+        reason = "the reclaim gate keeps every retired owner pointer initialized during the snapshot"
+    )]
     fn reclamation_snapshot(&self) -> DirectArenaReclamationSnapshot {
+        let _reclaim = self.reclaim_gate.lock();
         let readers = std::array::from_fn(|epoch| {
             self.readers[epoch * DIRECT_READER_SHARDS..(epoch + 1) * DIRECT_READER_SHARDS]
                 .iter()
                 .map(|counter| counter.0.load(Ordering::SeqCst))
                 .sum()
         });
-        let retired_values = self.retired.iter().map(|queue| queue.0.lock().len()).sum();
+        let mut retired_values = 0;
+        let mut retired_bytes = 0_u64;
+        #[cfg(feature = "cache-production-diagnostics")]
+        let mut retired_arena_values = 0_usize;
+        for queue in &self.retired {
+            let retired = queue.0.lock();
+            retired_values += retired.len();
+            retired_bytes = retired.iter().fold(retired_bytes, |total, handle| {
+                let published = handle.published();
+                #[cfg(feature = "cache-production-diagnostics")]
+                if !published.is_boxed() {
+                    retired_arena_values += 1;
+                }
+                let pointer = published.pointer::<V>();
+                // SAFETY: the handle remains in an owner retirement queue and
+                // `reclaim_gate` excludes the only path that can destroy it.
+                total.saturating_add(unsafe { (*pointer).weight() })
+            });
+        }
         let published_retired_values = self
             .retired_count
             .iter()
@@ -1842,8 +1970,53 @@ impl<V> DirectArenaOwner<V> {
             current_epoch: direct_epoch_slot(self.current_epoch.load(Ordering::SeqCst)),
             readers,
             retired_values,
+            retired_bytes,
+            #[cfg(feature = "cache-production-diagnostics")]
+            retired_arena_values,
             published_retired_values,
             recyclable_allocations,
+        }
+    }
+
+    #[cfg(feature = "cache-production-diagnostics")]
+    #[allow(
+        unsafe_code,
+        reason = "partition locks serialize arena block occupancy inspection"
+    )]
+    fn production_snapshot(&self) -> DirectArenaProductionSnapshot {
+        let reclamation = self.reclamation_snapshot();
+        let mut blocks = 0_usize;
+        let mut occupied = 0_usize;
+        for partition in &self.state.partitions {
+            let state = partition.state.lock();
+            blocks = blocks.saturating_add(state.blocks.len());
+            occupied = occupied.saturating_add(state.blocks.values().fold(0, |total, block| {
+                // SAFETY: the partition mutex serializes block state reads.
+                total + unsafe { block.live() }
+            }));
+        }
+        let entry_bytes = std::mem::size_of::<DirectArenaEntry<V>>();
+        let capacity = blocks.saturating_mul(DIRECT_BLOCK_SIZE);
+        let retired_arena = reclamation.retired_arena_values.min(occupied);
+        let active = occupied.saturating_sub(retired_arena);
+        let reusable = capacity.saturating_sub(occupied);
+        let block_releases = self.state.block_releases.load(Ordering::Relaxed);
+        DirectArenaProductionSnapshot {
+            retired_values: reclamation.retired_values,
+            retired_bytes: reclamation.retired_bytes,
+            peak_retired_values: self.peak_retired_values.load(Ordering::Relaxed),
+            peak_retired_bytes: self.peak_retired_bytes.load(Ordering::Relaxed),
+            allocation_requests: self.allocation_requests.load(Ordering::Relaxed),
+            boxed_allocation_requests: self.boxed_allocation_requests.load(Ordering::Relaxed),
+            recycled_box_reuses: self.recycled_box_reuses.load(Ordering::Relaxed),
+            blocks,
+            allocated_bytes: blocks.saturating_mul(std::mem::size_of::<DirectArenaBlock<V>>()),
+            active_allocations: active,
+            active_bytes: active.saturating_mul(entry_bytes),
+            reusable_allocations: reusable,
+            reusable_bytes: reusable.saturating_mul(entry_bytes),
+            block_growths: block_releases.saturating_add(u64::try_from(blocks).unwrap_or(u64::MAX)),
+            block_releases,
         }
     }
 
@@ -1861,6 +2034,17 @@ impl<V> DirectArenaOwner<V> {
         let shard = thread_id & (DIRECT_RETIRED_SHARDS - 1);
         let mut recycled = self.recycled_boxes()[shard].lock();
         let recycled_count = recycled.len().min(pointers.len());
+        #[cfg(feature = "cache-production-diagnostics")]
+        {
+            self.boxed_allocation_requests.fetch_add(
+                u64::try_from(pointers.len()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            self.recycled_box_reuses.fetch_add(
+                u64::try_from(recycled_count).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
         for output in &mut pointers[..recycled_count] {
             *output = recycled
                 .pop()
@@ -2004,6 +2188,12 @@ impl<V> DirectArenaOwner<V> {
         reason = "accepts one caller-proven exact-owner retirement token"
     )]
     unsafe fn retire(&self, thread_id: usize, handle: RemovedDirectHandle) {
+        #[cfg(feature = "cache-production-diagnostics")]
+        let retired_bytes = {
+            let pointer = handle.published().pointer::<V>();
+            // SAFETY: the caller transfers one still-initialized removed value.
+            unsafe { (*pointer).weight() }
+        };
         // A mutator pin prevents more than one rotation through publication
         // and queuing. Reclamation deliberately ages this slot for two
         // rotations, so either side of one racing rotation is safe here.
@@ -2013,6 +2203,8 @@ impl<V> DirectArenaOwner<V> {
         retired.push(handle);
         let queued = retired.len();
         drop(retired);
+        #[cfg(feature = "cache-production-diagnostics")]
+        self.note_retired(1, retired_bytes);
         if queued.is_multiple_of(DIRECT_RECLAIM_PUBLISH_BATCH) {
             let published = self.retired_count[epoch]
                 .fetch_add(DIRECT_RECLAIM_PUBLISH_BATCH, Ordering::Relaxed)
@@ -2039,6 +2231,14 @@ impl<V> DirectArenaOwner<V> {
         if handles.is_empty() {
             return;
         }
+        #[cfg(feature = "cache-production-diagnostics")]
+        let retired_entries = handles.len();
+        #[cfg(feature = "cache-production-diagnostics")]
+        let retired_bytes = handles.iter().fold(0_u64, |total, handle| {
+            let pointer = handle.published().pointer::<V>();
+            // SAFETY: every caller-proven token still owns an initialized value.
+            total.saturating_add(unsafe { (*pointer).weight() })
+        });
         // See `retire`: the live batch pin bounds this load to either side of
         // at most one rotation, and two-rotation aging covers both slots.
         let epoch = direct_epoch_slot(self.current_epoch.load(Ordering::SeqCst));
@@ -2048,6 +2248,8 @@ impl<V> DirectArenaOwner<V> {
         retired.append(handles);
         let published_after = retired.len() / DIRECT_RECLAIM_PUBLISH_BATCH;
         drop(retired);
+        #[cfg(feature = "cache-production-diagnostics")]
+        self.note_retired(retired_entries, retired_bytes);
         let publish = (published_after - published_before) * DIRECT_RECLAIM_PUBLISH_BATCH;
         if publish != 0 {
             let published =
@@ -2161,6 +2363,12 @@ impl<V> DirectArenaOwner<V> {
             self.reclaim_handles(&mut handles, shard, &mut arena_handles);
         }
         let arena_handles = arena_handles.disarm();
+        #[cfg(feature = "cache-production-diagnostics")]
+        let arena_retired_bytes = arena_handles.iter().fold(0_u64, |total, handle| {
+            let pointer = handle.published().pointer::<V>();
+            // SAFETY: the quiescent retired batch still owns initialized entries.
+            total.saturating_add(unsafe { (*pointer).weight() })
+        });
         let arena_pointers = arena_handles
             .iter()
             .map(|handle| handle.published().pointer::<V>())
@@ -2171,6 +2379,8 @@ impl<V> DirectArenaOwner<V> {
             self.state
                 .reclaim_entries(&arena_pointers, Some((fallback_queue, retired_count)));
         };
+        #[cfg(feature = "cache-production-diagnostics")]
+        self.note_reclaimed(arena_pointers.len(), arena_retired_bytes);
     }
 
     /// Immediately destroys one allocation that was never published.
@@ -2228,6 +2438,12 @@ impl<V> DirectArenaOwner<V> {
         let mut recycled = None;
         while let Some(removed) = handles.pop() {
             let handle = removed.published();
+            #[cfg(feature = "cache-production-diagnostics")]
+            let retired_bytes = {
+                let pointer = handle.pointer::<V>();
+                // SAFETY: this quiescent retired handle remains initialized.
+                unsafe { (*pointer).weight() }
+            };
             #[cfg(feature = "prepared-keys")]
             if handle.is_recycled_boxed() {
                 let pointer = handle.pointer::<V>();
@@ -2241,12 +2457,16 @@ impl<V> DirectArenaOwner<V> {
                     std::mem::forget(allocation);
                     recycled.push(handle);
                 }
+                #[cfg(feature = "cache-production-diagnostics")]
+                self.note_reclaimed(1, retired_bytes);
                 continue;
             }
             if handle.is_boxed() {
                 // SAFETY: boxed handles originate from Box::into_raw and the
                 // quiescent-state proof gives this reclaimer unique access.
                 unsafe { drop(Box::from_raw(handle.pointer::<V>())) };
+                #[cfg(feature = "cache-production-diagnostics")]
+                self.note_reclaimed(1, retired_bytes);
             } else {
                 arena_handles.push(removed);
             }
@@ -2309,6 +2529,8 @@ impl<V> DirectArenaState<V> {
                 .map(|_| AtomicU64::new(0))
                 .collect(),
             block_lookup: DirectBlockLookup::new(),
+            #[cfg(feature = "cache-production-diagnostics")]
+            block_releases: AtomicU64::new(0),
         }
     }
 
@@ -2419,6 +2641,8 @@ impl<V> DirectArenaState<V> {
                     &entries,
                     &self.block_lookup,
                     &self.availability,
+                    #[cfg(feature = "cache-production-diagnostics")]
+                    &self.block_releases,
                 );
             }
         }
@@ -2459,6 +2683,8 @@ impl<V> DirectArenaState<V> {
             distance / entry_bytes,
             &self.block_lookup,
             &self.availability,
+            #[cfg(feature = "cache-production-diagnostics")]
+            &self.block_releases,
         );
     }
 
@@ -2486,6 +2712,8 @@ impl<V> DirectArenaState<V> {
             distance / entry_bytes,
             &self.block_lookup,
             &self.availability,
+            #[cfg(feature = "cache-production-diagnostics")]
+            &self.block_releases,
         );
     }
 }
