@@ -20,9 +20,11 @@ use crate::cache_arena::{
     DirectArenaValue, DirectHandle, DirectValueArena, MAX_EXPIRY_TICK, RemovedDirectHandle,
     ValueArena,
 };
+use crate::generation_hash::GenerationKeyHash;
 use crate::{
     AdaptiveRebuildPolicy, AtomicEntry, AtomicGenerationBaseFilter, AtomicGenerationOverlay,
-    FrozenBuildError, InsertOutcome, LockFreeAtomicU64GenerationMap, NonMaxU64,
+    FrozenBuildError, FrozenIndexBackend, GenerationHashBuilder, InsertOutcome,
+    LockFreeAtomicU64GenerationMap, NonMaxU64,
 };
 
 const NEVER_EXPIRES: u64 = u64::MAX;
@@ -93,14 +95,30 @@ unsafe fn removed_after_exact_index_transfer(handle: DirectHandle) -> RemovedDir
     unsafe { RemovedDirectHandle::from_exact_removal(handle) }
 }
 const ACCESS_SAMPLE_MASK: u64 = 15;
+const HEAVY_ACCESS_SAMPLE_MASK: u64 = 0;
+const HEAVY_ACCESS_WEIGHT: u64 = 4_096;
 const FREQUENCY_REUSE_MIN_LOOKUPS: u64 = 1_024;
 const FREQUENCY_REUSE_WINDOW: u64 = 16_384;
+const FREQUENCY_REUSE_PUBLISH_INTERVAL: u64 = 4_096;
 const MUTATION_STRIPES: usize = 2_048;
 const EXPIRY_TICK_NANOS: u128 = 100_000_000;
 const DIRECT_LENGTH_IMMEDIATE_RECHECK: u8 = 64;
 const DIRECT_ADAPTIVE_EXISTING_THRESHOLD: u8 = 2;
 const DIRECT_FALLBACK_REFILL_MULTIPLIER: usize = 16;
 const DIRECT_ADMISSION_RECLAIM_INTERVAL: usize = 512;
+const DIRECT_DOORKEEPER_CLEAR_WORDS: usize = 16;
+const DIRECT_ASYNC_VICTIM_SAMPLE_MAX: usize = 1_024;
+const DIRECT_DOORKEEPER_GROUP_LOCK: u64 = 1_u64 << 63;
+const DIRECT_DOORKEEPER_EPOCH_MASK: u64 = DIRECT_DOORKEEPER_GROUP_LOCK - 1;
+const DIRECT_DOORKEEPER_INVALID_EPOCH: u64 = DIRECT_DOORKEEPER_EPOCH_MASK;
+
+fn doorkeeper_hashes_from_key_hash(key_hash: GenerationKeyHash) -> [u64; 2] {
+    doorkeeper_hashes_from_route(key_hash.route())
+}
+
+fn doorkeeper_hashes_from_route(route: u64) -> [u64; 2] {
+    [route, doorkeeper_mix64(route ^ 0xd6e8_feb8_6659_fd93)]
+}
 
 /// Configuration for [`PackedCache`].
 #[derive(Clone, Debug)]
@@ -720,6 +738,12 @@ struct CacheCounters {
     maintenance_errors: AtomicU64,
 }
 
+#[derive(Default)]
+#[repr(align(64))]
+struct DirectFrequencyReuseShard {
+    pending: AtomicU64,
+}
+
 #[cfg(feature = "cache-production-diagnostics")]
 #[repr(align(64))]
 struct DirectCacheDiagnosticCounters {
@@ -1065,6 +1089,8 @@ pub struct DirectPackedCache<V> {
     victim_reservoir: Mutex<Vec<DirectVictimReservoirBatch>>,
     admission_doorkeeper: Option<DirectAdmissionDoorkeeper>,
     frequency_reuse: AtomicU64,
+    frequency_reuse_shards: Option<Box<[DirectFrequencyReuseShard]>>,
+    frequency_reuse_publishing: AtomicBool,
     expiration_possible: AtomicBool,
     mutation_stripes: Box<[Mutex<()>]>,
     #[cfg(feature = "cache-production-diagnostics")]
@@ -1091,6 +1117,32 @@ pub struct DirectCacheGuard<'cache, V> {
     admissions_since_refresh: usize,
     pending_lengths: Option<DirectPendingLengths>,
     counter_shard: usize,
+}
+
+/// Reusable read session that clones values under short reclamation pins.
+///
+/// Unlike [`DirectCacheGuard`], this session never retains an arena reader
+/// epoch between calls. It is intended for cheaply shareable values such as
+/// `Arc<T>` when bounded retirement memory matters more than the absolute
+/// minimum borrowed-read overhead.
+pub struct DirectClonedCacheGuard<'cache, V> {
+    cache: &'cache DirectPackedCache<V>,
+    lookup_index: crate::generation_map::AtomicReadCache<'cache>,
+    accesses: Cell<u64>,
+    pending_hits: Cell<u64>,
+    pending_misses: Cell<u64>,
+    counter_shard: usize,
+}
+
+/// Cloned/shareable read session with an automatically bounded reader epoch.
+///
+/// Values are cloned before this session may refresh its borrowed guard, so
+/// returned values never borrow the cache. At most `refresh_interval` lookups
+/// share one arena epoch.
+pub struct DirectShareableCacheGuard<'cache, V> {
+    guard: DirectCacheGuard<'cache, V>,
+    refresh_interval: usize,
+    lookups: usize,
 }
 
 /// Short-lived conditional-admission batch for [`DirectPackedCache`].
@@ -1361,6 +1413,18 @@ impl DirectFrequencySketch {
             .unwrap_or(0)
     }
 
+    fn observe_resident(&self, hashes: [u64; 2]) -> u8 {
+        // Admissions advance the sketch's aging clock. Resident hits only
+        // refresh their two distributed counters, avoiding one globally
+        // contended fetch-add on every sampled read at high core counts.
+        let epoch = self.epoch.load(Ordering::Acquire);
+        hashes
+            .into_iter()
+            .map(|hash| self.observe_counter(hash, epoch))
+            .min()
+            .unwrap_or(0)
+    }
+
     fn estimate(&self, hashes: [u64; 2]) -> u8 {
         let epoch = self.epoch.load(Ordering::Acquire);
         hashes
@@ -1432,10 +1496,10 @@ impl DirectFrequencySketch {
 
 struct DirectAdmissionDoorkeeper {
     filters: [Box<[AtomicU64]>; 2],
-    current: AtomicUsize,
+    filter_epochs: [Box<[AtomicU64]>; 2],
+    generation: AtomicU64,
     observations: AtomicU64,
     rotate_every: u64,
-    rotation: Mutex<()>,
     frequency: Option<DirectFrequencySketch>,
     warmed: AtomicBool,
     admitted: AtomicUsize,
@@ -1454,6 +1518,7 @@ enum DirectAdmissionDecision {
 impl DirectAdmissionDoorkeeper {
     const BITS_PER_ENTRY: usize = 16;
 
+    #[cfg(test)]
     fn hashes(key: &[u8]) -> [u64; 2] {
         let first = rapidhash::v3::rapidhash_v3(key);
         [first, doorkeeper_mix64(first ^ 0xd6e8_feb8_6659_fd93)]
@@ -1479,12 +1544,18 @@ impl DirectAdmissionDoorkeeper {
                 .take(words)
                 .collect::<Box<[_]>>()
         };
+        let groups = words.div_ceil(DIRECT_DOORKEEPER_CLEAR_WORDS);
+        let make_epochs = |initial| {
+            std::iter::repeat_with(|| AtomicU64::new(initial))
+                .take(groups)
+                .collect::<Box<[_]>>()
+        };
         Self {
             filters: [make_filter(), make_filter()],
-            current: AtomicUsize::new(0),
+            filter_epochs: [make_epochs(0), make_epochs(DIRECT_DOORKEEPER_INVALID_EPOCH)],
+            generation: AtomicU64::new(0),
             observations: AtomicU64::new(0),
             rotate_every: u64::try_from(expected_entries.max(1)).unwrap_or(u64::MAX),
-            rotation: Mutex::new(()),
             frequency: frequency_max_gate
                 .map(|maximum| DirectFrequencySketch::new(expected_entries, maximum)),
             warmed: AtomicBool::new(false),
@@ -1495,39 +1566,93 @@ impl DirectAdmissionDoorkeeper {
         }
     }
 
-    fn observe(&self, key: &[u8], observe_frequency: bool) -> (bool, Option<u8>) {
+    fn observe_hashed(&self, hashes: [u64; 2], observe_frequency: bool) -> (bool, Option<u8>) {
         let observation = self
             .observations
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1);
         if observation.is_multiple_of(self.rotate_every) {
-            let _rotation = self.rotation.lock();
-            let current = self.current.load(Ordering::Relaxed);
-            let next = 1 - current;
-            for word in &self.filters[next] {
-                word.store(0, Ordering::Relaxed);
-            }
-            self.current.store(next, Ordering::Release);
+            self.generation
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                    Some(generation.wrapping_add(1) & DIRECT_DOORKEEPER_EPOCH_MASK)
+                })
+                .unwrap_or_else(|_| unreachable!("generation update always succeeds"));
             #[cfg(feature = "cache-production-diagnostics")]
             self.rotations.fetch_add(1, Ordering::Relaxed);
         }
-        let current = self.current.load(Ordering::Acquire);
-        let previous = 1 - current;
-        let hashes = Self::hashes(key);
-        let (word, mask) = Self::blocked_location(hashes, self.filters[current].len());
-        let seen = (self.filters[current][word].load(Ordering::Relaxed)
-            | self.filters[previous][word].load(Ordering::Relaxed))
-            & mask
-            == mask;
-        self.filters[current][word].fetch_or(mask, Ordering::Relaxed);
-        let frequency = (seen && observe_frequency)
-            .then(|| self.frequency.as_ref().map(|sketch| sketch.observe(hashes)))
-            .flatten();
-        (seen, frequency)
+        loop {
+            let generation = self.generation.load(Ordering::Acquire);
+            let current = usize::try_from(generation & 1).expect("one bit fits usize");
+            let previous = 1 - current;
+            let (word, mask) = Self::blocked_location(hashes, self.filters[current].len());
+            let seen = self.filter_contains(current, word, mask, generation)
+                || (generation != 0 && self.filter_contains(previous, word, mask, generation - 1));
+            if !self.prepare_filter_group(current, word, generation) {
+                continue;
+            }
+            self.filters[current][word].fetch_or(mask, Ordering::Relaxed);
+            let frequency = (seen && observe_frequency)
+                .then(|| self.frequency.as_ref().map(|sketch| sketch.observe(hashes)))
+                .flatten();
+            return (seen, frequency);
+        }
     }
 
-    fn admission_decision(&self, key: &[u8], enforce_frequency: bool) -> DirectAdmissionDecision {
-        let (seen, frequency) = self.observe(key, enforce_frequency);
+    #[cfg(test)]
+    fn observe(&self, key: &[u8], observe_frequency: bool) -> (bool, Option<u8>) {
+        self.observe_hashed(Self::hashes(key), observe_frequency)
+    }
+
+    fn filter_contains(&self, filter: usize, word: usize, mask: u64, generation: u64) -> bool {
+        let group = word / DIRECT_DOORKEEPER_CLEAR_WORDS;
+        self.filter_epochs[filter][group].load(Ordering::Acquire) == generation
+            && self.filters[filter][word].load(Ordering::Relaxed) & mask == mask
+    }
+
+    fn prepare_filter_group(&self, filter: usize, word: usize, generation: u64) -> bool {
+        let group = word / DIRECT_DOORKEEPER_CLEAR_WORDS;
+        let epoch = &self.filter_epochs[filter][group];
+        let mut observed = epoch.load(Ordering::Acquire);
+        loop {
+            if observed == generation {
+                return true;
+            }
+            if observed & DIRECT_DOORKEEPER_GROUP_LOCK != 0 {
+                spin_loop();
+                observed = epoch.load(Ordering::Acquire);
+                continue;
+            }
+            match epoch.compare_exchange_weak(
+                observed,
+                DIRECT_DOORKEEPER_GROUP_LOCK | generation,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(previous) => {
+                    if self.generation.load(Ordering::Acquire) != generation {
+                        epoch.store(previous, Ordering::Release);
+                        return false;
+                    }
+                    let begin = group * DIRECT_DOORKEEPER_CLEAR_WORDS;
+                    let end =
+                        (begin + DIRECT_DOORKEEPER_CLEAR_WORDS).min(self.filters[filter].len());
+                    for stale in &self.filters[filter][begin..end] {
+                        stale.store(0, Ordering::Relaxed);
+                    }
+                    epoch.store(generation, Ordering::Release);
+                    return true;
+                }
+                Err(current) => observed = current,
+            }
+        }
+    }
+
+    fn admission_decision_hashed(
+        &self,
+        hashes: [u64; 2],
+        enforce_frequency: bool,
+    ) -> DirectAdmissionDecision {
+        let (seen, frequency) = self.observe_hashed(hashes, enforce_frequency);
         if !self.warmed.load(Ordering::Acquire) {
             return DirectAdmissionDecision::Admit;
         }
@@ -1552,10 +1677,10 @@ impl DirectAdmissionDoorkeeper {
         self.rotations.load(Ordering::Relaxed)
     }
 
-    fn victim_frequency(&self, key: &[u8]) -> u8 {
+    fn victim_frequency_hashed(&self, hashes: [u64; 2]) -> u8 {
         self.frequency
             .as_ref()
-            .map_or(0, |sketch| sketch.estimate(Self::hashes(key)))
+            .map_or(0, |sketch| sketch.estimate(hashes))
     }
 
     fn note_victim_frequency(&self, frequency: u8, maximum_victim_frequency: u8) {
@@ -1564,11 +1689,23 @@ impl DirectAdmissionDoorkeeper {
         }
     }
 
+    fn note_access_hashed(&self, hashes: [u64; 2]) {
+        if let Some(sketch) = &self.frequency {
+            debug_assert!(sketch.is_under_pressure());
+            sketch.observe_resident(hashes);
+        }
+    }
+
+    fn tracks_resident_frequency(&self) -> bool {
+        self.frequency
+            .as_ref()
+            .is_some_and(DirectFrequencySketch::is_under_pressure)
+    }
+
+    #[cfg(test)]
     fn note_access(&self, key: &[u8]) {
-        if let Some(sketch) = &self.frequency
-            && sketch.is_under_pressure()
-        {
-            sketch.observe(Self::hashes(key));
+        if self.tracks_resident_frequency() {
+            self.note_access_hashed(Self::hashes(key));
         }
     }
 
@@ -3247,6 +3384,19 @@ impl<'cache, V> DirectCacheGuard<'cache, V> {
         self.admissions_since_refresh = 0;
     }
 
+    /// Publishes buffered state and releases every reader/writer epoch.
+    ///
+    /// Any references returned before this call must no longer be used. The
+    /// next read or guarded mutation lazily pins the then-current epochs.
+    pub fn quiesce(&mut self) {
+        self.flush_lengths();
+        self.flush_stats();
+        self.lookup_index.refresh();
+        self.arena.take();
+        self.index.take();
+        self.admissions_since_refresh = 0;
+    }
+
     fn refresh_guarded_batch(&mut self) {
         self.refresh();
         self.index.get_or_init(|| self.cache.index.read_guard());
@@ -3268,7 +3418,7 @@ impl<'cache, V> DirectCacheGuard<'cache, V> {
                 self.cache.expire_handle(key, handle);
                 continue;
             }
-            if record_access && self.sample_access() {
+            if record_access && self.sample_access(entry.weight()) {
                 entry.mark_accessed();
                 self.cache.note_frequency_access(key);
             }
@@ -3299,7 +3449,7 @@ impl<'cache, V> DirectCacheGuard<'cache, V> {
                 self.cache.expire_handle(key, handle);
                 continue;
             }
-            if record_access && self.sample_access() {
+            if record_access && self.sample_access(entry.weight()) {
                 entry.mark_accessed();
                 self.cache.note_frequency_access(key);
             }
@@ -3312,10 +3462,10 @@ impl<'cache, V> DirectCacheGuard<'cache, V> {
         self.arena.get_or_init(|| self.cache.arena.pin())
     }
 
-    fn sample_access(&self) -> bool {
+    fn sample_access(&self, weight: u64) -> bool {
         let accesses = self.accesses.get();
         self.accesses.set(accesses.wrapping_add(1));
-        accesses & ACCESS_SAMPLE_MASK == 0
+        accesses & self.cache.access_sample_mask(weight) == 0
     }
 
     fn flush_stats(&self) {
@@ -3329,7 +3479,8 @@ impl<'cache, V> DirectCacheGuard<'cache, V> {
         if misses != 0 {
             counters.misses.fetch_add(misses, Ordering::Relaxed);
         }
-        self.cache.record_frequency_reuse(hits, misses);
+        self.cache
+            .record_frequency_reuse_shard(self.counter_shard, hits, misses);
         if inserts != 0 {
             counters.inserts.fetch_add(inserts, Ordering::Relaxed);
         }
@@ -3338,6 +3489,131 @@ impl<'cache, V> DirectCacheGuard<'cache, V> {
     fn flush_lengths(&self) {
         if let (Some(pending), Some(index)) = (&self.pending_lengths, self.index.get()) {
             pending.flush(index);
+        }
+    }
+}
+
+impl<V> DirectClonedCacheGuard<'_, V> {
+    /// Clones a live value while recording access and buffering statistics.
+    #[must_use]
+    pub fn get(&self, key: &[u8]) -> Option<V>
+    where
+        V: Clone,
+    {
+        let value = self.lookup(key, true);
+        if value.is_some() {
+            self.pending_hits
+                .set(self.pending_hits.get().wrapping_add(1));
+        } else {
+            self.pending_misses
+                .set(self.pending_misses.get().wrapping_add(1));
+        }
+        value
+    }
+
+    /// Clones a live value without recording access or operation counters.
+    #[must_use]
+    pub fn peek(&self, key: &[u8]) -> Option<V>
+    where
+        V: Clone,
+    {
+        self.lookup(key, false)
+    }
+
+    /// Publishes buffered counters and adopts the current index generation.
+    pub fn refresh(&mut self) {
+        self.flush_stats();
+        self.lookup_index.refresh();
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "clones only while the exact index handle is protected by a short cache pin"
+    )]
+    fn lookup(&self, key: &[u8], record_access: bool) -> Option<V>
+    where
+        V: Clone,
+    {
+        for _ in 0..16 {
+            let pin = self.cache.arena.pin();
+            let raw = self.lookup_index.get_protected(key)?;
+            let handle = published_direct_handle_from_index(raw);
+            // SAFETY: the unchanged index handle and short pin belong to this cache.
+            let entry = unsafe { protected_direct_entry(&pin, handle) };
+            let expires_at = entry.expires_at();
+            if expires_at != NEVER_EXPIRES && expires_at <= self.cache.now() {
+                self.cache.expire_handle(key, handle);
+                continue;
+            }
+            if record_access && self.sample_access(entry.weight()) {
+                entry.mark_accessed();
+                self.cache.note_frequency_access(key);
+            }
+            return Some(entry.value().clone());
+        }
+        None
+    }
+
+    fn sample_access(&self, weight: u64) -> bool {
+        let accesses = self.accesses.get();
+        self.accesses.set(accesses.wrapping_add(1));
+        accesses & self.cache.access_sample_mask(weight) == 0
+    }
+
+    fn flush_stats(&self) {
+        let hits = self.pending_hits.replace(0);
+        let misses = self.pending_misses.replace(0);
+        let counters = &self.cache.counters[self.counter_shard];
+        if hits != 0 {
+            counters.hits.fetch_add(hits, Ordering::Relaxed);
+        }
+        if misses != 0 {
+            counters.misses.fetch_add(misses, Ordering::Relaxed);
+        }
+        self.cache
+            .record_frequency_reuse_shard(self.counter_shard, hits, misses);
+    }
+}
+
+impl<V> Drop for DirectClonedCacheGuard<'_, V> {
+    fn drop(&mut self) {
+        self.flush_stats();
+    }
+}
+
+impl<V> DirectShareableCacheGuard<'_, V> {
+    /// Clones a live value and advances the reader epoch at the configured bound.
+    #[must_use]
+    pub fn get(&mut self, key: &[u8]) -> Option<V>
+    where
+        V: Clone,
+    {
+        let value = self.guard.get(key).cloned();
+        self.note_lookup();
+        value
+    }
+
+    /// Clones a live value without access/statistics accounting.
+    #[must_use]
+    pub fn peek(&mut self, key: &[u8]) -> Option<V>
+    where
+        V: Clone,
+    {
+        let value = self.guard.peek(key).cloned();
+        self.note_lookup();
+        value
+    }
+
+    /// Immediately publishes buffered state and starts a fresh reader epoch.
+    pub fn refresh(&mut self) {
+        self.guard.quiesce();
+        self.lookups = 0;
+    }
+
+    fn note_lookup(&mut self) {
+        self.lookups += 1;
+        if self.lookups == self.refresh_interval {
+            self.refresh();
         }
     }
 }
@@ -3436,8 +3712,9 @@ impl<V> DirectCacheAdmissionBatch<'_, '_, V> {
     /// Panics only if the admission batch's internal generation reservation
     /// invariant is violated.
     #[allow(
+        clippy::too_many_lines,
         unsafe_code,
-        reason = "the batch exclusively owns an unpublished candidate from this cache arena"
+        reason = "keeps every feature-gated publication branch beside the batch's unpublished ownership transfer"
     )]
     pub fn insert_if_absent_with_options(
         &mut self,
@@ -3448,9 +3725,10 @@ impl<V> DirectCacheAdmissionBatch<'_, '_, V> {
     ) -> Result<CacheAdmissionOutcome, CacheInsertError> {
         let cache = self.guard.cache;
         let compact_weight = cache.validate_weight(key, weight)?;
-        if let Some(outcome) = cache.admission_precheck(key) {
-            return Ok(outcome);
-        }
+        let admission_hash = match cache.admission_precheck(key) {
+            Ok(hash) => hash,
+            Err(outcome) => return Ok(outcome),
+        };
         let inserted = self
             .reservation
             .allocate(value, compact_weight, cache.deadline(ttl));
@@ -3465,10 +3743,23 @@ impl<V> DirectCacheAdmissionBatch<'_, '_, V> {
         };
         let published = if let Some(pending) = context.pending_lengths {
             if pending.use_immediate() {
-                context.index.get_or_insert(key, inserted.index_value())
+                admission_hash.map_or_else(
+                    || context.index.get_or_insert(key, inserted.index_value()),
+                    |key_hash| {
+                        context
+                            .index
+                            .get_or_insert_hashed(key, inserted.index_value(), key_hash)
+                    },
+                )
             } else {
                 #[cfg(not(feature = "shared-gx"))]
-                let (published, deferred_stripe) = if self.route_only_admission {
+                let (published, deferred_stripe) = if let Some(key_hash) = admission_hash {
+                    context.index.get_or_insert_deferred_len_hashed(
+                        key,
+                        inserted.index_value(),
+                        key_hash,
+                    )
+                } else if self.route_only_admission {
                     context
                         .index
                         .get_or_insert_deferred_len_route_only(key, inserted.index_value())
@@ -3478,9 +3769,20 @@ impl<V> DirectCacheAdmissionBatch<'_, '_, V> {
                         .get_or_insert_deferred_len(key, inserted.index_value())
                 };
                 #[cfg(feature = "shared-gx")]
-                let (published, deferred_stripe) = context
-                    .index
-                    .get_or_insert_deferred_len(key, inserted.index_value());
+                let (published, deferred_stripe) = admission_hash.map_or_else(
+                    || {
+                        context
+                            .index
+                            .get_or_insert_deferred_len(key, inserted.index_value())
+                    },
+                    |key_hash| {
+                        context.index.get_or_insert_deferred_len_hashed(
+                            key,
+                            inserted.index_value(),
+                            key_hash,
+                        )
+                    },
+                );
                 if let Some(stripe) = deferred_stripe {
                     pending.record(context.index, stripe);
                 }
@@ -3489,7 +3791,11 @@ impl<V> DirectCacheAdmissionBatch<'_, '_, V> {
         } else {
             #[cfg(not(feature = "shared-gx"))]
             {
-                if self.route_only_admission {
+                if let Some(key_hash) = admission_hash {
+                    context
+                        .index
+                        .get_or_insert_hashed(key, inserted.index_value(), key_hash)
+                } else if self.route_only_admission {
                     let (published, inserted_stripe) = context
                         .index
                         .get_or_insert_deferred_len_route_only(key, inserted.index_value());
@@ -3502,7 +3808,14 @@ impl<V> DirectCacheAdmissionBatch<'_, '_, V> {
                 }
             }
             #[cfg(feature = "shared-gx")]
-            context.index.get_or_insert(key, inserted.index_value())
+            admission_hash.map_or_else(
+                || context.index.get_or_insert(key, inserted.index_value()),
+                |key_hash| {
+                    context
+                        .index
+                        .get_or_insert_hashed(key, inserted.index_value(), key_hash)
+                },
+            )
         };
         let outcome = if published == inserted.index_value() {
             cache.add_capacity(key, compact_weight);
@@ -3559,8 +3872,9 @@ impl<V> DirectCacheBulkAdmissionBatch<'_, '_, V> {
     /// Panics only if the bulk admission batch's internal generation
     /// reservation invariant is violated.
     #[allow(
+        clippy::too_many_lines,
         unsafe_code,
-        reason = "the bulk batch exclusively owns an unpublished candidate from this cache arena"
+        reason = "keeps every feature-gated publication branch beside the bulk batch's unpublished ownership transfer"
     )]
     pub fn insert_if_absent_with_options(
         &mut self,
@@ -3576,9 +3890,10 @@ impl<V> DirectCacheBulkAdmissionBatch<'_, '_, V> {
         } = self;
         let cache = batch.guard.cache;
         let compact_weight = cache.validate_weight(key, weight)?;
-        if let Some(outcome) = cache.admission_precheck(key) {
-            return Ok(outcome);
-        }
+        let admission_hash = match cache.admission_precheck(key) {
+            Ok(hash) => hash,
+            Err(outcome) => return Ok(outcome),
+        };
         let inserted = batch
             .reservation
             .allocate(value, compact_weight, cache.deadline(ttl));
@@ -3597,10 +3912,23 @@ impl<V> DirectCacheBulkAdmissionBatch<'_, '_, V> {
             deferred_limit: Some(&batch.protected),
         };
         let published = if pending.use_immediate() {
-            context.index.get_or_insert(key, inserted.index_value())
+            admission_hash.map_or_else(
+                || context.index.get_or_insert(key, inserted.index_value()),
+                |key_hash| {
+                    context
+                        .index
+                        .get_or_insert_hashed(key, inserted.index_value(), key_hash)
+                },
+            )
         } else {
             #[cfg(not(feature = "shared-gx"))]
-            let (published, deferred_stripe) = if batch.route_only_admission {
+            let (published, deferred_stripe) = if let Some(key_hash) = admission_hash {
+                context.index.get_or_insert_deferred_len_hashed(
+                    key,
+                    inserted.index_value(),
+                    key_hash,
+                )
+            } else if batch.route_only_admission {
                 #[cfg(feature = "operation-batch")]
                 {
                     if matches!(key.len(), 0..=7 | 9..=15 | 17..=23 | 25..=31) {
@@ -3626,9 +3954,20 @@ impl<V> DirectCacheBulkAdmissionBatch<'_, '_, V> {
                     .get_or_insert_deferred_len(key, inserted.index_value())
             };
             #[cfg(feature = "shared-gx")]
-            let (published, deferred_stripe) = context
-                .index
-                .get_or_insert_deferred_len(key, inserted.index_value());
+            let (published, deferred_stripe) = admission_hash.map_or_else(
+                || {
+                    context
+                        .index
+                        .get_or_insert_deferred_len(key, inserted.index_value())
+                },
+                |key_hash| {
+                    context.index.get_or_insert_deferred_len_hashed(
+                        key,
+                        inserted.index_value(),
+                        key_hash,
+                    )
+                },
+            );
             if let Some(stripe) = deferred_stripe {
                 pending.record(context.index, stripe);
             }
@@ -4303,14 +4642,23 @@ impl<V> DirectPackedCache<V> {
     /// Returns an invalid configuration or adaptive-index construction error.
     pub fn try_new(config: CacheConfig) -> Result<Self, CacheBuildError> {
         validate_direct_config(&config).map_err(CacheBuildError::Config)?;
-        let index = LockFreeAtomicU64GenerationMap::try_from_entries_with_options(
+        let hash_builder = GenerationHashBuilder::default();
+        let index =
+            LockFreeAtomicU64GenerationMap::try_from_entries_with_options_and_writer_hash_and_index(
             std::iter::empty::<(Box<[u8]>, NonMaxU64)>(),
             config.overlay_capacity,
             AtomicGenerationOverlay::AtomicAdaptive,
             AtomicGenerationBaseFilter::EmbeddedFingerprint,
+            hash_builder,
+            FrozenIndexBackend::PtrHash,
         )?;
         let admission_doorkeeper = config.admission_doorkeeper_entries.map(|entries| {
             DirectAdmissionDoorkeeper::new(entries, config.frequency_sketch_max_gate())
+        });
+        let frequency_reuse_shards = config.frequency_admission_min_hit_rate_bps.map(|_| {
+            std::iter::repeat_with(DirectFrequencyReuseShard::default)
+                .take(COUNTER_SHARDS)
+                .collect()
         });
         Ok(Self {
             index,
@@ -4332,6 +4680,8 @@ impl<V> DirectPackedCache<V> {
             victim_reservoir: Mutex::new(Vec::new()),
             admission_doorkeeper,
             frequency_reuse: AtomicU64::new(0),
+            frequency_reuse_shards,
+            frequency_reuse_publishing: AtomicBool::new(false),
             expiration_possible: AtomicBool::new(false),
             mutation_stripes: std::iter::repeat_with(|| Mutex::new(()))
                 .take(MUTATION_STRIPES)
@@ -4356,6 +4706,10 @@ impl<V> DirectPackedCache<V> {
     /// Returns an invalid configuration, an unrepresentable item charge, an
     /// initial capacity violation, or a frozen-index construction error. Keys
     /// must be unique. All values allocated before an error are reclaimed.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps staged cleanup and every fallible bulk-load phase in one auditable transaction"
+    )]
     pub fn try_from_entries_with_options<I, K>(
         config: CacheConfig,
         entries: I,
@@ -4397,13 +4751,16 @@ impl<V> DirectPackedCache<V> {
         let mut total_weight = 0_u64;
         let mut expiration_possible = false;
         let mut initial_error = None;
+        let hash_builder = GenerationHashBuilder::default();
+        let admission_hash_builder = hash_builder.clone();
         let indexed_entries = iterator.map(|(key, value, weight, ttl)| {
             let compact_weight = compact_initial_weight(&config, weight, &mut initial_error);
             total_weight =
                 checked_initial_weight(&config, total_weight, weight, &mut initial_error);
             let key_bytes = key.as_ref();
             if let Some(doorkeeper) = &admission_doorkeeper {
-                doorkeeper.observe(key_bytes, false);
+                let key_hash = GenerationKeyHash::new(&admission_hash_builder, key_bytes);
+                doorkeeper.observe_hashed(doorkeeper_hashes_from_key_hash(key_hash), false);
             }
             let shard = key_counter_hash(key_bytes) & (COUNTER_SHARDS - 1);
             expiration_possible |= ttl.is_some();
@@ -4414,12 +4771,15 @@ impl<V> DirectPackedCache<V> {
             (key, handle.index_value())
         });
 
-        let index_result = LockFreeAtomicU64GenerationMap::try_from_entries_with_options(
-            indexed_entries,
-            config.overlay_capacity,
-            AtomicGenerationOverlay::AtomicAdaptive,
-            AtomicGenerationBaseFilter::EmbeddedFingerprint,
-        );
+        let index_result =
+            LockFreeAtomicU64GenerationMap::try_from_entries_with_options_and_writer_hash_and_index(
+                indexed_entries,
+                config.overlay_capacity,
+                AtomicGenerationOverlay::AtomicAdaptive,
+                AtomicGenerationBaseFilter::EmbeddedFingerprint,
+                hash_builder,
+                FrozenIndexBackend::PtrHash,
+            );
         if let Some(error) = initial_error {
             drop(index_result);
             return Err(error);
@@ -4432,6 +4792,11 @@ impl<V> DirectPackedCache<V> {
         let (capacity, entry_pressure, weight_pressure) =
             initialized_direct_capacity(&config, &entry_shards, &weight_shards);
         let maintenance_worker = Arc::new(ArcSwapOption::empty());
+        let frequency_reuse_shards = config.frequency_admission_min_hit_rate_bps.map(|_| {
+            std::iter::repeat_with(DirectFrequencyReuseShard::default)
+                .take(COUNTER_SHARDS)
+                .collect()
+        });
         let mutation_stripes = std::iter::repeat_with(|| Mutex::new(()))
             .take(MUTATION_STRIPES)
             .collect();
@@ -4456,6 +4821,8 @@ impl<V> DirectPackedCache<V> {
             victim_reservoir: Mutex::new(Vec::new()),
             admission_doorkeeper,
             frequency_reuse: AtomicU64::new(0),
+            frequency_reuse_shards,
+            frequency_reuse_publishing: AtomicBool::new(false),
             expiration_possible: AtomicBool::new(expiration_possible),
             mutation_stripes,
             #[cfg(feature = "cache-production-diagnostics")]
@@ -4483,6 +4850,38 @@ impl<V> DirectPackedCache<V> {
             admissions_since_refresh: 0,
             pending_lengths: self.config.max_entries.map(|_| DirectPendingLengths::new()),
             counter_shard,
+        }
+    }
+
+    /// Starts a reusable cloned-read session without retaining an arena epoch.
+    #[must_use]
+    pub fn pin_cloned(&self) -> DirectClonedCacheGuard<'_, V> {
+        let counter_shard = DirectValueArena::<V>::thread_id() & (COUNTER_SHARDS - 1);
+        DirectClonedCacheGuard {
+            cache: self,
+            lookup_index: self.index.read_cache(),
+            accesses: Cell::new(0),
+            pending_hits: Cell::new(0),
+            pending_misses: Cell::new(0),
+            counter_shard,
+        }
+    }
+
+    /// Starts a cloned/shareable session with bounded epoch retention.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `refresh_interval` is zero.
+    #[must_use]
+    pub fn pin_shareable(&self, refresh_interval: usize) -> DirectShareableCacheGuard<'_, V> {
+        assert!(
+            refresh_interval != 0,
+            "shareable refresh interval is non-zero"
+        );
+        DirectShareableCacheGuard {
+            guard: self.pin(),
+            refresh_interval,
+            lookups: 0,
         }
     }
 
@@ -4529,10 +4928,41 @@ impl<V> DirectPackedCache<V> {
         value
     }
 
+    /// Reads by cloning the resident value under a short reclamation pin.
+    ///
+    /// This is the preferred shareable-read path for values such as `Arc<T>`:
+    /// it returns an ordinary owned value without keeping a cache epoch active.
+    /// For deeply owned values, clone cost remains the caller's tradeoff.
+    #[must_use]
+    pub fn get_cloned(&self, key: &[u8]) -> Option<V>
+    where
+        V: Clone,
+    {
+        let value = self.lookup_cloned(key, true);
+        let counters = self.counters_for(key);
+        if value.is_some() {
+            counters.hits.fetch_add(1, Ordering::Relaxed);
+            self.record_frequency_reuse(1, 0);
+        } else {
+            counters.misses.fetch_add(1, Ordering::Relaxed);
+            self.record_frequency_reuse(0, 1);
+        }
+        value
+    }
+
     /// Reads without changing access or operation counters.
     #[must_use]
     pub fn peek(&self, key: &[u8]) -> Option<DirectCacheValue<V>> {
         self.lookup(key, false)
+    }
+
+    /// Clones a live value without recording access or operation counters.
+    #[must_use]
+    pub fn peek_cloned(&self, key: &[u8]) -> Option<V>
+    where
+        V: Clone,
+    {
+        self.lookup_cloned(key, false)
     }
 
     /// Inserts or replaces a value while retiring any previous value.
@@ -4971,28 +5401,66 @@ impl<V> DirectPackedCache<V> {
         admission: Option<DirectAdmissionContext<'_, '_>>,
     ) -> Result<CacheAdmissionOutcome, CacheInsertError> {
         let compact_weight = self.validate_weight(key, weight)?;
-        if let Some(outcome) = self.admission_precheck(key) {
-            return Ok(outcome);
-        }
+        let admission_hash = match self.admission_precheck(key) {
+            Ok(hash) => hash,
+            Err(outcome) => return Ok(outcome),
+        };
         let inserted = self
             .arena
             .allocate(value, compact_weight, self.deadline(ttl));
         let published = admission.as_ref().map_or_else(
-            || self.index.get_or_insert(key, inserted.index_value()),
+            || {
+                admission_hash.map_or_else(
+                    || self.index.get_or_insert(key, inserted.index_value()),
+                    |key_hash| {
+                        self.index
+                            .get_or_insert_hashed(key, inserted.index_value(), key_hash)
+                    },
+                )
+            },
             |context| {
                 if let Some(pending) = context.pending_lengths {
                     if pending.use_immediate() {
-                        return context.index.get_or_insert(key, inserted.index_value());
+                        return admission_hash.map_or_else(
+                            || context.index.get_or_insert(key, inserted.index_value()),
+                            |key_hash| {
+                                context.index.get_or_insert_hashed(
+                                    key,
+                                    inserted.index_value(),
+                                    key_hash,
+                                )
+                            },
+                        );
                     }
-                    let (published, deferred_stripe) = context
-                        .index
-                        .get_or_insert_deferred_len(key, inserted.index_value());
+                    let (published, deferred_stripe) = admission_hash.map_or_else(
+                        || {
+                            context
+                                .index
+                                .get_or_insert_deferred_len(key, inserted.index_value())
+                        },
+                        |key_hash| {
+                            context.index.get_or_insert_deferred_len_hashed(
+                                key,
+                                inserted.index_value(),
+                                key_hash,
+                            )
+                        },
+                    );
                     if let Some(stripe) = deferred_stripe {
                         pending.record(context.index, stripe);
                     }
                     published
                 } else {
-                    context.index.get_or_insert(key, inserted.index_value())
+                    admission_hash.map_or_else(
+                        || context.index.get_or_insert(key, inserted.index_value()),
+                        |key_hash| {
+                            context.index.get_or_insert_hashed(
+                                key,
+                                inserted.index_value(),
+                                key_hash,
+                            )
+                        },
+                    )
                 }
             },
         );
@@ -5547,6 +6015,7 @@ impl<V> DirectPackedCache<V> {
                 .fetch_add(1, Ordering::Relaxed);
         }
         self.arena.reclaim_retired();
+        self.index.reclaim_retired_generations();
         Ok(CacheMaintenanceResult {
             expired,
             evicted,
@@ -5568,6 +6037,7 @@ impl<V> DirectPackedCache<V> {
         V: Send + Sync + 'static,
     {
         let interval = interval.max(Duration::from_millis(1));
+        self.index.defer_retired_generation_drops();
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let cache = Arc::clone(self);
@@ -5586,6 +6056,7 @@ impl<V> DirectPackedCache<V> {
                         .maintenance_errors
                         .fetch_add(1, Ordering::Relaxed);
                 }
+                cache.index.reclaim_retired_generations();
                 let now = Instant::now();
                 if now >= next_full {
                     if cache.maintain().is_err() {
@@ -5636,7 +6107,9 @@ impl<V> DirectPackedCache<V> {
                 continue;
             }
             if record_access
-                && self.counters_for(key).hits.load(Ordering::Relaxed) & ACCESS_SAMPLE_MASK == 0
+                && self.counters_for(key).hits.load(Ordering::Relaxed)
+                    & self.access_sample_mask(entry.weight())
+                    == 0
             {
                 entry.mark_accessed();
                 self.note_frequency_access(key);
@@ -5645,6 +6118,38 @@ impl<V> DirectPackedCache<V> {
                 // SAFETY: the still-published handle belongs to this cache pin.
                 entry: unsafe { pin.into_protected(handle) },
             });
+        }
+        None
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "clones only while the exact index handle is protected by this cache pin"
+    )]
+    fn lookup_cloned(&self, key: &[u8], record_access: bool) -> Option<V>
+    where
+        V: Clone,
+    {
+        for _ in 0..16 {
+            let pin = self.arena.pin();
+            let raw = self.index.get_protected(key)?;
+            let handle = published_direct_handle_from_index(raw);
+            // SAFETY: the unchanged index handle and pin belong to this cache.
+            let entry = unsafe { protected_direct_entry(&pin, handle) };
+            let expires_at = entry.expires_at();
+            if expires_at != NEVER_EXPIRES && expires_at <= self.now() {
+                self.expire_handle(key, handle);
+                continue;
+            }
+            if record_access
+                && self.counters_for(key).hits.load(Ordering::Relaxed)
+                    & self.access_sample_mask(entry.weight())
+                    == 0
+            {
+                entry.mark_accessed();
+                self.note_frequency_access(key);
+            }
+            return Some(entry.value().clone());
         }
         None
     }
@@ -5811,18 +6316,27 @@ impl<V> DirectPackedCache<V> {
         true
     }
 
-    fn admission_precheck(&self, key: &[u8]) -> Option<CacheAdmissionOutcome> {
-        let doorkeeper = self.admission_doorkeeper.as_ref()?;
-        let decision = doorkeeper.admission_decision(key, self.frequency_admission_active());
+    fn admission_precheck(
+        &self,
+        key: &[u8],
+    ) -> Result<Option<GenerationKeyHash>, CacheAdmissionOutcome> {
+        let Some(doorkeeper) = self.admission_doorkeeper.as_ref() else {
+            return Ok(None);
+        };
+        let key_hash = self.index.key_hash(key);
+        let decision = doorkeeper.admission_decision_hashed(
+            doorkeeper_hashes_from_key_hash(key_hash),
+            self.frequency_admission_active(),
+        );
         if decision == DirectAdmissionDecision::Admit {
             #[cfg(feature = "cache-production-diagnostics")]
             self.diagnostics
                 .doorkeeper_admissions
                 .fetch_add(1, Ordering::Relaxed);
-            return None;
+            return Ok(Some(key_hash));
         }
-        if self.index.get(key).is_some() {
-            return Some(CacheAdmissionOutcome::Existing);
+        if self.index.get_hashed(key, key_hash).is_some() {
+            return Err(CacheAdmissionOutcome::Existing);
         }
         #[cfg(feature = "cache-production-diagnostics")]
         match decision {
@@ -5841,7 +6355,7 @@ impl<V> DirectPackedCache<V> {
         self.counters_for(key)
             .rejected
             .fetch_add(1, Ordering::Relaxed);
-        Some(CacheAdmissionOutcome::Rejected)
+        Err(CacheAdmissionOutcome::Rejected)
     }
 
     fn note_admission_population(&self) {
@@ -5879,15 +6393,25 @@ impl<V> DirectPackedCache<V> {
         if minimum_hit_rate == 0 {
             return true;
         }
-        let (hits, lookups) = unpack_frequency_reuse(self.frequency_reuse.load(Ordering::Relaxed));
+        let mut state = self.frequency_reuse.load(Ordering::Relaxed);
+        if unpack_frequency_reuse(state).1 < FREQUENCY_REUSE_MIN_LOOKUPS {
+            self.publish_frequency_reuse();
+            state = self.frequency_reuse.load(Ordering::Relaxed);
+        }
+        let (hits, lookups) = unpack_frequency_reuse(state);
         lookups >= FREQUENCY_REUSE_MIN_LOOKUPS
             && u128::from(hits) * 10_000 >= u128::from(lookups) * u128::from(minimum_hit_rate)
     }
 
     fn record_frequency_reuse(&self, hits: u64, misses: u64) {
-        if self.config.frequency_admission_min_hit_rate_bps.is_none() {
+        let shard = DirectValueArena::<V>::thread_id() & (COUNTER_SHARDS - 1);
+        self.record_frequency_reuse_shard(shard, hits, misses);
+    }
+
+    fn record_frequency_reuse_shard(&self, shard: usize, hits: u64, misses: u64) {
+        let Some(shards) = &self.frequency_reuse_shards else {
             return;
-        }
+        };
         let lookups = hits.saturating_add(misses);
         if lookups == 0 {
             return;
@@ -5900,6 +6424,52 @@ impl<V> DirectPackedCache<V> {
                 u128::from(hits.min(lookups)) * u128::from(sample_lookups) / u128::from(lookups),
             )
             .unwrap_or(sample_lookups)
+        };
+        let previous = shards[shard & (COUNTER_SHARDS - 1)].pending.fetch_add(
+            pack_frequency_reuse(sample_hits, sample_lookups),
+            Ordering::Relaxed,
+        );
+        let previous_lookups = unpack_frequency_reuse(previous).1;
+        if previous_lookups / FREQUENCY_REUSE_PUBLISH_INTERVAL
+            != previous_lookups.saturating_add(sample_lookups) / FREQUENCY_REUSE_PUBLISH_INTERVAL
+        {
+            self.publish_frequency_reuse();
+        }
+    }
+
+    fn publish_frequency_reuse(&self) {
+        let Some(shards) = &self.frequency_reuse_shards else {
+            return;
+        };
+        if self
+            .frequency_reuse_publishing
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let (hits, lookups) = shards.iter().fold((0_u64, 0_u64), |totals, shard| {
+            let (hits, lookups) = unpack_frequency_reuse(shard.pending.swap(0, Ordering::Relaxed));
+            (
+                totals.0.saturating_add(hits),
+                totals.1.saturating_add(lookups),
+            )
+        });
+        if lookups != 0 {
+            self.merge_frequency_reuse(hits, lookups);
+        }
+        self.frequency_reuse_publishing
+            .store(false, Ordering::Release);
+    }
+
+    fn merge_frequency_reuse(&self, hits: u64, lookups: u64) {
+        debug_assert!(hits <= lookups);
+        let sample_lookups = lookups.min(FREQUENCY_REUSE_WINDOW);
+        let sample_hits = if lookups <= FREQUENCY_REUSE_WINDOW {
+            hits
+        } else {
+            u64::try_from(u128::from(hits) * u128::from(sample_lookups) / u128::from(lookups))
+                .unwrap_or(sample_lookups)
         };
         let mut previous = self.frequency_reuse.load(Ordering::Relaxed);
         loop {
@@ -6217,6 +6787,8 @@ impl<V> DirectPackedCache<V> {
         requested_removal_target: Option<usize>,
     ) -> usize {
         let pin = self.arena.pin();
+        let victim_sample_window =
+            self.victim_sample_window(expired_only, requested_removal_target.is_none());
         let removal_target = if expired_only {
             self.config.eviction_batch
         } else {
@@ -6235,7 +6807,13 @@ impl<V> DirectPackedCache<V> {
         }
         #[cfg(feature = "cache-pressure-timing")]
         let collection_started = Instant::now();
-        let mut batch = self.collect_victim_candidates(&pin, now, expired_only, protected);
+        let mut batch = self.collect_victim_candidates(
+            &pin,
+            now,
+            expired_only,
+            protected,
+            victim_sample_window,
+        );
         #[cfg(feature = "cache-pressure-timing")]
         self.diagnostics
             .record_victim_collection(collection_started);
@@ -6411,6 +6989,7 @@ impl<V> DirectPackedCache<V> {
         now: u64,
         expired_only: bool,
         protected: Option<DirectHandle>,
+        requested_window: usize,
     ) -> DirectVictimBatch {
         let population = if self.config.max_weight == u64::MAX {
             self.config.max_entries.unwrap_or_else(|| self.len())
@@ -6418,7 +6997,7 @@ impl<V> DirectPackedCache<V> {
             self.len()
         }
         .max(1);
-        let window = self.config.eviction_batch.min(population);
+        let window = requested_window.min(population);
         let (sampling_window, fallback_population, fallback_dominates) =
             self.victim_sampling_plan(population, window, expired_only);
         let mut victims = DirectVictimBatch::with_capacity(sampling_window);
@@ -6522,9 +7101,10 @@ impl<V> DirectPackedCache<V> {
         if expired_only {
             return 0;
         }
-        self.admission_doorkeeper
-            .as_ref()
-            .map_or(0, |doorkeeper| doorkeeper.victim_frequency(key))
+        self.admission_doorkeeper.as_ref().map_or(0, |doorkeeper| {
+            doorkeeper
+                .victim_frequency_hashed(doorkeeper_hashes_from_route(self.index.route_hash(key)))
+        })
     }
 
     fn note_victim_frequency(&self, frequency: u8) {
@@ -6534,9 +7114,39 @@ impl<V> DirectPackedCache<V> {
     }
 
     fn note_frequency_access(&self, key: &[u8]) {
-        if let Some(doorkeeper) = &self.admission_doorkeeper {
-            doorkeeper.note_access(key);
+        if let Some(doorkeeper) = &self.admission_doorkeeper
+            && doorkeeper.tracks_resident_frequency()
+        {
+            doorkeeper.note_access_hashed(doorkeeper_hashes_from_route(self.index.route_hash(key)));
         }
+    }
+
+    fn access_sample_mask(&self, weight: u64) -> u64 {
+        if weight >= HEAVY_ACCESS_WEIGHT
+            && self
+                .admission_doorkeeper
+                .as_ref()
+                .is_some_and(DirectAdmissionDoorkeeper::tracks_resident_frequency)
+        {
+            HEAVY_ACCESS_SAMPLE_MASK
+        } else {
+            ACCESS_SAMPLE_MASK
+        }
+    }
+
+    fn victim_sample_window(&self, expired_only: bool, background: bool) -> usize {
+        let configured = self.config.eviction_batch;
+        if expired_only
+            || !background
+            || self.config.async_hard_limit_bps.is_none()
+            || self.config.max_weight == u64::MAX
+            || configured >= DIRECT_ASYNC_VICTIM_SAMPLE_MAX
+        {
+            return configured;
+        }
+        configured
+            .saturating_mul(4)
+            .min(DIRECT_ASYNC_VICTIM_SAMPLE_MAX)
     }
 
     fn frequency_protects_resident(&self, frequency: u8) -> bool {
@@ -7061,7 +7671,8 @@ mod tests {
 
         assert_eq!(doorkeeper.observe(&key, false), (false, None));
 
-        let current = doorkeeper.current.load(Ordering::Relaxed);
+        let current = usize::try_from(doorkeeper.generation.load(Ordering::Relaxed) & 1)
+            .expect("one bit fits usize");
         let changed = doorkeeper.filters[current]
             .iter()
             .filter(|word| word.load(Ordering::Relaxed) != 0)
@@ -7076,6 +7687,91 @@ mod tests {
     }
 
     #[test]
+    fn doorkeeper_rotation_bounds_foreground_clear_work() {
+        let doorkeeper = DirectAdmissionDoorkeeper::new(1_024, None);
+        for word in &doorkeeper.filters[1] {
+            word.store(u64::MAX, Ordering::Relaxed);
+        }
+        doorkeeper
+            .observations
+            .store(doorkeeper.rotate_every - 1, Ordering::Relaxed);
+
+        assert_eq!(doorkeeper.observe(b"rotate", false), (false, None));
+
+        let cleared = doorkeeper.filters[1]
+            .iter()
+            .filter(|word| word.load(Ordering::Relaxed) != u64::MAX)
+            .count();
+        assert!(
+            cleared <= DIRECT_DOORKEEPER_CLEAR_WORDS,
+            "one admission cleared {cleared} words instead of a bounded group"
+        );
+    }
+
+    #[test]
+    fn doorkeeper_lazy_rotation_keeps_exactly_one_previous_generation() {
+        let doorkeeper = DirectAdmissionDoorkeeper::new(1_024, None);
+        let recurring = b"recurring";
+        let old = b"only-generation-zero";
+        assert_eq!(doorkeeper.observe(recurring, false), (false, None));
+        assert_eq!(doorkeeper.observe(recurring, false), (true, None));
+        assert_eq!(doorkeeper.observe(old, false), (false, None));
+        assert_eq!(doorkeeper.observe(old, false), (true, None));
+
+        doorkeeper
+            .observations
+            .store(doorkeeper.rotate_every - 1, Ordering::Relaxed);
+        assert_eq!(doorkeeper.observe(b"rotate-once", false), (false, None));
+        assert_eq!(
+            doorkeeper.observe(recurring, false),
+            (true, None),
+            "the immediately previous generation must remain visible"
+        );
+
+        doorkeeper
+            .observations
+            .store(doorkeeper.rotate_every * 2 - 1, Ordering::Relaxed);
+        assert_eq!(doorkeeper.observe(b"rotate-twice", false), (false, None));
+        assert_eq!(
+            doorkeeper.observe(recurring, false),
+            (true, None),
+            "membership refreshed in generation one must remain visible"
+        );
+        assert_eq!(doorkeeper.observe(old, false), (false, None));
+    }
+
+    #[test]
+    fn concurrent_doorkeeper_rotations_leave_no_group_locked() {
+        const THREADS: usize = 8;
+        const OBSERVATIONS: usize = 4_096;
+        let doorkeeper = Arc::new(DirectAdmissionDoorkeeper::new(64, None));
+
+        std::thread::scope(|scope| {
+            for thread in 0..THREADS {
+                let doorkeeper = Arc::clone(&doorkeeper);
+                scope.spawn(move || {
+                    for observation in 0..OBSERVATIONS {
+                        let key = ((thread as u64) << 32 | observation as u64).to_le_bytes();
+                        doorkeeper.observe(&key, false);
+                    }
+                });
+            }
+        });
+
+        assert_eq!(
+            doorkeeper.generation.load(Ordering::Relaxed),
+            u64::try_from(THREADS * OBSERVATIONS / 64).unwrap()
+        );
+        assert!(
+            doorkeeper
+                .filter_epochs
+                .iter()
+                .flatten()
+                .all(|epoch| { epoch.load(Ordering::Acquire) & DIRECT_DOORKEEPER_GROUP_LOCK == 0 })
+        );
+    }
+
+    #[test]
     fn resident_frequency_access_starts_only_after_capacity_pressure() {
         let doorkeeper = DirectAdmissionDoorkeeper::new(1_024, Some(8));
         let key = b"resident";
@@ -7085,8 +7781,24 @@ mod tests {
         assert_eq!(doorkeeper.frequency.as_ref().unwrap().estimate(hashes), 0);
 
         doorkeeper.note_victim_frequency(0, 8);
+        let aging_observations = doorkeeper
+            .frequency
+            .as_ref()
+            .unwrap()
+            .observations
+            .load(Ordering::Relaxed);
         doorkeeper.note_access(key);
         assert_eq!(doorkeeper.frequency.as_ref().unwrap().estimate(hashes), 1);
+        assert_eq!(
+            doorkeeper
+                .frequency
+                .as_ref()
+                .unwrap()
+                .observations
+                .load(Ordering::Relaxed),
+            aging_observations,
+            "resident hits must not contend on the global aging clock"
+        );
     }
 
     #[test]
@@ -7094,11 +7806,92 @@ mod tests {
         let cache = DirectPackedCache::<u64>::try_new(CacheConfig::new(16)).unwrap();
         let guard = cache.pin();
         let sampled = (0..300)
-            .filter(|_| guard.sample_access())
+            .filter(|_| guard.sample_access(1))
             .collect::<Vec<_>>();
         let expected = (0..300).filter(|index| index % 16 == 0).collect::<Vec<_>>();
 
         assert_eq!(sampled, expected);
+    }
+
+    #[test]
+    fn direct_guard_samples_heavy_values_more_often_only_under_pressure() {
+        let cache = DirectPackedCache::<u64>::try_new(
+            CacheConfig::new(16)
+                .with_admission_doorkeeper(16)
+                .with_frequency_admission(8),
+        )
+        .unwrap();
+        let guard = cache.pin();
+        let before_pressure = (0..64).filter(|_| guard.sample_access(4_096)).count();
+        cache.note_victim_frequency(0);
+        let under_pressure = (0..64).filter(|_| guard.sample_access(4_096)).count();
+
+        assert_eq!(before_pressure, 4);
+        assert_eq!(under_pressure, 64);
+    }
+
+    #[test]
+    fn direct_cloned_read_releases_reclamation_without_borrowing_the_cache() {
+        let cache = DirectPackedCache::try_new(CacheConfig::new(64)).expect("cache constructs");
+        cache
+            .insert_if_absent_with_options(b"key", String::from("value"), 5, None)
+            .expect("admission succeeds");
+
+        let cloned = cache.get_cloned(b"key").expect("value is resident");
+        assert!(cache.remove_discard(b"key"));
+        cache.arena.reclaim_retired();
+
+        assert_eq!(cloned, "value");
+        assert!(cache.peek(b"key").is_none());
+    }
+
+    #[test]
+    fn direct_cloned_guard_keeps_no_arena_epoch_between_reads() {
+        let cache = DirectPackedCache::try_new(CacheConfig::new(64)).expect("cache constructs");
+        cache
+            .insert_if_absent_with_options(b"key", Arc::new(String::from("value")), 5, None)
+            .expect("admission succeeds");
+        let guard = cache.pin_cloned();
+
+        let cloned = guard.get(b"key").expect("value is resident");
+        assert!(cache.remove_discard(b"key"));
+        cache.arena.reclaim_retired();
+
+        assert_eq!(&**cloned, "value");
+        #[cfg(feature = "cache-diagnostics")]
+        assert_eq!(cache.arena.reclamation_snapshot().retired_values, 0);
+    }
+
+    #[test]
+    fn direct_shareable_guard_automatically_bounds_its_reader_epoch() {
+        let cache = DirectPackedCache::try_new(CacheConfig::new(64)).expect("cache constructs");
+        cache
+            .insert_if_absent_with_options(b"key", Arc::new(String::from("value")), 5, None)
+            .expect("admission succeeds");
+        let mut guard = cache.pin_shareable(1);
+
+        let cloned = guard.get(b"key").expect("value is resident");
+        assert!(cache.remove_discard(b"key"));
+        cache.arena.reclaim_retired();
+
+        assert_eq!(&**cloned, "value");
+        #[cfg(feature = "cache-diagnostics")]
+        assert_eq!(cache.arena.reclamation_snapshot().retired_values, 0);
+    }
+
+    #[test]
+    fn async_background_eviction_expands_sampling_without_expanding_foreground_work() {
+        let cache = DirectPackedCache::<u64>::try_new(
+            CacheConfig::new(1_000_000)
+                .with_max_entries(50_000)
+                .with_eviction_batch(256)
+                .with_async_eviction(11_000),
+        )
+        .unwrap();
+
+        assert_eq!(cache.victim_sample_window(false, true), 1_024);
+        assert_eq!(cache.victim_sample_window(false, false), 256);
+        assert_eq!(cache.victim_sample_window(true, true), 256);
     }
 
     #[test]
@@ -7198,6 +7991,17 @@ mod tests {
             .count();
         assert_eq!(changed, 2, "the reset boundary must not sweep the sketch");
         assert_eq!(sketch.estimate([0, 1]), 7);
+    }
+
+    #[test]
+    fn resident_frequency_refreshes_counters_without_global_contention() {
+        let sketch = DirectFrequencySketch::new(32, 8);
+        let hashes = [64, 65];
+
+        sketch.observe_resident(hashes);
+
+        assert_eq!(sketch.estimate(hashes), 1);
+        assert_eq!(sketch.observations.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -7305,19 +8109,29 @@ mod tests {
                 scope.spawn(move || {
                     for _ in 0..1_000 {
                         if thread_index % 2 == 0 {
-                            cache.record_frequency_reuse(512, 0);
+                            cache.record_frequency_reuse_shard(thread_index, 512, 0);
                         } else {
-                            cache.record_frequency_reuse(0, 512);
+                            cache.record_frequency_reuse_shard(thread_index, 0, 512);
                         }
                     }
                 });
             }
         });
+        cache.publish_frequency_reuse();
 
         let (hits, lookups) = unpack_frequency_reuse(cache.frequency_reuse.load(Ordering::Relaxed));
         assert!(hits <= lookups);
         assert!(lookups <= FREQUENCY_REUSE_WINDOW);
         assert!(lookups >= FREQUENCY_REUSE_MIN_LOOKUPS);
+        #[cfg(feature = "cache-production-diagnostics")]
+        assert!(
+            cache
+                .diagnostics
+                .rolling_estimator_cas_retries
+                .load(Ordering::Relaxed)
+                <= 8,
+            "independent writer shards must not contend on the rolling summary"
+        );
     }
 
     #[test]

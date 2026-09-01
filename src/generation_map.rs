@@ -732,7 +732,7 @@ impl AtomicReadCache<'_> {
         )
     }
 
-    pub(crate) fn refresh(&self) {
+    pub(crate) fn refresh(&self) -> bool {
         let mut state = self.state.borrow_mut();
         let AtomicReadCacheState {
             current,
@@ -740,8 +740,18 @@ impl AtomicReadCache<'_> {
             base,
         } = &mut *state;
         let generation = current.load();
-        *base_generation = Arc::clone(generation);
-        *base = generation.base.load_full();
+        if !Arc::ptr_eq(base_generation, generation) {
+            *base_generation = Arc::clone(generation);
+            *base = generation.base.load_full();
+            return true;
+        }
+        if matches!(base.as_ref(), GenerationBase::Previous(_)) {
+            let refreshed = generation.base.load_full();
+            let changed = !Arc::ptr_eq(base, &refreshed);
+            *base = refreshed;
+            return changed;
+        }
+        false
     }
 }
 
@@ -771,6 +781,20 @@ impl AtomicReadGuard<'_> {
         current
     }
 
+    pub(crate) fn get_or_insert_hashed(
+        &self,
+        key: &[u8],
+        value: NonMaxU64,
+        key_hash: GenerationKeyHash,
+    ) -> NonMaxU64 {
+        let (current, deferred_stripe) =
+            self.get_or_insert_deferred_len_hashed(key, value, key_hash);
+        if let Some(stripe) = deferred_stripe {
+            self.generation.adjust_len(stripe, 1);
+        }
+        current
+    }
+
     pub(crate) fn get_or_insert_deferred_len(
         &self,
         key: &[u8],
@@ -790,6 +814,41 @@ impl AtomicReadGuard<'_> {
         // drains those reservations before it can close writer stripes, so a
         // stable guarded write does not need a second per-operation writer
         // reservation merely to keep this generation open.
+        let state = self.generation.writer_stripes[stripe].load(Ordering::Acquire);
+        debug_assert_eq!(state & WRITER_STRIPE_CLOSED, 0);
+        let route = GenerationWriteRoute {
+            stripe,
+            direct_base: state & WRITER_STRIPE_DIRECT_BASE != 0,
+            overlay_may_shadow_base: state & WRITER_STRIPE_OVERLAY_BASE != 0,
+            key_hash,
+        };
+        let (current, inserted) = self.generation.get_or_insert_atomic_with_base(
+            self.stable_base
+                .as_ref()
+                .expect("stable guarded writes retain a base"),
+            key,
+            value,
+            route,
+        );
+        (current, inserted.then_some(stripe))
+    }
+
+    pub(crate) fn get_or_insert_deferred_len_hashed(
+        &self,
+        key: &[u8],
+        value: NonMaxU64,
+        key_hash: GenerationKeyHash,
+    ) -> (NonMaxU64, Option<usize>) {
+        if self.stable_base.is_none() {
+            return (self.map.get_or_insert_hashed(key, value, key_hash), None);
+        }
+        let stripe =
+            GenerationMapCore::<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap>::writer_stripe(
+                key_hash,
+            );
+        // The caller already computed both digest lanes for policy work. Reuse
+        // them for exact publication even when this generation has an empty
+        // base; recomputing a route-only hash would discard that work.
         let state = self.generation.writer_stripes[stripe].load(Ordering::Acquire);
         debug_assert_eq!(state & WRITER_STRIPE_CLOSED, 0);
         let route = GenerationWriteRoute {
@@ -1655,6 +1714,25 @@ impl LockFreeAtomicU64GenerationMap {
         self.inner.get_atomic_protected(key)
     }
 
+    pub(crate) fn key_hash(&self, key: &[u8]) -> GenerationKeyHash {
+        self.inner.key_hash(key)
+    }
+
+    pub(crate) fn route_hash(&self, key: &[u8]) -> u64 {
+        #[cfg(feature = "shared-gx")]
+        {
+            GenerationKeyHash::new(&self.inner.writer_hash_builder, key).route()
+        }
+        #[cfg(not(feature = "shared-gx"))]
+        {
+            GenerationKeyHash::route_for(&self.inner.writer_hash_builder, key)
+        }
+    }
+
+    pub(crate) fn get_hashed(&self, key: &[u8], key_hash: GenerationKeyHash) -> Option<NonMaxU64> {
+        self.inner.get_atomic_protected_hashed(key, key_hash)
+    }
+
     pub(crate) fn read_guard(&self) -> AtomicReadGuard<'_> {
         loop {
             let generation = self.inner.current.load();
@@ -1715,6 +1793,17 @@ impl LockFreeAtomicU64GenerationMap {
     #[must_use]
     pub fn get_or_insert(&self, key: &[u8], value: NonMaxU64) -> NonMaxU64 {
         self.inner.pin_writer(key).get_or_insert(key, value)
+    }
+
+    pub(crate) fn get_or_insert_hashed(
+        &self,
+        key: &[u8],
+        value: NonMaxU64,
+        key_hash: GenerationKeyHash,
+    ) -> NonMaxU64 {
+        self.inner
+            .pin_writer_hashed(key_hash)
+            .get_or_insert(key, value)
     }
 
     /// Pins one generation for a short sequence of atomic operations.
@@ -2033,6 +2122,19 @@ impl LockFreeAtomicU64GenerationMap {
         self.inner.rebuild_adaptive_if_needed(policy)
     }
 
+    pub(crate) fn defer_retired_generation_drops(&self) {
+        self.inner.defer_retired_generation_drops();
+    }
+
+    pub(crate) fn reclaim_retired_generations(&self) -> usize {
+        self.inner.reclaim_retired_generations()
+    }
+
+    #[cfg(test)]
+    fn retired_generation_count(&self) -> usize {
+        self.inner.retired_generation_count()
+    }
+
     /// Returns the current logical entry count.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -2125,6 +2227,8 @@ impl LockFreeAtomicU64GenerationMap {
 struct GenerationMapCore<V, C, B> {
     current: ArcSwap<GenerationLayer<V, C, B>>,
     rebuild_gate: Mutex<()>,
+    defer_retired_generation_drops: AtomicBool,
+    retired_generations: Mutex<Vec<Arc<GenerationLayer<V, C, B>>>>,
     writer_hash_builder: GenerationHashBuilder,
     overlay_mode: GenerationOverlayMode,
     base_filter: AtomicGenerationBaseFilter,
@@ -2441,6 +2545,13 @@ where
         let base_publish = publish_started.elapsed();
         let from_generation = self.generation.fetch_add(1, Ordering::AcqRel);
 
+        if self.defer_retired_generation_drops.load(Ordering::Acquire) {
+            // Keep one owner after every read cache has revalidated. Explicit
+            // maintenance can then perform the potentially large last drop
+            // away from a request thread.
+            self.retired_generations.lock().push(previous);
+        }
+
         Ok(GenerationRebuild {
             from_generation,
             to_generation: from_generation.wrapping_add(1),
@@ -2539,12 +2650,43 @@ where
         Self {
             current: ArcSwap::from(initial),
             rebuild_gate: Mutex::new(()),
+            defer_retired_generation_drops: AtomicBool::new(false),
+            retired_generations: Mutex::new(Vec::new()),
             writer_hash_builder,
             overlay_mode,
             base_filter,
             frozen_index_backend,
             generation: AtomicU64::new(0),
         }
+    }
+
+    fn defer_retired_generation_drops(&self) {
+        self.defer_retired_generation_drops
+            .store(true, Ordering::Release);
+    }
+
+    fn reclaim_retired_generations(&self) -> usize {
+        let reclaimable = {
+            let mut retired = self.retired_generations.lock();
+            let mut reclaimable = Vec::new();
+            let mut index = 0;
+            while index < retired.len() {
+                if Arc::strong_count(&retired[index]) == 1 {
+                    reclaimable.push(retired.swap_remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            reclaimable
+        };
+        let reclaimed = reclaimable.len();
+        drop(reclaimable);
+        reclaimed
+    }
+
+    #[cfg(test)]
+    fn retired_generation_count(&self) -> usize {
+        self.retired_generations.lock().len()
     }
 
     const fn default_overlay_mode() -> GenerationOverlayMode {
@@ -2556,7 +2698,11 @@ where
     }
 
     fn pin_writer(&self, key: &[u8]) -> GenerationWriter<V, C, B> {
-        let (stripe, key_hash) = self.writer_route(key);
+        self.pin_writer_hashed(self.key_hash(key))
+    }
+
+    fn pin_writer_hashed(&self, key_hash: GenerationKeyHash) -> GenerationWriter<V, C, B> {
+        let stripe = Self::writer_stripe(key_hash);
         loop {
             let generation = self.current.load();
             // An open predecessor stripe remains the single writer destination
@@ -2576,19 +2722,33 @@ where
         }
     }
 
-    fn writer_route(&self, key: &[u8]) -> (usize, GenerationKeyHash) {
+    fn key_hash(&self, key: &[u8]) -> GenerationKeyHash {
+        GenerationKeyHash::new(&self.writer_hash_builder, key)
+    }
+
+    fn writer_stripe(key_hash: GenerationKeyHash) -> usize {
         let stripe_mask = u64::try_from(WRITER_STRIPES - 1).expect("writer stripe mask fits u64");
-        let key_hash = GenerationKeyHash::new(&self.writer_hash_builder, key);
-        let stripe = usize::try_from(key_hash.route() & stripe_mask)
-            .expect("masked writer stripe fits usize");
-        (stripe, key_hash)
+        usize::try_from(key_hash.route() & stripe_mask).expect("masked writer stripe fits usize")
+    }
+
+    fn writer_route(&self, key: &[u8]) -> (usize, GenerationKeyHash) {
+        let key_hash = self.key_hash(key);
+        (Self::writer_stripe(key_hash), key_hash)
     }
 }
 
 impl GenerationMapCore<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap> {
     fn get_atomic_protected(&self, key: &[u8]) -> Option<NonMaxU64> {
+        self.get_atomic_protected_hashed(key, self.key_hash(key))
+    }
+
+    fn get_atomic_protected_hashed(
+        &self,
+        key: &[u8],
+        key_hash: GenerationKeyHash,
+    ) -> Option<NonMaxU64> {
         let generation = self.current.load();
-        let (stripe, key_hash) = self.writer_route(key);
+        let stripe = Self::writer_stripe(key_hash);
         generation.get_atomic_protected(key, key_hash, stripe)
     }
 }
@@ -5676,6 +5836,70 @@ mod tests {
         let existing_value = map.get(&existing);
         assert_eq!(map.remove(&existing), existing_value);
         assert_eq!(cached.get_protected(&existing), None);
+    }
+
+    #[test]
+    fn read_cache_refresh_reports_only_material_generation_changes() {
+        let map = LockFreeAtomicU64GenerationMap::try_from_entries(
+            [(Box::<[u8]>::from(&b"base"[..]), NonMaxU64::new(1).unwrap())],
+            64,
+        )
+        .unwrap();
+        let cache = map.read_cache();
+
+        assert!(
+            !cache.refresh(),
+            "an unchanged frozen generation is a no-op"
+        );
+        map.insert(b"overlay", NonMaxU64::new(2).unwrap());
+        assert!(
+            !cache.refresh(),
+            "ordinary mutations do not replace the generation or its base"
+        );
+
+        map.rebuild(64).unwrap();
+        assert!(cache.refresh(), "a published generation must be adopted");
+        assert!(!cache.refresh(), "the adopted generation is stable again");
+        assert_eq!(cache.get_protected(b"overlay"), NonMaxU64::new(2));
+    }
+
+    #[test]
+    fn deferred_generation_drop_waits_for_read_cache_and_explicit_reclaim() {
+        let map = LockFreeAtomicU64GenerationMap::try_from_entries(
+            (0..64_u64).map(|value| (value.to_le_bytes(), NonMaxU64::new(value + 1).unwrap())),
+            128,
+        )
+        .unwrap();
+        map.defer_retired_generation_drops();
+        let cached = map.read_cache();
+
+        map.rebuild(128).unwrap();
+        assert_eq!(map.retired_generation_count(), 1);
+        assert_eq!(map.reclaim_retired_generations(), 0);
+
+        cached.refresh();
+        assert_eq!(map.reclaim_retired_generations(), 1);
+        assert_eq!(map.retired_generation_count(), 0);
+    }
+
+    #[test]
+    fn prehashed_atomic_conditional_insert_reuses_exact_hash_context() {
+        let map = LockFreeAtomicU64GenerationMap::try_from_entries(
+            std::iter::empty::<(Box<[u8]>, NonMaxU64)>(),
+            64,
+        )
+        .unwrap();
+        let key = b"prehashed";
+        let key_hash = map.key_hash(key);
+        assert_eq!(map.route_hash(key), key_hash.route());
+        let inserted = NonMaxU64::new(7).unwrap();
+        let racing = NonMaxU64::new(9).unwrap();
+
+        assert_eq!(map.get_hashed(key, key_hash), None);
+        assert_eq!(map.get_or_insert_hashed(key, inserted, key_hash), inserted);
+        assert_eq!(map.get_or_insert_hashed(key, racing, key_hash), inserted);
+        assert_eq!(map.get_hashed(key, key_hash), Some(inserted));
+        assert_eq!(map.len(), 1);
     }
 
     #[test]
