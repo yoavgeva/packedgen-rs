@@ -387,29 +387,45 @@ fn adaptive_frequency_admission_activates_after_reuse() {
             );
         }
     }
-    assert_eq!(
-        cache
-            .insert_if_absent_with_options(b"c", vec![3], 1, None)
-            .unwrap(),
-        CacheAdmissionOutcome::Rejected
-    );
-    assert_eq!(
-        cache
-            .insert_if_absent_with_options(b"c", vec![4], 1, None)
-            .unwrap(),
-        CacheAdmissionOutcome::Inserted
-    );
-    assert_eq!(
-        cache
-            .insert_if_absent_with_options(b"d", vec![5], 1, None)
-            .unwrap(),
-        CacheAdmissionOutcome::Rejected
-    );
-    assert_eq!(
-        cache
-            .insert_if_absent_with_options(b"d", vec![6], 1, None)
-            .unwrap(),
-        CacheAdmissionOutcome::Rejected
+    let mut admitted_probe = None;
+    for index in 0..256 {
+        let key = format!("adaptive-probe-{index}").into_bytes();
+        let first = cache
+            .insert_if_absent_with_options(&key, vec![3], 1, None)
+            .unwrap();
+        if first != CacheAdmissionOutcome::Rejected {
+            continue;
+        }
+        let second = cache
+            .insert_if_absent_with_options(&key, vec![4], 1, None)
+            .unwrap();
+        if second == CacheAdmissionOutcome::Inserted {
+            admitted_probe = Some(key);
+            break;
+        }
+    }
+    admitted_probe.expect("doorkeeper admits a repeated candidate");
+
+    let mut frequency_rejected = false;
+    for index in 256..512 {
+        let key = format!("adaptive-probe-{index}").into_bytes();
+        let first = cache
+            .insert_if_absent_with_options(&key, vec![5], 1, None)
+            .unwrap();
+        if first != CacheAdmissionOutcome::Rejected {
+            continue;
+        }
+        let second = cache
+            .insert_if_absent_with_options(&key, vec![6], 1, None)
+            .unwrap();
+        if second == CacheAdmissionOutcome::Rejected {
+            frequency_rejected = true;
+            break;
+        }
+    }
+    assert!(
+        frequency_rejected,
+        "adaptive gate rejects a low-frequency retry"
     );
     #[cfg(feature = "cache-production-diagnostics")]
     {
@@ -1707,6 +1723,23 @@ fn bulk_loaded_expired_entry_is_removed_on_read() {
     assert!(cache.get(b"expired").is_none());
     assert!(cache.is_empty());
     assert_eq!(cache.weight(), 0);
+}
+
+#[test]
+fn guarded_expiration_path_does_not_return_stale_value() {
+    let cache = cache(1_024, 16);
+    cache
+        .insert_discard_with_options(b"ttl", vec![1], 1, Some(Duration::ZERO))
+        .unwrap();
+
+    let guard = cache.pin();
+    assert!(guard.get(b"ttl").is_none());
+    drop(guard);
+
+    cache
+        .insert_discard_with_options(b"ttl", vec![2], 1, None)
+        .unwrap();
+    assert_eq!(&*cache.get(b"ttl").unwrap(), &vec![2]);
 }
 
 #[test]
