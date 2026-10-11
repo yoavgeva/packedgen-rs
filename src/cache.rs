@@ -5377,6 +5377,7 @@ impl<V> DirectPackedCache<V> {
         let Some(hard_capacity) = self.try_reserve_publish_capacity(compact_weight) else {
             return Ok(self.insert_discard_at_hard_capacity(key, value, compact_weight, ttl));
         };
+        let _reclaim_deferral = self.arena.defer_reclamation();
         let mutation = self.mutation_stripe(key).lock();
         let pin = self.arena.pin();
         // The entry handle carries the writer route and exact vacancy proof
@@ -6619,11 +6620,13 @@ impl<V> DirectPackedCache<V> {
         // Full cycles coalesce independently of capacity eviction. A rebuild
         // waits for guarded writers, which may themselves need the capacity
         // gate before they can release their generation reservation.
+        let _reclaim_deferral = self.arena.defer_reclamation();
         let _full_maintenance = self.full_maintenance_gate.lock();
         if self.maintenance_completions.load(Ordering::Acquire) != observed_completion {
             return Ok(CacheMaintenanceResult::default());
         }
         let (expired, evicted) = {
+            let _reclaim_deferral = self.arena.defer_reclamation();
             let _capacity = self.maintenance_gate.lock();
             let now = self.now();
             let expired = if self.expiration_possible.load(Ordering::Acquire) {
@@ -6820,6 +6823,7 @@ impl<V> DirectPackedCache<V> {
         key: &[u8],
         ttl: Option<Duration>,
     ) -> bool {
+        let _reclaim_deferral = self.arena.defer_reclamation();
         let mutation = self.mutation_stripe(key).lock();
         let Some(raw) = self.index.get_protected(key) else {
             return false;
@@ -6888,6 +6892,7 @@ impl<V> DirectPackedCache<V> {
         prepared: &AtomicPreparedKey,
         ttl: Option<Duration>,
     ) -> bool {
+        let _reclaim_deferral = self.arena.defer_reclamation();
         let mutation = self.mutation_stripe(key).lock();
         let Some(raw) = self.index.get_prepared(key, prepared) else {
             return false;
@@ -6917,6 +6922,7 @@ impl<V> DirectPackedCache<V> {
         reason = "the exact expiration removal and arena pin belong to this cache"
     )]
     fn expire_handle(&self, key: &[u8], expected: DirectHandle) -> bool {
+        let _reclaim_deferral = self.arena.defer_reclamation();
         let _mutation = self.mutation_stripe(key).lock();
         let pin = self.arena.pin();
         let Some(raw) = self.index.get_protected(key) else {
@@ -7251,6 +7257,8 @@ impl<V> DirectPackedCache<V> {
                 return reservation;
             }
 
+            let _reclaim_deferral = self.arena.defer_reclamation();
+
             if let Some(_maintenance) = self.maintenance_gate.try_lock() {
                 if let Some(reservation) = self.try_reserve_capacity(entries, weight) {
                     #[cfg(feature = "cache-pressure-timing")]
@@ -7510,6 +7518,7 @@ impl<V> DirectPackedCache<V> {
         } else {
             self.over_limit()
         } {
+            let _reclaim_deferral = self.arena.defer_reclamation();
             if let Some(_maintenance) = self.maintenance_gate.try_lock() {
                 if async_hard_limit && self.over_hard_limit() {
                     self.evict_to_hard_limit_locked(self.now(), Some(protected));
@@ -7564,6 +7573,7 @@ impl<V> DirectPackedCache<V> {
         }
         #[cfg(feature = "cache-pressure-timing")]
         let started = Instant::now();
+        let _reclaim_deferral = self.arena.defer_reclamation();
         let _maintenance = self.maintenance_gate.lock();
         let removed = self.evict_to_limits_locked(self.now(), None, None);
         #[cfg(feature = "cache-pressure-timing")]
@@ -7724,6 +7734,7 @@ impl<V> DirectPackedCache<V> {
             if protected_key.is_some_and(|protected_key| protected_key == key) {
                 continue;
             }
+            let _reclaim_deferral = self.arena.defer_reclamation();
             let _mutation = self.mutation_stripe(key).lock();
             if self.index.get_protected(key) != Some(handle.index_value()) {
                 continue;
@@ -8143,6 +8154,7 @@ impl<V> DirectPackedCache<V> {
             if Some(handle) == protected {
                 continue;
             }
+            let _reclaim_deferral = self.arena.defer_reclamation();
             let _mutation = self.mutation_stripe(key).lock();
             if self.index.get_protected(key) != Some(raw) {
                 continue;

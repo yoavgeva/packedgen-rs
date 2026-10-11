@@ -3097,3 +3097,71 @@ fn miri_concurrent_replacement_and_reclamation_smoke() {
     assert_eq!(cache.len(), WRITERS);
     assert_eq!(cache.weight(), (WRITERS * 8) as u64);
 }
+
+#[test]
+fn eviction_destructor_can_reenter_same_cache() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Weak, mpsc};
+
+    struct Reenter {
+        cache: Weak<DirectPackedCache<Reenter>>,
+        armed: Arc<AtomicBool>,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for Reenter {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+            if self.armed.swap(false, Ordering::SeqCst) {
+                let cache = self.cache.upgrade().unwrap();
+                cache
+                    .insert_discard_with_options(
+                        b"from-drop",
+                        Self {
+                            cache: self.cache.clone(),
+                            armed: Arc::clone(&self.armed),
+                            drops: Arc::clone(&self.drops),
+                        },
+                        1,
+                        None,
+                    )
+                    .unwrap();
+            }
+        }
+    }
+    let (send, receive) = mpsc::channel();
+    thread::spawn(move || {
+        let cache = Arc::new(
+            DirectPackedCache::try_new(
+                CacheConfig::new(u64::MAX)
+                    .with_max_entries(64)
+                    .with_overlay_capacity(4096),
+            )
+            .unwrap(),
+        );
+        let armed = Arc::new(AtomicBool::new(false));
+        let drops = Arc::new(AtomicUsize::new(0));
+        for key in 0..20_000_u64 {
+            if key == 64 {
+                armed.store(true, Ordering::SeqCst);
+            }
+            cache
+                .insert_discard_with_options(
+                    &key.to_le_bytes(),
+                    Reenter {
+                        cache: Arc::downgrade(&cache),
+                        armed: Arc::clone(&armed),
+                        drops: Arc::clone(&drops),
+                    },
+                    1,
+                    None,
+                )
+                .unwrap();
+        }
+        assert!(!armed.load(Ordering::SeqCst));
+        assert!(drops.load(Ordering::Relaxed) >= 1000);
+        send.send(()).unwrap();
+    });
+    receive
+        .recv_timeout(Duration::from_secs(10))
+        .expect("eviction destructor deadlocked");
+}

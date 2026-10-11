@@ -73,11 +73,34 @@ static NEXT_DIRECT_ARENA_THREAD: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     static DIRECT_ARENA_THREAD: Cell<usize> = const { Cell::new(usize::MAX) };
+    static DIRECT_RECLAIM_DEFERRAL_DEPTH: Cell<usize> = const { Cell::new(0) };
     // Non-zero only while this thread is running user destructors with one
     // direct arena's collector gate held. The exact owner identity matters:
     // destruction may re-enter a different cache, whose gate must still be
     // acquired normally.
     static DIRECT_RECLAIM_OWNER: Cell<usize> = const { Cell::new(0) };
+}
+
+pub(crate) struct DirectReclaimDeferral<'arena, V> {
+    owner: &'arena DirectArenaOwner<V>,
+    _not_send: PhantomData<*mut ()>,
+}
+
+impl<V> Drop for DirectReclaimDeferral<'_, V> {
+    fn drop(&mut self) {
+        let outermost = DIRECT_RECLAIM_DEFERRAL_DEPTH.with(|depth| {
+            depth.set(depth.get() - 1);
+            depth.get() == 0
+        });
+        if outermost {
+            let pending = self.owner.deferred_reclaim.swap(0, Ordering::Relaxed);
+            if pending != 0 {
+                for _ in 0..if pending == 2 { DIRECT_EPOCHS } else { 1 } {
+                    self.owner.try_advance(pending == 2);
+                }
+            }
+        }
+    }
 }
 
 struct DirectReclaimOwnerScope {
@@ -754,9 +777,17 @@ impl<V> DirectValueArena<V> {
         }
     }
 
+    pub(crate) fn defer_reclamation(&self) -> DirectReclaimDeferral<'_, V> {
+        DIRECT_RECLAIM_DEFERRAL_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        DirectReclaimDeferral {
+            owner: &self.owner,
+            _not_send: PhantomData,
+        }
+    }
+
     pub(crate) fn reclaim_retired(&self) {
         for _ in 0..DIRECT_EPOCHS {
-            self.owner.try_advance(true);
+            self.owner.advance_or_defer(true);
         }
     }
 
@@ -1874,6 +1905,7 @@ struct DirectArenaOwner<V> {
     peak_retired_values: AtomicUsize,
     #[cfg(feature = "cache-production-diagnostics")]
     peak_retired_bytes: AtomicU64,
+    deferred_reclaim: AtomicUsize,
     reclaim_gate: Mutex<()>,
 }
 
@@ -1904,6 +1936,7 @@ impl<V> DirectArenaOwner<V> {
             peak_retired_values: AtomicUsize::new(0),
             #[cfg(feature = "cache-production-diagnostics")]
             peak_retired_bytes: AtomicU64::new(0),
+            deferred_reclaim: AtomicUsize::new(0),
             reclaim_gate: Mutex::new(()),
         }
     }
@@ -2219,7 +2252,7 @@ impl<V> DirectArenaOwner<V> {
                 .fetch_add(DIRECT_RECLAIM_PUBLISH_BATCH, Ordering::Relaxed)
                 + DIRECT_RECLAIM_PUBLISH_BATCH;
             if published >= DIRECT_RECLAIM_BATCH {
-                self.try_advance(false);
+                self.advance_or_defer(false);
             }
         }
     }
@@ -2264,7 +2297,7 @@ impl<V> DirectArenaOwner<V> {
             let published =
                 self.retired_count[epoch].fetch_add(publish, Ordering::Relaxed) + publish;
             if published >= DIRECT_RECLAIM_BATCH {
-                self.try_advance(false);
+                self.advance_or_defer(false);
             }
         }
     }
@@ -2298,6 +2331,19 @@ impl<V> DirectArenaOwner<V> {
         self.retired[begin..begin + DIRECT_RETIRED_SHARDS]
             .iter()
             .any(|queue| !queue.0.lock().is_empty())
+    }
+
+    fn advance_or_defer(&self, force: bool) {
+        if DIRECT_RECLAIM_DEFERRAL_DEPTH.with(|depth| depth.get() != 0) {
+            self.deferred_reclaim
+                .fetch_max(if force { 2 } else { 1 }, Ordering::Relaxed);
+        } else {
+            let pending = self.deferred_reclaim.swap(0, Ordering::Relaxed);
+            let force = force || pending == 2;
+            for _ in 0..if force { DIRECT_EPOCHS } else { 1 } {
+                self.try_advance(force);
+            }
+        }
     }
 
     fn try_advance(&self, force: bool) {
@@ -3452,6 +3498,38 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("reentrant value destruction must not deadlock the collector gate");
         worker.join().expect("reclamation worker must not panic");
+    }
+
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "retires exclusively owned unpublished test values"
+    )]
+    fn different_value_arena_deferred_reclamation_resumes_on_maintenance() {
+        struct CountDrop(Arc<AtomicUsize>);
+        impl Drop for CountDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let outer = DirectValueArena::<u64>::new(1);
+        let inner = DirectValueArena::new(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        {
+            let _deferral = outer.defer_reclamation();
+            for _ in 0..1024 {
+                let handle = inner.allocate(CountDrop(Arc::clone(&drops)), 1, u64::MAX);
+                let pin = inner.pin();
+                // SAFETY: the unpublished handle is exclusively owned and protected by its arena pin.
+                unsafe {
+                    pin.retire(RemovedDirectHandle::from_exact_removal(handle));
+                }
+            }
+            inner.reclaim_retired();
+            assert_eq!(drops.load(Ordering::Relaxed), 0);
+        }
+        inner.reclaim_retired();
+        assert_eq!(drops.load(Ordering::Relaxed), 1024);
     }
 
     #[test]
