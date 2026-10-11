@@ -2766,6 +2766,16 @@ impl GenerationMapCore<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap> {
         let stripe = usize::try_from(key_hash.route() & stripe_mask)
             .expect("masked writer stripe fits usize");
         let state = writer.generation.writer_stripes[stripe].load(Ordering::Acquire);
+        // DIRECT_BASE is enabled only after draining writers and never cleared
+        // within a layer. Without a predecessor, that route cannot go stale.
+        if writer
+            .generation
+            .write_predecessor_active
+            .load(Ordering::Acquire)
+            || (state & WRITER_STRIPE_DIRECT_BASE == 0 && !writer.generation.base_is_empty)
+        {
+            return None;
+        }
         (state & WRITER_STRIPE_CLOSED == 0).then_some(GenerationWriteRoute {
             stripe,
             direct_base: state & WRITER_STRIPE_DIRECT_BASE != 0,

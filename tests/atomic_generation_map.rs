@@ -1910,3 +1910,67 @@ fn prepared_up_to_keys_reject_short_full_aliases() {
         assert_eq!(map.get_prepared(&short, &full_handle), Some(non_max(777)));
     }
 }
+
+#[cfg(feature = "prepared-batch-gate")]
+#[test]
+fn operation_guard_writes_remain_exact_during_rebuild() {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(2) {
+        let map = Arc::new(
+            LockFreeAtomicU64GenerationMap::try_from_entries([(vec![42_u8; 32], non_max(1))], 1)
+                .unwrap(),
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let barrier = Arc::new(Barrier::new(4));
+        let rebuild = {
+            let (map, stop, barrier) = (map.clone(), stop.clone(), barrier.clone());
+            thread::spawn(move || {
+                barrier.wait();
+                while !stop.load(Ordering::Relaxed) {
+                    map.rebuild(1).unwrap();
+                }
+            })
+        };
+        let mut workers = Vec::new();
+        for id in 1..=2_u64 {
+            let (map, stop, barrier) = (map.clone(), stop.clone(), barrier.clone());
+            workers.push(thread::spawn(move || {
+                let mut displaced = Vec::new();
+                let mut sequence = 0;
+                barrier.wait();
+                while !stop.load(Ordering::Relaxed) {
+                    sequence += 1;
+                    let value = non_max(id << 40 | sequence);
+                    let outcome = if id == 1 {
+                        let guard = map.operation_guard();
+                        guard.insert(&[42; 32], value)
+                    } else {
+                        map.insert(&[42; 32], value)
+                    };
+                    let InsertOutcome::Replaced(old) = outcome else {
+                        panic!("existing key must be replaced");
+                    };
+                    displaced.push(old);
+                }
+                displaced
+            }));
+        }
+        barrier.wait();
+        thread::sleep(Duration::from_millis(25));
+        stop.store(true, Ordering::Relaxed);
+        let displaced: Vec<_> = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect();
+        rebuild.join().unwrap();
+        let mut unique = HashSet::new();
+        for old in displaced {
+            assert!(unique.insert(old), "value displaced twice: {old:?}");
+        }
+        assert!(!unique.contains(&map.get(&[42; 32]).unwrap()));
+    }
+}
