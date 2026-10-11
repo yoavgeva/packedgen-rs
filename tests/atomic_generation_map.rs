@@ -1878,3 +1878,35 @@ fn adaptive_test_key(index: usize, length: usize) -> Vec<u8> {
     }
     key
 }
+
+#[cfg(feature = "prepared-keys")]
+#[test]
+fn prepared_up_to_keys_reject_short_full_aliases() {
+    for overlay in [
+        AtomicGenerationOverlay::AtomicAdaptive,
+        AtomicGenerationOverlay::AtomicUpTo8,
+    ] {
+        let map = LockFreeAtomicU64GenerationMap::try_from_entries_with_options(
+            std::iter::empty::<(Vec<u8>, NonMaxU64)>(),
+            8192,
+            overlay,
+            AtomicGenerationBaseFilter::EmbeddedFingerprint,
+        )
+        .unwrap();
+        for value in 0..128_u64 {
+            assert!(map.insert_new(&value.to_le_bytes(), non_max(value + 1)));
+        }
+        let short = [42_u8; 7];
+        let full = [42, 42, 42, 42, 42, 42, 42, 7];
+        assert!(map.insert_new(&short, non_max(777)));
+        assert!(map.insert_new(&full, non_max(888)));
+        let short_handle = map.prepare_key(&short);
+        let full_handle = map.prepare_key(&full);
+        if overlay == AtomicGenerationOverlay::AtomicAdaptive {
+            assert!(short_handle.has_native_slot());
+            assert!(full_handle.has_native_slot());
+        }
+        assert_eq!(map.get_prepared(&full, &short_handle), Some(non_max(888)));
+        assert_eq!(map.get_prepared(&short, &full_handle), Some(non_max(777)));
+    }
+}

@@ -2976,12 +2976,18 @@ impl<C: StableCell, const KEY_BYTES: usize, const KEY_WORDS: usize>
         key: &[u8],
         read: impl FnOnce(&C) -> R,
     ) -> Option<R> {
+        let key_bytes = key.len();
         let key = self.encode_key(key)?;
         let slot = self.slots.get(index)?;
         let bucket = index / ATOMIC_BUCKET_SLOTS;
         let offset = index % ATOMIC_BUCKET_SLOTS;
         let control = self.controls.get(bucket)?.load(Ordering::Acquire);
-        if control_byte(control, offset) < 2 || !self.key_matches(index, &key) {
+        let tag = control_byte(control, offset);
+        if tag < 2
+            || (matches!(self.key_mode, AtomicKeyMode::UpTo)
+                && (tag >= 128) != (key_bytes == KEY_BYTES))
+            || !self.key_matches(index, &key)
+        {
             return None;
         }
         Some(read(&slot.cell))
