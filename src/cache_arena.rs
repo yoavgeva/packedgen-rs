@@ -2724,7 +2724,7 @@ impl<V> DirectArenaState<V> {
     }
 }
 
-fn direct_arena_thread() -> usize {
+pub(crate) fn direct_arena_thread() -> usize {
     DIRECT_ARENA_THREAD.with(|thread| {
         let current = thread.get();
         if current != usize::MAX {

@@ -18,7 +18,7 @@ use crate::cache_arena::{
     ArenaAllocationError, ArenaEntry, ArenaHandle, ArenaPin, ArenaValue, DIRECT_MAX_EXPIRY_TICK,
     DirectArenaEntry, DirectArenaMutationPin, DirectArenaPin, DirectArenaReservation,
     DirectArenaValue, DirectHandle, DirectValueArena, MAX_EXPIRY_TICK, RemovedDirectHandle,
-    ValueArena,
+    ValueArena, direct_arena_thread,
 };
 use crate::generation_hash::GenerationKeyHash;
 use crate::{
@@ -2382,7 +2382,7 @@ impl<V> PackedCache<V> {
     #[must_use]
     pub fn get(&self, key: &[u8]) -> Option<CacheValue<V>> {
         let value = self.lookup(key, true);
-        let counters = self.counters_for(key);
+        let counters = &self.counters[direct_arena_thread() & (COUNTER_SHARDS - 1)];
         if value.is_some() {
             counters.hits.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -5302,7 +5302,7 @@ impl<V> DirectPackedCache<V> {
     #[must_use]
     pub fn get(&self, key: &[u8]) -> Option<DirectCacheValue<V>> {
         let value = self.lookup(key, true);
-        let counters = self.counters_for(key);
+        let counters = &self.counters[direct_arena_thread() & (COUNTER_SHARDS - 1)];
         if value.is_some() {
             counters.hits.fetch_add(1, Ordering::Relaxed);
             self.record_frequency_reuse(1, 0);
@@ -5324,7 +5324,7 @@ impl<V> DirectPackedCache<V> {
         V: Clone,
     {
         let value = self.lookup_cloned(key, true);
-        let counters = self.counters_for(key);
+        let counters = &self.counters[direct_arena_thread() & (COUNTER_SHARDS - 1)];
         if value.is_some() {
             counters.hits.fetch_add(1, Ordering::Relaxed);
             self.record_frequency_reuse(1, 0);
@@ -8568,6 +8568,40 @@ impl Drop for CacheMaintenance {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn one_thread_routes_distinct_key_hits_to_one_shard() {
+        let config = CacheConfig::new(u64::MAX).with_overlay_capacity(128);
+        let packed = PackedCache::try_new(config.clone()).unwrap();
+        let direct = DirectPackedCache::try_new(config).unwrap();
+        for key in 0_u64..64 {
+            packed
+                .insert_with_options(&key.to_le_bytes(), key, 1, None)
+                .unwrap();
+            direct
+                .insert_discard_with_options(&key.to_le_bytes(), key, 1, None)
+                .unwrap();
+            assert!(packed.get(&key.to_le_bytes()).is_some());
+            assert!(direct.get(&key.to_le_bytes()).is_some());
+        }
+        for counters in [&packed.counters, &direct.counters] {
+            let populated = counters
+                .iter()
+                .filter(|counter| counter.hits.load(Ordering::Relaxed) != 0)
+                .count();
+            assert_eq!(
+                populated, 1,
+                "distinct keys must not select distinct hit shards"
+            );
+            assert_eq!(
+                counters
+                    .iter()
+                    .map(|counter| counter.hits.load(Ordering::Relaxed))
+                    .sum::<u64>(),
+                64
+            );
+        }
+    }
 
     #[test]
     fn entry_only_hard_reservations_do_not_scan_weights() {
