@@ -1080,6 +1080,20 @@ impl PartialOrd for Victim {
 /// a 31-bit generation prevents a stale index handle from observing a reused
 /// slot. Capacity maintenance uses weakly consistent index scans and exact
 /// handle-matched removals, avoiding a second retained copy of every key.
+///
+/// Values must support concurrent sharing to share the cache:
+///
+/// ```compile_fail
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<packedgen::PackedCache<std::cell::Cell<u8>>>();
+/// ```
+///
+/// Values must also support transfer between threads:
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<packedgen::PackedCache<std::rc::Rc<u8>>>();
+/// ```
 pub struct PackedCache<V> {
     index: LockFreeAtomicU64GenerationMap,
     arena: ValueArena<V>,
@@ -2958,7 +2972,7 @@ impl<V> PackedCache<V> {
         let evicted = self.evict_to_limits_locked(now, None);
         let rebuilt = self
             .index
-            .rebuild_adaptive_if_needed(self.config.rebuild_policy)?
+            .try_rebuild_adaptive_if_needed(self.config.rebuild_policy)?
             .is_some();
         if rebuilt {
             self.maintenance_counters()
@@ -5363,25 +5377,26 @@ impl<V> DirectPackedCache<V> {
         let Some(hard_capacity) = self.try_reserve_publish_capacity(compact_weight) else {
             return Ok(self.insert_discard_at_hard_capacity(key, value, compact_weight, ttl));
         };
+        let _reclaim_deferral = self.arena.defer_reclamation();
         let mutation = self.mutation_stripe(key).lock();
         let pin = self.arena.pin();
         // The entry handle carries the writer route and exact vacancy proof
         // into the new-key insertion, avoiding the old read-then-rehash path.
         // Occupied keys still use the allocator that wins replacement churn.
-        let (replacement, outcome, protected_previous) = match self.index.entry(key) {
-            AtomicEntry::Occupied(previous) => {
+        let (replacement, outcome) = match self.index.entry(key) {
+            AtomicEntry::Occupied(_) => {
                 let replacement =
                     self.arena
                         .allocate_boxed(value, compact_weight, self.deadline(ttl));
                 let outcome = self.index.insert(key, replacement.index_value());
-                (replacement, outcome, Some(previous))
+                (replacement, outcome)
             }
             AtomicEntry::Vacant(vacant) => {
                 let replacement = self
                     .arena
                     .allocate(value, compact_weight, self.deadline(ttl));
                 let outcome = vacant.insert(replacement.index_value());
-                (replacement, outcome, None)
+                (replacement, outcome)
             }
         };
         let result = match outcome {
@@ -5394,10 +5409,7 @@ impl<V> DirectPackedCache<V> {
                 CacheWriteOutcome::Inserted
             }
             InsertOutcome::Replaced(previous) => {
-                debug_assert!(
-                    protected_previous.is_none() || protected_previous == Some(previous),
-                    "same-key mutation changed despite its cache stripe"
-                );
+                // A concurrent lock-free writer may have replaced the value.
                 let previous = published_direct_handle_from_index(previous);
                 // SAFETY: the displaced index handle and pin belong to this cache.
                 let previous_weight = unsafe { protected_direct_entry(&pin, previous) }.weight();
@@ -6585,10 +6597,9 @@ impl<V> DirectPackedCache<V> {
 
     /// Purges expired entries, enforces limits, and rebuilds adaptively.
     ///
-    /// Before calling this on a thread that has used a [`DirectCacheGuard`]
-    /// for guarded mutations, refresh, quiesce, or drop that guard. A rebuild
-    /// waits for its retained generation reservation to finish. Ordinary
-    /// borrowed reads do not retain that writer reservation.
+    /// Rebuild is deferred while guarded mutations retain generation
+    /// reservations. Refresh, quiesce, or drop those guards to allow a later
+    /// cycle to rebuild. Ordinary borrowed reads do not retain reservations.
     ///
     /// # Errors
     ///
@@ -6603,13 +6614,14 @@ impl<V> DirectPackedCache<V> {
         observed_completion: u64,
     ) -> Result<CacheMaintenanceResult, FrozenBuildError> {
         // Full cycles coalesce independently of capacity eviction. A rebuild
-        // waits for guarded writers, which may themselves need the capacity
-        // gate before they can release their generation reservation.
+        // defers if guarded writers retain generation reservations.
+        let _reclaim_deferral = self.arena.defer_reclamation();
         let _full_maintenance = self.full_maintenance_gate.lock();
         if self.maintenance_completions.load(Ordering::Acquire) != observed_completion {
             return Ok(CacheMaintenanceResult::default());
         }
         let (expired, evicted) = {
+            let _reclaim_deferral = self.arena.defer_reclamation();
             let _capacity = self.maintenance_gate.lock();
             let now = self.now();
             let expired = if self.expiration_possible.load(Ordering::Acquire) {
@@ -6622,7 +6634,7 @@ impl<V> DirectPackedCache<V> {
         };
         let rebuilt = self
             .index
-            .rebuild_adaptive_if_needed(self.config.rebuild_policy)?
+            .try_rebuild_adaptive_if_needed(self.config.rebuild_policy)?
             .is_some();
         if rebuilt {
             self.maintenance_counters()
@@ -6806,6 +6818,7 @@ impl<V> DirectPackedCache<V> {
         key: &[u8],
         ttl: Option<Duration>,
     ) -> bool {
+        let _reclaim_deferral = self.arena.defer_reclamation();
         let mutation = self.mutation_stripe(key).lock();
         let Some(raw) = self.index.get_protected(key) else {
             return false;
@@ -6874,6 +6887,7 @@ impl<V> DirectPackedCache<V> {
         prepared: &AtomicPreparedKey,
         ttl: Option<Duration>,
     ) -> bool {
+        let _reclaim_deferral = self.arena.defer_reclamation();
         let mutation = self.mutation_stripe(key).lock();
         let Some(raw) = self.index.get_prepared(key, prepared) else {
             return false;
@@ -6903,6 +6917,7 @@ impl<V> DirectPackedCache<V> {
         reason = "the exact expiration removal and arena pin belong to this cache"
     )]
     fn expire_handle(&self, key: &[u8], expected: DirectHandle) -> bool {
+        let _reclaim_deferral = self.arena.defer_reclamation();
         let _mutation = self.mutation_stripe(key).lock();
         let pin = self.arena.pin();
         let Some(raw) = self.index.get_protected(key) else {
@@ -7237,6 +7252,8 @@ impl<V> DirectPackedCache<V> {
                 return reservation;
             }
 
+            let _reclaim_deferral = self.arena.defer_reclamation();
+
             if let Some(_maintenance) = self.maintenance_gate.try_lock() {
                 if let Some(reservation) = self.try_reserve_capacity(entries, weight) {
                     #[cfg(feature = "cache-pressure-timing")]
@@ -7496,6 +7513,7 @@ impl<V> DirectPackedCache<V> {
         } else {
             self.over_limit()
         } {
+            let _reclaim_deferral = self.arena.defer_reclamation();
             if let Some(_maintenance) = self.maintenance_gate.try_lock() {
                 if async_hard_limit && self.over_hard_limit() {
                     self.evict_to_hard_limit_locked(self.now(), Some(protected));
@@ -7550,6 +7568,7 @@ impl<V> DirectPackedCache<V> {
         }
         #[cfg(feature = "cache-pressure-timing")]
         let started = Instant::now();
+        let _reclaim_deferral = self.arena.defer_reclamation();
         let _maintenance = self.maintenance_gate.lock();
         let removed = self.evict_to_limits_locked(self.now(), None, None);
         #[cfg(feature = "cache-pressure-timing")]
@@ -7589,7 +7608,7 @@ impl<V> DirectPackedCache<V> {
         // rebuild waiting for the writer's old read-batch reservation.
         let rebuilt = self
             .index
-            .rebuild_adaptive_if_needed(self.config.rebuild_policy)?
+            .try_rebuild_adaptive_if_needed(self.config.rebuild_policy)?
             .is_some();
         if rebuilt {
             self.maintenance_counters()
@@ -7710,6 +7729,7 @@ impl<V> DirectPackedCache<V> {
             if protected_key.is_some_and(|protected_key| protected_key == key) {
                 continue;
             }
+            let _reclaim_deferral = self.arena.defer_reclamation();
             let _mutation = self.mutation_stripe(key).lock();
             if self.index.get_protected(key) != Some(handle.index_value()) {
                 continue;
@@ -8129,6 +8149,7 @@ impl<V> DirectPackedCache<V> {
             if Some(handle) == protected {
                 continue;
             }
+            let _reclaim_deferral = self.arena.defer_reclamation();
             let _mutation = self.mutation_stripe(key).lock();
             if self.index.get_protected(key) != Some(raw) {
                 continue;
@@ -9286,7 +9307,7 @@ mod tests {
     }
 
     #[test]
-    fn full_maintenance_releases_capacity_gate_while_waiting_for_guarded_writers() {
+    fn full_maintenance_defers_rebuild_while_guarded_writers_hold_reservations() {
         let cache = Arc::new(
             DirectPackedCache::<u64>::try_new(
                 CacheConfig::new(u64::MAX)
@@ -9317,8 +9338,7 @@ mod tests {
         );
 
         // Guarded admissions retain this exact generation reservation until
-        // refresh. A rebuild can redirect publication but cannot finish its
-        // handoff while this reservation remains live.
+        // refresh. Maintenance must defer rebuild without publishing a redirect.
         let mut guard = cache.pin();
         assert_eq!(
             guard
@@ -9333,34 +9353,26 @@ mod tests {
                 .send(maintaining.maintain())
                 .expect("receiver remains live");
         });
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while cache.index.stats().layer_depth < 2 && Instant::now() < deadline {
-            thread::yield_now();
-        }
-        let handoff_started = cache.index.stats().layer_depth >= 2;
-        let capacity_gate_available = cache.maintenance_gate.try_lock().is_some();
-        let admission = if handoff_started && capacity_gate_available {
-            Some(guard.insert_if_absent_with_options(&64_u64.to_le_bytes(), 64, 1, None))
-        } else {
-            None
-        };
-
-        // Clean up before asserting so the old implementation fails without
-        // leaving a deadlocked or detached maintenance thread behind.
-        guard.quiesce();
-        drop(guard);
+        let initial_depth = cache.index.stats().layer_depth;
         let result = done_rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("maintenance finishes after the guarded writer quiesces")
+            .expect("maintenance defers while the guarded writer remains live")
             .expect("maintenance succeeds");
         maintenance
             .join()
             .expect("maintenance thread remains healthy");
-        assert!(
-            handoff_started,
-            "the rebuild must reach its guarded handoff"
-        );
-        assert!(result.rebuilt);
+        assert!(!result.rebuilt);
+        assert_eq!(cache.index.stats().layer_depth, initial_depth);
+        let capacity_gate_available = cache.maintenance_gate.try_lock().is_some();
+        let admission = if capacity_gate_available {
+            Some(guard.insert_if_absent_with_options(&64_u64.to_le_bytes(), 64, 1, None))
+        } else {
+            None
+        };
+        guard.quiesce();
+        drop(guard);
+        assert!(cache.maintain().expect("deferred rebuild succeeds").rebuilt);
+        assert_eq!(cache.index.stats().layer_depth, 1);
         assert!(
             capacity_gate_available,
             "a guarded writer must be able to enforce capacity before releasing its generation reservation"

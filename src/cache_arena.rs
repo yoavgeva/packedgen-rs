@@ -73,28 +73,28 @@ static NEXT_DIRECT_ARENA_THREAD: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     static DIRECT_ARENA_THREAD: Cell<usize> = const { Cell::new(usize::MAX) };
-    // Non-zero only while this thread is running user destructors with one
-    // direct arena's collector gate held. The exact owner identity matters:
-    // destruction may re-enter a different cache, whose gate must still be
-    // acquired normally.
-    static DIRECT_RECLAIM_OWNER: Cell<usize> = const { Cell::new(0) };
+    static DIRECT_RECLAIM_DEFERRAL_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
-struct DirectReclaimOwnerScope {
-    previous: usize,
+pub(crate) struct DirectReclaimDeferral<'arena, V> {
+    owner: &'arena DirectArenaOwner<V>,
+    _not_send: PhantomData<*mut ()>,
 }
 
-impl DirectReclaimOwnerScope {
-    fn enter(owner: usize) -> Self {
-        debug_assert_ne!(owner, 0);
-        let previous = DIRECT_RECLAIM_OWNER.with(|current| current.replace(owner));
-        Self { previous }
-    }
-}
-
-impl Drop for DirectReclaimOwnerScope {
+impl<V> Drop for DirectReclaimDeferral<'_, V> {
     fn drop(&mut self) {
-        DIRECT_RECLAIM_OWNER.with(|current| current.set(self.previous));
+        let outermost = DIRECT_RECLAIM_DEFERRAL_DEPTH.with(|depth| {
+            depth.set(depth.get() - 1);
+            depth.get() == 0
+        });
+        if outermost {
+            let pending = self.owner.deferred_reclaim.swap(0, Ordering::Relaxed);
+            if pending != 0 {
+                for _ in 0..if pending == 2 { DIRECT_EPOCHS } else { 1 } {
+                    self.owner.try_advance(pending == 2);
+                }
+            }
+        }
     }
 }
 
@@ -754,9 +754,17 @@ impl<V> DirectValueArena<V> {
         }
     }
 
+    pub(crate) fn defer_reclamation(&self) -> DirectReclaimDeferral<'_, V> {
+        DIRECT_RECLAIM_DEFERRAL_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        DirectReclaimDeferral {
+            owner: &self.owner,
+            _not_send: PhantomData,
+        }
+    }
+
     pub(crate) fn reclaim_retired(&self) {
         for _ in 0..DIRECT_EPOCHS {
-            self.owner.try_advance(true);
+            self.owner.advance_or_defer(true);
         }
     }
 
@@ -1874,6 +1882,7 @@ struct DirectArenaOwner<V> {
     peak_retired_values: AtomicUsize,
     #[cfg(feature = "cache-production-diagnostics")]
     peak_retired_bytes: AtomicU64,
+    deferred_reclaim: AtomicUsize,
     reclaim_gate: Mutex<()>,
 }
 
@@ -1904,6 +1913,7 @@ impl<V> DirectArenaOwner<V> {
             peak_retired_values: AtomicUsize::new(0),
             #[cfg(feature = "cache-production-diagnostics")]
             peak_retired_bytes: AtomicU64::new(0),
+            deferred_reclaim: AtomicUsize::new(0),
             reclaim_gate: Mutex::new(()),
         }
     }
@@ -2126,16 +2136,6 @@ impl<V> DirectArenaOwner<V> {
         if self.mutator_activity.load(Ordering::SeqCst) {
             return;
         }
-        let owner = ptr::from_ref(self).addr();
-        if DIRECT_RECLAIM_OWNER.with(|current| current.get() == owner) {
-            // A value destructor has re-entered this exact arena while the
-            // current thread already owns `reclaim_gate`. Announce mutation
-            // observation directly: trying to acquire the non-reentrant gate
-            // again would deadlock. This is still serialized by that gate and
-            // affects only the first reentrant mutation, not a hot path.
-            self.mutator_activity.store(true, Ordering::SeqCst);
-            return;
-        }
         // First use synchronizes once with the collector gate before any index
         // mutation. A collector either finishes first or observes the
         // permanent flag; it can never skip a concurrently active first slot.
@@ -2219,7 +2219,7 @@ impl<V> DirectArenaOwner<V> {
                 .fetch_add(DIRECT_RECLAIM_PUBLISH_BATCH, Ordering::Relaxed)
                 + DIRECT_RECLAIM_PUBLISH_BATCH;
             if published >= DIRECT_RECLAIM_BATCH {
-                self.try_advance(false);
+                self.advance_or_defer(false);
             }
         }
     }
@@ -2264,7 +2264,7 @@ impl<V> DirectArenaOwner<V> {
             let published =
                 self.retired_count[epoch].fetch_add(publish, Ordering::Relaxed) + publish;
             if published >= DIRECT_RECLAIM_BATCH {
-                self.try_advance(false);
+                self.advance_or_defer(false);
             }
         }
     }
@@ -2300,6 +2300,19 @@ impl<V> DirectArenaOwner<V> {
             .any(|queue| !queue.0.lock().is_empty())
     }
 
+    fn advance_or_defer(&self, force: bool) {
+        if DIRECT_RECLAIM_DEFERRAL_DEPTH.with(|depth| depth.get() != 0) {
+            self.deferred_reclaim
+                .fetch_max(if force { 2 } else { 1 }, Ordering::Relaxed);
+        } else {
+            let pending = self.deferred_reclaim.swap(0, Ordering::Relaxed);
+            let force = force || pending == 2;
+            for _ in 0..if force { DIRECT_EPOCHS } else { 1 } {
+                self.try_advance(force);
+            }
+        }
+    }
+
     fn try_advance(&self, force: bool) {
         let observed = direct_epoch_slot(self.current_epoch.load(Ordering::SeqCst));
         if !force && self.retired_count[observed].load(Ordering::Relaxed) < DIRECT_RECLAIM_BATCH {
@@ -2333,11 +2346,10 @@ impl<V> DirectArenaOwner<V> {
         // removal and readers admitted during one racing rotation have left.
         if self.epoch_has_retired(advance.next_epoch) {
             self.retired_count[advance.next_epoch].swap(0, Ordering::Relaxed);
-            // Reclamation invokes arbitrary `V::drop` code while this thread
-            // owns `reclaim_gate`. Mark the exact owner only for that cold
-            // interval so a destructor's first same-arena mutation can
-            // announce itself without recursively locking the gate.
-            let _owner_scope = DirectReclaimOwnerScope::enter(ptr::from_ref(self).addr());
+            // Destructors may nest through another arena before this arena's
+            // first mutation. Publish the permanent flag under reclaim_gate
+            // before user code so reentrant activation never relocks the gate.
+            self.mutator_activity.store(true, Ordering::SeqCst);
             self.drain_retired_epoch(advance.next_epoch);
         }
         debug_assert_eq!(
@@ -2842,6 +2854,8 @@ pub(crate) enum ArenaAllocationError {
 }
 
 pub(crate) struct ValueArena<V> {
+    // Values are owned here, shared by readers, and reclaimed on other threads.
+    _marker: PhantomData<Arc<ArenaEntry<V>>>,
     partitions: Box<[ArenaPartition<V>]>,
     active_partitions: AtomicUsize,
     collector: Arc<Collector>,
@@ -2856,6 +2870,7 @@ impl<V> ValueArena<V> {
                 .collect(),
             active_partitions: AtomicUsize::new(1),
             collector: Arc::new(Collector::new().batch_size(512)),
+            _marker: PhantomData,
         }
     }
 
@@ -3449,6 +3464,99 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("reentrant value destruction must not deadlock the collector gate");
         worker.join().expect("reclamation worker must not panic");
+    }
+
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "retires exclusively owned unpublished test values"
+    )]
+    fn different_value_arena_deferred_reclamation_resumes_on_maintenance() {
+        struct CountDrop(Arc<AtomicUsize>);
+        impl Drop for CountDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let outer = DirectValueArena::<u64>::new(1);
+        let inner = DirectValueArena::new(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        {
+            let _deferral = outer.defer_reclamation();
+            for _ in 0..1024 {
+                let handle = inner.allocate(CountDrop(Arc::clone(&drops)), 1, u64::MAX);
+                let pin = inner.pin();
+                // SAFETY: the unpublished handle is exclusively owned and protected by its arena pin.
+                unsafe {
+                    pin.retire(RemovedDirectHandle::from_exact_removal(handle));
+                }
+            }
+            inner.reclaim_retired();
+            assert_eq!(drops.load(Ordering::Relaxed), 0);
+        }
+        inner.reclaim_retired();
+        assert_eq!(drops.load(Ordering::Relaxed), 1024);
+    }
+
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "retires exclusively owned unpublished test values"
+    )]
+    fn nested_retired_value_drop_can_activate_outer_arena() {
+        struct Action(Option<Box<dyn FnOnce() + Send + Sync>>);
+        impl Drop for Action {
+            fn drop(&mut self) {
+                if let Some(action) = self.0.take() {
+                    action();
+                }
+            }
+        }
+        let outer = DirectValueArena::new(1);
+        let inner = DirectValueArena::new(1);
+        let outer_owner = Arc::downgrade(&outer.owner);
+        let inner_handle = inner.allocate(
+            Action(Some(Box::new(move || {
+                let owner = outer_owner.upgrade().unwrap();
+                owner.activate_mutators();
+                let reservation = owner.enter_mutator(0);
+                owner.leave_mutator(reservation);
+            }))),
+            1,
+            u64::MAX,
+        );
+        let inner_pin = inner.pin();
+        // SAFETY: the unpublished handle is exclusively owned and protected by its arena pin.
+        unsafe {
+            inner_pin.retire(RemovedDirectHandle::from_exact_removal(inner_handle));
+        }
+        drop(inner_pin);
+        let outer_handle = outer.allocate(
+            Action(Some(Box::new(move || {
+                inner.reclaim_retired();
+            }))),
+            1,
+            u64::MAX,
+        );
+        let outer_pin = outer.pin();
+        // SAFETY: the unpublished handle is exclusively owned and protected by its arena pin.
+        unsafe {
+            outer_pin.retire(RemovedDirectHandle::from_exact_removal(outer_handle));
+        }
+        drop(outer_pin);
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            outer.reclaim_retired();
+            send.send(()).unwrap();
+        });
+        receive
+            .recv_timeout(std::time::Duration::from_secs(if cfg!(miri) {
+                120
+            } else {
+                2
+            }))
+            .expect("nested destruction must not deadlock the outer collector gate");
+        worker.join().unwrap();
     }
 
     #[test]

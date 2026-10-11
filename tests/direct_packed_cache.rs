@@ -3097,3 +3097,191 @@ fn miri_concurrent_replacement_and_reclamation_smoke() {
     assert_eq!(cache.len(), WRITERS);
     assert_eq!(cache.weight(), (WRITERS * 8) as u64);
 }
+
+#[test]
+fn eviction_destructor_can_reenter_same_cache() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Weak, mpsc};
+
+    struct Reenter {
+        cache: Weak<DirectPackedCache<Reenter>>,
+        armed: Arc<AtomicBool>,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for Reenter {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+            if self.armed.swap(false, Ordering::SeqCst) {
+                let cache = self.cache.upgrade().unwrap();
+                cache
+                    .insert_discard_with_options(
+                        b"from-drop",
+                        Self {
+                            cache: self.cache.clone(),
+                            armed: Arc::clone(&self.armed),
+                            drops: Arc::clone(&self.drops),
+                        },
+                        1,
+                        None,
+                    )
+                    .unwrap();
+            }
+        }
+    }
+    let (send, receive) = mpsc::channel();
+    thread::spawn(move || {
+        let cache = Arc::new(
+            DirectPackedCache::try_new(
+                CacheConfig::new(u64::MAX)
+                    .with_max_entries(64)
+                    .with_overlay_capacity(4096),
+            )
+            .unwrap(),
+        );
+        let armed = Arc::new(AtomicBool::new(false));
+        let drops = Arc::new(AtomicUsize::new(0));
+        for key in 0..20_000_u64 {
+            if key == 64 {
+                armed.store(true, Ordering::SeqCst);
+            }
+            cache
+                .insert_discard_with_options(
+                    &key.to_le_bytes(),
+                    Reenter {
+                        cache: Arc::downgrade(&cache),
+                        armed: Arc::clone(&armed),
+                        drops: Arc::clone(&drops),
+                    },
+                    1,
+                    None,
+                )
+                .unwrap();
+        }
+        assert!(!armed.load(Ordering::SeqCst));
+        assert!(drops.load(Ordering::Relaxed) >= 1000);
+        send.send(()).unwrap();
+    });
+    receive
+        .recv_timeout(Duration::from_secs(10))
+        .expect("eviction destructor deadlocked");
+}
+
+#[test]
+fn striped_insert_tolerates_lock_free_same_key_writers() {
+    for replacement_batch in [false, true] {
+        let cache = Arc::new(
+            DirectPackedCache::try_new(CacheConfig::new(u64::MAX).with_overlay_capacity(64))
+                .unwrap(),
+        );
+        cache
+            .insert_discard_with_options(b"key", 0_u64, 1, None)
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let writer_cache = Arc::clone(&cache);
+        let writer_barrier = Arc::clone(&barrier);
+        let writer = thread::spawn(move || {
+            writer_barrier.wait();
+            for value in 0..20_000_u64 {
+                writer_cache
+                    .insert_discard_with_options(b"key", value, 1, None)
+                    .unwrap();
+            }
+        });
+        let competitor_cache = Arc::clone(&cache);
+        let competitor = thread::spawn(move || {
+            let mut guard = competitor_cache.pin();
+            barrier.wait();
+            for value in 0..20_000_u64 {
+                if replacement_batch {
+                    guard
+                        .replacement_batch()
+                        .replace_discard_with_options(b"key", value, 1, None)
+                        .unwrap();
+                } else {
+                    competitor_cache.remove_discard(b"key");
+                    competitor_cache
+                        .insert_if_absent_with_options(b"key", value, 1, None)
+                        .unwrap();
+                }
+            }
+        });
+        let writer_result = writer.join();
+        competitor.join().unwrap();
+        writer_result.expect("striped insert must accept concurrent lock-free replacement");
+        let resident = cache.peek(b"key").is_some();
+        assert!(cache.len() <= 1);
+        assert_eq!(cache.len(), usize::from(resident));
+        assert_eq!(cache.weight(), u64::from(resident));
+    }
+}
+
+fn reservation_rebuild_cache() -> DirectPackedCache<u64> {
+    DirectPackedCache::try_new(
+        CacheConfig::new(u64::MAX)
+            .with_max_entries(64)
+            .with_overlay_capacity(64)
+            .with_rebuild_policy(packedgen::AdaptiveRebuildPolicy {
+                max_slot_utilization_bps: 1,
+                min_learned_insertions: 1,
+                max_distribution_drift_bps: 1,
+                max_short_key_spill_bps: 1,
+            }),
+    )
+    .unwrap()
+}
+
+#[test]
+fn maintenance_defers_rebuild_for_same_thread_guard_reservation() {
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        let cache = reservation_rebuild_cache();
+        for key in 0..64_u64 {
+            cache
+                .insert_discard_with_options(&key.to_le_bytes(), key, 1, None)
+                .unwrap();
+        }
+        let mut guard = cache.pin();
+        guard
+            .insert_if_absent_with_options(&0_u64.to_le_bytes(), 0, 1, None)
+            .unwrap();
+        assert!(!cache.maintain().unwrap().rebuilt);
+        assert_eq!(guard.get(&0_u64.to_le_bytes()), Some(&0));
+        guard.quiesce();
+        assert!(cache.maintain().unwrap().rebuilt);
+        assert_eq!(cache.len(), 64);
+        assert_eq!(cache.weight(), 64);
+        send.send(()).unwrap();
+    });
+    receive
+        .recv_timeout(Duration::from_secs(5))
+        .expect("same-thread guard reservation blocked maintenance");
+    worker.join().unwrap();
+}
+
+#[test]
+fn maintenance_shutdown_returns_with_live_guard_reservation() {
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        let cache = Arc::new(reservation_rebuild_cache());
+        for key in 0..64_u64 {
+            cache
+                .insert_discard_with_options(&key.to_le_bytes(), key, 1, None)
+                .unwrap();
+        }
+        let mut guard = cache.pin();
+        guard
+            .insert_if_absent_with_options(&0_u64.to_le_bytes(), 0, 1, None)
+            .unwrap();
+        let maintenance = cache.spawn_maintenance(Duration::from_millis(1));
+        thread::sleep(Duration::from_millis(100));
+        drop(maintenance);
+        assert_eq!(guard.get(&0_u64.to_le_bytes()), Some(&0));
+        guard.quiesce();
+        assert!(cache.maintain().unwrap().rebuilt);
+        send.send(()).unwrap();
+    });
+    receive
+        .recv_timeout(Duration::from_secs(5))
+        .expect("live guard reservation blocked worker shutdown");
+    worker.join().unwrap();
+}
