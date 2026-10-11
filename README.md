@@ -168,7 +168,8 @@ rejected-experiment, and live-compaction results are in
 
 `PackedCache<V>` and the newer `DirectPackedCache<V>` build experimental
 arbitrary-value caches on that adaptive index. They add epoch-protected values, caller-accounted weight,
-optional entry limits, 100 ms-resolution per-item TTL, compact sampled CLOCK
+optional entry limits, per-item TTL (never before the TTL; up to ~100-200 ms
+after), compact sampled CLOCK
 eviction, statistics, and background maintenance. A reusable pinned guard is
 the fast read API; an owned thread-local guard keeps values stable after
 replacement or removal. The arena activates allocation partitions as the

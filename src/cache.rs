@@ -18,7 +18,7 @@ use crate::cache_arena::{
     ArenaAllocationError, ArenaEntry, ArenaHandle, ArenaPin, ArenaValue, DIRECT_MAX_EXPIRY_TICK,
     DirectArenaEntry, DirectArenaMutationPin, DirectArenaPin, DirectArenaReservation,
     DirectArenaValue, DirectHandle, DirectValueArena, MAX_EXPIRY_TICK, RemovedDirectHandle,
-    ValueArena,
+    ValueArena, direct_arena_thread,
 };
 use crate::generation_hash::GenerationKeyHash;
 use crate::{
@@ -34,6 +34,12 @@ const DEFAULT_EVICTION_BATCH: usize = 64;
 const MAX_EXPIRATION_BATCHES: usize = 16;
 const COUNTER_SHARDS: usize = 64;
 const DIRECT_RESERVOIR_KEY_CHUNK: usize = 64;
+
+#[cfg(test)]
+thread_local! {
+    // Keep operation counts isolated from parallel unit tests.
+    static DIRECT_WEIGHT_SCANS: AtomicUsize = const { AtomicUsize::new(0) };
+}
 
 /// Decodes an unchanged value loaded from the direct cache's authoritative
 /// index. Keeping this boundary private to the cache module prevents unrelated
@@ -725,7 +731,8 @@ pub struct CacheMaintenanceResult {
 }
 
 #[derive(Default)]
-#[repr(align(64))]
+// Isolate hot shards on Apple cache lines and paired Intel prefetch lines.
+#[repr(align(128))]
 struct CacheCounters {
     hits: AtomicU64,
     misses: AtomicU64,
@@ -740,13 +747,13 @@ struct CacheCounters {
 }
 
 #[derive(Default)]
-#[repr(align(64))]
+#[repr(align(128))]
 struct DirectFrequencyReuseShard {
     pending: AtomicU64,
 }
 
 #[derive(Default)]
-#[repr(align(64))]
+#[repr(align(128))]
 struct DirectDoorkeeperObservationShard {
     pending: AtomicU64,
 }
@@ -769,7 +776,7 @@ impl DirectDoorkeeperObservations {
 }
 
 #[cfg(feature = "cache-production-diagnostics")]
-#[repr(align(64))]
+#[repr(align(128))]
 struct DirectCacheDiagnosticCounters {
     current_entries: AtomicUsize,
     current_weight: AtomicU64,
@@ -1386,7 +1393,7 @@ impl<V: fmt::Debug> fmt::Debug for DirectCacheValue<V> {
 }
 
 #[derive(Default)]
-#[repr(align(64))]
+#[repr(align(128))]
 struct DirectCapacityCounters {
     entries: AtomicU64,
     weight: AtomicU64,
@@ -2389,7 +2396,7 @@ impl<V> PackedCache<V> {
     #[must_use]
     pub fn get(&self, key: &[u8]) -> Option<CacheValue<V>> {
         let value = self.lookup(key, true);
-        let counters = self.counters_for(key);
+        let counters = &self.counters[direct_arena_thread() & (COUNTER_SHARDS - 1)];
         if value.is_some() {
             counters.hits.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -3216,7 +3223,8 @@ impl<V> PackedCache<V> {
             let ticks = if nanos == 0 {
                 0
             } else {
-                nanos.div_ceil(EXPIRY_TICK_NANOS)
+                // `now` floors elapsed time, so cover the unknown tick phase.
+                nanos.div_ceil(EXPIRY_TICK_NANOS).saturating_add(1)
             };
             let ttl = u64::try_from(ticks).unwrap_or(MAX_EXPIRY_TICK);
             now.saturating_add(ttl).min(MAX_EXPIRY_TICK)
@@ -5309,7 +5317,7 @@ impl<V> DirectPackedCache<V> {
     #[must_use]
     pub fn get(&self, key: &[u8]) -> Option<DirectCacheValue<V>> {
         let value = self.lookup(key, true);
-        let counters = self.counters_for(key);
+        let counters = &self.counters[direct_arena_thread() & (COUNTER_SHARDS - 1)];
         if value.is_some() {
             counters.hits.fetch_add(1, Ordering::Relaxed);
             self.record_frequency_reuse(1, 0);
@@ -5331,7 +5339,7 @@ impl<V> DirectPackedCache<V> {
         V: Clone,
     {
         let value = self.lookup_cloned(key, true);
-        let counters = self.counters_for(key);
+        let counters = &self.counters[direct_arena_thread() & (COUNTER_SHARDS - 1)];
         if value.is_some() {
             counters.hits.fetch_add(1, Ordering::Relaxed);
             self.record_frequency_reuse(1, 0);
@@ -6285,6 +6293,10 @@ impl<V> DirectPackedCache<V> {
     )]
     pub fn weight(&self) -> u64 {
         if self.config.max_weight == u64::MAX {
+            #[cfg(test)]
+            DIRECT_WEIGHT_SCANS.with(|scans| {
+                scans.fetch_add(1, Ordering::Relaxed);
+            });
             let pin = self.arena.pin();
             let mut weight = 0_u64;
             self.index.scan_entries(&mut |_, raw| {
@@ -7312,13 +7324,13 @@ impl<V> DirectPackedCache<V> {
                 .saturating_add(incoming_weight)
                 .saturating_sub(capacity.max_weight)
         };
-        let average_weight = self
-            .weight()
-            .div_ceil(u64::try_from(self.len().max(1)).unwrap_or(u64::MAX))
-            .max(1);
         let weight_target = if self.config.max_weight == u64::MAX {
             0
         } else {
+            let average_weight = self
+                .weight()
+                .div_ceil(u64::try_from(self.len().max(1)).unwrap_or(u64::MAX))
+                .max(1);
             weight_deficit
                 .saturating_add(self.config.max_weight.div_ceil(256).max(1))
                 .div_ceil(average_weight)
@@ -8257,7 +8269,8 @@ impl<V> DirectPackedCache<V> {
             let ticks = if nanos == 0 {
                 0
             } else {
-                nanos.div_ceil(EXPIRY_TICK_NANOS)
+                // `now` floors elapsed time, so cover the unknown tick phase.
+                nanos.div_ceil(EXPIRY_TICK_NANOS).saturating_add(1)
             };
             let ttl = u64::try_from(ticks).unwrap_or(DIRECT_MAX_EXPIRY_TICK);
             now.saturating_add(ttl).min(DIRECT_MAX_EXPIRY_TICK)
@@ -8578,6 +8591,77 @@ impl Drop for CacheMaintenance {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn one_thread_routes_distinct_key_hits_to_one_shard() {
+        let config = CacheConfig::new(u64::MAX).with_overlay_capacity(128);
+        let packed = PackedCache::try_new(config.clone()).unwrap();
+        let direct = DirectPackedCache::try_new(config).unwrap();
+        for key in 0_u64..64 {
+            packed
+                .insert_with_options(&key.to_le_bytes(), key, 1, None)
+                .unwrap();
+            direct
+                .insert_discard_with_options(&key.to_le_bytes(), key, 1, None)
+                .unwrap();
+            assert!(packed.get(&key.to_le_bytes()).is_some());
+            assert!(direct.get(&key.to_le_bytes()).is_some());
+        }
+        for counters in [&packed.counters, &direct.counters] {
+            let populated = counters
+                .iter()
+                .filter(|counter| counter.hits.load(Ordering::Relaxed) != 0)
+                .count();
+            assert_eq!(
+                populated, 1,
+                "distinct keys must not select distinct hit shards"
+            );
+            assert_eq!(
+                counters
+                    .iter()
+                    .map(|counter| counter.hits.load(Ordering::Relaxed))
+                    .sum::<u64>(),
+                64
+            );
+        }
+    }
+
+    #[test]
+    fn entry_only_hard_reservations_do_not_scan_weights() {
+        let cache = DirectPackedCache::try_new(
+            CacheConfig::new(u64::MAX)
+                .with_max_entries(2_000)
+                .with_overlay_capacity(4_096)
+                .with_async_eviction(10_100),
+        )
+        .unwrap();
+        for key in 0_u64..2_020 {
+            cache
+                .insert_discard_with_options(&key.to_le_bytes(), key, 1, None)
+                .unwrap();
+        }
+        let before = DIRECT_WEIGHT_SCANS.with(|scans| scans.load(Ordering::Relaxed));
+        for key in 2_020_u64..2_520 {
+            cache
+                .insert_discard_with_options(&key.to_le_bytes(), key, 1, None)
+                .unwrap();
+        }
+        assert_eq!(
+            DIRECT_WEIGHT_SCANS.with(|scans| scans.load(Ordering::Relaxed)),
+            before
+        );
+        assert!(cache.len() <= 2_020);
+    }
+
+    #[test]
+    fn hot_shards_have_128_byte_alignment() {
+        assert!(std::mem::align_of::<CacheCounters>() >= 128);
+        assert!(std::mem::align_of::<DirectFrequencyReuseShard>() >= 128);
+        assert!(std::mem::align_of::<DirectDoorkeeperObservationShard>() >= 128);
+        #[cfg(feature = "cache-diagnostics")]
+        assert!(std::mem::align_of::<DirectCacheDiagnosticCounters>() >= 128);
+        assert!(std::mem::align_of::<DirectCapacityCounters>() >= 128);
+    }
     use super::*;
 
     #[test]
