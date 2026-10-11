@@ -149,7 +149,8 @@ hash state are fixed map overhead, not per-entry metadata.
   need an explicit complete charge.
 - Per-entry weight is limited to `u32::MAX`. This saves four bytes per value
   entry; larger charges return `WeightNotCompact`.
-- Expiration uses 100 ms ticks and supports about 13.6 years from cache
+- Expiration uses 100 ms ticks: never before the TTL; up to ~100-200 ms after.
+  It supports about 13.6 years from cache
   creation. A zero TTL expires immediately; nonzero TTLs round up to a tick.
 - Compact CLOCK eviction uses one sampled access bit in the generation word.
   A hit marks approximately once per 16 reads. Eviction first chooses

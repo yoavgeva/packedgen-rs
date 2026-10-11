@@ -3209,7 +3209,8 @@ impl<V> PackedCache<V> {
             let ticks = if nanos == 0 {
                 0
             } else {
-                nanos.div_ceil(EXPIRY_TICK_NANOS)
+                // `now` floors elapsed time, so cover the unknown tick phase.
+                nanos.div_ceil(EXPIRY_TICK_NANOS).saturating_add(1)
             };
             let ttl = u64::try_from(ticks).unwrap_or(MAX_EXPIRY_TICK);
             now.saturating_add(ttl).min(MAX_EXPIRY_TICK)
@@ -8247,7 +8248,8 @@ impl<V> DirectPackedCache<V> {
             let ticks = if nanos == 0 {
                 0
             } else {
-                nanos.div_ceil(EXPIRY_TICK_NANOS)
+                // `now` floors elapsed time, so cover the unknown tick phase.
+                nanos.div_ceil(EXPIRY_TICK_NANOS).saturating_add(1)
             };
             let ttl = u64::try_from(ticks).unwrap_or(DIRECT_MAX_EXPIRY_TICK);
             now.saturating_add(ttl).min(DIRECT_MAX_EXPIRY_TICK)
