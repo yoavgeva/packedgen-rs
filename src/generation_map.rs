@@ -12,6 +12,7 @@ use arc_swap::cache::Cache as ArcSwapCache;
 use arc_swap::{ArcSwap, ArcSwapOption, Guard};
 use parking_lot::Mutex;
 
+use crate::arena::MAX_PACKED_KEY_BYTES;
 #[cfg(feature = "prepared-keys")]
 use crate::atomic_value::AtomicPreparedSlot;
 use crate::atomic_value::{
@@ -442,6 +443,10 @@ pub struct LockFreeGenerationMap<V> {
 
 impl<V> LockFreeGenerationMap<V> {
     /// Wraps an existing packed-base/lock-free-overlay generation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     #[must_use]
     pub fn from_hybrid(initial: LockFreeHybridMap<V>) -> Self {
         Self {
@@ -453,7 +458,7 @@ impl<V> LockFreeGenerationMap<V> {
     ///
     /// # Errors
     ///
-    /// Returns a frozen-map build error for duplicate keys, allocation failure,
+    /// Returns a frozen-map build error for oversized or duplicate keys, allocation failure,
     /// or perfect-index construction failure.
     pub fn try_from_entries<I, K>(
         entries: I,
@@ -489,6 +494,10 @@ impl<V> LockFreeGenerationMap<V> {
     }
 
     /// Inserts or replaces a value through the lock-free writer path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     pub fn insert(&self, key: &[u8], value: V) -> InsertOutcome<V>
     where
         V: Clone,
@@ -497,6 +506,10 @@ impl<V> LockFreeGenerationMap<V> {
     }
 
     /// Inserts only when the logical key is absent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     pub fn insert_new(&self, key: &[u8], value: V) -> bool
     where
         V: Clone,
@@ -513,6 +526,10 @@ impl<V> LockFreeGenerationMap<V> {
     }
 
     /// Atomically updates an existing value or inserts a default.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     pub fn upsert(&self, key: &[u8], insert_value: V, update: impl Fn(&V) -> V) -> V
     where
         V: Clone,
@@ -1047,12 +1064,20 @@ impl AtomicOperationGuard<'_> {
     }
 
     /// Inserts or replaces a value without a per-call writer pin.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     #[must_use]
     pub fn insert(&self, key: &[u8], value: NonMaxU64) -> InsertOutcome<NonMaxU64> {
         self.map.inner.insert_in_batch(&self.writer, key, value)
     }
 
     /// Inserts only while the logical key is absent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     #[must_use]
     pub fn insert_new(&self, key: &[u8], value: NonMaxU64) -> bool {
         self.map.inner.insert_new_in_batch(&self.writer, key, value)
@@ -1060,6 +1085,10 @@ impl AtomicOperationGuard<'_> {
 
     /// Returns the existing value or inserts `value` through the pinned
     /// generation without pinning and releasing a writer stripe per call.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     #[must_use]
     pub fn get_or_insert(&self, key: &[u8], value: NonMaxU64) -> NonMaxU64 {
         self.map
@@ -1077,6 +1106,10 @@ impl AtomicOperationGuard<'_> {
     }
 
     /// Atomically updates an existing value or inserts `insert_value`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     pub fn upsert(
         &self,
         key: &[u8],
@@ -1178,6 +1211,10 @@ impl AtomicVacantEntry<'_, '_> {
     /// Another writer can win the key between the probe and this call. In that
     /// case this operation replaces its value and returns
     /// [`InsertOutcome::Replaced`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     #[must_use]
     pub fn insert(self, value: NonMaxU64) -> InsertOutcome<NonMaxU64> {
         self.writer.insert_vacant(self.key, value, self.target)
@@ -1187,6 +1224,10 @@ impl AtomicVacantEntry<'_, '_> {
     ///
     /// Returns `false` when another writer made the key live after the entry
     /// probe. The carried hash and frozen-base proof are still reused.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     #[must_use]
     pub fn insert_new(self, value: NonMaxU64) -> bool {
         self.writer.insert_new_vacant(self.key, value, self.target)
@@ -1574,6 +1615,10 @@ impl From<AtomicGenerationOverlay> for GenerationOverlayMode {
 
 impl LockFreeAtomicU64GenerationMap {
     /// Wraps an existing hybrid whose values use the atomic value domain.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     #[must_use]
     pub fn from_hybrid(initial: LockFreeHybridMap<NonMaxU64>) -> Self {
         Self {
@@ -1585,7 +1630,7 @@ impl LockFreeAtomicU64GenerationMap {
     ///
     /// # Errors
     ///
-    /// Returns a frozen-map build error for duplicate keys, allocation failure,
+    /// Returns a frozen-map build error for oversized or duplicate keys, allocation failure,
     /// or perfect-index construction failure.
     pub fn try_from_entries<I, K>(
         entries: I,
@@ -1607,7 +1652,7 @@ impl LockFreeAtomicU64GenerationMap {
     ///
     /// # Errors
     ///
-    /// Returns a frozen-map build error for duplicate keys, allocation failure,
+    /// Returns a frozen-map build error for oversized or duplicate keys, allocation failure,
     /// or perfect-index construction failure.
     pub fn try_from_entries_with_overlay<I, K>(
         entries: I,
@@ -1637,7 +1682,7 @@ impl LockFreeAtomicU64GenerationMap {
     ///
     /// # Errors
     ///
-    /// Returns a frozen-map build error for duplicate keys, allocation failure,
+    /// Returns a frozen-map build error for oversized or duplicate keys, allocation failure,
     /// or perfect-index construction failure.
     pub fn try_from_entries_with_options<I, K>(
         entries: I,
@@ -1806,6 +1851,10 @@ impl LockFreeAtomicU64GenerationMap {
     /// pins one writer stripe, and publishes both insertion and length change
     /// through that writer. If another writer wins the race, its value is
     /// returned without replacing it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     #[must_use]
     pub fn get_or_insert(&self, key: &[u8], value: NonMaxU64) -> NonMaxU64 {
         self.inner.pin_writer(key).get_or_insert(key, value)
@@ -1845,6 +1894,10 @@ impl LockFreeAtomicU64GenerationMap {
     /// # Panics
     ///
     /// Panics when `keys`, `values`, and `results` have different lengths.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     #[cfg(feature = "prepared-batch-gate")]
     pub fn get_or_insert_batch<K>(
         &self,
@@ -2004,6 +2057,10 @@ impl LockFreeAtomicU64GenerationMap {
     ///
     /// Invalid handles fall back to the ordinary exact writer path. Length
     /// accounting remains correct when the prepared slot was deleted.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     #[cfg(feature = "prepared-keys")]
     pub fn insert_prepared(
         &self,
@@ -2025,7 +2082,7 @@ impl LockFreeAtomicU64GenerationMap {
     /// # Panics
     ///
     /// Panics unless `keys`, `prepared`, `values`, and `previous` have equal
-    /// lengths.
+    /// lengths, or if a key exceeds the packed arena limit of 64 KiB.
     #[cfg(feature = "prepared-keys")]
     pub fn insert_prepared_batch<K>(
         &self,
@@ -2061,11 +2118,19 @@ impl LockFreeAtomicU64GenerationMap {
     }
 
     /// Inserts or replaces a value through the lock-free writer path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     pub fn insert(&self, key: &[u8], value: NonMaxU64) -> InsertOutcome<NonMaxU64> {
         self.inner.insert(key, value)
     }
 
     /// Inserts only when the logical key is absent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     pub fn insert_new(&self, key: &[u8], value: NonMaxU64) -> bool {
         self.inner.insert_new(key, value)
     }
@@ -2080,6 +2145,10 @@ impl LockFreeAtomicU64GenerationMap {
     }
 
     /// Atomically updates an existing value or inserts a default.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     pub fn upsert(
         &self,
         key: &[u8],
@@ -2260,8 +2329,18 @@ where
     /// Wraps an existing packed-base/lock-free-overlay generation.
     ///
     /// The supplied hybrid becomes a stable base under a new writable layer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     #[must_use]
     pub fn from_hybrid(initial: LockFreeHybridMap<V>) -> Self {
+        initial.for_each_entry(&mut |key, _| {
+            assert!(
+                key.len() <= MAX_PACKED_KEY_BYTES,
+                "generation map key exceeds MAX_PACKED_KEY_BYTES (64 KiB)"
+            );
+        });
         let len = initial.len();
         let overlay_mode = Self::default_overlay_mode();
         let writer_hash_builder = GenerationHashBuilder::default();
@@ -2284,7 +2363,7 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a frozen-map build error for duplicate keys, allocation
+    /// Returns a frozen-map build error for oversized or duplicate keys, allocation
     /// failure, or perfect-index construction failure.
     pub fn try_from_entries<I, K>(
         entries: I,
@@ -2406,6 +2485,10 @@ where
     }
 
     /// Inserts or replaces a value through the lock-free writer path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     pub fn insert(&self, key: &[u8], value: V) -> InsertOutcome<V>
     where
         V: Clone,
@@ -2414,6 +2497,10 @@ where
     }
 
     /// Inserts only when the logical key is absent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     pub fn insert_new(&self, key: &[u8], value: V) -> bool
     where
         V: Clone,
@@ -2435,6 +2522,10 @@ where
     /// Atomically updates an existing value or inserts a default.
     ///
     /// `update` has the same retry-safe requirement as [`Self::update`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     pub fn upsert(&self, key: &[u8], insert_value: V, update: impl Fn(&V) -> V) -> V
     where
         V: Clone,
@@ -2473,7 +2564,8 @@ where
     ///
     /// Returns a frozen-map construction error. The redirected layer remains
     /// correct and continues to reference the previous generation if packing
-    /// fails; a later rebuild can compact the resulting extra layer.
+    /// fails. Subsequent rebuilds retry packing; repeated construction failures
+    /// can retain additional layers.
     ///
     /// # Panics
     ///

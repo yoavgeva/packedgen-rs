@@ -1974,3 +1974,73 @@ fn operation_guard_writes_remain_exact_during_rebuild() {
         assert!(!unique.contains(&map.get(&[42; 32]).unwrap()));
     }
 }
+
+#[test]
+fn oversized_keys_cannot_poison_rebuilds() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let map = LockFreeAtomicU64GenerationMap::try_from_entries(
+        (0..1000_u64).map(|value| (value.to_le_bytes(), non_max(value))),
+        1024,
+    )
+    .unwrap();
+    let oversized = vec![7_u8; 70_000];
+    assert!(catch_unwind(AssertUnwindSafe(|| map.insert_new(&oversized, non_max(1)))).is_err());
+    for operation in 0..4 {
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| match operation {
+                0 => {
+                    let _ = map.insert(&oversized, non_max(1));
+                }
+                1 => {
+                    let _ = map.get_or_insert(&oversized, non_max(1));
+                }
+                2 => {
+                    let _ = map.upsert(&oversized, non_max(1), increment);
+                }
+                _ => {
+                    let AtomicEntry::Vacant(entry) = map.entry(&oversized) else {
+                        panic!("oversized key must not be present");
+                    };
+                    let _ = entry.insert(non_max(1));
+                }
+            }))
+            .is_err()
+        );
+    }
+    #[cfg(feature = "prepared-keys")]
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            let _ = map.insert_prepared(&oversized, &map.prepare_key(&oversized), non_max(1));
+        }))
+        .is_err()
+    );
+    #[cfg(feature = "prepared-batch-gate")]
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            let _ = map.operation_guard().insert(&oversized, non_max(1));
+        }))
+        .is_err()
+    );
+    assert!(
+        LockFreeAtomicU64GenerationMap::try_from_entries([(&oversized, non_max(1))], 1).is_err()
+    );
+    assert_eq!(map.get(&oversized), None);
+    assert_eq!(map.remove(&oversized), None);
+    for _ in 0..3 {
+        map.rebuild(1024).unwrap();
+        assert!(map.stats().layer_depth <= 1);
+    }
+    let generic = packedgen::PackedGenMap::try_from_entries(
+        (0..1000_u64).map(|value| (value.to_le_bytes(), value)),
+        1024,
+    )
+    .unwrap();
+    assert!(catch_unwind(AssertUnwindSafe(|| generic.insert(&oversized, 1))).is_err());
+    assert_eq!(generic.get_cloned(&oversized), None);
+    assert_eq!(generic.remove(&oversized), None);
+    for _ in 0..3 {
+        generic.rebuild(1024).unwrap();
+        assert!(generic.stats().layer_depth <= 1);
+    }
+}

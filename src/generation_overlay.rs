@@ -1077,6 +1077,10 @@ impl<C: StableCell> GenerationOverlay<C> {
         cell: C,
         occupied: impl FnOnce(&C) -> R,
     ) -> OverlayInsert<R> {
+        assert!(
+            key.len() <= crate::arena::MAX_PACKED_KEY_BYTES,
+            "generation map key exceeds MAX_PACKED_KEY_BYTES (64 KiB)"
+        );
         let mut occupied = Some(occupied);
         if let Some(adaptive) = &self.adaptive {
             let result = self.insert_or_visit_adaptive(
@@ -1250,6 +1254,10 @@ impl<C: StableCell> GenerationOverlay<C> {
         cell: C,
         occupied: impl FnOnce(&C) -> R,
     ) -> OverlayInsert<R> {
+        assert!(
+            key.len() <= crate::arena::MAX_PACKED_KEY_BYTES,
+            "generation map key exceeds MAX_PACKED_KEY_BYTES (64 KiB)"
+        );
         let mut occupied = Some(occupied);
         if let Some(adaptive) = &self.adaptive {
             let result = self.insert_or_visit_adaptive(
@@ -1576,6 +1584,10 @@ impl<C: StableCell> GenerationOverlay<C> {
         cell: C,
         occupied: impl FnOnce(&C) -> R,
     ) -> OverlayInsert<R> {
+        assert!(
+            key.len() <= crate::arena::MAX_PACKED_KEY_BYTES,
+            "generation map key exceeds MAX_PACKED_KEY_BYTES (64 KiB)"
+        );
         let mut occupied = Some(occupied);
         if adaptive.sample_may_contain(key_hash) {
             let sample = adaptive
