@@ -1012,7 +1012,7 @@ impl Implementation {
             #[cfg(feature = "phast")]
             Self::AtomicPhastPlusOneByte => "packedgen-atomic-phast-plus-one-byte-filter",
             Self::Dash => "dashmap-6.2.1",
-            Self::Papaya => "papaya-0.2.4",
+            Self::Papaya => "papaya-0.2.5",
             Self::Scc => "scc-3.8.5",
             Self::Flurry => "flurry-0.5.2",
             Self::RwLockHashBrown => "rwlock-hashbrown-0.17.1",
