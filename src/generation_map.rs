@@ -816,6 +816,10 @@ impl AtomicReadGuard<'_> {
         // reservation merely to keep this generation open.
         let state = self.generation.writer_stripes[stripe].load(Ordering::Acquire);
         debug_assert_eq!(state & WRITER_STRIPE_CLOSED, 0);
+        // An open generation alone does not stabilize a non-direct stripe.
+        if state & WRITER_STRIPE_DIRECT_BASE == 0 && !self.generation.base_is_empty {
+            return (self.map.get_or_insert(key, value), None);
+        }
         let route = GenerationWriteRoute {
             stripe,
             direct_base: state & WRITER_STRIPE_DIRECT_BASE != 0,
@@ -851,6 +855,10 @@ impl AtomicReadGuard<'_> {
         // base; recomputing a route-only hash would discard that work.
         let state = self.generation.writer_stripes[stripe].load(Ordering::Acquire);
         debug_assert_eq!(state & WRITER_STRIPE_CLOSED, 0);
+        // An open generation alone does not stabilize a non-direct stripe.
+        if state & WRITER_STRIPE_DIRECT_BASE == 0 && !self.generation.base_is_empty {
+            return (self.map.get_or_insert_hashed(key, value, key_hash), None);
+        }
         let route = GenerationWriteRoute {
             stripe,
             direct_base: state & WRITER_STRIPE_DIRECT_BASE != 0,
@@ -942,6 +950,10 @@ impl AtomicReadGuard<'_> {
         // keeps this generation and its writer stripes open through removal.
         let state = self.generation.writer_stripes[stripe].load(Ordering::Acquire);
         debug_assert_eq!(state & WRITER_STRIPE_CLOSED, 0);
+        // An open generation alone does not stabilize a non-direct stripe.
+        if state & WRITER_STRIPE_DIRECT_BASE == 0 && !self.generation.base_is_empty {
+            return (self.map.remove(key), None);
+        }
         let route = GenerationWriteRoute {
             stripe,
             direct_base: state & WRITER_STRIPE_DIRECT_BASE != 0,
@@ -976,6 +988,10 @@ impl AtomicReadGuard<'_> {
             .expect("masked writer stripe fits usize");
         let state = self.generation.writer_stripes[stripe].load(Ordering::Acquire);
         debug_assert_eq!(state & WRITER_STRIPE_CLOSED, 0);
+        // An open generation alone does not stabilize a non-direct stripe.
+        if state & WRITER_STRIPE_DIRECT_BASE == 0 && !self.generation.base_is_empty {
+            return (self.map.remove_prepared(key, prepared), None);
+        }
         if state & WRITER_STRIPE_DIRECT_BASE != 0 && state & WRITER_STRIPE_OVERLAY_BASE == 0 {
             match self
                 .stable_base
