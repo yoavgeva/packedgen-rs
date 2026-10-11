@@ -2972,7 +2972,7 @@ impl<V> PackedCache<V> {
         let evicted = self.evict_to_limits_locked(now, None);
         let rebuilt = self
             .index
-            .rebuild_adaptive_if_needed(self.config.rebuild_policy)?
+            .try_rebuild_adaptive_if_needed(self.config.rebuild_policy)?
             .is_some();
         if rebuilt {
             self.maintenance_counters()
@@ -6597,10 +6597,9 @@ impl<V> DirectPackedCache<V> {
 
     /// Purges expired entries, enforces limits, and rebuilds adaptively.
     ///
-    /// Before calling this on a thread that has used a [`DirectCacheGuard`]
-    /// for guarded mutations, refresh, quiesce, or drop that guard. A rebuild
-    /// waits for its retained generation reservation to finish. Ordinary
-    /// borrowed reads do not retain that writer reservation.
+    /// Rebuild is deferred while guarded mutations retain generation
+    /// reservations. Refresh, quiesce, or drop those guards to allow a later
+    /// cycle to rebuild. Ordinary borrowed reads do not retain reservations.
     ///
     /// # Errors
     ///
@@ -6615,8 +6614,7 @@ impl<V> DirectPackedCache<V> {
         observed_completion: u64,
     ) -> Result<CacheMaintenanceResult, FrozenBuildError> {
         // Full cycles coalesce independently of capacity eviction. A rebuild
-        // waits for guarded writers, which may themselves need the capacity
-        // gate before they can release their generation reservation.
+        // defers if guarded writers retain generation reservations.
         let _reclaim_deferral = self.arena.defer_reclamation();
         let _full_maintenance = self.full_maintenance_gate.lock();
         if self.maintenance_completions.load(Ordering::Acquire) != observed_completion {
@@ -6636,7 +6634,7 @@ impl<V> DirectPackedCache<V> {
         };
         let rebuilt = self
             .index
-            .rebuild_adaptive_if_needed(self.config.rebuild_policy)?
+            .try_rebuild_adaptive_if_needed(self.config.rebuild_policy)?
             .is_some();
         if rebuilt {
             self.maintenance_counters()
@@ -7610,7 +7608,7 @@ impl<V> DirectPackedCache<V> {
         // rebuild waiting for the writer's old read-batch reservation.
         let rebuilt = self
             .index
-            .rebuild_adaptive_if_needed(self.config.rebuild_policy)?
+            .try_rebuild_adaptive_if_needed(self.config.rebuild_policy)?
             .is_some();
         if rebuilt {
             self.maintenance_counters()
@@ -9309,7 +9307,7 @@ mod tests {
     }
 
     #[test]
-    fn full_maintenance_releases_capacity_gate_while_waiting_for_guarded_writers() {
+    fn full_maintenance_defers_rebuild_while_guarded_writers_hold_reservations() {
         let cache = Arc::new(
             DirectPackedCache::<u64>::try_new(
                 CacheConfig::new(u64::MAX)
@@ -9340,8 +9338,7 @@ mod tests {
         );
 
         // Guarded admissions retain this exact generation reservation until
-        // refresh. A rebuild can redirect publication but cannot finish its
-        // handoff while this reservation remains live.
+        // refresh. Maintenance must defer rebuild without publishing a redirect.
         let mut guard = cache.pin();
         assert_eq!(
             guard
@@ -9356,34 +9353,26 @@ mod tests {
                 .send(maintaining.maintain())
                 .expect("receiver remains live");
         });
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while cache.index.stats().layer_depth < 2 && Instant::now() < deadline {
-            thread::yield_now();
-        }
-        let handoff_started = cache.index.stats().layer_depth >= 2;
-        let capacity_gate_available = cache.maintenance_gate.try_lock().is_some();
-        let admission = if handoff_started && capacity_gate_available {
-            Some(guard.insert_if_absent_with_options(&64_u64.to_le_bytes(), 64, 1, None))
-        } else {
-            None
-        };
-
-        // Clean up before asserting so the old implementation fails without
-        // leaving a deadlocked or detached maintenance thread behind.
-        guard.quiesce();
-        drop(guard);
+        let initial_depth = cache.index.stats().layer_depth;
         let result = done_rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("maintenance finishes after the guarded writer quiesces")
+            .expect("maintenance defers while the guarded writer remains live")
             .expect("maintenance succeeds");
         maintenance
             .join()
             .expect("maintenance thread remains healthy");
-        assert!(
-            handoff_started,
-            "the rebuild must reach its guarded handoff"
-        );
-        assert!(result.rebuilt);
+        assert!(!result.rebuilt);
+        assert_eq!(cache.index.stats().layer_depth, initial_depth);
+        let capacity_gate_available = cache.maintenance_gate.try_lock().is_some();
+        let admission = if capacity_gate_available {
+            Some(guard.insert_if_absent_with_options(&64_u64.to_le_bytes(), 64, 1, None))
+        } else {
+            None
+        };
+        guard.quiesce();
+        drop(guard);
+        assert!(cache.maintain().expect("deferred rebuild succeeds").rebuilt);
+        assert_eq!(cache.index.stats().layer_depth, 1);
         assert!(
             capacity_gate_available,
             "a guarded writer must be able to enforce capacity before releasing its generation reservation"

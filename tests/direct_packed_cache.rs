@@ -3214,3 +3214,74 @@ fn striped_insert_tolerates_lock_free_same_key_writers() {
         assert_eq!(cache.weight(), u64::from(resident));
     }
 }
+
+fn reservation_rebuild_cache() -> DirectPackedCache<u64> {
+    DirectPackedCache::try_new(
+        CacheConfig::new(u64::MAX)
+            .with_max_entries(64)
+            .with_overlay_capacity(64)
+            .with_rebuild_policy(packedgen::AdaptiveRebuildPolicy {
+                max_slot_utilization_bps: 1,
+                min_learned_insertions: 1,
+                max_distribution_drift_bps: 1,
+                max_short_key_spill_bps: 1,
+            }),
+    )
+    .unwrap()
+}
+
+#[test]
+fn maintenance_defers_rebuild_for_same_thread_guard_reservation() {
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        let cache = reservation_rebuild_cache();
+        for key in 0..64_u64 {
+            cache
+                .insert_discard_with_options(&key.to_le_bytes(), key, 1, None)
+                .unwrap();
+        }
+        let mut guard = cache.pin();
+        guard
+            .insert_if_absent_with_options(&0_u64.to_le_bytes(), 0, 1, None)
+            .unwrap();
+        assert!(!cache.maintain().unwrap().rebuilt);
+        assert_eq!(guard.get(&0_u64.to_le_bytes()), Some(&0));
+        guard.quiesce();
+        assert!(cache.maintain().unwrap().rebuilt);
+        assert_eq!(cache.len(), 64);
+        assert_eq!(cache.weight(), 64);
+        send.send(()).unwrap();
+    });
+    receive
+        .recv_timeout(Duration::from_secs(5))
+        .expect("same-thread guard reservation blocked maintenance");
+    worker.join().unwrap();
+}
+
+#[test]
+fn maintenance_shutdown_returns_with_live_guard_reservation() {
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        let cache = Arc::new(reservation_rebuild_cache());
+        for key in 0..64_u64 {
+            cache
+                .insert_discard_with_options(&key.to_le_bytes(), key, 1, None)
+                .unwrap();
+        }
+        let mut guard = cache.pin();
+        guard
+            .insert_if_absent_with_options(&0_u64.to_le_bytes(), 0, 1, None)
+            .unwrap();
+        let maintenance = cache.spawn_maintenance(Duration::from_millis(1));
+        thread::sleep(Duration::from_millis(100));
+        drop(maintenance);
+        assert_eq!(guard.get(&0_u64.to_le_bytes()), Some(&0));
+        guard.quiesce();
+        assert!(cache.maintain().unwrap().rebuilt);
+        send.send(()).unwrap();
+    });
+    receive
+        .recv_timeout(Duration::from_secs(5))
+        .expect("live guard reservation blocked worker shutdown");
+    worker.join().unwrap();
+}

@@ -2122,6 +2122,14 @@ impl LockFreeAtomicU64GenerationMap {
         self.inner.rebuild_adaptive_if_needed(policy)
     }
 
+    pub(crate) fn try_rebuild_adaptive_if_needed(
+        &self,
+        policy: AdaptiveRebuildPolicy,
+    ) -> Result<Option<GenerationRebuild>, FrozenBuildError> {
+        self.inner
+            .rebuild_adaptive_with_read_batch_limit(policy, true)
+    }
+
     pub(crate) fn defer_retired_generation_drops(&self) {
         self.inner.defer_retired_generation_drops();
     }
@@ -2478,6 +2486,17 @@ where
     where
         V: Clone,
     {
+        self.rebuild_adaptive_with_read_batch_limit(policy, false)
+    }
+
+    fn rebuild_adaptive_with_read_batch_limit(
+        &self,
+        policy: AdaptiveRebuildPolicy,
+        bounded_read_batches: bool,
+    ) -> Result<Option<GenerationRebuild>, FrozenBuildError>
+    where
+        V: Clone,
+    {
         let Some(initial) = self.adaptive_overlay_stats() else {
             return Ok(None);
         };
@@ -2492,10 +2511,22 @@ where
         if !current.recommendation(policy).is_recommended() {
             return Ok(None);
         }
-        self.rebuild_locked(current.capacity).map(Some)
+        self.rebuild_locked_with_read_batch_limit(current.capacity, bounded_read_batches)
     }
 
     fn rebuild_locked(&self, overlay_capacity: usize) -> Result<GenerationRebuild, FrozenBuildError>
+    where
+        V: Clone,
+    {
+        self.rebuild_locked_with_read_batch_limit(overlay_capacity, false)
+            .map(|rebuilt| rebuilt.expect("blocking rebuild never skips read-batch closure"))
+    }
+
+    fn rebuild_locked_with_read_batch_limit(
+        &self,
+        overlay_capacity: usize,
+        bounded_read_batches: bool,
+    ) -> Result<Option<GenerationRebuild>, FrozenBuildError>
     where
         V: Clone,
     {
@@ -2510,8 +2541,13 @@ where
         );
 
         let redirect_started = Instant::now();
+        if bounded_read_batches && !previous.try_close_read_batches() {
+            return Ok(None);
+        }
         self.current.store(Arc::clone(&next));
-        previous.close_read_batches();
+        if !bounded_read_batches {
+            previous.close_read_batches();
+        }
         #[cfg(feature = "prepared-batch-gate")]
         previous.close_prepared_batch_writers();
         previous.close_writer_stripes();
@@ -2552,7 +2588,7 @@ where
             self.retired_generations.lock().push(previous);
         }
 
-        Ok(GenerationRebuild {
+        Ok(Some(GenerationRebuild {
             from_generation,
             to_generation: from_generation.wrapping_add(1),
             entries,
@@ -2561,7 +2597,7 @@ where
             writer_redirect,
             background_build,
             base_publish,
-        })
+        }))
     }
 
     /// Returns the current logical entry count.
@@ -4695,6 +4731,32 @@ where
                 }
             }
         }
+    }
+
+    fn try_close_read_batches(&self) -> bool {
+        let previous = self
+            .read_batches
+            .fetch_or(WRITER_STRIPE_CLOSED, Ordering::AcqRel);
+        if previous & WRITER_STRIPE_COUNT_MASK == 0 {
+            return true;
+        }
+        let started = Instant::now();
+        let mut spins = 0_u32;
+        while self.read_batches.load(Ordering::Acquire) & WRITER_STRIPE_COUNT_MASK != 0 {
+            if spins < 64 {
+                spin_loop();
+                spins += 1;
+            } else if started.elapsed() < std::time::Duration::from_millis(1) {
+                thread::yield_now();
+            } else {
+                // No redirect has been published: reopen this still-current
+                // layer without altering reservations that remain outstanding.
+                self.read_batches
+                    .fetch_and(!WRITER_STRIPE_CLOSED, Ordering::Release);
+                return false;
+            }
+        }
+        true
     }
 
     fn close_read_batches(&self) {
