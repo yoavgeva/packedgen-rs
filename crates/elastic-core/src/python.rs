@@ -19,7 +19,7 @@ use std::num::NonZeroUsize;
 use std::ptr::NonNull;
 
 use pyo3::Borrowed;
-use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyFrozenSet, PySet, PyString, PyTuple, PyType};
@@ -923,12 +923,16 @@ macro_rules! define_map_classes {
                 Ok(())
             }
 
-            #[pyo3(signature = (key, default = None))]
-            fn pop(
-                &mut self,
-                key: &Bound<PyAny>,
-                default: Option<Py<PyAny>>,
-            ) -> PyResult<Py<PyAny>> {
+            #[pyo3(signature = (key, *args))]
+            fn pop(&mut self, key: &Bound<PyAny>, args: &Bound<PyTuple>) -> PyResult<Py<PyAny>> {
+                if args.len() > 1 {
+                    return Err(PyTypeError::new_err("pop expected at most 2 arguments"));
+                }
+                let default = if args.is_empty() {
+                    None
+                } else {
+                    Some(args.get_item(0)?.unbind())
+                };
                 let probe = ProbeKey::from_bound(key)?;
                 match map_remove(&mut self.inner, probe.as_key())? {
                     Some(v) => {

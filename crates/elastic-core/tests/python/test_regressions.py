@@ -63,3 +63,14 @@ def test_set_key_equality_errors(cls, operation):
             getattr(s, operation)([k2])
     assert len(s) == 1
     assert k1 in s
+
+
+@pytest.mark.parametrize("cls", [dict] + MAPS)
+def test_pop_explicit_none(cls):
+    m = cls()
+    assert m.pop("missing", None) is None
+    assert m.pop("missing", 5) == 5
+    with pytest.raises(KeyError):
+        m.pop("missing")
+    with pytest.raises(TypeError):
+        m.pop("missing", 1, 2)
