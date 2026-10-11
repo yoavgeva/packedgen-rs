@@ -74,3 +74,33 @@ def test_pop_explicit_none(cls):
         m.pop("missing")
     with pytest.raises(TypeError):
         m.pop("missing", 1, 2)
+
+
+@pytest.mark.parametrize("cls", [dict] + MAPS)
+@pytest.mark.parametrize("operation", ["update", "ior"])
+def test_map_self_update(cls, operation):
+    m = cls({"a": 1, "b": 2})
+    if operation == "update":
+        m.update(m, c=3)
+        assert dict(m.items()) == {"a": 1, "b": 2, "c": 3}
+    else:
+        m |= m
+        assert dict(m.items()) == {"a": 1, "b": 2}
+
+
+@pytest.mark.parametrize("cls", [set] + SETS)
+@pytest.mark.parametrize("operation", ["ior", "iand", "isub", "ixor", "update", "intersection_update", "difference_update", "symmetric_difference_update"])
+def test_set_self_update(cls, operation):
+    s = cls([1, 2, 3])
+    if operation == "ior":
+        s |= s
+    elif operation == "iand":
+        s &= s
+    elif operation == "isub":
+        s -= s
+    elif operation == "ixor":
+        s ^= s
+    else:
+        getattr(s, operation)(s)
+    empty = operation in ("isub", "ixor", "difference_update", "symmetric_difference_update")
+    assert set(s) == (set() if empty else {1, 2, 3})
