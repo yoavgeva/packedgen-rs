@@ -5306,6 +5306,11 @@ fn writer_stripe_len_bits(delta: isize) -> usize {
 #[repr(align(64))]
 struct PaddedAtomicUsize(AtomicUsize);
 
+#[cfg(test)]
+std::thread_local! {
+    static MEMBERSHIP_TRAVERSALS: Cell<usize> = const { Cell::new(0) };
+}
+
 enum BaseMembershipFilter {
     Disabled,
     OneByte(Box<[u64]>),
@@ -5320,6 +5325,10 @@ impl BaseMembershipFilter {
                 Self::OneByte(vec![0; entries.div_ceil(8)].into_boxed_slice())
             }
         }
+    }
+
+    fn needs_hashes(&self) -> bool {
+        matches!(self, Self::OneByte(_))
     }
 
     fn insert_hash(&mut self, hash: u64) {
@@ -5385,9 +5394,13 @@ where
         hash_builder: &GenerationHashBuilder,
     ) -> Self {
         let mut membership = BaseMembershipFilter::new(map.len(), filter);
-        map.for_each_entry(&mut |key, _| {
-            membership.insert_hash(GenerationKeyHash::new(hash_builder, key).route());
-        });
+        if membership.needs_hashes() {
+            map.for_each_entry(&mut |key, _| {
+                #[cfg(test)]
+                MEMBERSHIP_TRAVERSALS.with(|count| count.set(count.get() + 1));
+                membership.insert_hash(GenerationKeyHash::new(hash_builder, key).route());
+            });
+        }
         Self::Frozen {
             map: Arc::new(map),
             membership,
@@ -5808,6 +5821,32 @@ pub struct GenerationMapStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frozen_membership_only_traverses_hash_storing_filters() {
+        for (filter, expected) in [
+            (AtomicGenerationBaseFilter::Disabled, 0),
+            (AtomicGenerationBaseFilter::EmbeddedFingerprint, 0),
+            (AtomicGenerationBaseFilter::OneBytePerEntry, 1_000),
+        ] {
+            MEMBERSHIP_TRAVERSALS.with(|count| count.set(0));
+            let map = LockFreeAtomicU64GenerationMap::try_from_entries_with_options(
+                (0..1_000_u64).map(|key| (key.to_le_bytes(), NonMaxU64::new(key).unwrap())),
+                32,
+                AtomicGenerationOverlay::AtomicFixed32,
+                filter,
+            )
+            .unwrap();
+            assert_eq!(
+                MEMBERSHIP_TRAVERSALS.with(Cell::get),
+                expected,
+                "{filter:?}"
+            );
+            for key in 0..1_000_u64 {
+                assert_eq!(map.get(&key.to_le_bytes()), NonMaxU64::new(key));
+            }
+        }
+    }
 
     #[test]
     fn read_cache_revalidates_across_mutations_and_rebuild() {
