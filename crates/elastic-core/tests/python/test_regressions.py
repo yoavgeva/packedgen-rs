@@ -134,3 +134,18 @@ def test_set_pop_drain_with_insertions(cls):
     while s:
         expected.remove(s.pop())
     assert not expected
+
+
+class RaisingValue:
+    def __eq__(self, other):
+        raise ValueError("value comparison failed")
+
+
+@pytest.mark.parametrize("cls", [dict] + MAPS)
+@pytest.mark.parametrize("view", ["values", "items"])
+def test_value_view_equality_errors(cls, view):
+    m = cls({"key": RaisingValue()})
+    candidate = object() if view == "values" else ("key", object())
+    with pytest.raises(ValueError, match="value comparison failed"):
+        candidate in getattr(m, view)()
+    assert len(m) == 1

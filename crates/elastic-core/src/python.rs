@@ -1123,14 +1123,14 @@ macro_rules! define_map_classes {
             fn __len__(&self, py: Python) -> usize {
                 self.map.borrow(py).inner.len()
             }
-            fn __contains__(&self, value: &Bound<PyAny>, py: Python) -> bool {
+            fn __contains__(&self, value: &Bound<PyAny>, py: Python) -> PyResult<bool> {
                 let m = self.map.borrow(py);
                 for (_, v) in &m.inner {
-                    if v.bind(py).eq(value).unwrap_or(false) {
-                        return true;
+                    if v.bind(py).eq(value)? {
+                        return Ok(true);
                     }
                 }
-                false
+                Ok(false)
             }
             fn __repr__(&self, py: Python) -> PyResult<String> {
                 let m = self.map.borrow(py);
@@ -1187,7 +1187,7 @@ macro_rules! define_map_classes {
                 let m = self.map.borrow(py);
                 let probe = ProbeKey::from_bound(&k)?;
                 match checked_probe(|| m.inner.get(probe.as_key()))? {
-                    Some(stored_v) => Ok(stored_v.bind(py).eq(&v).unwrap_or(false)),
+                    Some(stored_v) => stored_v.bind(py).eq(&v),
                     None => Ok(false),
                 }
             }
