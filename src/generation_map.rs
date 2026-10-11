@@ -558,12 +558,18 @@ impl<V> LockFreeGenerationMap<V> {
     }
 
     /// Returns the current logical entry count.
+    ///
+    /// This is O(writer stripes): it sums the 4,096 striped counters rather
+    /// than reading one cached count. Avoid calling it per operation on hot paths.
     #[must_use]
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
     /// Returns whether the current logical generation is empty.
+    ///
+    /// This calls [`Self::len`] and is O(writer stripes), summing 4,096 counters.
+    /// Avoid calling it per operation on hot paths.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
@@ -2160,12 +2166,18 @@ impl LockFreeAtomicU64GenerationMap {
     }
 
     /// Returns the current logical entry count.
+    ///
+    /// This is O(writer stripes): it sums the 4,096 striped counters rather
+    /// than reading one cached count. Avoid calling it per operation on hot paths.
     #[must_use]
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
     /// Returns whether the current logical generation is empty.
+    ///
+    /// This calls [`Self::len`] and is O(writer stripes), summing 4,096 counters.
+    /// Avoid calling it per operation on hot paths.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
@@ -2597,12 +2609,18 @@ where
     }
 
     /// Returns the current logical entry count.
+    ///
+    /// This is O(writer stripes): it sums the 4,096 striped counters rather
+    /// than reading one cached count. Avoid calling it per operation on hot paths.
     #[must_use]
     pub fn len(&self) -> usize {
         self.current.load().len()
     }
 
     /// Returns whether the current logical generation is empty.
+    ///
+    /// This calls [`Self::len`] and is O(writer stripes), summing 4,096 counters.
+    /// Avoid calling it per operation on hot paths.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.current.load().is_empty()
