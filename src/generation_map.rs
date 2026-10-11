@@ -1,4 +1,4 @@
-#[cfg(feature = "prepared-keys")]
+#[cfg(any(test, feature = "prepared-keys"))]
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::hint::spin_loop;
@@ -4816,11 +4816,25 @@ where
 
     fn mark_overlay_may_shadow_base(&self, stripe: usize) {
         self.mark_overlay_touched();
-        self.writer_stripes[stripe].fetch_or(WRITER_STRIPE_OVERLAY_BASE, Ordering::Release);
+        let flag = &self.writer_stripes[stripe];
+        // Flags are monotonic within a generation. The first Release write
+        // precedes overlay publication; readers synchronize with publication,
+        // so an already-set flag needs no additional Release write.
+        if flag.load(Ordering::Relaxed) & WRITER_STRIPE_OVERLAY_BASE == 0 {
+            #[cfg(test)]
+            OVERLAY_FLAG_WRITES.with(|count| count.set(count.get() + 1));
+            flag.fetch_or(WRITER_STRIPE_OVERLAY_BASE, Ordering::Release);
+        }
     }
 
     fn mark_overlay_touched(&self) {
-        self.overlay_touched.store(true, Ordering::Release);
+        // As above, overlay publication orders the first monotonic Release
+        // write before readers; repeating it provides no extra guarantee.
+        if !self.overlay_touched.load(Ordering::Relaxed) {
+            #[cfg(test)]
+            OVERLAY_TOUCHED_WRITES.with(|count| count.set(count.get() + 1));
+            self.overlay_touched.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -5308,6 +5322,8 @@ struct PaddedAtomicUsize(AtomicUsize);
 
 #[cfg(test)]
 std::thread_local! {
+    static OVERLAY_FLAG_WRITES: Cell<usize> = const { Cell::new(0) };
+    static OVERLAY_TOUCHED_WRITES: Cell<usize> = const { Cell::new(0) };
     static MEMBERSHIP_TRAVERSALS: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -5821,6 +5837,39 @@ pub struct GenerationMapStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlay_flags_are_written_only_once_for_repeated_stripe_inserts() {
+        let hash_builder = GenerationHashBuilder::default();
+        let keys: Vec<_> = (0..u64::MAX)
+            .map(u64::to_le_bytes)
+            .filter(|key| {
+                GenerationMapCore::<u64, OverlayCell<u64>, FrozenPackedMap<u64>>::writer_stripe(
+                    GenerationKeyHash::new(&hash_builder, key),
+                ) == 0
+            })
+            .take(1_000)
+            .collect();
+        let map = GenerationMapCore::<u64, OverlayCell<u64>, FrozenPackedMap<u64>>::try_from_entries_with_modes_and_writer_hash(
+            keys.iter().map(|key| (key, 0)),
+            2_000,
+            GenerationOverlayMode::Papaya,
+            AtomicGenerationBaseFilter::Disabled,
+            hash_builder,
+        ).unwrap();
+        OVERLAY_FLAG_WRITES.with(|count| count.set(0));
+        OVERLAY_TOUCHED_WRITES.with(|count| count.set(0));
+        for key in keys {
+            assert_eq!(map.insert(&key, 1), InsertOutcome::Replaced(0));
+        }
+        eprintln!(
+            "flag RMWs={}, touched stores={}",
+            OVERLAY_FLAG_WRITES.with(Cell::get),
+            OVERLAY_TOUCHED_WRITES.with(Cell::get)
+        );
+        assert_eq!(OVERLAY_FLAG_WRITES.with(Cell::get), 1);
+        assert_eq!(OVERLAY_TOUCHED_WRITES.with(Cell::get), 1);
+    }
 
     #[test]
     fn frozen_membership_only_traverses_hash_storing_filters() {
