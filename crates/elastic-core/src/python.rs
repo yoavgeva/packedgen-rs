@@ -11,6 +11,7 @@
     reason = "isolates CPython-owned pointer tagging and GIL-guarded access"
 )]
 
+use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
@@ -26,6 +27,92 @@ use pyo3::types::{PyDict, PyFrozenSet, PySet, PyString, PyTuple, PyType};
 use crate::map::{HashMap, TableBackend};
 use crate::set::HashSet;
 use crate::{ElasticHashMap, ElasticHashSet, FunnelHashMap, FunnelHashSet, ReserveFraction};
+
+thread_local! {
+    static EQ_ERROR: RefCell<Option<PyErr>> = const { RefCell::new(None) };
+}
+
+// Save/restore the outer operation's error when Python equality re-enters us.
+struct EqErrorScope(Option<PyErr>);
+
+impl Drop for EqErrorScope {
+    fn drop(&mut self) {
+        EQ_ERROR.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+
+fn checked_probe<T>(probe: impl FnOnce() -> T) -> PyResult<T> {
+    let _scope = EqErrorScope(EQ_ERROR.with(|slot| slot.borrow_mut().take()));
+    let result = probe();
+    match EQ_ERROR.with(|slot| slot.borrow_mut().take()) {
+        Some(error) => Err(error),
+        None => Ok(result),
+    }
+}
+
+fn record_eq_error(error: PyErr) {
+    EQ_ERROR.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(error);
+        }
+    });
+}
+
+fn map_insert<P: TableBackend<HashedAny, Py<PyAny>>>(
+    inner: &mut HashMap<HashedAny, Py<PyAny>, P>,
+    key: HashedAny,
+    value: Py<PyAny>,
+) -> PyResult<()> {
+    // Entry only probes. No replacement or insertion occurs until it is clean.
+    match checked_probe(|| inner.entry(key))? {
+        crate::map::Entry::Occupied(mut entry) => {
+            entry.insert(value);
+        }
+        crate::map::Entry::Vacant(entry) => {
+            entry.insert(value);
+        }
+    }
+    Ok(())
+}
+
+fn map_remove<P: TableBackend<HashedAny, Py<PyAny>>>(
+    inner: &mut HashMap<HashedAny, Py<PyAny>, P>,
+    key: &HashedAny,
+) -> PyResult<Option<Py<PyAny>>> {
+    let key = Python::attach(|py| key.clone_with_py(py));
+    Ok(match checked_probe(|| inner.entry(key))? {
+        crate::map::Entry::Occupied(entry) => Some(entry.remove()),
+        crate::map::Entry::Vacant(_) => None,
+    })
+}
+
+fn set_insert<P: TableBackend<HashedAny, ()>>(
+    inner: &mut HashSet<HashedAny, P>,
+    key: HashedAny,
+) -> PyResult<bool> {
+    Ok(match checked_probe(|| inner.entry(key))? {
+        crate::set::Entry::Occupied(_) => false,
+        crate::set::Entry::Vacant(entry) => {
+            entry.insert();
+            true
+        }
+    })
+}
+
+fn set_remove<P: TableBackend<HashedAny, ()>>(
+    inner: &mut HashSet<HashedAny, P>,
+    key: &HashedAny,
+) -> PyResult<bool> {
+    let key = Python::attach(|py| key.clone_with_py(py));
+    Ok(match checked_probe(|| inner.entry(key))? {
+        crate::set::Entry::Occupied(entry) => {
+            entry.remove();
+            true
+        }
+        crate::set::Entry::Vacant(_) => false,
+    })
+}
 
 fn parse_reserve(reserve_exponent: Option<u32>) -> PyResult<ReserveFraction> {
     if let Some(reserve_exponent) = reserve_exponent {
@@ -275,9 +362,17 @@ impl PartialEq for HashedAny {
                     return false;
                 }
             }
-            self.obj_borrowed(py)
-                .eq(other.obj_borrowed(py))
-                .unwrap_or(false)
+            if EQ_ERROR.with(|slot| slot.borrow().is_some()) {
+                return false;
+            }
+            // Equivalent compares probe to stored key; dict compares stored first.
+            match other.obj_borrowed(py).eq(self.obj_borrowed(py)) {
+                Ok(equal) => equal,
+                Err(error) => {
+                    record_eq_error(error);
+                    false
+                }
+            }
         })
     }
 }
@@ -297,10 +392,11 @@ fn map_extend_cloned<P: TableBackend<HashedAny, Py<PyAny>>>(
     dst: &mut HashMap<HashedAny, Py<PyAny>, P>,
     src: &HashMap<HashedAny, Py<PyAny>, P>,
     py: Python,
-) {
+) -> PyResult<()> {
     for (k, v) in src {
-        dst.insert(k.clone_with_py(py), v.clone_ref(py));
+        map_insert(dst, k.clone_with_py(py), v.clone_ref(py))?;
     }
+    Ok(())
 }
 
 /// Apply `dict.update` semantics to `inner`: same-type peer (`same_inner`,
@@ -318,7 +414,7 @@ fn map_update<P: TableBackend<HashedAny, Py<PyAny>>>(
     if let Some(peer) = same_inner {
         inner.reserve(peer.len());
         for (k, v) in peer {
-            inner.insert(k.clone_with_py(py), v.clone_ref(py));
+            map_insert(inner, k.clone_with_py(py), v.clone_ref(py))?;
             touched = true;
         }
     } else if let Some(other) = other {
@@ -326,7 +422,7 @@ fn map_update<P: TableBackend<HashedAny, Py<PyAny>>>(
             inner.reserve(dict.len());
             for (k, v) in dict.iter() {
                 let key = HashedAny::from_bound(&k)?;
-                inner.insert(key, v.unbind());
+                map_insert(inner, key, v.unbind())?;
                 touched = true;
             }
         } else if other.hasattr("keys")? {
@@ -338,7 +434,7 @@ fn map_update<P: TableBackend<HashedAny, Py<PyAny>>>(
                 let k = k?;
                 let v = other.get_item(&k)?;
                 let key = HashedAny::from_bound(&k)?;
-                inner.insert(key, v.unbind());
+                map_insert(inner, key, v.unbind())?;
                 touched = true;
             }
         } else {
@@ -358,7 +454,7 @@ fn map_update<P: TableBackend<HashedAny, Py<PyAny>>>(
                 let k = item.get_item(0)?;
                 let v = item.get_item(1)?;
                 let key = HashedAny::from_bound(&k)?;
-                inner.insert(key, v.unbind());
+                map_insert(inner, key, v.unbind())?;
                 touched = true;
             }
         }
@@ -367,7 +463,7 @@ fn map_update<P: TableBackend<HashedAny, Py<PyAny>>>(
         inner.reserve(kwargs.len());
         for (k, v) in kwargs.iter() {
             let key = HashedAny::from_bound(&k)?;
-            inner.insert(key, v.unbind());
+            map_insert(inner, key, v.unbind())?;
             touched = true;
         }
     }
@@ -381,59 +477,58 @@ fn map_eq<P: TableBackend<HashedAny, Py<PyAny>>>(
     other: &Bound<PyAny>,
     py: Python,
     same_inner: Option<&HashMap<HashedAny, Py<PyAny>, P>>,
-) -> bool {
+) -> PyResult<bool> {
     if let Some(peer) = same_inner {
         if inner.len() != peer.len() {
-            return false;
+            return Ok(false);
         }
         for (k, v) in inner {
-            match peer.get(k) {
+            match checked_probe(|| peer.get(k))? {
                 Some(ov) => {
-                    if !v.bind(py).eq(ov.bind(py)).unwrap_or(false) {
-                        return false;
+                    if !v.bind(py).eq(ov.bind(py))? {
+                        return Ok(false);
                     }
                 }
-                None => return false,
+                None => return Ok(false),
             }
         }
-        return true;
+        return Ok(true);
     }
     if let Ok(d) = other.cast::<PyDict>() {
         if d.len() != inner.len() {
-            return false;
+            return Ok(false);
         }
         for (k, v) in inner {
             let key_b = k.obj_borrowed(py);
             match d.get_item(key_b) {
                 Ok(Some(other_v)) => {
-                    if !v.bind(py).eq(&other_v).unwrap_or(false) {
-                        return false;
+                    if !v.bind(py).eq(&other_v)? {
+                        return Ok(false);
                     }
                 }
-                _ => return false,
+                Err(error) => return Err(error),
+                Ok(None) => return Ok(false),
             }
         }
-        return true;
+        return Ok(true);
     }
-    if !other.hasattr("keys").unwrap_or(false) {
-        return false;
+    if !other.hasattr("keys")? {
+        return Ok(false);
     }
     let Ok(other_len) = other.len() else {
-        return false;
+        return Ok(false);
     };
     if other_len != inner.len() {
-        return false;
+        return Ok(false);
     }
     for (k, v) in inner {
         let key_b = k.obj_borrowed(py);
-        let Ok(other_v) = other.get_item(key_b) else {
-            return false;
-        };
-        if !v.bind(py).eq(&other_v).unwrap_or(false) {
-            return false;
+        let other_v = other.get_item(key_b)?;
+        if !v.bind(py).eq(&other_v)? {
+            return Ok(false);
         }
     }
-    true
+    Ok(true)
 }
 
 /// `dict.fromkeys` body: insert each key from `iterable`, all mapped to `value`.
@@ -445,7 +540,7 @@ fn map_from_keys<P: TableBackend<HashedAny, Py<PyAny>>>(
 ) -> PyResult<()> {
     for k in iterable.try_iter()? {
         let key = HashedAny::from_bound(&k?)?;
-        inner.insert(key, value.clone_ref(py));
+        map_insert(inner, key, value.clone_ref(py))?;
     }
     Ok(())
 }
@@ -524,7 +619,7 @@ fn keys_view_symmetric_difference<P: TableBackend<HashedAny, Py<PyAny>>>(
     for item in other.try_iter()? {
         let item = item?;
         let probe = ProbeKey::from_bound(&item)?;
-        if !inner.contains_key(probe.as_key()) {
+        if !checked_probe(|| inner.contains_key(probe.as_key()))? {
             result.add(item)?;
         }
     }
@@ -719,12 +814,12 @@ macro_rules! define_map_classes {
 
             fn __contains__(&self, key: &Bound<PyAny>) -> PyResult<bool> {
                 let probe = ProbeKey::from_bound(key)?;
-                Ok(self.inner.contains_key(probe.as_key()))
+                checked_probe(|| self.inner.contains_key(probe.as_key()))
             }
 
             fn __getitem__(&self, key: &Bound<PyAny>, py: Python) -> PyResult<Py<PyAny>> {
                 let probe = ProbeKey::from_bound(key)?;
-                match self.inner.get(probe.as_key()) {
+                match checked_probe(|| self.inner.get(probe.as_key()))? {
                     Some(v) => Ok(v.clone_ref(py)),
                     None => Err(missing_key(key)),
                 }
@@ -732,14 +827,14 @@ macro_rules! define_map_classes {
 
             fn __setitem__(&mut self, key: &Bound<PyAny>, value: &Bound<PyAny>) -> PyResult<()> {
                 let k = HashedAny::from_bound(key)?;
-                self.inner.insert(k, value.clone().unbind());
+                map_insert(&mut self.inner, k, value.clone().unbind())?;
                 self.bump();
                 Ok(())
             }
 
             fn __delitem__(&mut self, key: &Bound<PyAny>) -> PyResult<()> {
                 let probe = ProbeKey::from_bound(key)?;
-                match self.inner.remove(probe.as_key()) {
+                match map_remove(&mut self.inner, probe.as_key())? {
                     Some(_) => {
                         self.bump();
                         Ok(())
@@ -756,7 +851,7 @@ macro_rules! define_map_classes {
                 py: Python,
             ) -> PyResult<Py<PyAny>> {
                 let probe = ProbeKey::from_bound(key)?;
-                Ok(match self.inner.get(probe.as_key()) {
+                Ok(match checked_probe(|| self.inner.get(probe.as_key()))? {
                     Some(v) => v.clone_ref(py),
                     None => default.unwrap_or_else(|| py.None()),
                 })
@@ -835,7 +930,7 @@ macro_rules! define_map_classes {
                 default: Option<Py<PyAny>>,
             ) -> PyResult<Py<PyAny>> {
                 let probe = ProbeKey::from_bound(key)?;
-                match self.inner.remove(probe.as_key()) {
+                match map_remove(&mut self.inner, probe.as_key())? {
                     Some(v) => {
                         self.bump();
                         Ok(v)
@@ -862,26 +957,26 @@ macro_rules! define_map_classes {
                 py: Python,
             ) -> PyResult<Py<PyAny>> {
                 let probe = ProbeKey::from_bound(key)?;
-                if let Some(v) = self.inner.get(probe.as_key()) {
+                if let Some(v) = checked_probe(|| self.inner.get(probe.as_key()))? {
                     return Ok(v.clone_ref(py));
                 }
                 let k = HashedAny::from_bound(key)?;
                 let value = default.unwrap_or_else(|| py.None());
-                self.inner.insert(k, value.clone_ref(py));
+                map_insert(&mut self.inner, k, value.clone_ref(py))?;
                 self.bump();
                 Ok(value)
             }
 
-            fn copy(&self, py: Python) -> Self {
+            fn copy(&self, py: Python) -> PyResult<Self> {
                 let mut new = $Inner::with_capacity(self.inner.len());
-                map_extend_cloned(&mut new, &self.inner, py);
-                Self {
+                map_extend_cloned(&mut new, &self.inner, py)?;
+                Ok(Self {
                     inner: new,
                     generation: 0,
-                }
+                })
             }
 
-            fn __eq__(&self, other: &Bound<PyAny>, py: Python) -> bool {
+            fn __eq__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<bool> {
                 dispatch_same_type!(map_eq, &self.inner, other, py)
             }
 
@@ -892,7 +987,7 @@ macro_rules! define_map_classes {
                     inner: $Inner::with_capacity(cap),
                     generation: 0,
                 };
-                map_extend_cloned(&mut new.inner, &self.inner, py);
+                map_extend_cloned(&mut new.inner, &self.inner, py)?;
                 new.update(Some(other), None, py)?;
                 Ok(new)
             }
@@ -905,7 +1000,7 @@ macro_rules! define_map_classes {
                     generation: 0,
                 };
                 new.update(Some(other), None, py)?;
-                map_extend_cloned(&mut new.inner, &self.inner, py);
+                map_extend_cloned(&mut new.inner, &self.inner, py)?;
                 new.bump();
                 Ok(new)
             }
@@ -948,7 +1043,7 @@ macro_rules! define_map_classes {
             fn __contains__(&self, key: &Bound<PyAny>, py: Python) -> PyResult<bool> {
                 let m = self.map.borrow(py);
                 let probe = ProbeKey::from_bound(key)?;
-                Ok(m.inner.contains_key(probe.as_key()))
+                checked_probe(|| m.inner.contains_key(probe.as_key()))
             }
             fn __repr__(&self, py: Python) -> PyResult<String> {
                 let m = self.map.borrow(py);
@@ -962,20 +1057,20 @@ macro_rules! define_map_classes {
                     parts?.join(", ")
                 ))
             }
-            fn __eq__(&self, other: &Bound<PyAny>, py: Python) -> bool {
+            fn __eq__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<bool> {
                 let m = self.map.borrow(py);
                 let Ok(other_len) = other.len() else {
-                    return false;
+                    return Ok(false);
                 };
                 if other_len != m.inner.len() {
-                    return false;
+                    return Ok(false);
                 }
                 for (k, _) in &m.inner {
-                    if !other.contains(k.obj_borrowed(py)).unwrap_or(false) {
-                        return false;
+                    if !other.contains(k.obj_borrowed(py))? {
+                        return Ok(false);
                     }
                 }
-                true
+                Ok(true)
             }
             fn __and__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Py<PySet>> {
                 keys_view_intersection(&self.map.borrow(py).inner, other, py)
@@ -1075,7 +1170,7 @@ macro_rules! define_map_classes {
                 let v = tup.get_item(1)?;
                 let m = self.map.borrow(py);
                 let probe = ProbeKey::from_bound(&k)?;
-                match m.inner.get(probe.as_key()) {
+                match checked_probe(|| m.inner.get(probe.as_key()))? {
                     Some(stored_v) => Ok(stored_v.bind(py).eq(&v).unwrap_or(false)),
                     None => Ok(false),
                 }
@@ -1096,23 +1191,21 @@ macro_rules! define_map_classes {
                     parts?.join(", ")
                 ))
             }
-            fn __eq__(&self, other: &Bound<PyAny>, py: Python) -> bool {
+            fn __eq__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<bool> {
                 let m = self.map.borrow(py);
                 let Ok(other_len) = other.len() else {
-                    return false;
+                    return Ok(false);
                 };
                 if other_len != m.inner.len() {
-                    return false;
+                    return Ok(false);
                 }
                 for (k, v) in &m.inner {
-                    let Ok(tup) = PyTuple::new(py, [k.obj_clone_ref(py), v.clone_ref(py)]) else {
-                        return false;
-                    };
-                    if !other.contains(&tup).unwrap_or(false) {
-                        return false;
+                    let tup = PyTuple::new(py, [k.obj_clone_ref(py), v.clone_ref(py)])?;
+                    if !other.contains(&tup)? {
+                        return Ok(false);
                     }
                 }
-                true
+                Ok(true)
             }
             fn __and__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Py<PySet>> {
                 items_view_intersection(&self.map.borrow(py).inner, other, py)
@@ -1195,7 +1288,7 @@ fn set_add_all<P: TableBackend<HashedAny, ()>>(
         let py = other.py();
         inner.reserve(peer.len());
         for value in peer {
-            inner.insert(value.clone_with_py(py));
+            set_insert(inner, value.clone_with_py(py))?;
         }
     } else {
         if let Ok(hint) = other.len() {
@@ -1203,7 +1296,7 @@ fn set_add_all<P: TableBackend<HashedAny, ()>>(
         }
         for item in other.try_iter()? {
             let item = item?;
-            inner.insert(HashedAny::from_bound(&item)?);
+            set_insert(inner, HashedAny::from_bound(&item)?)?;
         }
     }
     Ok(inner.len() != before)
@@ -1218,13 +1311,13 @@ fn set_remove_all<P: TableBackend<HashedAny, ()>>(
     let before = inner.len();
     if let Some(peer) = same_inner {
         for value in peer {
-            inner.remove(value);
+            set_remove(inner, value)?;
         }
     } else {
         for item in other.try_iter()? {
             let item = item?;
             let probe = ProbeKey::from_bound(&item)?;
-            inner.remove(probe.as_key());
+            set_remove(inner, probe.as_key())?;
         }
     }
     Ok(inner.len() != before)
@@ -1239,14 +1332,40 @@ fn set_retain_in<P: TableBackend<HashedAny, ()>>(
 ) -> PyResult<bool> {
     let before = inner.len();
     if let Some(peer) = same_inner {
-        inner.retain(|value| peer.contains(value));
+        checked_probe(|| {
+            inner.retain(|value| {
+                if EQ_ERROR.with(|slot| slot.borrow().is_some()) {
+                    return true;
+                }
+                match checked_probe(|| peer.contains(value)) {
+                    Ok(keep) => keep,
+                    Err(error) => {
+                        record_eq_error(error);
+                        true
+                    }
+                }
+            });
+        })?;
         return Ok(inner.len() != before);
     }
     let other_set = PySet::empty(py)?;
     for item in other.try_iter()? {
         other_set.add(item?)?;
     }
-    inner.retain(|value| other_set.contains(value.obj_borrowed(py)).unwrap_or(false));
+    checked_probe(|| {
+        inner.retain(|value| {
+            if EQ_ERROR.with(|slot| slot.borrow().is_some()) {
+                return true;
+            }
+            match other_set.contains(value.obj_borrowed(py)) {
+                Ok(keep) => keep,
+                Err(error) => {
+                    record_eq_error(error);
+                    true
+                }
+            }
+        });
+    })?;
     Ok(inner.len() != before)
 }
 
@@ -1261,8 +1380,8 @@ fn set_symmetric_difference_with<P: TableBackend<HashedAny, ()>>(
         let py = other.py();
         let mut touched = false;
         for value in peer {
-            if !inner.remove(value) {
-                inner.insert(value.clone_with_py(py));
+            if !set_remove(inner, value)? {
+                set_insert(inner, value.clone_with_py(py))?;
             }
             touched = true;
         }
@@ -1271,12 +1390,13 @@ fn set_symmetric_difference_with<P: TableBackend<HashedAny, ()>>(
     let mut unique_other = std::collections::HashSet::new();
     for item in other.try_iter()? {
         let item = item?;
-        unique_other.insert(HashedAny::from_bound(&item)?);
+        let key = HashedAny::from_bound(&item)?;
+        checked_probe(|| unique_other.insert(key))?;
     }
     let mut touched = false;
     for value in unique_other {
-        if !inner.remove(&value) {
-            inner.insert(value);
+        if !set_remove(inner, &value)? {
+            set_insert(inner, value)?;
         }
         touched = true;
     }
@@ -1296,7 +1416,7 @@ fn set_isdisjoint<P: TableBackend<HashedAny, ()>>(
             (peer, inner)
         };
         for value in smaller {
-            if larger.contains(value) {
+            if checked_probe(|| larger.contains(value))? {
                 return Ok(false);
             }
         }
@@ -1305,7 +1425,7 @@ fn set_isdisjoint<P: TableBackend<HashedAny, ()>>(
     for item in other.try_iter()? {
         let item = item?;
         let probe = ProbeKey::from_bound(&item)?;
-        if inner.contains(probe.as_key()) {
+        if checked_probe(|| inner.contains(probe.as_key()))? {
             return Ok(false);
         }
     }
@@ -1324,7 +1444,7 @@ fn set_issubset<P: TableBackend<HashedAny, ()>>(
             return Ok(false);
         }
         for value in inner {
-            if !peer.contains(value) {
+            if !checked_probe(|| peer.contains(value))? {
                 return Ok(false);
             }
         }
@@ -1357,7 +1477,7 @@ fn set_issuperset<P: TableBackend<HashedAny, ()>>(
             return Ok(false);
         }
         for value in peer {
-            if !inner.contains(value) {
+            if !checked_probe(|| inner.contains(value))? {
                 return Ok(false);
             }
         }
@@ -1366,7 +1486,7 @@ fn set_issuperset<P: TableBackend<HashedAny, ()>>(
     for item in other.try_iter()? {
         let item = item?;
         let probe = ProbeKey::from_bound(&item)?;
-        if !inner.contains(probe.as_key()) {
+        if !checked_probe(|| inner.contains(probe.as_key()))? {
             return Ok(false);
         }
     }
@@ -1381,7 +1501,7 @@ fn set_eq<P: TableBackend<HashedAny, ()>>(
     same_inner: Option<&HashSet<HashedAny, P>>,
 ) -> PyResult<bool> {
     if let Some(peer) = same_inner {
-        return Ok(inner == peer);
+        return checked_probe(|| inner == peer);
     }
     if !is_set_like(other)? {
         return Ok(false);
@@ -1395,7 +1515,7 @@ fn set_eq<P: TableBackend<HashedAny, ()>>(
     for item in other.try_iter()? {
         let item = item?;
         let probe = ProbeKey::from_bound(&item)?;
-        if !inner.contains(probe.as_key()) {
+        if !checked_probe(|| inner.contains(probe.as_key()))? {
             return Ok(false);
         }
     }
@@ -1411,7 +1531,7 @@ fn set_rsub_into<P: TableBackend<HashedAny, ()>>(
 ) -> PyResult<()> {
     set_add_all(dst, other, None)?;
     for value in this {
-        dst.remove(value);
+        set_remove(dst, value)?;
     }
     Ok(())
 }
@@ -1526,7 +1646,7 @@ macro_rules! define_set_classes {
 
             fn __contains__(&self, value: &Bound<PyAny>) -> PyResult<bool> {
                 let probe = ProbeKey::from_bound(value)?;
-                Ok(self.inner.contains(probe.as_key()))
+                checked_probe(|| self.inner.contains(probe.as_key()))
             }
 
             fn __iter__(slf: Bound<Self>) -> $KeyIter {
@@ -1551,20 +1671,20 @@ macro_rules! define_set_classes {
                 )
             }
 
-            fn copy(&self, py: Python) -> Self {
+            fn copy(&self, py: Python) -> PyResult<Self> {
                 let mut new = $Inner::with_capacity(self.inner.len());
                 for value in self.inner.iter() {
-                    new.insert(value.clone_with_py(py));
+                    set_insert(&mut new, value.clone_with_py(py))?;
                 }
-                Self {
+                Ok(Self {
                     inner: new,
                     generation: 0,
-                }
+                })
             }
 
             fn add(&mut self, value: &Bound<PyAny>) -> PyResult<()> {
                 let key = HashedAny::from_bound(value)?;
-                if self.inner.insert(key) {
+                if set_insert(&mut self.inner, key)? {
                     self.bump();
                 }
                 Ok(())
@@ -1572,7 +1692,7 @@ macro_rules! define_set_classes {
 
             fn discard(&mut self, value: &Bound<PyAny>) -> PyResult<()> {
                 let probe = ProbeKey::from_bound(value)?;
-                if self.inner.remove(probe.as_key()) {
+                if set_remove(&mut self.inner, probe.as_key())? {
                     self.bump();
                 }
                 Ok(())
@@ -1580,7 +1700,7 @@ macro_rules! define_set_classes {
 
             fn remove(&mut self, value: &Bound<PyAny>) -> PyResult<()> {
                 let probe = ProbeKey::from_bound(value)?;
-                if self.inner.remove(probe.as_key()) {
+                if set_remove(&mut self.inner, probe.as_key())? {
                     self.bump();
                     Ok(())
                 } else {
@@ -1619,7 +1739,7 @@ macro_rules! define_set_classes {
 
             #[pyo3(signature = (*others))]
             fn union(&self, others: &Bound<PyTuple>, py: Python) -> PyResult<Self> {
-                let mut new = self.copy(py);
+                let mut new = self.copy(py)?;
                 for other in others.try_iter()? {
                     new.add_all(&other?)?;
                 }
@@ -1628,7 +1748,7 @@ macro_rules! define_set_classes {
 
             #[pyo3(signature = (*others))]
             fn intersection(&self, others: &Bound<PyTuple>, py: Python) -> PyResult<Self> {
-                let mut new = self.copy(py);
+                let mut new = self.copy(py)?;
                 for other in others.try_iter()? {
                     new.retain_in(&other?, py)?;
                 }
@@ -1637,7 +1757,7 @@ macro_rules! define_set_classes {
 
             #[pyo3(signature = (*others))]
             fn difference(&self, others: &Bound<PyTuple>, py: Python) -> PyResult<Self> {
-                let mut new = self.copy(py);
+                let mut new = self.copy(py)?;
                 for other in others.try_iter()? {
                     new.remove_all(&other?)?;
                 }
@@ -1645,7 +1765,7 @@ macro_rules! define_set_classes {
             }
 
             fn symmetric_difference(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
-                let mut new = self.copy(py);
+                let mut new = self.copy(py)?;
                 new.symmetric_difference_with(other)?;
                 Ok(new)
             }
@@ -1691,7 +1811,7 @@ macro_rules! define_set_classes {
             }
 
             fn __or__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
-                let mut new = self.copy(py);
+                let mut new = self.copy(py)?;
                 new.add_all(other)?;
                 Ok(new)
             }
@@ -1702,7 +1822,7 @@ macro_rules! define_set_classes {
             }
 
             fn __and__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
-                let mut new = self.copy(py);
+                let mut new = self.copy(py)?;
                 new.retain_in(other, py)?;
                 Ok(new)
             }
@@ -1712,7 +1832,7 @@ macro_rules! define_set_classes {
             }
 
             fn __sub__(&self, other: &Bound<PyAny>, py: Python) -> PyResult<Self> {
-                let mut new = self.copy(py);
+                let mut new = self.copy(py)?;
                 new.remove_all(other)?;
                 Ok(new)
             }
