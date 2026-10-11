@@ -543,9 +543,20 @@ fn get_or_insert_atomic(value: &AtomicU64, insert_value: NonMaxU64) -> (NonMaxU6
     }
 }
 
+fn value_cas_backoff(backoff: &mut usize) {
+    #[cfg(test)]
+    CAS_FAILURES.with(|failures| failures.set(failures.get() + 1));
+    // Let the cache-line owner finish, with a bounded exponential delay.
+    for _ in 0..*backoff {
+        spin_loop();
+    }
+    *backoff = (*backoff * 2).min(64);
+}
+
 #[cfg(feature = "prepared-keys")]
 fn replace_existing_atomic(value: &AtomicU64, replacement: NonMaxU64) -> Option<NonMaxU64> {
     let mut current = value.load(Ordering::Acquire);
+    let mut backoff = 1;
     loop {
         let previous = NonMaxU64::new(current)?;
         match value.compare_exchange_weak(
@@ -555,7 +566,10 @@ fn replace_existing_atomic(value: &AtomicU64, replacement: NonMaxU64) -> Option<
             Ordering::Acquire,
         ) {
             Ok(_) => return Some(previous),
-            Err(observed) => current = observed,
+            Err(observed) => {
+                value_cas_backoff(&mut backoff);
+                current = observed;
+            }
         }
     }
 }
@@ -573,14 +587,8 @@ fn update_atomic(
         {
             Ok(_) => return Some(next),
             Err(observed) => {
+                value_cas_backoff(&mut backoff);
                 current = observed;
-                // Let the current cache-line owner complete under contention.
-                // The cap preserves distributed-update throughput while
-                // preventing a hot key from becoming an unbounded CAS storm.
-                for _ in 0..backoff {
-                    spin_loop();
-                }
-                backoff = (backoff * 2).min(8);
             }
         }
     }
@@ -592,19 +600,24 @@ fn upsert_atomic(
     update: &impl Fn(&NonMaxU64) -> NonMaxU64,
 ) -> (NonMaxU64, bool) {
     let mut current = value.load(Ordering::Acquire);
+    let mut backoff = 1;
     loop {
         let became_live = current == DELETED;
         let next = NonMaxU64::new(current).map_or(insert_value, |value| update(&value));
         match value.compare_exchange_weak(current, next.get(), Ordering::AcqRel, Ordering::Acquire)
         {
             Ok(_) => return (next, became_live),
-            Err(observed) => current = observed,
+            Err(observed) => {
+                value_cas_backoff(&mut backoff);
+                current = observed;
+            }
         }
     }
 }
 
 fn remove_atomic(value: &AtomicU64, predicate: &impl Fn(&NonMaxU64) -> bool) -> Option<NonMaxU64> {
     let mut current = value.load(Ordering::Acquire);
+    let mut backoff = 1;
     loop {
         let current_value = NonMaxU64::new(current)?;
         if !predicate(&current_value) {
@@ -612,7 +625,60 @@ fn remove_atomic(value: &AtomicU64, predicate: &impl Fn(&NonMaxU64) -> bool) -> 
         }
         match value.compare_exchange_weak(current, DELETED, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return Some(current_value),
-            Err(observed) => current = observed,
+            Err(observed) => {
+                value_cas_backoff(&mut backoff);
+                current = observed;
+            }
         }
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static CAS_FAILURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hot_key_cas_failures_are_bounded() {
+        const THREADS: usize = 8;
+        const OPERATIONS: usize = 50_000;
+        let value = AtomicU64::new(0);
+        let barrier = std::sync::Barrier::new(THREADS);
+        let failures = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        CAS_FAILURES.with(|failures| failures.set(0));
+                        barrier.wait();
+                        for _ in 0..OPERATIONS {
+                            update_atomic(&value, &|current| {
+                                NonMaxU64::new(current.get() + 1).unwrap()
+                            });
+                        }
+                        CAS_FAILURES.with(std::cell::Cell::get)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .sum::<usize>()
+        });
+        let operations = THREADS * OPERATIONS;
+        #[allow(clippy::cast_precision_loss)]
+        let ratio = failures as f64 / operations as f64;
+        eprintln!("failed CAS: {failures}/{operations}, ratio={ratio:.6}");
+        assert_eq!(
+            value.load(Ordering::Acquire),
+            u64::try_from(operations).unwrap()
+        );
+        assert!(
+            failures < operations / 2,
+            "CAS failure ratio {ratio:.6} >= 0.5"
+        );
     }
 }

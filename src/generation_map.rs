@@ -1,4 +1,4 @@
-#[cfg(feature = "prepared-keys")]
+#[cfg(any(test, feature = "prepared-keys"))]
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::hint::spin_loop;
@@ -507,6 +507,9 @@ impl<V> LockFreeGenerationMap<V> {
     ///
     /// Returns a frozen-map build error for oversized or duplicate keys, allocation failure,
     /// or perfect-index construction failure.
+    ///
+    /// `overlay_capacity` may not exceed 2^32 entries. Larger requests return
+    /// [`FrozenBuildError::AllocationFailed`] without allocating an overlay.
     pub fn try_from_entries<I, K>(
         entries: I,
         overlay_capacity: usize,
@@ -609,6 +612,9 @@ impl<V> LockFreeGenerationMap<V> {
     /// Returns a frozen-map construction error. The redirected layer remains
     /// usable and retains its previous-generation base if packing fails.
     ///
+    /// `overlay_capacity` may not exceed 2^32 entries. Larger requests return
+    /// [`FrozenBuildError::AllocationFailed`] before redirecting any writers.
+    ///
     /// # Panics
     ///
     /// In debug builds, panics if this thread retains a vacant entry or operation
@@ -627,12 +633,18 @@ impl<V> LockFreeGenerationMap<V> {
     }
 
     /// Returns the current logical entry count.
+    ///
+    /// This is O(writer stripes): it sums the 4,096 striped counters rather
+    /// than reading one cached count. Avoid calling it per operation on hot paths.
     #[must_use]
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
     /// Returns whether the current logical generation is empty.
+    ///
+    /// This calls [`Self::len`] and is O(writer stripes), summing 4,096 counters.
+    /// Avoid calling it per operation on hot paths.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
@@ -1696,6 +1708,9 @@ impl LockFreeAtomicU64GenerationMap {
     ///
     /// Returns a frozen-map build error for oversized or duplicate keys, allocation failure,
     /// or perfect-index construction failure.
+    ///
+    /// `overlay_capacity` may not exceed 2^32 entries. Larger requests return
+    /// [`FrozenBuildError::AllocationFailed`] without allocating an overlay.
     pub fn try_from_entries<I, K>(
         entries: I,
         overlay_capacity: usize,
@@ -1718,6 +1733,9 @@ impl LockFreeAtomicU64GenerationMap {
     ///
     /// Returns a frozen-map build error for oversized or duplicate keys, allocation failure,
     /// or perfect-index construction failure.
+    ///
+    /// `overlay_capacity` may not exceed 2^32 entries. Larger requests return
+    /// [`FrozenBuildError::AllocationFailed`] without allocating an overlay.
     pub fn try_from_entries_with_overlay<I, K>(
         entries: I,
         overlay_capacity: usize,
@@ -1748,6 +1766,9 @@ impl LockFreeAtomicU64GenerationMap {
     ///
     /// Returns a frozen-map build error for oversized or duplicate keys, allocation failure,
     /// or perfect-index construction failure.
+    ///
+    /// `overlay_capacity` may not exceed 2^32 entries. Larger requests return
+    /// [`FrozenBuildError::AllocationFailed`] without allocating an overlay.
     pub fn try_from_entries_with_options<I, K>(
         entries: I,
         overlay_capacity: usize,
@@ -1774,6 +1795,9 @@ impl LockFreeAtomicU64GenerationMap {
     /// must route keys through identical writer stripes. Normal applications
     /// should use [`Self::try_from_entries_with_options`].
     #[doc(hidden)]
+    ///
+    /// `overlay_capacity` may not exceed 2^32 entries. Larger requests return
+    /// [`FrozenBuildError::AllocationFailed`] without allocating an overlay.
     pub fn try_from_entries_with_options_and_writer_hash<I, K>(
         entries: I,
         overlay_capacity: usize,
@@ -1800,6 +1824,9 @@ impl LockFreeAtomicU64GenerationMap {
     /// This exists for paired backend experiments. Normal applications should
     /// keep using [`Self::try_from_entries_with_options`].
     #[doc(hidden)]
+    ///
+    /// `overlay_capacity` may not exceed 2^32 entries. Larger requests return
+    /// [`FrozenBuildError::AllocationFailed`] without allocating an overlay.
     pub fn try_from_entries_with_options_and_writer_hash_and_index<I, K>(
         entries: I,
         overlay_capacity: usize,
@@ -2248,6 +2275,9 @@ impl LockFreeAtomicU64GenerationMap {
     /// Returns a frozen-map construction error. The redirected layer remains
     /// usable and retains its previous-generation base if packing fails.
     ///
+    /// `overlay_capacity` may not exceed 2^32 entries. Larger requests return
+    /// [`FrozenBuildError::AllocationFailed`] before redirecting any writers.
+    ///
     /// # Panics
     ///
     /// In debug builds, panics if this thread retains a vacant entry or operation
@@ -2310,12 +2340,18 @@ impl LockFreeAtomicU64GenerationMap {
     }
 
     /// Returns the current logical entry count.
+    ///
+    /// This is O(writer stripes): it sums the 4,096 striped counters rather
+    /// than reading one cached count. Avoid calling it per operation on hot paths.
     #[must_use]
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
     /// Returns whether the current logical generation is empty.
+    ///
+    /// This calls [`Self::len`] and is O(writer stripes), summing 4,096 counters.
+    /// Avoid calling it per operation on hot paths.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
@@ -2442,7 +2478,8 @@ where
                 0,
                 overlay_mode,
                 writer_hash_builder.clone(),
-            ),
+            )
+            .expect("zero-capacity overlay allocation is bounded"),
             overlay_mode,
             writer_hash_builder,
             B::DEFAULT_BASE_FILTER,
@@ -2456,6 +2493,9 @@ where
     ///
     /// Returns a frozen-map build error for oversized or duplicate keys, allocation
     /// failure, or perfect-index construction failure.
+    ///
+    /// `overlay_capacity` may not exceed 2^32 entries. Larger requests return
+    /// [`FrozenBuildError::AllocationFailed`] without allocating an overlay.
     pub fn try_from_entries<I, K>(
         entries: I,
         overlay_capacity: usize,
@@ -2524,6 +2564,7 @@ where
         I: IntoIterator<Item = (K, V)>,
         K: AsRef<[u8]>,
     {
+        crate::generation_overlay::validate_overlay_capacity(overlay_capacity)?;
         let frozen = B::try_from_entries_with_policy_index_and_hash(
             entries,
             base_filter,
@@ -2538,7 +2579,7 @@ where
                 overlay_capacity,
                 overlay_mode,
                 writer_hash_builder.clone(),
-            ),
+            )?,
             overlay_mode,
             writer_hash_builder,
             base_filter,
@@ -2658,11 +2699,14 @@ where
     /// fails. Subsequent rebuilds retry packing; repeated construction failures
     /// can retain additional layers.
     ///
+    /// `overlay_capacity` may not exceed 2^32 entries. Larger requests return
+    /// [`FrozenBuildError::AllocationFailed`] before redirecting any writers.
+    ///
     /// # Panics
     ///
     /// In debug builds, panics if this thread retains an entry or operation
     /// guard created on this thread for this map. Also panics if a packed base
-    /// entry has an invalid key reference (internal corruption).
+    /// entry has an invalid key reference (internal invariant corruption).
     ///
     /// # Deadlocks
     ///
@@ -2716,7 +2760,7 @@ where
             overlay_capacity,
             self.overlay_mode,
             self.writer_hash_builder.clone(),
-        );
+        )?; // Allocation errors return before the redirect is published.
 
         let redirect_started = Instant::now();
         self.current.store(Arc::clone(&next));
@@ -2774,12 +2818,18 @@ where
     }
 
     /// Returns the current logical entry count.
+    ///
+    /// This is O(writer stripes): it sums the 4,096 striped counters rather
+    /// than reading one cached count. Avoid calling it per operation on hot paths.
     #[must_use]
     pub fn len(&self) -> usize {
         self.current.load().len()
     }
 
     /// Returns whether the current logical generation is empty.
+    ///
+    /// This calls [`Self::len`] and is O(writer stripes), summing 4,096 counters.
+    /// Avoid calling it per operation on hot paths.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.current.load().is_empty()
@@ -4233,7 +4283,7 @@ where
         overlay_capacity: usize,
         overlay_mode: GenerationOverlayMode,
         overlay_hash_builder: GenerationHashBuilder,
-    ) -> Arc<Self> {
+    ) -> Result<Arc<Self>, FrozenBuildError> {
         let base_is_empty = matches!(
             &base,
             GenerationBase::Frozen { map, .. } if map.len() == 0
@@ -4243,7 +4293,7 @@ where
             GenerationBase::Frozen { .. } | GenerationBase::StableHybrid(_) => (None, false),
         };
         let direct_base = matches!(&base, GenerationBase::Frozen { .. }) && B::DIRECT_MUTATION;
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             base: ArcSwap::from_pointee(base),
             base_is_empty,
             write_predecessor: ArcSwapOption::from(write_predecessor),
@@ -4252,7 +4302,7 @@ where
                 overlay_capacity,
                 overlay_mode,
                 overlay_hash_builder,
-            ),
+            )?,
             overlay_touched: AtomicBool::new(false),
             initial_len: AtomicIsize::new(isize::try_from(len).unwrap_or(isize::MAX)),
             writer_stripes: (0..WRITER_STRIPES)
@@ -4270,7 +4320,7 @@ where
                 .map(|_| PaddedAtomicUsize(AtomicUsize::new(0)))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
-        })
+        }))
     }
 
     fn with_value<R>(&self, key: &[u8], read: impl FnOnce(Option<&V>) -> R) -> R {
@@ -5037,11 +5087,25 @@ where
 
     fn mark_overlay_may_shadow_base(&self, stripe: usize) {
         self.mark_overlay_touched();
-        self.writer_stripes[stripe].fetch_or(WRITER_STRIPE_OVERLAY_BASE, Ordering::Release);
+        let flag = &self.writer_stripes[stripe];
+        // Flags are monotonic within a generation. The first Release write
+        // precedes overlay publication; readers synchronize with publication,
+        // so an already-set flag needs no additional Release write.
+        if flag.load(Ordering::Relaxed) & WRITER_STRIPE_OVERLAY_BASE == 0 {
+            #[cfg(test)]
+            OVERLAY_FLAG_WRITES.with(|count| count.set(count.get() + 1));
+            flag.fetch_or(WRITER_STRIPE_OVERLAY_BASE, Ordering::Release);
+        }
     }
 
     fn mark_overlay_touched(&self) {
-        self.overlay_touched.store(true, Ordering::Release);
+        // As above, overlay publication orders the first monotonic Release
+        // write before readers; repeating it provides no extra guarantee.
+        if !self.overlay_touched.load(Ordering::Relaxed) {
+            #[cfg(test)]
+            OVERLAY_TOUCHED_WRITES.with(|count| count.set(count.get() + 1));
+            self.overlay_touched.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -5527,6 +5591,13 @@ fn writer_stripe_len_bits(delta: isize) -> usize {
 #[repr(align(64))]
 struct PaddedAtomicUsize(AtomicUsize);
 
+#[cfg(test)]
+std::thread_local! {
+    static OVERLAY_FLAG_WRITES: Cell<usize> = const { Cell::new(0) };
+    static OVERLAY_TOUCHED_WRITES: Cell<usize> = const { Cell::new(0) };
+    static MEMBERSHIP_TRAVERSALS: Cell<usize> = const { Cell::new(0) };
+}
+
 enum BaseMembershipFilter {
     Disabled,
     OneByte(Box<[u64]>),
@@ -5541,6 +5612,10 @@ impl BaseMembershipFilter {
                 Self::OneByte(vec![0; entries.div_ceil(8)].into_boxed_slice())
             }
         }
+    }
+
+    fn needs_hashes(&self) -> bool {
+        matches!(self, Self::OneByte(_))
     }
 
     fn insert_hash(&mut self, hash: u64) {
@@ -5606,9 +5681,13 @@ where
         hash_builder: &GenerationHashBuilder,
     ) -> Self {
         let mut membership = BaseMembershipFilter::new(map.len(), filter);
-        map.for_each_entry(&mut |key, _| {
-            membership.insert_hash(GenerationKeyHash::new(hash_builder, key).route());
-        });
+        if membership.needs_hashes() {
+            map.for_each_entry(&mut |key, _| {
+                #[cfg(test)]
+                MEMBERSHIP_TRAVERSALS.with(|count| count.set(count.get() + 1));
+                membership.insert_hash(GenerationKeyHash::new(hash_builder, key).route());
+            });
+        }
         Self::Frozen {
             map: Arc::new(map),
             membership,
@@ -6029,6 +6108,65 @@ pub struct GenerationMapStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlay_flags_are_written_only_once_for_repeated_stripe_inserts() {
+        let hash_builder = GenerationHashBuilder::default();
+        let keys: Vec<_> = (0..u64::MAX)
+            .map(u64::to_le_bytes)
+            .filter(|key| {
+                GenerationMapCore::<u64, OverlayCell<u64>, FrozenPackedMap<u64>>::writer_stripe(
+                    GenerationKeyHash::new(&hash_builder, key),
+                ) == 0
+            })
+            .take(1_000)
+            .collect();
+        let map = GenerationMapCore::<u64, OverlayCell<u64>, FrozenPackedMap<u64>>::try_from_entries_with_modes_and_writer_hash(
+            keys.iter().map(|key| (key, 0)),
+            2_000,
+            GenerationOverlayMode::Papaya,
+            AtomicGenerationBaseFilter::Disabled,
+            hash_builder,
+        ).unwrap();
+        OVERLAY_FLAG_WRITES.with(|count| count.set(0));
+        OVERLAY_TOUCHED_WRITES.with(|count| count.set(0));
+        for key in keys {
+            assert_eq!(map.insert(&key, 1), InsertOutcome::Replaced(0));
+        }
+        eprintln!(
+            "flag RMWs={}, touched stores={}",
+            OVERLAY_FLAG_WRITES.with(Cell::get),
+            OVERLAY_TOUCHED_WRITES.with(Cell::get)
+        );
+        assert_eq!(OVERLAY_FLAG_WRITES.with(Cell::get), 1);
+        assert_eq!(OVERLAY_TOUCHED_WRITES.with(Cell::get), 1);
+    }
+
+    #[test]
+    fn frozen_membership_only_traverses_hash_storing_filters() {
+        for (filter, expected) in [
+            (AtomicGenerationBaseFilter::Disabled, 0),
+            (AtomicGenerationBaseFilter::EmbeddedFingerprint, 0),
+            (AtomicGenerationBaseFilter::OneBytePerEntry, 1_000),
+        ] {
+            MEMBERSHIP_TRAVERSALS.with(|count| count.set(0));
+            let map = LockFreeAtomicU64GenerationMap::try_from_entries_with_options(
+                (0..1_000_u64).map(|key| (key.to_le_bytes(), NonMaxU64::new(key).unwrap())),
+                32,
+                AtomicGenerationOverlay::AtomicFixed32,
+                filter,
+            )
+            .unwrap();
+            assert_eq!(
+                MEMBERSHIP_TRAVERSALS.with(Cell::get),
+                expected,
+                "{filter:?}"
+            );
+            for key in 0..1_000_u64 {
+                assert_eq!(map.get(&key.to_le_bytes()), NonMaxU64::new(key));
+            }
+        }
+    }
 
     #[test]
     fn read_cache_revalidates_across_mutations_and_rebuild() {
