@@ -1077,6 +1077,10 @@ impl<C: StableCell> GenerationOverlay<C> {
         cell: C,
         occupied: impl FnOnce(&C) -> R,
     ) -> OverlayInsert<R> {
+        assert!(
+            key.len() <= crate::arena::MAX_PACKED_KEY_BYTES,
+            "generation map key exceeds MAX_PACKED_KEY_BYTES (64 KiB)"
+        );
         let mut occupied = Some(occupied);
         if let Some(adaptive) = &self.adaptive {
             let result = self.insert_or_visit_adaptive(
@@ -1250,6 +1254,10 @@ impl<C: StableCell> GenerationOverlay<C> {
         cell: C,
         occupied: impl FnOnce(&C) -> R,
     ) -> OverlayInsert<R> {
+        assert!(
+            key.len() <= crate::arena::MAX_PACKED_KEY_BYTES,
+            "generation map key exceeds MAX_PACKED_KEY_BYTES (64 KiB)"
+        );
         let mut occupied = Some(occupied);
         if let Some(adaptive) = &self.adaptive {
             let result = self.insert_or_visit_adaptive(
@@ -1576,6 +1584,10 @@ impl<C: StableCell> GenerationOverlay<C> {
         cell: C,
         occupied: impl FnOnce(&C) -> R,
     ) -> OverlayInsert<R> {
+        assert!(
+            key.len() <= crate::arena::MAX_PACKED_KEY_BYTES,
+            "generation map key exceeds MAX_PACKED_KEY_BYTES (64 KiB)"
+        );
         let mut occupied = Some(occupied);
         if adaptive.sample_may_contain(key_hash) {
             let sample = adaptive
@@ -2976,12 +2988,18 @@ impl<C: StableCell, const KEY_BYTES: usize, const KEY_WORDS: usize>
         key: &[u8],
         read: impl FnOnce(&C) -> R,
     ) -> Option<R> {
+        let key_bytes = key.len();
         let key = self.encode_key(key)?;
         let slot = self.slots.get(index)?;
         let bucket = index / ATOMIC_BUCKET_SLOTS;
         let offset = index % ATOMIC_BUCKET_SLOTS;
         let control = self.controls.get(bucket)?.load(Ordering::Acquire);
-        if control_byte(control, offset) < 2 || !self.key_matches(index, &key) {
+        let tag = control_byte(control, offset);
+        if tag < 2
+            || (matches!(self.key_mode, AtomicKeyMode::UpTo)
+                && (tag >= 128) != (key_bytes == KEY_BYTES))
+            || !self.key_matches(index, &key)
+        {
             return None;
         }
         Some(read(&slot.cell))

@@ -1878,3 +1878,318 @@ fn adaptive_test_key(index: usize, length: usize) -> Vec<u8> {
     }
     key
 }
+
+#[cfg(feature = "prepared-keys")]
+#[test]
+fn prepared_up_to_keys_reject_short_full_aliases() {
+    for overlay in [
+        AtomicGenerationOverlay::AtomicAdaptive,
+        AtomicGenerationOverlay::AtomicUpTo8,
+    ] {
+        let map = LockFreeAtomicU64GenerationMap::try_from_entries_with_options(
+            std::iter::empty::<(Vec<u8>, NonMaxU64)>(),
+            8192,
+            overlay,
+            AtomicGenerationBaseFilter::EmbeddedFingerprint,
+        )
+        .unwrap();
+        for value in 0..128_u64 {
+            assert!(map.insert_new(&value.to_le_bytes(), non_max(value + 1)));
+        }
+        let short = [42_u8; 7];
+        let full = [42, 42, 42, 42, 42, 42, 42, 7];
+        assert!(map.insert_new(&short, non_max(777)));
+        assert!(map.insert_new(&full, non_max(888)));
+        let short_handle = map.prepare_key(&short);
+        let full_handle = map.prepare_key(&full);
+        if overlay == AtomicGenerationOverlay::AtomicAdaptive {
+            assert!(short_handle.has_native_slot());
+            assert!(full_handle.has_native_slot());
+        }
+        assert_eq!(map.get_prepared(&full, &short_handle), Some(non_max(888)));
+        assert_eq!(map.get_prepared(&short, &full_handle), Some(non_max(777)));
+    }
+}
+
+#[cfg(feature = "prepared-batch-gate")]
+#[test]
+fn operation_guard_writes_remain_exact_during_rebuild() {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(2) {
+        let map = Arc::new(
+            LockFreeAtomicU64GenerationMap::try_from_entries([(vec![42_u8; 32], non_max(1))], 1)
+                .unwrap(),
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let barrier = Arc::new(Barrier::new(4));
+        let rebuild = {
+            let (map, stop, barrier) = (map.clone(), stop.clone(), barrier.clone());
+            thread::spawn(move || {
+                barrier.wait();
+                while !stop.load(Ordering::Relaxed) {
+                    map.rebuild(1).unwrap();
+                }
+            })
+        };
+        let mut workers = Vec::new();
+        for id in 1..=2_u64 {
+            let (map, stop, barrier) = (map.clone(), stop.clone(), barrier.clone());
+            workers.push(thread::spawn(move || {
+                let mut displaced = Vec::new();
+                let mut sequence = 0;
+                barrier.wait();
+                while !stop.load(Ordering::Relaxed) {
+                    sequence += 1;
+                    let value = non_max(id << 40 | sequence);
+                    let outcome = if id == 1 {
+                        let guard = map.operation_guard();
+                        guard.insert(&[42; 32], value)
+                    } else {
+                        map.insert(&[42; 32], value)
+                    };
+                    let InsertOutcome::Replaced(old) = outcome else {
+                        panic!("existing key must be replaced");
+                    };
+                    displaced.push(old);
+                }
+                displaced
+            }));
+        }
+        barrier.wait();
+        thread::sleep(Duration::from_millis(25));
+        stop.store(true, Ordering::Relaxed);
+        let displaced: Vec<_> = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect();
+        rebuild.join().unwrap();
+        let mut unique = HashSet::new();
+        for old in displaced {
+            assert!(unique.insert(old), "value displaced twice: {old:?}");
+        }
+        assert!(!unique.contains(&map.get(&[42; 32]).unwrap()));
+    }
+}
+
+#[test]
+fn oversized_keys_cannot_poison_rebuilds() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let map = LockFreeAtomicU64GenerationMap::try_from_entries(
+        (0..1000_u64).map(|value| (value.to_le_bytes(), non_max(value))),
+        1024,
+    )
+    .unwrap();
+    let oversized = vec![7_u8; 70_000];
+    assert!(catch_unwind(AssertUnwindSafe(|| map.insert_new(&oversized, non_max(1)))).is_err());
+    for operation in 0..4 {
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| match operation {
+                0 => {
+                    let _ = map.insert(&oversized, non_max(1));
+                }
+                1 => {
+                    let _ = map.get_or_insert(&oversized, non_max(1));
+                }
+                2 => {
+                    let _ = map.upsert(&oversized, non_max(1), increment);
+                }
+                _ => {
+                    let AtomicEntry::Vacant(entry) = map.entry(&oversized) else {
+                        panic!("oversized key must not be present");
+                    };
+                    let _ = entry.insert(non_max(1));
+                }
+            }))
+            .is_err()
+        );
+    }
+    #[cfg(feature = "prepared-keys")]
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            let _ = map.insert_prepared(&oversized, &map.prepare_key(&oversized), non_max(1));
+        }))
+        .is_err()
+    );
+    #[cfg(feature = "prepared-batch-gate")]
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            let _ = map.operation_guard().insert(&oversized, non_max(1));
+        }))
+        .is_err()
+    );
+    assert!(
+        LockFreeAtomicU64GenerationMap::try_from_entries([(&oversized, non_max(1))], 1).is_err()
+    );
+    assert_eq!(map.get(&oversized), None);
+    assert_eq!(map.remove(&oversized), None);
+    for _ in 0..3 {
+        map.rebuild(1024).unwrap();
+        assert!(map.stats().layer_depth <= 1);
+    }
+    let generic = packedgen::PackedGenMap::try_from_entries(
+        (0..1000_u64).map(|value| (value.to_le_bytes(), value)),
+        1024,
+    )
+    .unwrap();
+    assert!(catch_unwind(AssertUnwindSafe(|| generic.insert(&oversized, 1))).is_err());
+    assert_eq!(generic.get_cloned(&oversized), None);
+    assert_eq!(generic.remove(&oversized), None);
+    for _ in 0..3 {
+        generic.rebuild(1024).unwrap();
+        assert!(generic.stats().layer_depth <= 1);
+    }
+}
+
+#[cfg(debug_assertions)]
+fn assert_rebuild_rejects_same_thread_pin(operation_guard: bool) {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let (send, receive) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let map = LockFreeAtomicU64GenerationMap::try_from_entries(
+            [(0_u64.to_le_bytes(), non_max(1))],
+            64,
+        )
+        .unwrap();
+        let key = 1000_u64.to_le_bytes();
+        let other = LockFreeAtomicU64GenerationMap::try_from_entries(
+            std::iter::empty::<(Vec<u8>, NonMaxU64)>(),
+            64,
+        )
+        .unwrap();
+        let check = || {
+            other.rebuild(64).unwrap();
+            let panic = catch_unwind(AssertUnwindSafe(|| map.rebuild(64)))
+                .expect_err("rebuild must reject a same-thread pin");
+            let message = panic
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                .unwrap();
+            assert!(message.contains("drop it first"));
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| {
+                    map.rebuild_adaptive_if_needed(AdaptiveRebuildPolicy::default())
+                }))
+                .is_err()
+            );
+        };
+        if operation_guard {
+            #[cfg(feature = "prepared-batch-gate")]
+            {
+                let guard = map.operation_guard();
+                check();
+                drop(guard);
+            }
+        } else {
+            let entry = map.entry(&key);
+            assert!(matches!(entry, AtomicEntry::Vacant(_)));
+            check();
+            drop(entry);
+        }
+        map.rebuild(64).unwrap();
+        send.send(()).unwrap();
+    });
+    receive
+        .recv_timeout(Duration::from_secs(5))
+        .expect("rebuild hung while its caller retained a pin");
+    worker.join().unwrap();
+}
+
+#[cfg(all(debug_assertions, feature = "prepared-batch-gate"))]
+#[test]
+fn rebuild_rejects_same_thread_operation_guard() {
+    assert_rebuild_rejects_same_thread_pin(true);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn rebuild_rejects_same_thread_vacant_entry() {
+    assert_rebuild_rejects_same_thread_pin(false);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn retained_entry_pins_are_map_specific_and_counted() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let map = LockFreeAtomicU64GenerationMap::try_from_entries(
+        std::iter::empty::<(Vec<u8>, NonMaxU64)>(),
+        64,
+    )
+    .unwrap();
+    let other = LockFreeAtomicU64GenerationMap::try_from_entries(
+        std::iter::empty::<(Vec<u8>, NonMaxU64)>(),
+        64,
+    )
+    .unwrap();
+    let first = map.entry(b"first");
+    let second = map.entry(b"second");
+    other.rebuild(64).unwrap();
+    drop(first);
+    assert!(catch_unwind(AssertUnwindSafe(|| map.rebuild(64))).is_err());
+    let AtomicEntry::Vacant(second) = second else {
+        panic!("expected vacant entry");
+    };
+    assert!(second.insert_new(non_max(2)));
+    map.rebuild(64).unwrap();
+    let occupied = map.entry(b"second");
+    assert!(matches!(occupied, AtomicEntry::Occupied(_)));
+    map.rebuild(64).unwrap();
+}
+
+#[cfg(feature = "prepared-batch-gate")]
+#[test]
+fn retained_handles_remain_send_and_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<packedgen::AtomicEntry<'_, '_>>();
+    assert_send_sync::<packedgen::AtomicVacantEntry<'_, '_>>();
+    assert_send_sync::<packedgen::AtomicOperationGuard<'_>>();
+}
+
+#[cfg(all(debug_assertions, feature = "prepared-batch-gate"))]
+#[test]
+fn moved_operation_guard_releases_creator_reservation() {
+    let map = LockFreeAtomicU64GenerationMap::try_from_entries(
+        std::iter::empty::<(Vec<u8>, NonMaxU64)>(),
+        64,
+    )
+    .unwrap();
+    let guard = map.operation_guard();
+    thread::scope(|scope| {
+        scope.spawn(move || drop(guard)).join().unwrap();
+    });
+    map.rebuild(64).unwrap();
+}
+
+#[cfg(all(debug_assertions, feature = "prepared-batch-gate"))]
+#[test]
+#[should_panic(expected = "drop it first")]
+fn rebuild_panics_with_same_thread_operation_guard() {
+    let map = LockFreeAtomicU64GenerationMap::try_from_entries(
+        std::iter::empty::<(Vec<u8>, NonMaxU64)>(),
+        64,
+    )
+    .unwrap();
+    let _guard = map.operation_guard();
+    let _ = map.rebuild(64);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "drop it first")]
+fn rebuild_panics_with_same_thread_vacant_entry() {
+    let map = LockFreeAtomicU64GenerationMap::try_from_entries(
+        std::iter::empty::<(Vec<u8>, NonMaxU64)>(),
+        64,
+    )
+    .unwrap();
+    let _entry = map.entry(b"new key");
+    let _ = map.rebuild(64);
+}

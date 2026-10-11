@@ -12,6 +12,7 @@ use arc_swap::cache::Cache as ArcSwapCache;
 use arc_swap::{ArcSwap, ArcSwapOption, Guard};
 use parking_lot::Mutex;
 
+use crate::arena::MAX_PACKED_KEY_BYTES;
 #[cfg(feature = "prepared-keys")]
 use crate::atomic_value::AtomicPreparedSlot;
 use crate::atomic_value::{
@@ -33,6 +34,53 @@ use crate::{
     FrozenBuildError, FrozenIndexBackend, FrozenMapStats, FrozenPackedMap, InsertOutcome,
     LockFreeHybridMap, LockFreeHybridStats,
 };
+
+#[cfg(debug_assertions)]
+struct DebugMapPin<'map> {
+    registry: &'map Mutex<Vec<(thread::ThreadId, usize)>>,
+    creator: thread::ThreadId,
+}
+
+#[cfg(debug_assertions)]
+impl<'map> DebugMapPin<'map> {
+    fn new(registry: &'map Mutex<Vec<(thread::ThreadId, usize)>>) -> Self {
+        let creator = thread::current().id();
+        let mut pins = registry.lock();
+        if let Some((_, count)) = pins.iter_mut().find(|(id, _)| *id == creator) {
+            *count += 1;
+        } else {
+            pins.push((creator, 1));
+        }
+        Self { registry, creator }
+    }
+
+    fn assert_rebuild_allowed(registry: &Mutex<Vec<(thread::ThreadId, usize)>>) {
+        let caller = thread::current().id();
+        assert!(
+            !registry
+                .lock()
+                .iter()
+                .any(|(id, count)| *id == caller && *count != 0),
+            "rebuild called while this thread holds an entry/operation guard on the same map; drop it first"
+        );
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for DebugMapPin<'_> {
+    fn drop(&mut self) {
+        // Debit the creator even if a Send handle was moved to another thread.
+        let mut pins = self.registry.lock();
+        let index = pins
+            .iter()
+            .position(|(id, _)| *id == self.creator)
+            .expect("retained map pin has a creator reservation");
+        pins[index].1 -= 1;
+        if pins[index].1 == 0 {
+            pins.swap_remove(index);
+        }
+    }
+}
 
 trait GenerationFrozen<V>: Sized {
     const DIRECT_MUTATION: bool;
@@ -442,6 +490,10 @@ pub struct LockFreeGenerationMap<V> {
 
 impl<V> LockFreeGenerationMap<V> {
     /// Wraps an existing packed-base/lock-free-overlay generation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     #[must_use]
     pub fn from_hybrid(initial: LockFreeHybridMap<V>) -> Self {
         Self {
@@ -453,7 +505,7 @@ impl<V> LockFreeGenerationMap<V> {
     ///
     /// # Errors
     ///
-    /// Returns a frozen-map build error for duplicate keys, allocation failure,
+    /// Returns a frozen-map build error for oversized or duplicate keys, allocation failure,
     /// or perfect-index construction failure.
     pub fn try_from_entries<I, K>(
         entries: I,
@@ -489,6 +541,10 @@ impl<V> LockFreeGenerationMap<V> {
     }
 
     /// Inserts or replaces a value through the lock-free writer path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     pub fn insert(&self, key: &[u8], value: V) -> InsertOutcome<V>
     where
         V: Clone,
@@ -497,6 +553,10 @@ impl<V> LockFreeGenerationMap<V> {
     }
 
     /// Inserts only when the logical key is absent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     pub fn insert_new(&self, key: &[u8], value: V) -> bool
     where
         V: Clone,
@@ -513,6 +573,10 @@ impl<V> LockFreeGenerationMap<V> {
     }
 
     /// Atomically updates an existing value or inserts a default.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     pub fn upsert(&self, key: &[u8], insert_value: V, update: impl Fn(&V) -> V) -> V
     where
         V: Clone,
@@ -544,6 +608,17 @@ impl<V> LockFreeGenerationMap<V> {
     ///
     /// Returns a frozen-map construction error. The redirected layer remains
     /// usable and retains its previous-generation base if packing fails.
+    ///
+    /// # Panics
+    ///
+    /// In debug builds, panics if this thread retains a vacant entry or operation
+    /// guard created on this thread for the same map.
+    ///
+    /// # Deadlocks
+    ///
+    /// Calling this while the same thread holds a vacant entry or operation
+    /// guard on this map never returns when rebuilding is needed. Drop or
+    /// consume those handles first. Debug detection tracks the creator thread.
     pub fn rebuild(&self, overlay_capacity: usize) -> Result<GenerationRebuild, FrozenBuildError>
     where
         V: Clone,
@@ -816,6 +891,10 @@ impl AtomicReadGuard<'_> {
         // reservation merely to keep this generation open.
         let state = self.generation.writer_stripes[stripe].load(Ordering::Acquire);
         debug_assert_eq!(state & WRITER_STRIPE_CLOSED, 0);
+        // An open generation alone does not stabilize a non-direct stripe.
+        if state & WRITER_STRIPE_DIRECT_BASE == 0 && !self.generation.base_is_empty {
+            return (self.map.get_or_insert(key, value), None);
+        }
         let route = GenerationWriteRoute {
             stripe,
             direct_base: state & WRITER_STRIPE_DIRECT_BASE != 0,
@@ -851,6 +930,10 @@ impl AtomicReadGuard<'_> {
         // base; recomputing a route-only hash would discard that work.
         let state = self.generation.writer_stripes[stripe].load(Ordering::Acquire);
         debug_assert_eq!(state & WRITER_STRIPE_CLOSED, 0);
+        // An open generation alone does not stabilize a non-direct stripe.
+        if state & WRITER_STRIPE_DIRECT_BASE == 0 && !self.generation.base_is_empty {
+            return (self.map.get_or_insert_hashed(key, value, key_hash), None);
+        }
         let route = GenerationWriteRoute {
             stripe,
             direct_base: state & WRITER_STRIPE_DIRECT_BASE != 0,
@@ -942,6 +1025,10 @@ impl AtomicReadGuard<'_> {
         // keeps this generation and its writer stripes open through removal.
         let state = self.generation.writer_stripes[stripe].load(Ordering::Acquire);
         debug_assert_eq!(state & WRITER_STRIPE_CLOSED, 0);
+        // An open generation alone does not stabilize a non-direct stripe.
+        if state & WRITER_STRIPE_DIRECT_BASE == 0 && !self.generation.base_is_empty {
+            return (self.map.remove(key), None);
+        }
         let route = GenerationWriteRoute {
             stripe,
             direct_base: state & WRITER_STRIPE_DIRECT_BASE != 0,
@@ -976,6 +1063,10 @@ impl AtomicReadGuard<'_> {
             .expect("masked writer stripe fits usize");
         let state = self.generation.writer_stripes[stripe].load(Ordering::Acquire);
         debug_assert_eq!(state & WRITER_STRIPE_CLOSED, 0);
+        // An open generation alone does not stabilize a non-direct stripe.
+        if state & WRITER_STRIPE_DIRECT_BASE == 0 && !self.generation.base_is_empty {
+            return (self.map.remove_prepared(key, prepared), None);
+        }
         if state & WRITER_STRIPE_DIRECT_BASE != 0 && state & WRITER_STRIPE_OVERLAY_BASE == 0 {
             match self
                 .stable_base
@@ -1014,12 +1105,15 @@ impl Drop for AtomicReadGuard<'_> {
 /// The guard amortizes generation handoff protection across many keys. Keep it
 /// scoped to one request or worker batch: a live guard can delay an online
 /// rebuild from closing its generation, in the same way that a retained vacant
-/// entry delays one writer stripe.
+/// entry delays one writer stripe. Drop the guard before calling rebuild on
+/// the same thread; otherwise rebuild never returns (debug builds panic).
 #[cfg(feature = "prepared-batch-gate")]
 #[must_use]
 pub struct AtomicOperationGuard<'map> {
     map: &'map LockFreeAtomicU64GenerationMap,
     writer: AtomicPreparedBatchWriter,
+    #[cfg(debug_assertions)]
+    _debug_pin: DebugMapPin<'map>,
 }
 
 #[cfg(feature = "prepared-batch-gate")]
@@ -1031,12 +1125,20 @@ impl AtomicOperationGuard<'_> {
     }
 
     /// Inserts or replaces a value without a per-call writer pin.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     #[must_use]
     pub fn insert(&self, key: &[u8], value: NonMaxU64) -> InsertOutcome<NonMaxU64> {
         self.map.inner.insert_in_batch(&self.writer, key, value)
     }
 
     /// Inserts only while the logical key is absent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     #[must_use]
     pub fn insert_new(&self, key: &[u8], value: NonMaxU64) -> bool {
         self.map.inner.insert_new_in_batch(&self.writer, key, value)
@@ -1044,6 +1146,10 @@ impl AtomicOperationGuard<'_> {
 
     /// Returns the existing value or inserts `value` through the pinned
     /// generation without pinning and releasing a writer stripe per call.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     #[must_use]
     pub fn get_or_insert(&self, key: &[u8], value: NonMaxU64) -> NonMaxU64 {
         self.map
@@ -1061,6 +1167,10 @@ impl AtomicOperationGuard<'_> {
     }
 
     /// Atomically updates an existing value or inserts `insert_value`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     pub fn upsert(
         &self,
         key: &[u8],
@@ -1110,13 +1220,16 @@ pub enum AtomicEntry<'map, 'key> {
 /// The handle carries the precomputed route and keeps the relevant writer
 /// stripe open across a concurrent rebuild. Dropping it without inserting is
 /// harmless. Handles should be short-lived because a retained handle can delay
-/// rebuild progress for its stripe.
+/// rebuild progress for its stripe. Consume or drop the handle before calling
+/// rebuild on the same thread; otherwise rebuild never returns (debug builds panic).
 #[must_use]
 pub struct AtomicVacantEntry<'map, 'key> {
     _map: &'map LockFreeAtomicU64GenerationMap,
     key: &'key [u8],
     writer: GenerationWriter<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap>,
     target: AtomicVacantTarget,
+    #[cfg(debug_assertions)]
+    _debug_pin: DebugMapPin<'map>,
 }
 
 enum AtomicVacantTarget {
@@ -1162,6 +1275,10 @@ impl AtomicVacantEntry<'_, '_> {
     /// Another writer can win the key between the probe and this call. In that
     /// case this operation replaces its value and returns
     /// [`InsertOutcome::Replaced`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     #[must_use]
     pub fn insert(self, value: NonMaxU64) -> InsertOutcome<NonMaxU64> {
         self.writer.insert_vacant(self.key, value, self.target)
@@ -1171,6 +1288,10 @@ impl AtomicVacantEntry<'_, '_> {
     ///
     /// Returns `false` when another writer made the key live after the entry
     /// probe. The carried hash and frozen-base proof are still reused.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     #[must_use]
     pub fn insert_new(self, value: NonMaxU64) -> bool {
         self.writer.insert_new_vacant(self.key, value, self.target)
@@ -1558,6 +1679,10 @@ impl From<AtomicGenerationOverlay> for GenerationOverlayMode {
 
 impl LockFreeAtomicU64GenerationMap {
     /// Wraps an existing hybrid whose values use the atomic value domain.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     #[must_use]
     pub fn from_hybrid(initial: LockFreeHybridMap<NonMaxU64>) -> Self {
         Self {
@@ -1569,7 +1694,7 @@ impl LockFreeAtomicU64GenerationMap {
     ///
     /// # Errors
     ///
-    /// Returns a frozen-map build error for duplicate keys, allocation failure,
+    /// Returns a frozen-map build error for oversized or duplicate keys, allocation failure,
     /// or perfect-index construction failure.
     pub fn try_from_entries<I, K>(
         entries: I,
@@ -1591,7 +1716,7 @@ impl LockFreeAtomicU64GenerationMap {
     ///
     /// # Errors
     ///
-    /// Returns a frozen-map build error for duplicate keys, allocation failure,
+    /// Returns a frozen-map build error for oversized or duplicate keys, allocation failure,
     /// or perfect-index construction failure.
     pub fn try_from_entries_with_overlay<I, K>(
         entries: I,
@@ -1621,7 +1746,7 @@ impl LockFreeAtomicU64GenerationMap {
     ///
     /// # Errors
     ///
-    /// Returns a frozen-map build error for duplicate keys, allocation failure,
+    /// Returns a frozen-map build error for oversized or duplicate keys, allocation failure,
     /// or perfect-index construction failure.
     pub fn try_from_entries_with_options<I, K>(
         entries: I,
@@ -1770,7 +1895,8 @@ impl LockFreeAtomicU64GenerationMap {
     /// This is intended for cache-style miss-then-insert flows. The vacant
     /// path reuses the route hash and exact absence proof, while retaining the
     /// same lock-free race semantics as [`Self::insert`] and
-    /// [`Self::insert_new`].
+    /// [`Self::insert_new`]. Consume or drop a vacant handle before calling
+    /// rebuild on the same thread; otherwise rebuild never returns (debug builds panic).
     pub fn entry<'map, 'key>(&'map self, key: &'key [u8]) -> AtomicEntry<'map, 'key> {
         let writer = self.inner.pin_writer(key);
         match writer.probe_entry(key) {
@@ -1780,6 +1906,8 @@ impl LockFreeAtomicU64GenerationMap {
                 key,
                 writer,
                 target,
+                #[cfg(debug_assertions)]
+                _debug_pin: DebugMapPin::new(&self.inner.retained_pins),
             }),
         }
     }
@@ -1790,6 +1918,10 @@ impl LockFreeAtomicU64GenerationMap {
     /// pins one writer stripe, and publishes both insertion and length change
     /// through that writer. If another writer wins the race, its value is
     /// returned without replacing it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     #[must_use]
     pub fn get_or_insert(&self, key: &[u8], value: NonMaxU64) -> NonMaxU64 {
         self.inner.pin_writer(key).get_or_insert(key, value)
@@ -1811,12 +1943,15 @@ impl LockFreeAtomicU64GenerationMap {
     /// This adds 16 cache-line-separated generation gates (about 1 KiB per
     /// live generation) through the `prepared-batch-gate` feature. Reusing one
     /// guard removes the per-operation writer pin/release pair; successful
-    /// insertions still publish exact length changes.
+    /// insertions still publish exact length changes. Drop the guard before
+    /// rebuilding on the same thread; otherwise rebuild never returns (debug builds panic).
     #[cfg(feature = "prepared-batch-gate")]
     pub fn operation_guard(&self) -> AtomicOperationGuard<'_> {
         AtomicOperationGuard {
             map: self,
             writer: self.inner.pin_prepared_batch_writer(0),
+            #[cfg(debug_assertions)]
+            _debug_pin: DebugMapPin::new(&self.inner.retained_pins),
         }
     }
 
@@ -1828,7 +1963,8 @@ impl LockFreeAtomicU64GenerationMap {
     ///
     /// # Panics
     ///
-    /// Panics when `keys`, `values`, and `results` have different lengths.
+    /// Panics when `keys`, `values`, and `results` have different lengths,
+    /// or if a key exceeds the packed arena limit of 64 KiB.
     #[cfg(feature = "prepared-batch-gate")]
     pub fn get_or_insert_batch<K>(
         &self,
@@ -1988,6 +2124,10 @@ impl LockFreeAtomicU64GenerationMap {
     ///
     /// Invalid handles fall back to the ordinary exact writer path. Length
     /// accounting remains correct when the prepared slot was deleted.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     #[cfg(feature = "prepared-keys")]
     pub fn insert_prepared(
         &self,
@@ -2009,7 +2149,7 @@ impl LockFreeAtomicU64GenerationMap {
     /// # Panics
     ///
     /// Panics unless `keys`, `prepared`, `values`, and `previous` have equal
-    /// lengths.
+    /// lengths, or if a key exceeds the packed arena limit of 64 KiB.
     #[cfg(feature = "prepared-keys")]
     pub fn insert_prepared_batch<K>(
         &self,
@@ -2045,11 +2185,19 @@ impl LockFreeAtomicU64GenerationMap {
     }
 
     /// Inserts or replaces a value through the lock-free writer path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     pub fn insert(&self, key: &[u8], value: NonMaxU64) -> InsertOutcome<NonMaxU64> {
         self.inner.insert(key, value)
     }
 
     /// Inserts only when the logical key is absent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     pub fn insert_new(&self, key: &[u8], value: NonMaxU64) -> bool {
         self.inner.insert_new(key, value)
     }
@@ -2064,6 +2212,10 @@ impl LockFreeAtomicU64GenerationMap {
     }
 
     /// Atomically updates an existing value or inserts a default.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     pub fn upsert(
         &self,
         key: &[u8],
@@ -2095,6 +2247,17 @@ impl LockFreeAtomicU64GenerationMap {
     ///
     /// Returns a frozen-map construction error. The redirected layer remains
     /// usable and retains its previous-generation base if packing fails.
+    ///
+    /// # Panics
+    ///
+    /// In debug builds, panics if this thread retains a vacant entry or operation
+    /// guard created on this thread for the same map.
+    ///
+    /// # Deadlocks
+    ///
+    /// Calling this while the same thread holds a vacant entry or operation
+    /// guard on this map never returns when rebuilding is needed. Drop or
+    /// consume those handles first. Debug detection tracks the creator thread.
     pub fn rebuild(&self, overlay_capacity: usize) -> Result<GenerationRebuild, FrozenBuildError> {
         self.inner.rebuild(overlay_capacity)
     }
@@ -2115,6 +2278,17 @@ impl LockFreeAtomicU64GenerationMap {
     ///
     /// Returns a frozen-map construction error. The redirected generation
     /// remains correct and usable if packing fails.
+    ///
+    /// # Panics
+    ///
+    /// In debug builds, panics if this thread retains a vacant entry or operation
+    /// guard created on this thread for the same map.
+    ///
+    /// # Deadlocks
+    ///
+    /// Calling this while the same thread holds a vacant entry or operation
+    /// guard on this map never returns when rebuilding is needed. Drop or
+    /// consume those handles first. Debug detection tracks the creator thread.
     pub fn rebuild_adaptive_if_needed(
         &self,
         policy: AdaptiveRebuildPolicy,
@@ -2227,6 +2401,8 @@ impl LockFreeAtomicU64GenerationMap {
 struct GenerationMapCore<V, C, B> {
     current: ArcSwap<GenerationLayer<V, C, B>>,
     rebuild_gate: Mutex<()>,
+    #[cfg(debug_assertions)]
+    retained_pins: Mutex<Vec<(thread::ThreadId, usize)>>,
     defer_retired_generation_drops: AtomicBool,
     retired_generations: Mutex<Vec<Arc<GenerationLayer<V, C, B>>>>,
     writer_hash_builder: GenerationHashBuilder,
@@ -2244,8 +2420,18 @@ where
     /// Wraps an existing packed-base/lock-free-overlay generation.
     ///
     /// The supplied hybrid becomes a stable base under a new writable layer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     #[must_use]
     pub fn from_hybrid(initial: LockFreeHybridMap<V>) -> Self {
+        initial.for_each_entry(&mut |key, _| {
+            assert!(
+                key.len() <= MAX_PACKED_KEY_BYTES,
+                "generation map key exceeds MAX_PACKED_KEY_BYTES (64 KiB)"
+            );
+        });
         let len = initial.len();
         let overlay_mode = Self::default_overlay_mode();
         let writer_hash_builder = GenerationHashBuilder::default();
@@ -2268,7 +2454,7 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a frozen-map build error for duplicate keys, allocation
+    /// Returns a frozen-map build error for oversized or duplicate keys, allocation
     /// failure, or perfect-index construction failure.
     pub fn try_from_entries<I, K>(
         entries: I,
@@ -2390,6 +2576,10 @@ where
     }
 
     /// Inserts or replaces a value through the lock-free writer path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     pub fn insert(&self, key: &[u8], value: V) -> InsertOutcome<V>
     where
         V: Clone,
@@ -2398,6 +2588,10 @@ where
     }
 
     /// Inserts only when the logical key is absent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     pub fn insert_new(&self, key: &[u8], value: V) -> bool
     where
         V: Clone,
@@ -2419,6 +2613,10 @@ where
     /// Atomically updates an existing value or inserts a default.
     ///
     /// `update` has the same retry-safe requirement as [`Self::update`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key exceeds the packed arena limit of 64 KiB.
     pub fn upsert(&self, key: &[u8], insert_value: V, update: impl Fn(&V) -> V) -> V
     where
         V: Clone,
@@ -2457,16 +2655,25 @@ where
     ///
     /// Returns a frozen-map construction error. The redirected layer remains
     /// correct and continues to reference the previous generation if packing
-    /// fails; a later rebuild can compact the resulting extra layer.
+    /// fails. Subsequent rebuilds retry packing; repeated construction failures
+    /// can retain additional layers.
     ///
     /// # Panics
     ///
-    /// Panics only if a packed base entry has an invalid key reference, which
-    /// indicates internal invariant corruption.
+    /// In debug builds, panics if this thread retains an entry or operation
+    /// guard created on this thread for this map. Also panics if a packed base
+    /// entry has an invalid key reference (internal corruption).
+    ///
+    /// # Deadlocks
+    ///
+    /// Calling this while the same thread holds a vacant entry or operation
+    /// guard on this map never returns. Drop or consume those handles first.
     pub fn rebuild(&self, overlay_capacity: usize) -> Result<GenerationRebuild, FrozenBuildError>
     where
         V: Clone,
     {
+        #[cfg(debug_assertions)]
+        DebugMapPin::assert_rebuild_allowed(&self.retained_pins);
         let _one_rebuild = self.rebuild_gate.lock();
         self.rebuild_locked(overlay_capacity)
     }
@@ -2478,6 +2685,8 @@ where
     where
         V: Clone,
     {
+        #[cfg(debug_assertions)]
+        DebugMapPin::assert_rebuild_allowed(&self.retained_pins);
         let Some(initial) = self.adaptive_overlay_stats() else {
             return Ok(None);
         };
@@ -2650,6 +2859,8 @@ where
         Self {
             current: ArcSwap::from(initial),
             rebuild_gate: Mutex::new(()),
+            #[cfg(debug_assertions)]
+            retained_pins: Mutex::new(Vec::new()),
             defer_retired_generation_drops: AtomicBool::new(false),
             retired_generations: Mutex::new(Vec::new()),
             writer_hash_builder,
@@ -2766,6 +2977,16 @@ impl GenerationMapCore<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap> {
         let stripe = usize::try_from(key_hash.route() & stripe_mask)
             .expect("masked writer stripe fits usize");
         let state = writer.generation.writer_stripes[stripe].load(Ordering::Acquire);
+        // DIRECT_BASE is enabled only after draining writers and never cleared
+        // within a layer. Without a predecessor, that route cannot go stale.
+        if writer
+            .generation
+            .write_predecessor_active
+            .load(Ordering::Acquire)
+            || (state & WRITER_STRIPE_DIRECT_BASE == 0 && !writer.generation.base_is_empty)
+        {
+            return None;
+        }
         (state & WRITER_STRIPE_CLOSED == 0).then_some(GenerationWriteRoute {
             stripe,
             direct_base: state & WRITER_STRIPE_DIRECT_BASE != 0,
