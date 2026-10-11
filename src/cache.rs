@@ -1080,6 +1080,20 @@ impl PartialOrd for Victim {
 /// a 31-bit generation prevents a stale index handle from observing a reused
 /// slot. Capacity maintenance uses weakly consistent index scans and exact
 /// handle-matched removals, avoiding a second retained copy of every key.
+///
+/// Values must support concurrent sharing to share the cache:
+///
+/// ```compile_fail
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<packedgen::PackedCache<std::cell::Cell<u8>>>();
+/// ```
+///
+/// Values must also support transfer between threads:
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<packedgen::PackedCache<std::rc::Rc<u8>>>();
+/// ```
 pub struct PackedCache<V> {
     index: LockFreeAtomicU64GenerationMap,
     arena: ValueArena<V>,

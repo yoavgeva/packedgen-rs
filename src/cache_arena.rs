@@ -2842,6 +2842,8 @@ pub(crate) enum ArenaAllocationError {
 }
 
 pub(crate) struct ValueArena<V> {
+    // Values are owned here, shared by readers, and reclaimed on other threads.
+    _marker: PhantomData<Arc<ArenaEntry<V>>>,
     partitions: Box<[ArenaPartition<V>]>,
     active_partitions: AtomicUsize,
     collector: Arc<Collector>,
@@ -2856,6 +2858,7 @@ impl<V> ValueArena<V> {
                 .collect(),
             active_partitions: AtomicUsize::new(1),
             collector: Arc::new(Collector::new().batch_size(512)),
+            _marker: PhantomData,
         }
     }
 
