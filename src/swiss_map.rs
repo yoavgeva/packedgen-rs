@@ -97,7 +97,13 @@ where
             )));
         }
 
-        let key_ref = self.arena.insert(key)?;
+        let key_ref = match self.arena.insert(key) {
+            Err(ArenaError::TooManySegments) if self.arena.len() > self.len() => {
+                self.compact_keys()?;
+                self.arena.insert(key)?
+            }
+            result => result?,
+        };
         self.live_key_bytes += key.len();
         let arena = &self.arena;
         let hash_builder = &self.hash_builder;
@@ -145,7 +151,8 @@ where
 
     /// Removes `key` and returns its value.
     ///
-    /// Removed bytes remain in the append-only arena until [`Self::clear`].
+    /// Removed bytes remain until explicit clearing or compaction. Insertion
+    /// automatically compacts removed keys if the arena exhausts its segments.
     pub fn remove(&mut self, key: &[u8]) -> Option<V> {
         let hash = self.hash_key(key);
         let arena = &self.arena;
@@ -156,6 +163,28 @@ where
         let (entry, _) = occupied.remove();
         self.live_key_bytes = self.live_key_bytes.saturating_sub(entry.key.len());
         Some(entry.value)
+    }
+
+    // Stage all references before replacing any, so allocation errors leave
+    // live keys and values intact.
+    fn compact_keys(&mut self) -> Result<(), ArenaError> {
+        let mut compacted = self.arena.empty_like();
+        let mut replacement_refs = Vec::new();
+        replacement_refs
+            .try_reserve_exact(self.len())
+            .map_err(|_| ArenaError::AllocationFailed)?;
+        for entry in &self.table {
+            let key = self
+                .arena
+                .get(entry.key)
+                .expect("live SwissTable entry must resolve during compaction");
+            replacement_refs.push(compacted.insert(key)?);
+        }
+        for (entry, replacement) in self.table.iter_mut().zip(replacement_refs) {
+            entry.key = replacement;
+        }
+        self.arena = compacted;
+        Ok(())
     }
 
     /// Removes all entries and releases packed key segments.
@@ -222,7 +251,7 @@ pub struct SwissMapStats {
 }
 
 impl SwissMapStats {
-    /// Bytes retained for removed keys until the map is cleared.
+    /// Bytes retained for removed keys until clearing or automatic compaction.
     #[must_use]
     pub const fn dead_key_bytes(self) -> usize {
         self.arena_key_bytes.saturating_sub(self.live_key_bytes)
