@@ -172,69 +172,90 @@ fn doorkeeper_rejects_one_off_pressure_and_admits_a_repeat() {
 
 #[test]
 fn frequency_admission_requires_more_evidence_than_frequent_victims() {
-    let cache = DirectPackedCache::try_new(
-        CacheConfig::new(u64::MAX)
-            .with_max_entries(2)
-            .with_overlay_capacity(32)
-            .with_eviction_batch(2)
-            .with_admission_doorkeeper(2)
-            .with_frequency_admission(5),
-    )
-    .unwrap();
-    for key in [b"a".as_slice(), b"b".as_slice()] {
-        assert_eq!(
-            cache
-                .insert_if_absent_with_options(key, vec![1], 1, None)
-                .unwrap(),
-            CacheAdmissionOutcome::Inserted
-        );
-    }
-    for _ in 0..4 {
+    let mut false_positives = 0;
+    let mut completed = false;
+    // The one-word Bloom filter can admit a fresh probe on its first sighting.
+    'scenario: for _ in 0..16 {
+        let cache = DirectPackedCache::try_new(
+            CacheConfig::new(u64::MAX)
+                .with_max_entries(2)
+                .with_overlay_capacity(32)
+                .with_eviction_batch(2)
+                .with_admission_doorkeeper(2)
+                .with_frequency_admission(5),
+        )
+        .unwrap();
         for key in [b"a".as_slice(), b"b".as_slice()] {
             assert_eq!(
                 cache
-                    .insert_if_absent_with_options(key, vec![2], 1, None)
+                    .insert_if_absent_with_options(key, vec![1], 1, None)
                     .unwrap(),
-                CacheAdmissionOutcome::Existing
+                CacheAdmissionOutcome::Inserted
             );
         }
-    }
-    assert_eq!(
-        cache
-            .insert_if_absent_with_options(b"c", vec![3], 1, None)
-            .unwrap(),
-        CacheAdmissionOutcome::Rejected
-    );
-    assert_eq!(
-        cache
-            .insert_if_absent_with_options(b"c", vec![4], 1, None)
-            .unwrap(),
-        CacheAdmissionOutcome::Inserted
-    );
-
-    let mut rejections = 0;
-    let mut admitted = false;
-    for attempt in 1..=16 {
-        match cache
-            .insert_if_absent_with_options(b"d", vec![attempt], 1, None)
-            .unwrap()
-        {
-            CacheAdmissionOutcome::Rejected => rejections += 1,
-            CacheAdmissionOutcome::Inserted => {
-                admitted = true;
-                break;
-            }
-            CacheAdmissionOutcome::Existing => {
-                panic!("candidate became existing before this test observed its admission")
+        for _ in 0..4 {
+            for key in [b"a".as_slice(), b"b".as_slice()] {
+                assert_eq!(
+                    cache
+                        .insert_if_absent_with_options(key, vec![2], 1, None)
+                        .unwrap(),
+                    CacheAdmissionOutcome::Existing
+                );
             }
         }
+        let first_probe = cache
+            .insert_if_absent_with_options(b"c", vec![3], 1, None)
+            .unwrap();
+        if first_probe == CacheAdmissionOutcome::Inserted {
+            false_positives += 1;
+            continue 'scenario;
+        }
+        assert_eq!(first_probe, CacheAdmissionOutcome::Rejected);
+        assert_eq!(
+            cache
+                .insert_if_absent_with_options(b"c", vec![4], 1, None)
+                .unwrap(),
+            CacheAdmissionOutcome::Inserted
+        );
+
+        let mut rejections = 0;
+        let mut admitted = false;
+        for attempt in 1..=16 {
+            match cache
+                .insert_if_absent_with_options(b"d", vec![attempt], 1, None)
+                .unwrap()
+            {
+                CacheAdmissionOutcome::Rejected => rejections += 1,
+                CacheAdmissionOutcome::Inserted => {
+                    if attempt == 1 {
+                        false_positives += 1;
+                        continue 'scenario;
+                    }
+                    admitted = true;
+                    break;
+                }
+                CacheAdmissionOutcome::Existing => {
+                    panic!("candidate became existing before this test observed its admission")
+                }
+            }
+        }
+        assert!(rejections >= 1, "candidate needs evidence before admission");
+        assert!(
+            admitted,
+            "repeated evidence eventually admits the candidate"
+        );
+        assert!(cache.len() <= 2);
+        completed = true;
+        break;
     }
-    assert!(rejections >= 1, "candidate needs evidence before admission");
     assert!(
-        admitted,
-        "repeated evidence eventually admits the candidate"
+        completed,
+        "at least one fresh cache must complete the full scenario"
     );
-    assert!(cache.len() <= 2);
+    assert!(
+        false_positives <= 3,
+        "too many first-sighting false positives: {false_positives}"
+    );
 }
 
 #[test]
@@ -303,56 +324,75 @@ fn frequency_admission_preserves_a_sampled_hot_resident_during_churn() {
 
 #[test]
 fn adaptive_frequency_admission_falls_back_for_low_reuse_traffic() {
-    let cache = DirectPackedCache::try_new(
-        CacheConfig::new(u64::MAX)
-            .with_max_entries(2)
-            .with_overlay_capacity(32)
-            .with_eviction_batch(2)
-            .with_admission_doorkeeper(2)
-            .with_adaptive_frequency_admission(5, 2_500),
-    )
-    .unwrap();
-    for key in [b"a".as_slice(), b"b".as_slice()] {
-        cache
-            .insert_if_absent_with_options(key, vec![1], 1, None)
-            .unwrap();
-    }
-    for _ in 0..4 {
+    let mut false_positives = 0;
+    let mut completed = false;
+    // The one-word Bloom filter can admit a fresh probe on its first sighting.
+    'scenario: for _ in 0..16 {
+        let cache = DirectPackedCache::try_new(
+            CacheConfig::new(u64::MAX)
+                .with_max_entries(2)
+                .with_overlay_capacity(32)
+                .with_eviction_batch(2)
+                .with_admission_doorkeeper(2)
+                .with_adaptive_frequency_admission(5, 2_500),
+        )
+        .unwrap();
         for key in [b"a".as_slice(), b"b".as_slice()] {
-            assert_eq!(
-                cache
-                    .insert_if_absent_with_options(key, vec![2], 1, None)
-                    .unwrap(),
-                CacheAdmissionOutcome::Existing
-            );
+            cache
+                .insert_if_absent_with_options(key, vec![1], 1, None)
+                .unwrap();
         }
-    }
-    assert_eq!(
-        cache
+        for _ in 0..4 {
+            for key in [b"a".as_slice(), b"b".as_slice()] {
+                assert_eq!(
+                    cache
+                        .insert_if_absent_with_options(key, vec![2], 1, None)
+                        .unwrap(),
+                    CacheAdmissionOutcome::Existing
+                );
+            }
+        }
+        let first_probe = cache
             .insert_if_absent_with_options(b"c", vec![3], 1, None)
-            .unwrap(),
-        CacheAdmissionOutcome::Rejected
-    );
-    assert_eq!(
-        cache
-            .insert_if_absent_with_options(b"c", vec![4], 1, None)
-            .unwrap(),
-        CacheAdmissionOutcome::Inserted
-    );
-    for _ in 0..1_024 {
-        assert!(cache.get(b"d").is_none());
-    }
-    assert_eq!(
-        cache
+            .unwrap();
+        if first_probe == CacheAdmissionOutcome::Inserted {
+            false_positives += 1;
+            continue 'scenario;
+        }
+        assert_eq!(first_probe, CacheAdmissionOutcome::Rejected);
+        assert_eq!(
+            cache
+                .insert_if_absent_with_options(b"c", vec![4], 1, None)
+                .unwrap(),
+            CacheAdmissionOutcome::Inserted
+        );
+        for _ in 0..1_024 {
+            assert!(cache.get(b"d").is_none());
+        }
+        let first_probe = cache
             .insert_if_absent_with_options(b"d", vec![5], 1, None)
-            .unwrap(),
-        CacheAdmissionOutcome::Rejected
+            .unwrap();
+        if first_probe == CacheAdmissionOutcome::Inserted {
+            false_positives += 1;
+            continue 'scenario;
+        }
+        assert_eq!(first_probe, CacheAdmissionOutcome::Rejected);
+        assert_eq!(
+            cache
+                .insert_if_absent_with_options(b"d", vec![6], 1, None)
+                .unwrap(),
+            CacheAdmissionOutcome::Inserted
+        );
+        completed = true;
+        break;
+    }
+    assert!(
+        completed,
+        "at least one fresh cache must complete the full scenario"
     );
-    assert_eq!(
-        cache
-            .insert_if_absent_with_options(b"d", vec![6], 1, None)
-            .unwrap(),
-        CacheAdmissionOutcome::Inserted
+    assert!(
+        false_positives <= 3,
+        "too many first-sighting false positives: {false_positives}"
     );
 }
 
