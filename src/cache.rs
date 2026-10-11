@@ -35,6 +35,12 @@ const MAX_EXPIRATION_BATCHES: usize = 16;
 const COUNTER_SHARDS: usize = 64;
 const DIRECT_RESERVOIR_KEY_CHUNK: usize = 64;
 
+#[cfg(test)]
+thread_local! {
+    // Keep operation counts isolated from parallel unit tests.
+    static DIRECT_WEIGHT_SCANS: AtomicUsize = const { AtomicUsize::new(0) };
+}
+
 /// Decodes an unchanged value loaded from the direct cache's authoritative
 /// index. Keeping this boundary private to the cache module prevents unrelated
 /// safe crate code from forging a dereferenceable arena handle.
@@ -6274,6 +6280,10 @@ impl<V> DirectPackedCache<V> {
     )]
     pub fn weight(&self) -> u64 {
         if self.config.max_weight == u64::MAX {
+            #[cfg(test)]
+            DIRECT_WEIGHT_SCANS.with(|scans| {
+                scans.fetch_add(1, Ordering::Relaxed);
+            });
             let pin = self.arena.pin();
             let mut weight = 0_u64;
             self.index.scan_entries(&mut |_, raw| {
@@ -7296,13 +7306,13 @@ impl<V> DirectPackedCache<V> {
                 .saturating_add(incoming_weight)
                 .saturating_sub(capacity.max_weight)
         };
-        let average_weight = self
-            .weight()
-            .div_ceil(u64::try_from(self.len().max(1)).unwrap_or(u64::MAX))
-            .max(1);
         let weight_target = if self.config.max_weight == u64::MAX {
             0
         } else {
+            let average_weight = self
+                .weight()
+                .div_ceil(u64::try_from(self.len().max(1)).unwrap_or(u64::MAX))
+                .max(1);
             weight_deficit
                 .saturating_add(self.config.max_weight.div_ceil(256).max(1))
                 .div_ceil(average_weight)
@@ -8558,6 +8568,33 @@ impl Drop for CacheMaintenance {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn entry_only_hard_reservations_do_not_scan_weights() {
+        let cache = DirectPackedCache::try_new(
+            CacheConfig::new(u64::MAX)
+                .with_max_entries(2_000)
+                .with_overlay_capacity(4_096)
+                .with_async_eviction(10_100),
+        )
+        .unwrap();
+        for key in 0_u64..2_020 {
+            cache
+                .insert_discard_with_options(&key.to_le_bytes(), key, 1, None)
+                .unwrap();
+        }
+        let before = DIRECT_WEIGHT_SCANS.with(|scans| scans.load(Ordering::Relaxed));
+        for key in 2_020_u64..2_520 {
+            cache
+                .insert_discard_with_options(&key.to_le_bytes(), key, 1, None)
+                .unwrap();
+        }
+        assert_eq!(
+            DIRECT_WEIGHT_SCANS.with(|scans| scans.load(Ordering::Relaxed)),
+            before
+        );
+        assert!(cache.len() <= 2_020);
+    }
 
     #[test]
     fn hot_shards_have_128_byte_alignment() {
