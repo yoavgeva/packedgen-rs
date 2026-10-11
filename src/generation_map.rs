@@ -35,6 +35,53 @@ use crate::{
     LockFreeHybridMap, LockFreeHybridStats,
 };
 
+#[cfg(debug_assertions)]
+struct DebugMapPin<'map> {
+    registry: &'map Mutex<Vec<(thread::ThreadId, usize)>>,
+    creator: thread::ThreadId,
+}
+
+#[cfg(debug_assertions)]
+impl<'map> DebugMapPin<'map> {
+    fn new(registry: &'map Mutex<Vec<(thread::ThreadId, usize)>>) -> Self {
+        let creator = thread::current().id();
+        let mut pins = registry.lock();
+        if let Some((_, count)) = pins.iter_mut().find(|(id, _)| *id == creator) {
+            *count += 1;
+        } else {
+            pins.push((creator, 1));
+        }
+        Self { registry, creator }
+    }
+
+    fn assert_rebuild_allowed(registry: &Mutex<Vec<(thread::ThreadId, usize)>>) {
+        let caller = thread::current().id();
+        assert!(
+            !registry
+                .lock()
+                .iter()
+                .any(|(id, count)| *id == caller && *count != 0),
+            "rebuild called while this thread holds an entry/operation guard on the same map; drop it first"
+        );
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for DebugMapPin<'_> {
+    fn drop(&mut self) {
+        // Debit the creator even if a Send handle was moved to another thread.
+        let mut pins = self.registry.lock();
+        let index = pins
+            .iter()
+            .position(|(id, _)| *id == self.creator)
+            .expect("retained map pin has a creator reservation");
+        pins[index].1 -= 1;
+        if pins[index].1 == 0 {
+            pins.swap_remove(index);
+        }
+    }
+}
+
 trait GenerationFrozen<V>: Sized {
     const DIRECT_MUTATION: bool;
     const DEFAULT_BASE_FILTER: AtomicGenerationBaseFilter;
@@ -561,6 +608,17 @@ impl<V> LockFreeGenerationMap<V> {
     ///
     /// Returns a frozen-map construction error. The redirected layer remains
     /// usable and retains its previous-generation base if packing fails.
+    ///
+    /// # Panics
+    ///
+    /// In debug builds, panics if this thread retains a vacant entry or operation
+    /// guard created on this thread for the same map.
+    ///
+    /// # Deadlocks
+    ///
+    /// Calling this while the same thread holds a vacant entry or operation
+    /// guard on this map never returns when rebuilding is needed. Drop or
+    /// consume those handles first. Debug detection tracks the creator thread.
     pub fn rebuild(&self, overlay_capacity: usize) -> Result<GenerationRebuild, FrozenBuildError>
     where
         V: Clone,
@@ -1047,12 +1105,15 @@ impl Drop for AtomicReadGuard<'_> {
 /// The guard amortizes generation handoff protection across many keys. Keep it
 /// scoped to one request or worker batch: a live guard can delay an online
 /// rebuild from closing its generation, in the same way that a retained vacant
-/// entry delays one writer stripe.
+/// entry delays one writer stripe. Drop the guard before calling rebuild on
+/// the same thread; otherwise rebuild never returns (debug builds panic).
 #[cfg(feature = "prepared-batch-gate")]
 #[must_use]
 pub struct AtomicOperationGuard<'map> {
     map: &'map LockFreeAtomicU64GenerationMap,
     writer: AtomicPreparedBatchWriter,
+    #[cfg(debug_assertions)]
+    _debug_pin: DebugMapPin<'map>,
 }
 
 #[cfg(feature = "prepared-batch-gate")]
@@ -1159,13 +1220,16 @@ pub enum AtomicEntry<'map, 'key> {
 /// The handle carries the precomputed route and keeps the relevant writer
 /// stripe open across a concurrent rebuild. Dropping it without inserting is
 /// harmless. Handles should be short-lived because a retained handle can delay
-/// rebuild progress for its stripe.
+/// rebuild progress for its stripe. Consume or drop the handle before calling
+/// rebuild on the same thread; otherwise rebuild never returns (debug builds panic).
 #[must_use]
 pub struct AtomicVacantEntry<'map, 'key> {
     _map: &'map LockFreeAtomicU64GenerationMap,
     key: &'key [u8],
     writer: GenerationWriter<NonMaxU64, AtomicU64Cell, AtomicU64FrozenMap>,
     target: AtomicVacantTarget,
+    #[cfg(debug_assertions)]
+    _debug_pin: DebugMapPin<'map>,
 }
 
 enum AtomicVacantTarget {
@@ -1831,7 +1895,8 @@ impl LockFreeAtomicU64GenerationMap {
     /// This is intended for cache-style miss-then-insert flows. The vacant
     /// path reuses the route hash and exact absence proof, while retaining the
     /// same lock-free race semantics as [`Self::insert`] and
-    /// [`Self::insert_new`].
+    /// [`Self::insert_new`]. Consume or drop a vacant handle before calling
+    /// rebuild on the same thread; otherwise rebuild never returns (debug builds panic).
     pub fn entry<'map, 'key>(&'map self, key: &'key [u8]) -> AtomicEntry<'map, 'key> {
         let writer = self.inner.pin_writer(key);
         match writer.probe_entry(key) {
@@ -1841,6 +1906,8 @@ impl LockFreeAtomicU64GenerationMap {
                 key,
                 writer,
                 target,
+                #[cfg(debug_assertions)]
+                _debug_pin: DebugMapPin::new(&self.inner.retained_pins),
             }),
         }
     }
@@ -1876,12 +1943,15 @@ impl LockFreeAtomicU64GenerationMap {
     /// This adds 16 cache-line-separated generation gates (about 1 KiB per
     /// live generation) through the `prepared-batch-gate` feature. Reusing one
     /// guard removes the per-operation writer pin/release pair; successful
-    /// insertions still publish exact length changes.
+    /// insertions still publish exact length changes. Drop the guard before
+    /// rebuilding on the same thread; otherwise rebuild never returns (debug builds panic).
     #[cfg(feature = "prepared-batch-gate")]
     pub fn operation_guard(&self) -> AtomicOperationGuard<'_> {
         AtomicOperationGuard {
             map: self,
             writer: self.inner.pin_prepared_batch_writer(0),
+            #[cfg(debug_assertions)]
+            _debug_pin: DebugMapPin::new(&self.inner.retained_pins),
         }
     }
 
@@ -1893,11 +1963,8 @@ impl LockFreeAtomicU64GenerationMap {
     ///
     /// # Panics
     ///
-    /// Panics when `keys`, `values`, and `results` have different lengths.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a key exceeds the packed arena limit of 64 KiB.
+    /// Panics when `keys`, `values`, and `results` have different lengths,
+    /// or if a key exceeds the packed arena limit of 64 KiB.
     #[cfg(feature = "prepared-batch-gate")]
     pub fn get_or_insert_batch<K>(
         &self,
@@ -2180,6 +2247,17 @@ impl LockFreeAtomicU64GenerationMap {
     ///
     /// Returns a frozen-map construction error. The redirected layer remains
     /// usable and retains its previous-generation base if packing fails.
+    ///
+    /// # Panics
+    ///
+    /// In debug builds, panics if this thread retains a vacant entry or operation
+    /// guard created on this thread for the same map.
+    ///
+    /// # Deadlocks
+    ///
+    /// Calling this while the same thread holds a vacant entry or operation
+    /// guard on this map never returns when rebuilding is needed. Drop or
+    /// consume those handles first. Debug detection tracks the creator thread.
     pub fn rebuild(&self, overlay_capacity: usize) -> Result<GenerationRebuild, FrozenBuildError> {
         self.inner.rebuild(overlay_capacity)
     }
@@ -2200,6 +2278,17 @@ impl LockFreeAtomicU64GenerationMap {
     ///
     /// Returns a frozen-map construction error. The redirected generation
     /// remains correct and usable if packing fails.
+    ///
+    /// # Panics
+    ///
+    /// In debug builds, panics if this thread retains a vacant entry or operation
+    /// guard created on this thread for the same map.
+    ///
+    /// # Deadlocks
+    ///
+    /// Calling this while the same thread holds a vacant entry or operation
+    /// guard on this map never returns when rebuilding is needed. Drop or
+    /// consume those handles first. Debug detection tracks the creator thread.
     pub fn rebuild_adaptive_if_needed(
         &self,
         policy: AdaptiveRebuildPolicy,
@@ -2312,6 +2401,8 @@ impl LockFreeAtomicU64GenerationMap {
 struct GenerationMapCore<V, C, B> {
     current: ArcSwap<GenerationLayer<V, C, B>>,
     rebuild_gate: Mutex<()>,
+    #[cfg(debug_assertions)]
+    retained_pins: Mutex<Vec<(thread::ThreadId, usize)>>,
     defer_retired_generation_drops: AtomicBool,
     retired_generations: Mutex<Vec<Arc<GenerationLayer<V, C, B>>>>,
     writer_hash_builder: GenerationHashBuilder,
@@ -2569,12 +2660,20 @@ where
     ///
     /// # Panics
     ///
-    /// Panics only if a packed base entry has an invalid key reference, which
-    /// indicates internal invariant corruption.
+    /// In debug builds, panics if this thread retains an entry or operation
+    /// guard created on this thread for this map. Also panics if a packed base
+    /// entry has an invalid key reference (internal corruption).
+    ///
+    /// # Deadlocks
+    ///
+    /// Calling this while the same thread holds a vacant entry or operation
+    /// guard on this map never returns. Drop or consume those handles first.
     pub fn rebuild(&self, overlay_capacity: usize) -> Result<GenerationRebuild, FrozenBuildError>
     where
         V: Clone,
     {
+        #[cfg(debug_assertions)]
+        DebugMapPin::assert_rebuild_allowed(&self.retained_pins);
         let _one_rebuild = self.rebuild_gate.lock();
         self.rebuild_locked(overlay_capacity)
     }
@@ -2586,6 +2685,8 @@ where
     where
         V: Clone,
     {
+        #[cfg(debug_assertions)]
+        DebugMapPin::assert_rebuild_allowed(&self.retained_pins);
         let Some(initial) = self.adaptive_overlay_stats() else {
             return Ok(None);
         };
@@ -2758,6 +2859,8 @@ where
         Self {
             current: ArcSwap::from(initial),
             rebuild_gate: Mutex::new(()),
+            #[cfg(debug_assertions)]
+            retained_pins: Mutex::new(Vec::new()),
             defer_retired_generation_drops: AtomicBool::new(false),
             retired_generations: Mutex::new(Vec::new()),
             writer_hash_builder,

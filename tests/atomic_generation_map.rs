@@ -2044,3 +2044,152 @@ fn oversized_keys_cannot_poison_rebuilds() {
         assert!(generic.stats().layer_depth <= 1);
     }
 }
+
+#[cfg(debug_assertions)]
+fn assert_rebuild_rejects_same_thread_pin(operation_guard: bool) {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let (send, receive) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let map = LockFreeAtomicU64GenerationMap::try_from_entries(
+            [(0_u64.to_le_bytes(), non_max(1))],
+            64,
+        )
+        .unwrap();
+        let key = 1000_u64.to_le_bytes();
+        let other = LockFreeAtomicU64GenerationMap::try_from_entries(
+            std::iter::empty::<(Vec<u8>, NonMaxU64)>(),
+            64,
+        )
+        .unwrap();
+        let check = || {
+            other.rebuild(64).unwrap();
+            let panic = catch_unwind(AssertUnwindSafe(|| map.rebuild(64)))
+                .expect_err("rebuild must reject a same-thread pin");
+            let message = panic
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                .unwrap();
+            assert!(message.contains("drop it first"));
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| {
+                    map.rebuild_adaptive_if_needed(AdaptiveRebuildPolicy::default())
+                }))
+                .is_err()
+            );
+        };
+        if operation_guard {
+            #[cfg(feature = "prepared-batch-gate")]
+            {
+                let guard = map.operation_guard();
+                check();
+                drop(guard);
+            }
+        } else {
+            let entry = map.entry(&key);
+            assert!(matches!(entry, AtomicEntry::Vacant(_)));
+            check();
+            drop(entry);
+        }
+        map.rebuild(64).unwrap();
+        send.send(()).unwrap();
+    });
+    receive
+        .recv_timeout(Duration::from_secs(5))
+        .expect("rebuild hung while its caller retained a pin");
+    worker.join().unwrap();
+}
+
+#[cfg(all(debug_assertions, feature = "prepared-batch-gate"))]
+#[test]
+fn rebuild_rejects_same_thread_operation_guard() {
+    assert_rebuild_rejects_same_thread_pin(true);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn rebuild_rejects_same_thread_vacant_entry() {
+    assert_rebuild_rejects_same_thread_pin(false);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn retained_entry_pins_are_map_specific_and_counted() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let map = LockFreeAtomicU64GenerationMap::try_from_entries(
+        std::iter::empty::<(Vec<u8>, NonMaxU64)>(),
+        64,
+    )
+    .unwrap();
+    let other = LockFreeAtomicU64GenerationMap::try_from_entries(
+        std::iter::empty::<(Vec<u8>, NonMaxU64)>(),
+        64,
+    )
+    .unwrap();
+    let first = map.entry(b"first");
+    let second = map.entry(b"second");
+    other.rebuild(64).unwrap();
+    drop(first);
+    assert!(catch_unwind(AssertUnwindSafe(|| map.rebuild(64))).is_err());
+    let AtomicEntry::Vacant(second) = second else {
+        panic!("expected vacant entry");
+    };
+    assert!(second.insert_new(non_max(2)));
+    map.rebuild(64).unwrap();
+    let occupied = map.entry(b"second");
+    assert!(matches!(occupied, AtomicEntry::Occupied(_)));
+    map.rebuild(64).unwrap();
+}
+
+#[cfg(feature = "prepared-batch-gate")]
+#[test]
+fn retained_handles_remain_send_and_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<packedgen::AtomicEntry<'_, '_>>();
+    assert_send_sync::<packedgen::AtomicVacantEntry<'_, '_>>();
+    assert_send_sync::<packedgen::AtomicOperationGuard<'_>>();
+}
+
+#[cfg(all(debug_assertions, feature = "prepared-batch-gate"))]
+#[test]
+fn moved_operation_guard_releases_creator_reservation() {
+    let map = LockFreeAtomicU64GenerationMap::try_from_entries(
+        std::iter::empty::<(Vec<u8>, NonMaxU64)>(),
+        64,
+    )
+    .unwrap();
+    let guard = map.operation_guard();
+    thread::scope(|scope| {
+        scope.spawn(move || drop(guard)).join().unwrap();
+    });
+    map.rebuild(64).unwrap();
+}
+
+#[cfg(all(debug_assertions, feature = "prepared-batch-gate"))]
+#[test]
+#[should_panic(expected = "drop it first")]
+fn rebuild_panics_with_same_thread_operation_guard() {
+    let map = LockFreeAtomicU64GenerationMap::try_from_entries(
+        std::iter::empty::<(Vec<u8>, NonMaxU64)>(),
+        64,
+    )
+    .unwrap();
+    let _guard = map.operation_guard();
+    let _ = map.rebuild(64);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "drop it first")]
+fn rebuild_panics_with_same_thread_vacant_entry() {
+    let map = LockFreeAtomicU64GenerationMap::try_from_entries(
+        std::iter::empty::<(Vec<u8>, NonMaxU64)>(),
+        64,
+    )
+    .unwrap();
+    let _entry = map.entry(b"new key");
+    let _ = map.rebuild(64);
+}
