@@ -3165,3 +3165,52 @@ fn eviction_destructor_can_reenter_same_cache() {
         .recv_timeout(Duration::from_secs(10))
         .expect("eviction destructor deadlocked");
 }
+
+#[test]
+fn striped_insert_tolerates_lock_free_same_key_writers() {
+    for replacement_batch in [false, true] {
+        let cache = Arc::new(
+            DirectPackedCache::try_new(CacheConfig::new(u64::MAX).with_overlay_capacity(64))
+                .unwrap(),
+        );
+        cache
+            .insert_discard_with_options(b"key", 0_u64, 1, None)
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let writer_cache = Arc::clone(&cache);
+        let writer_barrier = Arc::clone(&barrier);
+        let writer = thread::spawn(move || {
+            writer_barrier.wait();
+            for value in 0..20_000_u64 {
+                writer_cache
+                    .insert_discard_with_options(b"key", value, 1, None)
+                    .unwrap();
+            }
+        });
+        let competitor_cache = Arc::clone(&cache);
+        let competitor = thread::spawn(move || {
+            let mut guard = competitor_cache.pin();
+            barrier.wait();
+            for value in 0..20_000_u64 {
+                if replacement_batch {
+                    guard
+                        .replacement_batch()
+                        .replace_discard_with_options(b"key", value, 1, None)
+                        .unwrap();
+                } else {
+                    competitor_cache.remove_discard(b"key");
+                    competitor_cache
+                        .insert_if_absent_with_options(b"key", value, 1, None)
+                        .unwrap();
+                }
+            }
+        });
+        let writer_result = writer.join();
+        competitor.join().unwrap();
+        writer_result.expect("striped insert must accept concurrent lock-free replacement");
+        let resident = cache.peek(b"key").is_some();
+        assert!(cache.len() <= 1);
+        assert_eq!(cache.len(), usize::from(resident));
+        assert_eq!(cache.weight(), u64::from(resident));
+    }
+}

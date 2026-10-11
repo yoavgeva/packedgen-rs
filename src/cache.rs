@@ -5383,20 +5383,20 @@ impl<V> DirectPackedCache<V> {
         // The entry handle carries the writer route and exact vacancy proof
         // into the new-key insertion, avoiding the old read-then-rehash path.
         // Occupied keys still use the allocator that wins replacement churn.
-        let (replacement, outcome, protected_previous) = match self.index.entry(key) {
-            AtomicEntry::Occupied(previous) => {
+        let (replacement, outcome) = match self.index.entry(key) {
+            AtomicEntry::Occupied(_) => {
                 let replacement =
                     self.arena
                         .allocate_boxed(value, compact_weight, self.deadline(ttl));
                 let outcome = self.index.insert(key, replacement.index_value());
-                (replacement, outcome, Some(previous))
+                (replacement, outcome)
             }
             AtomicEntry::Vacant(vacant) => {
                 let replacement = self
                     .arena
                     .allocate(value, compact_weight, self.deadline(ttl));
                 let outcome = vacant.insert(replacement.index_value());
-                (replacement, outcome, None)
+                (replacement, outcome)
             }
         };
         let result = match outcome {
@@ -5409,10 +5409,7 @@ impl<V> DirectPackedCache<V> {
                 CacheWriteOutcome::Inserted
             }
             InsertOutcome::Replaced(previous) => {
-                debug_assert!(
-                    protected_previous.is_none() || protected_previous == Some(previous),
-                    "same-key mutation changed despite its cache stripe"
-                );
+                // A concurrent lock-free writer may have replaced the value.
                 let previous = published_direct_handle_from_index(previous);
                 // SAFETY: the displaced index handle and pin belong to this cache.
                 let previous_weight = unsafe { protected_direct_entry(&pin, previous) }.weight();
