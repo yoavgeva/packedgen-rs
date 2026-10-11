@@ -725,7 +725,8 @@ pub struct CacheMaintenanceResult {
 }
 
 #[derive(Default)]
-#[repr(align(64))]
+// Isolate hot shards on Apple cache lines and paired Intel prefetch lines.
+#[repr(align(128))]
 struct CacheCounters {
     hits: AtomicU64,
     misses: AtomicU64,
@@ -740,13 +741,13 @@ struct CacheCounters {
 }
 
 #[derive(Default)]
-#[repr(align(64))]
+#[repr(align(128))]
 struct DirectFrequencyReuseShard {
     pending: AtomicU64,
 }
 
 #[derive(Default)]
-#[repr(align(64))]
+#[repr(align(128))]
 struct DirectDoorkeeperObservationShard {
     pending: AtomicU64,
 }
@@ -769,7 +770,7 @@ impl DirectDoorkeeperObservations {
 }
 
 #[cfg(feature = "cache-production-diagnostics")]
-#[repr(align(64))]
+#[repr(align(128))]
 struct DirectCacheDiagnosticCounters {
     current_entries: AtomicUsize,
     current_weight: AtomicU64,
@@ -1372,7 +1373,7 @@ impl<V: fmt::Debug> fmt::Debug for DirectCacheValue<V> {
 }
 
 #[derive(Default)]
-#[repr(align(64))]
+#[repr(align(128))]
 struct DirectCapacityCounters {
     entries: AtomicU64,
     weight: AtomicU64,
@@ -8557,6 +8558,16 @@ impl Drop for CacheMaintenance {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn hot_shards_have_128_byte_alignment() {
+        assert!(std::mem::align_of::<CacheCounters>() >= 128);
+        assert!(std::mem::align_of::<DirectFrequencyReuseShard>() >= 128);
+        assert!(std::mem::align_of::<DirectDoorkeeperObservationShard>() >= 128);
+        #[cfg(feature = "cache-diagnostics")]
+        assert!(std::mem::align_of::<DirectCacheDiagnosticCounters>() >= 128);
+        assert!(std::mem::align_of::<DirectCapacityCounters>() >= 128);
+    }
     use super::*;
 
     #[test]

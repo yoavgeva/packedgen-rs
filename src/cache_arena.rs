@@ -1260,7 +1260,7 @@ unsafe impl<V: Send + Sync> Send for DirectAvailableBlock<V> {}
 // pointee requires `V: Send + Sync`.
 unsafe impl<V: Send + Sync> Sync for DirectAvailableBlock<V> {}
 
-#[repr(align(64))]
+#[repr(align(128))]
 struct DirectArenaPartition<V> {
     state: Mutex<DirectArenaPartitionState<V>>,
 }
@@ -1741,7 +1741,7 @@ fn direct_mark_partition_available(availability: &[AtomicU64], partition: usize,
     }
 }
 
-#[repr(align(64))]
+#[repr(align(128))]
 struct DirectReaderCounter(AtomicUsize);
 
 impl DirectReaderCounter {
@@ -1750,7 +1750,7 @@ impl DirectReaderCounter {
     }
 }
 
-#[repr(align(64))]
+#[repr(align(128))]
 struct DirectMutatorSlot(AtomicBool);
 
 impl DirectMutatorSlot {
@@ -1759,7 +1759,7 @@ impl DirectMutatorSlot {
     }
 }
 
-#[repr(align(64))]
+#[repr(align(128))]
 struct DirectRetiredQueue(Mutex<Vec<RemovedDirectHandle>>);
 
 impl DirectRetiredQueue {
@@ -2793,7 +2793,7 @@ struct PartitionState {
     free: Vec<u32>,
 }
 
-#[repr(align(64))]
+#[repr(align(128))]
 struct ArenaPartition<V> {
     directory: OnceLock<Box<ArenaDirectory<V>>>,
     state: Mutex<PartitionState>,
@@ -3274,6 +3274,15 @@ fn adjust_weight(total: &AtomicU64, previous: u64, replacement: u64) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn hot_shards_have_128_byte_alignment() {
+        assert!(std::mem::align_of::<DirectArenaPartition<u64>>() >= 128);
+        assert!(std::mem::align_of::<DirectReaderCounter>() >= 128);
+        assert!(std::mem::align_of::<DirectMutatorSlot>() >= 128);
+        assert!(std::mem::align_of::<DirectRetiredQueue>() >= 128);
+        assert!(std::mem::align_of::<ArenaPartition<u64>>() >= 128);
+    }
     use super::*;
 
     #[test]
