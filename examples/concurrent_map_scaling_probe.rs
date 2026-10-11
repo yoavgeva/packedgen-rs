@@ -1,4 +1,5 @@
-//! Warm concurrent-map scaling comparison using the same keys, values, and hasher.
+//! Warm concurrent-map scaling using identical keys/values and explicitly labelled hashers.
+//! Set `PACKEDGEN_COMPETITOR_HASHER=rapidhash` (default: foldhash) to change competitors.
 
 #![allow(
     missing_docs,
@@ -8,6 +9,7 @@
     clippy::too_many_lines
 )]
 
+use std::hash::{BuildHasher, Hasher};
 use std::hint::black_box;
 use std::sync::Barrier;
 use std::time::{Duration, Instant};
@@ -31,11 +33,60 @@ const PREPARED_OPERATION_BATCH: usize = 16;
 
 type Key = Box<[u8]>;
 type Atomic = LockFreeAtomicU64GenerationMap;
-type Dash = DashMap<Key, u64, DefaultHashBuilder>;
-type Papaya = PapayaHashMap<Key, u64, DefaultHashBuilder>;
-type Scc = SccHashMap<Key, u64, DefaultHashBuilder>;
-type Flurry = FlurryHashMap<Key, u64, DefaultHashBuilder>;
-type Locked = RwLock<HashBrownMap<Key, u64, DefaultHashBuilder>>;
+type Dash = DashMap<Key, u64, CompetitorHashBuilder>;
+type Papaya = PapayaHashMap<Key, u64, CompetitorHashBuilder>;
+type Scc = SccHashMap<Key, u64, CompetitorHashBuilder>;
+type Flurry = FlurryHashMap<Key, u64, CompetitorHashBuilder>;
+type Locked = RwLock<HashBrownMap<Key, u64, CompetitorHashBuilder>>;
+
+#[derive(Clone)]
+enum CompetitorHashBuilder {
+    Fold(DefaultHashBuilder),
+    Rapid(rapidhash::fast::RandomState),
+}
+
+enum CompetitorHasher {
+    Fold(<DefaultHashBuilder as BuildHasher>::Hasher),
+    Rapid(<rapidhash::fast::RandomState as BuildHasher>::Hasher),
+}
+
+impl BuildHasher for CompetitorHashBuilder {
+    type Hasher = CompetitorHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        match self {
+            Self::Fold(state) => CompetitorHasher::Fold(state.build_hasher()),
+            Self::Rapid(state) => CompetitorHasher::Rapid(state.build_hasher()),
+        }
+    }
+}
+
+impl Hasher for CompetitorHasher {
+    fn finish(&self) -> u64 {
+        match self {
+            Self::Fold(hasher) => hasher.finish(),
+            Self::Rapid(hasher) => hasher.finish(),
+        }
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Fold(hasher) => hasher.write(bytes),
+            Self::Rapid(hasher) => hasher.write(bytes),
+        }
+    }
+}
+
+struct Sample {
+    operations: usize,
+    elapsed: Duration,
+}
+
+impl Sample {
+    fn ns_per_op(&self) -> f64 {
+        self.elapsed.as_secs_f64() * 1e9 / self.operations as f64
+    }
+}
 
 fn main() {
     let mut arguments = std::env::args().skip(1);
@@ -44,7 +95,7 @@ fn main() {
     let default_threads =
         std::thread::available_parallelism().map_or(8, |count| count.get().min(16));
     let maximum_threads = argument(&mut arguments, default_threads).max(1);
-    let sample_count = argument(&mut arguments, 7).max(3);
+    let sample_count = argument(&mut arguments, 10).max(10);
     let shards = argument(&mut arguments, 64).max(2).next_power_of_two();
     let workload_filter = arguments.next();
     let implementation_filter = arguments.next();
@@ -54,7 +105,13 @@ fn main() {
             .expect("thread filter must be a positive integer")
             .max(1)
     });
-    let hash_builder = DefaultHashBuilder::default();
+    let hasher_name =
+        std::env::var("PACKEDGEN_COMPETITOR_HASHER").unwrap_or_else(|_| "foldhash".to_owned());
+    let hash_builder = match hasher_name.as_str() {
+        "foldhash" => CompetitorHashBuilder::Fold(DefaultHashBuilder::default()),
+        "rapidhash" => CompetitorHashBuilder::Rapid(rapidhash::fast::RandomState::default()),
+        _ => panic!("PACKEDGEN_COMPETITOR_HASHER must be foldhash or rapidhash"),
+    };
     #[cfg(feature = "shared-gx")]
     let generation_hash_builder = GenerationHashBuilder::with_seed(0);
     #[cfg(not(feature = "shared-gx"))]
@@ -65,8 +122,24 @@ fn main() {
         .collect::<Vec<_>>();
 
     eprintln!("guard_batch_operations={GUARD_BATCH_OPERATIONS}; threads are unpinned OS threads");
+    #[cfg(feature = "shared-gx")]
+    let packed_hasher = "gxhash (GenerationHashBuilder)";
+    #[cfg(not(feature = "shared-gx"))]
+    let packed_hasher = "rapidhash (GenerationHashBuilder, byte-slice hashing)";
+    for implementation in Implementation::ALL {
+        println!(
+            "# {} hasher={}",
+            implementation.name(),
+            if implementation.is_atomic_index() {
+                packed_hasher
+            } else {
+                &hasher_name
+            }
+        );
+    }
+    println!("# >=500ms timed work/sample; fresh maps per round; normalized ns/op; >=10 samples");
     println!(
-        "implementation,workload,entries,operations,threads,shards,samples,median_ns,throughput_mops,paired_vs_first_pct"
+        "implementation,workload,entries,min_sample_ops,max_sample_ops,threads,shards,samples,median_ns_per_op,min_ns_per_op,max_ns_per_op,cv_pct,throughput_mops,paired_vs_first_pct"
     );
     for workload in Workload::ALL {
         if workload_filter
@@ -88,11 +161,13 @@ fn main() {
                         .is_none_or(|filter| implementation.matches_filter(filter))
                 })
                 .collect::<Vec<_>>();
-            let mut measurements = vec![Vec::with_capacity(sample_count); implementations.len()];
+            let mut measurements = (0..implementations.len())
+                .map(|_| Vec::with_capacity(sample_count))
+                .collect::<Vec<_>>();
             for sample in 0..sample_count {
                 for offset in 0..implementations.len() {
                     let implementation_index = (sample + offset) % implementations.len();
-                    measurements[implementation_index].push(measure(
+                    measurements[implementation_index].push(measure_sample(
                         implementations[implementation_index],
                         workload,
                         operations,
@@ -111,22 +186,30 @@ fn main() {
                 .zip(&mut measurements)
                 .zip(paired_changes)
             {
-                samples.sort_unstable();
-                let median = samples[samples.len() / 2];
-                let throughput = operations as f64 / median.as_secs_f64() / 1_000_000.0;
+                let min_operations = samples.iter().map(|s| s.operations).min().unwrap();
+                let max_operations = samples.iter().map(|s| s.operations).max().unwrap();
+                let mut times = samples.iter().map(Sample::ns_per_op).collect::<Vec<_>>();
+                times.sort_unstable_by(f64::total_cmp);
+                let median = f64::midpoint(times[(times.len() - 1) / 2], times[times.len() / 2]);
+                let mean = times.iter().sum::<f64>() / times.len() as f64;
+                let variance = times.iter().map(|time| (time - mean).powi(2)).sum::<f64>()
+                    / times.len() as f64;
+                let cv = variance.sqrt() / mean * 100.0;
+                let throughput = 1_000.0 / median;
                 println!(
-                    "{},{},{entries},{operations},{threads},{shards},{},{},{throughput:.3},{paired_change:.3}",
+                    "{},{},{entries},{min_operations},{max_operations},{threads},{shards},{},{median:.3},{:.3},{:.3},{cv:.3},{throughput:.3},{paired_change:.3}",
                     implementation.name(),
                     workload.name(),
                     samples.len(),
-                    median.as_nanos(),
+                    times[0],
+                    times[times.len() - 1],
                 );
             }
         }
     }
 }
 
-fn paired_changes(measurements: &[Vec<Duration>]) -> Vec<f64> {
+fn paired_changes(measurements: &[Vec<Sample>]) -> Vec<f64> {
     let Some(control) = measurements.first() else {
         return Vec::new();
     };
@@ -136,14 +219,53 @@ fn paired_changes(measurements: &[Vec<Duration>]) -> Vec<f64> {
             let mut changes = control
                 .iter()
                 .zip(samples)
-                .map(|(control, sample)| {
-                    (control.as_secs_f64() / sample.as_secs_f64() - 1.0) * 100.0
-                })
+                .map(|(control, sample)| (control.ns_per_op() / sample.ns_per_op() - 1.0) * 100.0)
                 .collect::<Vec<_>>();
             changes.sort_unstable_by(f64::total_cmp);
             changes[changes.len() / 2]
         })
         .collect()
+}
+
+fn measure_sample(
+    implementation: Implementation,
+    workload: Workload,
+    initial_operations: usize,
+    threads: usize,
+    shards: usize,
+    keys: &[[u8; 32]],
+    misses: &[[u8; 32]],
+    hash_builder: &CompetitorHashBuilder,
+    generation_hash_builder: &GenerationHashBuilder,
+) -> Sample {
+    let mut sample = Sample {
+        operations: 0,
+        elapsed: Duration::ZERO,
+    };
+    let mut operations = (initial_operations / 64).max(1);
+    // Rebuild between rounds so destructive workloads still measure successful operations.
+    while sample.elapsed < Duration::from_millis(500) {
+        let elapsed = measure(
+            implementation,
+            workload,
+            operations,
+            threads,
+            shards,
+            keys,
+            misses,
+            hash_builder,
+            generation_hash_builder,
+        );
+        sample.operations += operations;
+        sample.elapsed += elapsed;
+        let limit = if matches!(workload, Workload::DeleteHit) {
+            keys.len()
+        } else {
+            misses.len()
+        };
+        operations = operations.saturating_mul(2).min(limit).max(1);
+    }
+    sample
 }
 
 fn measure(
@@ -154,7 +276,7 @@ fn measure(
     shards: usize,
     keys: &[[u8; 32]],
     misses: &[[u8; 32]],
-    hash_builder: &DefaultHashBuilder,
+    hash_builder: &CompetitorHashBuilder,
     generation_hash_builder: &GenerationHashBuilder,
 ) -> Duration {
     let map = BenchMap::build(
@@ -166,21 +288,25 @@ fn measure(
         generation_hash_builder,
     );
     map.warm(keys, misses);
+    let ready = Barrier::new(threads + 1);
     let start = Barrier::new(threads + 1);
     let done = Barrier::new(threads + 1);
     let elapsed = std::thread::scope(|scope| {
         for thread in 0..threads {
             let map = &map;
+            let ready = &ready;
             let start = &start;
             let done = &done;
             let begin = operations * thread / threads;
             let end = operations * (thread + 1) / threads;
             scope.spawn(move || {
+                ready.wait();
                 start.wait();
                 map.run(workload, begin, end, keys, misses);
                 done.wait();
             });
         }
+        ready.wait();
         let started = Instant::now();
         start.wait();
         done.wait();
@@ -209,7 +335,7 @@ impl BenchMap {
         new_key_capacity: usize,
         shards: usize,
         keys: &[[u8; 32]],
-        hash_builder: &DefaultHashBuilder,
+        hash_builder: &CompetitorHashBuilder,
         generation_hash_builder: &GenerationHashBuilder,
     ) -> Self {
         let capacity = keys.len().saturating_add(new_key_capacity);
@@ -886,7 +1012,7 @@ impl Implementation {
             #[cfg(feature = "phast")]
             Self::AtomicPhastPlusOneByte => "packedgen-atomic-phast-plus-one-byte-filter",
             Self::Dash => "dashmap-6.2.1",
-            Self::Papaya => "papaya-0.2.4",
+            Self::Papaya => "papaya-0.2.5",
             Self::Scc => "scc-3.8.5",
             Self::Flurry => "flurry-0.5.2",
             Self::RwLockHashBrown => "rwlock-hashbrown-0.17.1",

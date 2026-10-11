@@ -11,6 +11,7 @@ mod support;
 use support::{LARGE_ENTRIES as ENTRIES, scramble};
 
 fn point_lookups(criterion: &mut Criterion) {
+    let keys = (0..ENTRIES as u64).map(scramble).collect::<Vec<_>>();
     let mut group = criterion.benchmark_group("successful_lookup_u64");
     group.throughput(Throughput::Elements(1));
 
@@ -23,14 +24,14 @@ fn point_lookups(criterion: &mut Criterion) {
             map.try_insert(scramble(key), key).unwrap();
         }
 
-        let mut cursor = 0_u64;
+        let mut cursor = 0_usize;
         group.bench_with_input(
             BenchmarkId::new("elastic", format!("reserve_2^-{reserve_exponent}")),
             &reserve_exponent,
             |bencher, _| {
                 bencher.iter(|| {
-                    cursor = cursor.wrapping_add(1);
-                    map.get(black_box(&scramble(cursor % ENTRIES as u64)))
+                    cursor = (cursor + 1) % keys.len();
+                    map.get(black_box(&keys[cursor]))
                 });
             },
         );
@@ -40,11 +41,11 @@ fn point_lookups(criterion: &mut Criterion) {
     for key in 0..ENTRIES as u64 {
         baseline.insert(scramble(key), key);
     }
-    let mut cursor = 0_u64;
+    let mut cursor = 0_usize;
     group.bench_function("hashbrown", |bencher| {
         bencher.iter(|| {
-            cursor = cursor.wrapping_add(1);
-            baseline.get(black_box(&scramble(cursor % ENTRIES as u64)))
+            cursor = (cursor + 1) % keys.len();
+            baseline.get(black_box(&keys[cursor]))
         });
     });
 
