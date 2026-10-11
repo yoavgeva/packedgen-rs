@@ -1167,6 +1167,8 @@ where
         while *scan < self.shape.n {
             let slot = *scan;
             *scan += 1;
+            #[cfg(test)]
+            crate::common::iter::note_scan_visits(1);
             // SAFETY: the loop condition proves `slot < shape.n`, the exact
             // storage capacity.
             if unsafe { self.storage.control_at(slot) }.is_occupied() {

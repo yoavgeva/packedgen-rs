@@ -405,6 +405,11 @@ where
         self.map.remove_entry(value).map(|(k, ())| k)
     }
 
+    /// Removes and returns an arbitrary value, or `None` when empty.
+    pub fn pop(&mut self) -> Option<T> {
+        self.map.pop_first().map(|(key, ())| key)
+    }
+
     /// Removes all values, keeping allocated capacity.
     pub fn clear(&mut self) {
         self.map.clear();

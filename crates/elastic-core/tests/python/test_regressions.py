@@ -104,3 +104,33 @@ def test_set_self_update(cls, operation):
         getattr(s, operation)(s)
     empty = operation in ("isub", "ixor", "difference_update", "symmetric_difference_update")
     assert set(s) == (set() if empty else {1, 2, 3})
+
+
+@pytest.mark.parametrize("cls", MAPS)
+def test_popitem_drain_with_insertions(cls):
+    m = cls({i: i for i in range(2000)})
+    expected = dict(m.items())
+    for _ in range(500):
+        key, value = m.popitem()
+        assert expected.pop(key) == value
+    for i in range(2000, 2500):
+        m[i] = i
+        expected[i] = i
+    while m:
+        key, value = m.popitem()
+        assert expected.pop(key) == value
+    assert not expected
+
+
+@pytest.mark.parametrize("cls", SETS)
+def test_set_pop_drain_with_insertions(cls):
+    s = cls(range(2000))
+    expected = set(s)
+    for _ in range(500):
+        expected.remove(s.pop())
+    for i in range(2000, 2500):
+        s.add(i)
+        expected.add(i)
+    while s:
+        expected.remove(s.pop())
+    assert not expected

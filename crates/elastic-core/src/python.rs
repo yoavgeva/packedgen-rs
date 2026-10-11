@@ -551,7 +551,7 @@ fn map_popitem<P: TableBackend<HashedAny, Py<PyAny>>>(
     inner: &mut HashMap<HashedAny, Py<PyAny>, P>,
     py: Python,
 ) -> Option<(Py<PyAny>, Py<PyAny>)> {
-    let (k, v) = inner.extract_if(|_, _| true).next()?;
+    let (k, v) = inner.pop_first()?;
     Some((k.obj_clone_ref(py), v))
 }
 
@@ -1728,9 +1728,7 @@ macro_rules! define_set_classes {
                 if self.inner.is_empty() {
                     return Err(PyKeyError::new_err("pop from an empty set"));
                 }
-                // `extract_if` removes only the elements it yields (its `Drop` is
-                // a no-op), so taking one leaves the rest intact.
-                let value = self.inner.extract_if(|_| true).next().expect("len > 0");
+                let value = self.inner.pop().expect("len > 0");
                 let obj = value.obj_clone_ref(py);
                 self.bump();
                 Ok(obj)

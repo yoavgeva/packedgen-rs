@@ -1383,6 +1383,24 @@ where
         self.scan_advance(scan)
     }
 
+    fn pop_next(&self, hint: &mut [usize; 2]) -> Option<(usize, usize)> {
+        while let Some(level) = self.levels.get(hint[0]) {
+            while hint[1] < level.capacity() {
+                let slot = hint[1];
+                hint[1] += 1;
+                #[cfg(test)]
+                crate::common::iter::note_scan_visits(1);
+                // SAFETY: the loop bounds this slot by the level's control extent.
+                if unsafe { level.control_at(slot) }.is_occupied() {
+                    return Some((hint[0], slot));
+                }
+            }
+            hint[0] += 1;
+            hint[1] = 0;
+        }
+        None
+    }
+
     // -- Lifecycle --
 
     #[inline]
