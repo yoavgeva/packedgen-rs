@@ -1,8 +1,9 @@
 #![allow(missing_docs)]
 
-use std::sync::Barrier;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
+use std::time::Duration;
 
 use packedgen::{
     ConcurrentConfigError, ConcurrentSwissMap, InsertOutcome, SegmentedLoad, UpsertOutcome,
@@ -249,6 +250,46 @@ fn mix(mut value: u64) -> u64 {
     value ^= value >> 27;
     value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
+}
+
+#[test]
+fn with_value_allows_reentrant_reads_with_a_writer_queued() {
+    let map = Arc::new(
+        ConcurrentSwissMap::try_with_capacity_and_shards(16, 1, SegmentedLoad::Balanced).unwrap(),
+    );
+    map.try_insert(b"key", 1_u64).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let (read_tx, read_rx) = mpsc::channel();
+    let (write_tx, write_rx) = mpsc::channel();
+    let reader_map = Arc::clone(&map);
+    let reader_barrier = Arc::clone(&barrier);
+    let reader = thread::spawn(move || {
+        let result = reader_map.with_value(b"key", |value| {
+            reader_barrier.wait();
+            // Give the writer time to queue behind this closure's read lock.
+            thread::sleep(Duration::from_millis(200));
+            assert!(reader_map.contains_key(b"key"));
+            assert_eq!(reader_map.stats().len, 1);
+            value.copied().unwrap() + reader_map.get_cloned(b"key").unwrap()
+        });
+        read_tx.send(result).unwrap();
+    });
+    let writer_map = Arc::clone(&map);
+    let writer = thread::spawn(move || {
+        barrier.wait();
+        write_tx.send(writer_map.try_insert(b"other", 2)).unwrap();
+    });
+
+    // Unscoped threads let a failing timeout terminate the test instead of
+    // hanging while a scope waits for the deadlocked threads to join.
+    assert_eq!(read_rx.recv_timeout(Duration::from_secs(3)), Ok(2));
+    assert_eq!(
+        write_rx.recv_timeout(Duration::from_secs(3)),
+        Ok(Ok(InsertOutcome::Inserted))
+    );
+    reader.join().unwrap();
+    writer.join().unwrap();
+    assert_eq!(map.get_cloned(b"other"), Some(2));
 }
 
 #[test]
