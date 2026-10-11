@@ -212,6 +212,11 @@ pub unsafe trait TableBackend<K, V>: Sized {
     /// pointers: `IterMut`/`Drain` lift each to a `&mut`, so a repeat aliases (UB).
     fn scan_next(&self, scan: &mut Self::Scan) -> Option<(*mut SlotEntry<K, V>, Self::Location)>;
 
+    /// Find the next live slot for repeated arbitrary removal. Unlike `Scan`,
+    /// this hint contains only indices and must recheck controls on every call.
+    /// The shell resets it after insertion or an allocation epoch change.
+    fn pop_next(&self, hint: &mut [usize; 2]) -> Option<Self::Location>;
+
     // -- Lifecycle: construct, resize, clean up, clone --
 
     /// Construct storage for the public exact-reserve constructor family.
@@ -324,6 +329,10 @@ fn fingerprint(hash: u64) -> u8 {
 /// Use a [`TableBackend`] backend to store key-value pairs.
 pub struct HashMap<K, V, P: TableBackend<K, V>> {
     table: P,
+    // Epoch + distinct-insertion count invalidate the pointer-free pop hint.
+    pop_epoch: u64,
+    pop_insertions: usize,
+    pop_hint: [usize; 2],
     _marker: PhantomData<(K, V)>,
 }
 
@@ -353,6 +362,9 @@ impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
     fn from_table(table: P) -> Self {
         Self {
             table,
+            pop_epoch: 0,
+            pop_insertions: 0,
+            pop_hint: [0; 2],
             _marker: PhantomData,
         }
     }
@@ -1459,6 +1471,27 @@ impl<K, V, P: TableBackend<K, V>> HashMap<K, V, P> {
         }
     }
 
+    /// Removes and returns an arbitrary entry, or `None` when empty.
+    pub fn pop_first(&mut self) -> Option<(K, V)> {
+        if self.is_empty() {
+            return None;
+        }
+        let epoch = self.epoch();
+        if self.pop_epoch != epoch.generation || self.pop_insertions != epoch.distinct_insertions {
+            self.pop_hint = [0; 2];
+            self.pop_epoch = epoch.generation;
+            self.pop_insertions = epoch.distinct_insertions;
+        }
+        let loc = self.table.pop_next(&mut self.pop_hint)?;
+        // Defer rebuilding until this traversal completes; per-pop cleanup
+        // would restart the scan and turn draining into repeated rescans.
+        let entry = self.table.remove_deferred(loc);
+        if self.is_empty() {
+            self.table.wipe_all();
+        }
+        Some(entry)
+    }
+
     /// Removes and yields the entries for which `f` returns `true`.
     pub fn extract_if<F>(&mut self, f: F) -> ExtractIf<'_, K, V, P, F>
     where
@@ -1940,4 +1973,96 @@ impl<K, V, P: TableBackend<K, V>> IntoIterator for HashMap<K, V, P> {
             remaining,
         }
     }
+}
+
+#[cfg(all(test, feature = "default-hasher"))]
+mod pop_tests {
+    use crate::common::iter::SCAN_VISITS;
+    use crate::{ElasticHashMap, FunnelHashMap};
+
+    macro_rules! pop_linear_test {
+        ($name:ident, $map:ident) => {
+            #[test]
+            fn $name() {
+                let n = 20_000;
+                let mut map = $map::with_capacity(n);
+                for k in 0..n {
+                    map.insert(k, k);
+                }
+                SCAN_VISITS.with(|visits| visits.set(0));
+                let mut popped = 0;
+                while let Some((k, v)) = map.pop_first() {
+                    assert_eq!(k, v);
+                    popped += 1;
+                }
+                assert_eq!(popped, n);
+                let visits = SCAN_VISITS.with(core::cell::Cell::get);
+                println!("{visits} slot visits for {n} pops");
+                assert!(visits < 40 * n, "{visits} slot visits for {n} pops");
+            }
+        };
+    }
+    macro_rules! pop_mutation_test {
+        ($name:ident, $map:ident) => {
+            #[test]
+            fn $name() {
+                let mut map = $map::with_capacity(200);
+                let mut expected = std::collections::HashMap::new();
+                for k in 0..100 {
+                    map.insert(k, k);
+                    expected.insert(k, k);
+                }
+                let (first, value) = map.pop_first().unwrap();
+                assert_eq!(expected.remove(&first), Some(value));
+                for _ in 0..29 {
+                    let (k, v) = map.pop_first().unwrap();
+                    assert_eq!(expected.remove(&k), Some(v));
+                }
+                // Reusing the first popped key exercises insertion behind the hint.
+                map.insert(first, first);
+                expected.insert(first, first);
+                for k in 100..150 {
+                    map.insert(k, k);
+                    expected.insert(k, k);
+                }
+                // Mutations other than pop may remove a later hinted slot or
+                // rebuild the arena. No cached live mask/pointer may survive.
+                let removed = *expected.keys().next().unwrap();
+                assert_eq!(map.remove(&removed), expected.remove(&removed));
+                map.retain(|k, _| k % 3 != 0);
+                expected.retain(|k, _| k % 3 != 0);
+                map.reserve(1000);
+                map.shrink_to_fit();
+                while let Some((k, v)) = map.pop_first() {
+                    assert_eq!(expected.remove(&k), Some(v));
+                }
+                assert!(expected.is_empty());
+                for k in 0..100 {
+                    map.insert(k, k);
+                }
+                map.pop_first().unwrap();
+                map.clear();
+                assert_eq!(map.pop_first(), None);
+                for k in 0..100 {
+                    map.insert(k, k);
+                    expected.insert(k, k);
+                }
+                let mut next_key = 100;
+                while let Some((k, v)) = map.pop_first() {
+                    assert_eq!(expected.remove(&k), Some(v));
+                    if next_key < 1000 {
+                        map.insert(next_key, next_key);
+                        expected.insert(next_key, next_key);
+                        next_key += 1;
+                    }
+                }
+                assert_eq!(next_key, 1000);
+                assert!(expected.is_empty());
+            }
+        };
+    }
+    pop_mutation_test!(elastic_pop_handles_mutations, ElasticHashMap);
+    pop_mutation_test!(funnel_pop_handles_mutations, FunnelHashMap);
+    pop_linear_test!(elastic_pop_drain_is_linear, ElasticHashMap);
+    pop_linear_test!(funnel_pop_drain_is_linear, FunnelHashMap);
 }
