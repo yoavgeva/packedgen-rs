@@ -434,3 +434,59 @@ fn mix(mut value: u64) -> u64 {
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
 }
+
+#[test]
+fn maintenance_plan_rejects_a_different_map_instance() {
+    let config = ElasticConfig::new(64);
+    let mut source = PackedBinaryMap::new(config);
+    let mut target = PackedBinaryMap::new(config);
+    for index in 0_u64..10 {
+        source
+            .try_insert(format!("aaaa{index:04}").as_bytes(), index)
+            .unwrap();
+        target
+            .try_insert(format!("bbbb{index:04}").as_bytes(), 100 + index)
+            .unwrap();
+    }
+    let before = target.stats();
+    let mut plan = source.try_begin_maintenance().unwrap();
+    source
+        .prepare_maintenance_step(&mut plan, usize::MAX)
+        .unwrap();
+
+    assert!(target.maintenance_plan_is_stale(&plan));
+    assert_eq!(
+        target.finish_maintenance(&mut plan),
+        Err(MaintenanceError::StalePlan)
+    );
+    assert_eq!(target.stats(), before);
+    for index in 0_u64..10 {
+        assert_eq!(
+            target.get(format!("bbbb{index:04}").as_bytes()),
+            Some(&(100 + index))
+        );
+        assert_eq!(target.get(format!("aaaa{index:04}").as_bytes()), None);
+    }
+    source.finish_maintenance(&mut plan).unwrap();
+    assert_eq!(source.get(b"aaaa0003"), Some(&3));
+}
+
+#[test]
+fn maintenance_preparation_rejects_foreign_loaded_and_explicit_arena_maps() {
+    let config = ElasticConfig::new(64);
+    let source = PackedBinaryMap::try_from_entries(config, [(b"aaaa0003", 3)]).unwrap();
+    let mut target = PackedBinaryMap::with_key_segment_bytes(config, 64).unwrap();
+    target.try_insert(b"bbbb0003", 103).unwrap();
+    let mut plan = source.try_begin_maintenance().unwrap();
+    assert!(target.maintenance_plan_is_stale(&plan));
+    assert_eq!(
+        target.prepare_maintenance_step(&mut plan, usize::MAX),
+        Err(MaintenanceError::StalePlan)
+    );
+    assert_eq!(plan.remaining(), 1);
+    source
+        .prepare_maintenance_step(&mut plan, usize::MAX)
+        .unwrap();
+    assert!(plan.is_ready());
+    assert_eq!(target.get(b"bbbb0003"), Some(&103));
+}
