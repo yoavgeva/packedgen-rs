@@ -455,6 +455,9 @@ impl<V> LockFreeGenerationMap<V> {
     ///
     /// Returns a frozen-map build error for duplicate keys, allocation failure,
     /// or perfect-index construction failure.
+    ///
+    /// `overlay_capacity` may not exceed 2^32 entries. Larger requests return
+    /// [`FrozenBuildError::AllocationFailed`] without allocating an overlay.
     pub fn try_from_entries<I, K>(
         entries: I,
         overlay_capacity: usize,
@@ -544,6 +547,9 @@ impl<V> LockFreeGenerationMap<V> {
     ///
     /// Returns a frozen-map construction error. The redirected layer remains
     /// usable and retains its previous-generation base if packing fails.
+    ///
+    /// `overlay_capacity` may not exceed 2^32 entries. Larger requests return
+    /// [`FrozenBuildError::AllocationFailed`] before redirecting any writers.
     pub fn rebuild(&self, overlay_capacity: usize) -> Result<GenerationRebuild, FrozenBuildError>
     where
         V: Clone,
@@ -1571,6 +1577,9 @@ impl LockFreeAtomicU64GenerationMap {
     ///
     /// Returns a frozen-map build error for duplicate keys, allocation failure,
     /// or perfect-index construction failure.
+    ///
+    /// `overlay_capacity` may not exceed 2^32 entries. Larger requests return
+    /// [`FrozenBuildError::AllocationFailed`] without allocating an overlay.
     pub fn try_from_entries<I, K>(
         entries: I,
         overlay_capacity: usize,
@@ -1593,6 +1602,9 @@ impl LockFreeAtomicU64GenerationMap {
     ///
     /// Returns a frozen-map build error for duplicate keys, allocation failure,
     /// or perfect-index construction failure.
+    ///
+    /// `overlay_capacity` may not exceed 2^32 entries. Larger requests return
+    /// [`FrozenBuildError::AllocationFailed`] without allocating an overlay.
     pub fn try_from_entries_with_overlay<I, K>(
         entries: I,
         overlay_capacity: usize,
@@ -1623,6 +1635,9 @@ impl LockFreeAtomicU64GenerationMap {
     ///
     /// Returns a frozen-map build error for duplicate keys, allocation failure,
     /// or perfect-index construction failure.
+    ///
+    /// `overlay_capacity` may not exceed 2^32 entries. Larger requests return
+    /// [`FrozenBuildError::AllocationFailed`] without allocating an overlay.
     pub fn try_from_entries_with_options<I, K>(
         entries: I,
         overlay_capacity: usize,
@@ -1649,6 +1664,9 @@ impl LockFreeAtomicU64GenerationMap {
     /// must route keys through identical writer stripes. Normal applications
     /// should use [`Self::try_from_entries_with_options`].
     #[doc(hidden)]
+    ///
+    /// `overlay_capacity` may not exceed 2^32 entries. Larger requests return
+    /// [`FrozenBuildError::AllocationFailed`] without allocating an overlay.
     pub fn try_from_entries_with_options_and_writer_hash<I, K>(
         entries: I,
         overlay_capacity: usize,
@@ -1675,6 +1693,9 @@ impl LockFreeAtomicU64GenerationMap {
     /// This exists for paired backend experiments. Normal applications should
     /// keep using [`Self::try_from_entries_with_options`].
     #[doc(hidden)]
+    ///
+    /// `overlay_capacity` may not exceed 2^32 entries. Larger requests return
+    /// [`FrozenBuildError::AllocationFailed`] without allocating an overlay.
     pub fn try_from_entries_with_options_and_writer_hash_and_index<I, K>(
         entries: I,
         overlay_capacity: usize,
@@ -2095,6 +2116,9 @@ impl LockFreeAtomicU64GenerationMap {
     ///
     /// Returns a frozen-map construction error. The redirected layer remains
     /// usable and retains its previous-generation base if packing fails.
+    ///
+    /// `overlay_capacity` may not exceed 2^32 entries. Larger requests return
+    /// [`FrozenBuildError::AllocationFailed`] before redirecting any writers.
     pub fn rebuild(&self, overlay_capacity: usize) -> Result<GenerationRebuild, FrozenBuildError> {
         self.inner.rebuild(overlay_capacity)
     }
@@ -2256,7 +2280,8 @@ where
                 0,
                 overlay_mode,
                 writer_hash_builder.clone(),
-            ),
+            )
+            .expect("zero-capacity overlay allocation is bounded"),
             overlay_mode,
             writer_hash_builder,
             B::DEFAULT_BASE_FILTER,
@@ -2270,6 +2295,9 @@ where
     ///
     /// Returns a frozen-map build error for duplicate keys, allocation
     /// failure, or perfect-index construction failure.
+    ///
+    /// `overlay_capacity` may not exceed 2^32 entries. Larger requests return
+    /// [`FrozenBuildError::AllocationFailed`] without allocating an overlay.
     pub fn try_from_entries<I, K>(
         entries: I,
         overlay_capacity: usize,
@@ -2338,6 +2366,7 @@ where
         I: IntoIterator<Item = (K, V)>,
         K: AsRef<[u8]>,
     {
+        crate::generation_overlay::validate_overlay_capacity(overlay_capacity)?;
         let frozen = B::try_from_entries_with_policy_index_and_hash(
             entries,
             base_filter,
@@ -2352,7 +2381,7 @@ where
                 overlay_capacity,
                 overlay_mode,
                 writer_hash_builder.clone(),
-            ),
+            )?,
             overlay_mode,
             writer_hash_builder,
             base_filter,
@@ -2463,6 +2492,9 @@ where
     ///
     /// Panics only if a packed base entry has an invalid key reference, which
     /// indicates internal invariant corruption.
+    ///
+    /// `overlay_capacity` may not exceed 2^32 entries. Larger requests return
+    /// [`FrozenBuildError::AllocationFailed`] before redirecting any writers.
     pub fn rebuild(&self, overlay_capacity: usize) -> Result<GenerationRebuild, FrozenBuildError>
     where
         V: Clone,
@@ -2507,7 +2539,7 @@ where
             overlay_capacity,
             self.overlay_mode,
             self.writer_hash_builder.clone(),
-        );
+        )?; // Allocation errors return before the redirect is published.
 
         let redirect_started = Instant::now();
         self.current.store(Arc::clone(&next));
@@ -4012,7 +4044,7 @@ where
         overlay_capacity: usize,
         overlay_mode: GenerationOverlayMode,
         overlay_hash_builder: GenerationHashBuilder,
-    ) -> Arc<Self> {
+    ) -> Result<Arc<Self>, FrozenBuildError> {
         let base_is_empty = matches!(
             &base,
             GenerationBase::Frozen { map, .. } if map.len() == 0
@@ -4022,7 +4054,7 @@ where
             GenerationBase::Frozen { .. } | GenerationBase::StableHybrid(_) => (None, false),
         };
         let direct_base = matches!(&base, GenerationBase::Frozen { .. }) && B::DIRECT_MUTATION;
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             base: ArcSwap::from_pointee(base),
             base_is_empty,
             write_predecessor: ArcSwapOption::from(write_predecessor),
@@ -4031,7 +4063,7 @@ where
                 overlay_capacity,
                 overlay_mode,
                 overlay_hash_builder,
-            ),
+            )?,
             overlay_touched: AtomicBool::new(false),
             initial_len: AtomicIsize::new(isize::try_from(len).unwrap_or(isize::MAX)),
             writer_stripes: (0..WRITER_STRIPES)
@@ -4049,7 +4081,7 @@ where
                 .map(|_| PaddedAtomicUsize(AtomicUsize::new(0)))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
-        })
+        }))
     }
 
     fn with_value<R>(&self, key: &[u8], read: impl FnOnce(Option<&V>) -> R) -> R {

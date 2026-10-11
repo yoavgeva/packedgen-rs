@@ -14,9 +14,60 @@ use packedgen::FrozenIndexBackend;
 use packedgen::GenerationHashBuilder;
 use packedgen::{
     AdaptiveOverlayPhase, AdaptiveRebuildPolicy, AtomicEntry, AtomicGenerationBaseFilter,
-    AtomicGenerationOverlay, InsertOutcome, LockFreeAtomicU64GenerationMap, NonMaxU64,
-    NonMaxU64Error,
+    AtomicGenerationOverlay, FrozenBuildError, InsertOutcome, LockFreeAtomicU64GenerationMap,
+    NonMaxU64, NonMaxU64Error,
 };
+
+#[test]
+fn oversized_overlay_capacities_return_allocation_errors() {
+    let modes = [
+        AtomicGenerationOverlay::AtomicFixed32,
+        AtomicGenerationOverlay::AtomicUpTo8,
+        AtomicGenerationOverlay::AtomicUpTo16,
+        AtomicGenerationOverlay::AtomicAdaptive,
+        AtomicGenerationOverlay::AtomicUpTo32,
+        AtomicGenerationOverlay::CompactFixed32,
+        AtomicGenerationOverlay::CompactSized { key_bytes: 8 },
+        AtomicGenerationOverlay::CompactSized { key_bytes: 32 },
+        AtomicGenerationOverlay::ArcSwapFixed32,
+        AtomicGenerationOverlay::Papaya,
+    ];
+    for mode in modes {
+        for capacity in [usize::MAX, 1_usize << 40] {
+            let started = std::time::Instant::now();
+            let result = LockFreeAtomicU64GenerationMap::try_from_entries_with_options(
+                std::iter::empty::<([u8; 8], NonMaxU64)>(),
+                capacity,
+                mode,
+                AtomicGenerationBaseFilter::Disabled,
+            );
+            assert!(
+                matches!(result, Err(FrozenBuildError::AllocationFailed)),
+                "{mode:?}, {capacity}"
+            );
+            assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        }
+        let map = LockFreeAtomicU64GenerationMap::try_from_entries_with_options(
+            (0..8_u64).map(|key| (key.to_le_bytes(), non_max(key))),
+            32,
+            mode,
+            AtomicGenerationBaseFilter::Disabled,
+        )
+        .unwrap();
+        for capacity in [usize::MAX, 1_usize << 40] {
+            let depth = map.stats().layer_depth;
+            assert!(matches!(
+                map.rebuild(capacity),
+                Err(FrozenBuildError::AllocationFailed)
+            ));
+            assert_eq!(map.stats().layer_depth, depth);
+            for key in 0..8_u64 {
+                assert_eq!(map.get(&key.to_le_bytes()), Some(non_max(key)));
+            }
+            map.rebuild(32).unwrap();
+        }
+    }
+}
 
 #[test]
 fn value_domain_reserves_only_the_deletion_marker() {
