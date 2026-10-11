@@ -11,10 +11,11 @@ result_dir="$result_root/$run_id"
 
 quick() {
   cargo fmt --all -- --check
-  cargo test --test direct_cache_differential
-  cargo test --test direct_packed_cache
-  cargo test --test cache_concurrency_model
-  cargo clippy --all-targets --all-features -- -D warnings
+  cargo test --locked --test direct_cache_differential
+  cargo test --locked --test direct_packed_cache
+  cargo test --locked --test direct_cache_allocations
+  cargo test --locked --test cache_concurrency_model
+  cargo clippy --locked --all-targets --all-features -- -D warnings
 }
 
 msrv() {
@@ -55,28 +56,28 @@ bench() {
   for workload in $workloads; do
     for thread_count in $threads; do
       append_csv "$result_dir/throughput.csv" \
-        cargo run --quiet --release --features "$features" --example cache_probe -- \
+        cargo run --locked --quiet --release --features "$features" --example cache_probe -- \
         "$entries" "$operations" "$thread_count" "$samples" "$workload"
     done
   done
 
   for count in $memory_entries; do
     append_csv "$result_dir/memory.csv" \
-      cargo run --quiet --release --features "$features" --example memory_probe -- \
+      cargo run --locked --quiet --release --features "$features" --example memory_probe -- \
       direct-packed-cache-mixed-value64 "$count"
     append_csv "$result_dir/memory.csv" \
-      cargo run --quiet --release --features "$features" --example memory_probe -- \
+      cargo run --locked --quiet --release --features "$features" --example memory_probe -- \
       direct-packed-cache-batch-admission-mixed-value64 "$count"
     append_csv "$result_dir/memory.csv" \
-      cargo run --quiet --release --features "$features" --example memory_probe -- \
+      cargo run --locked --quiet --release --features "$features" --example memory_probe -- \
       papaya-cache-compact-mixed-value64 "$count"
     append_csv "$result_dir/memory.csv" \
-      cargo run --quiet --release --features "$features" --example memory_probe -- \
+      cargo run --locked --quiet --release --features "$features" --example memory_probe -- \
       papaya-cache-inline-compact-mixed-value64 "$count"
   done
 
   append_csv "$result_dir/latency.csv" \
-    cargo run --quiet --release --features "$features" --example cache_latency_probe -- \
+    cargo run --locked --quiet --release --features "$features" --example cache_latency_probe -- \
     "$entries" "$operations" "$write_operations" 8 2 "$samples"
 
   printf 'PackedGen cache proof results: %s\n' "$result_dir"

@@ -18,10 +18,16 @@ or shift failures.
 
 ## Status
 
+For the current direct-cache implementation/practices assessment, remaining
+memory and scaling work, and profiling instructions, see the
+[2026-09-12 Rust performance review](docs/RUST_PERFORMANCE_REVIEW_2026-09-12.md).
+
 This repository is **not production-ready**. Its primary
-`AtomicPackedGenMap` has lock-free readers and point
-writers, but still needs Loom/Miri/sanitizer verification, Linux-pinned p99
-measurements, traversal/eviction APIs, and a stable public API.
+`AtomicPackedGenMap` has lock-free readers and point writers. Focused
+Loom/Miri/sanitizer checks now exist, but do not replace exact-revision release
+qualification, Linux-pinned latency/RSS/scaling measurements, or a stable public
+API. The bounded cache's remaining performance and memory gaps are tracked in
+[the P2 report](docs/P2_CHURN_LARGE_2026-09-01.md).
 
 `ConcurrentSwissMap` now provides a separate practical multi-reader,
 multi-writer backend. Power-of-two shards independently own a read/write lock,
@@ -839,15 +845,21 @@ batches of 32 reduce Elastic lookup from roughly 66 ns to 54 ns/key, versus
 PackedGen is therefore not yet "better than SwissTable" overall; the release
 gates require the remaining latency work and a RAM-limited system win.
 
-`FrozenPackedMap` explores a second, immutable backend built on PtrHash 2.0.1.
-It retains exact semantics by checking the original packed key after perfect
-indexing. At one million 32-byte keys it used 49.004 requested bytes per entry,
-42.0% less than HashBrown. With the opt-in `gxhash` hardware-AES feature, its
-measured successful lookup was ~14.5 ns/key versus HashBrown's ~27.1 ns/key on
-the same million-key corpus. Frozen construction is slower (~1.78 ms versus
-~0.48 ms for 16K entries), so this backend deliberately trades build and
-mutation support for density and read speed. The portable XXH3-128 path remains
-the default; enable `gxhash` only on supported AES-capable targets.
+Early `FrozenPackedMap` experiments used a second, immutable backend built on
+PtrHash 2.0.1. The measurements below came from that historical fixture; they
+were not a re-run or release claim for the current pinned PtrHash 2.1.1
+dependency. See the [2.1.1 arbitrary-miss safety fix](docs/SAFETY_REVIEW_2026-08-30.md#frozen-index-arbitrary-miss-fix--2026-08-31)
+and [current dependency and security policy](docs/DEPENDENCY_POLICY.md) for the
+current path. The fixture used original-key verification to reject nonmembers,
+but that check did not cure the underlying arbitrary-miss safety defect fixed in
+2.1.1. At one million 32-byte keys it used 49.004
+requested bytes per entry, 42.0% less than HashBrown. With the opt-in `gxhash`
+hardware-AES feature, its measured successful lookup was ~14.5 ns/key versus
+HashBrown's ~27.1 ns/key on the same million-key corpus. Frozen construction was
+slower (~1.78 ms versus ~0.48 ms for 16K entries), so the fixture deliberately
+traded build and mutation support for density and read speed. That fixture used
+the portable XXH3-128 path by default; it enabled `gxhash` only on supported
+AES-capable targets.
 
 The same-requested-RAM probe exposes allocation cliffs that a single
 bytes-per-entry point hides. With a 64 MiB requested-allocation budget, packed

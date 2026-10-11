@@ -2365,11 +2365,28 @@ fn concurrent_async_admission_never_crosses_the_configured_hard_limit() {
         }
     });
 
+    let observed_len = cache.len();
+    let observed_weight = cache.weight();
+    let hard_limit_weight = u64::try_from(HARD_LIMIT).unwrap();
     let diagnostics = cache.production_diagnostics();
-    assert!(cache.len() <= HARD_LIMIT);
-    assert!(cache.weight() <= u64::try_from(HARD_LIMIT).unwrap());
-    assert!(diagnostics.peak_entries <= HARD_LIMIT);
-    assert!(diagnostics.peak_weight <= u64::try_from(HARD_LIMIT).unwrap());
+    assert!(
+        observed_len <= HARD_LIMIT,
+        "live entry count crossed hard limit: observed_len={observed_len}, hard_limit={HARD_LIMIT}, diagnostics={diagnostics:?}"
+    );
+    assert!(
+        observed_weight <= hard_limit_weight,
+        "live weight crossed hard limit: observed_weight={observed_weight}, hard_limit_weight={hard_limit_weight}, diagnostics={diagnostics:?}"
+    );
+    assert!(
+        diagnostics.peak_entries <= HARD_LIMIT,
+        "diagnostic peak entries crossed hard limit: peak_entries={}, hard_limit={HARD_LIMIT}, diagnostics={diagnostics:?}",
+        diagnostics.peak_entries
+    );
+    assert!(
+        diagnostics.peak_weight <= hard_limit_weight,
+        "diagnostic peak weight crossed hard limit: peak_weight={}, hard_limit_weight={hard_limit_weight}, diagnostics={diagnostics:?}",
+        diagnostics.peak_weight
+    );
 }
 
 #[test]

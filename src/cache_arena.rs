@@ -1803,6 +1803,15 @@ impl<'a> DirectRetiredBatch<'a> {
     }
 }
 
+fn collect_direct_arena_pointers<V>(
+    handles: Vec<RemovedDirectHandle>,
+) -> Vec<*mut DirectArenaEntry<V>> {
+    handles
+        .into_iter()
+        .map(|handle| handle.published().pointer::<V>())
+        .collect()
+}
+
 impl Drop for DirectRetiredBatch<'_> {
     fn drop(&mut self) {
         if self.handles.is_empty() {
@@ -2369,10 +2378,7 @@ impl<V> DirectArenaOwner<V> {
             // SAFETY: the quiescent retired batch still owns initialized entries.
             total.saturating_add(unsafe { (*pointer).weight() })
         });
-        let arena_pointers = arena_handles
-            .iter()
-            .map(|handle| handle.published().pointer::<V>())
-            .collect::<Vec<_>>();
+        let arena_pointers = collect_direct_arena_pointers::<V>(arena_handles);
         // SAFETY: the handles came from this owner's retired queues, the
         // selected epoch is quiescent, and the queue owns each retirement once.
         unsafe {
@@ -3583,6 +3589,55 @@ mod tests {
         assert!(result.is_err());
         drop(arena);
         assert_eq!(drops.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "the test inspects live entries through converted raw pointers"
+    )]
+    fn direct_arena_pointer_collection_reuses_handle_buffer() {
+        assert_eq!(
+            std::mem::size_of::<RemovedDirectHandle>(),
+            std::mem::size_of::<*mut DirectArenaEntry<()>>()
+        );
+        assert_eq!(
+            std::mem::align_of::<RemovedDirectHandle>(),
+            std::mem::align_of::<*mut DirectArenaEntry<()>>()
+        );
+
+        for count in [0, 1, 17, DIRECT_RECLAIM_PUBLISH_BATCH + 1] {
+            let arena = DirectValueArena::new(1);
+            let mut handles = Vec::with_capacity(count);
+            let count_u64 = u64::try_from(count).expect("test count fits u64");
+            for value in 0_u64..count_u64 {
+                let handle = arena.allocate(value, 1, u64::MAX);
+                // The test transfers each distinct unpublished allocation's
+                // sole ownership into the private retirement marker without
+                // claiming that an index removal occurred.
+                handles.push(RemovedDirectHandle(handle));
+            }
+            let handle_storage = handles.as_ptr();
+
+            let pointers = collect_direct_arena_pointers::<u64>(handles);
+
+            assert_eq!(pointers.len(), count);
+            if count != 0 {
+                assert_eq!(
+                    pointers.as_ptr().cast::<RemovedDirectHandle>(),
+                    handle_storage,
+                    "pointer conversion should reuse the owning handle allocation"
+                );
+            }
+            for (value, pointer) in (0_u64..count_u64).zip(pointers.iter()) {
+                // SAFETY: every pointer came from the live arena immediately
+                // above, and the arena remains alive through this assertion.
+                let entry = unsafe { &**pointer };
+                assert_eq!(entry.value(), &value);
+            }
+            drop(pointers);
+            drop(arena);
+        }
     }
 
     #[test]

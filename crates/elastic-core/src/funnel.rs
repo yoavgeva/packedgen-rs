@@ -351,9 +351,8 @@ unsafe fn scan_clean_funnel_bucket<T>(
         // SAFETY: the same contract provides a complete readable SIMD group.
         let matches = unsafe { simd::eq_mask_group(group, fingerprint) };
         // SAFETY: the same contract provides a complete readable SIMD group.
-        let first_empty = unsafe { simd::free_mask_group(group) }
-            .into_iter()
-            .find(|&lane| lane < logical_lanes);
+        let first_empty =
+            unsafe { simd::free_mask_group(group) }.find(|&lane| lane < logical_lanes);
         let semantic_lanes = first_empty.unwrap_or(logical_lanes);
 
         for lane in matches {
