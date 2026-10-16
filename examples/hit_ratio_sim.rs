@@ -7,8 +7,8 @@
 //! file). POLICY defaults to every policy: `packed`, `packed-doorkeeper`,
 //! `packed-adaptive`, `packed-tiered`, `quick`, `lru`, `opt`, and the reference
 //! models `model-clock`, `model-s3clock`, and `model-s3fifo`. One CSV row is
-//! printed per policy. A packed policy accepts `/batch=N` to set its eviction
-//! batch; a model accepts `/small=PCT`, `/ghost=PCT`, and `/sample=N` (see
+//! printed per policy. A packed policy accepts `/batch=N`, `/probation=BPS`,
+//! and `/maint=N` (see `packed_config`); a model accepts `/small=PCT`, `/ghost=PCT`, and `/sample=N` (see
 //! `ClockModel::parse`).
 //!
 //! Reads are look-aside, as in `bounded_cache_probe`: a miss admits the key.
@@ -79,6 +79,13 @@ fn key(id: u64) -> Key {
     result
 }
 
+/// Per-request randomness for the synthetic traces. Mixing the seed first
+/// keeps nearby seeds from permuting the same draws, which `seed ^ operation`
+/// alone would do; `turnover` keeps that form to match the probe exactly.
+fn draw(seed: u64, operation: u64) -> u64 {
+    mix(mix(seed) ^ operation)
+}
+
 fn unit(random: u64) -> f64 {
     (random >> 11) as f64 / (1_u64 << 53) as f64
 }
@@ -147,7 +154,7 @@ impl Zipf {
 fn zipf(entries: u64, operations: u64, seed: u64, alpha: f64) -> Trace {
     let distribution = Zipf::new(10 * entries, alpha);
     let requests = (0..operations)
-        .map(|operation| read(distribution.sample(mix(seed ^ operation))))
+        .map(|operation| read(distribution.sample(draw(seed, operation))))
         .collect();
     Trace {
         preload: 0..0,
@@ -167,7 +174,7 @@ fn scan_zipf(entries: u64, operations: u64, seed: u64, alpha: f64) -> Trace {
             if operation % period < scan {
                 read(universe + operation)
             } else {
-                read(distribution.sample(mix(seed ^ operation)))
+                read(distribution.sample(draw(seed, operation)))
             }
         })
         .collect();
@@ -183,7 +190,7 @@ fn shift(entries: u64, operations: u64, seed: u64, alpha: f64) -> Trace {
     let distribution = Zipf::new(universe, alpha);
     let requests = (0..operations)
         .map(|operation| {
-            let rank = distribution.sample(mix(seed ^ operation));
+            let rank = distribution.sample(draw(seed, operation));
             read(if operation < operations / 2 {
                 rank
             } else {
@@ -319,19 +326,29 @@ fn replay(trace: &Trace, session: &mut impl Session) -> Outcome {
     outcome
 }
 
-/// `POLICY[/batch=N]`; the suffix sets the eviction batch (victim window).
-fn packed_config(policy: &str, entries: usize) -> CacheConfig {
+/// `POLICY[/batch=N][/probation=BPS][/maint=N]`: the eviction batch (victim
+/// window), the probationary share, and writes between `maintain()` calls
+/// (zero never maintains). Returns the config and maintenance interval.
+fn packed_config(policy: &str, entries: usize) -> (CacheConfig, usize) {
     let mut base = CacheConfig::new(u64::try_from(entries).expect("entries fit u64") * CHARGE)
         .with_max_entries(entries)
         .with_overlay_capacity(entries.max(64));
-    let policy = match policy.split_once("/batch=") {
-        Some((policy, batch)) => {
-            base = base.with_eviction_batch(batch.parse().expect("batch is an integer"));
-            policy
+    let mut maintenance_interval = MAINTENANCE_INTERVAL;
+    let mut parts = policy.split('/');
+    let policy = parts.next().expect("split yields a policy name");
+    for part in parts {
+        let (option, value) = part.split_once('=').expect("options are NAME=VALUE");
+        let value: usize = value.parse().expect("option values are integers");
+        match option {
+            "batch" => base = base.with_eviction_batch(value),
+            "probation" => {
+                base = base.with_probation(u16::try_from(value).expect("share fits u16"));
+            }
+            "maint" => maintenance_interval = value,
+            _ => panic!("unknown packed option: {option}"),
         }
-        None => policy,
-    };
-    match policy {
+    }
+    let config = match policy {
         "packed" => base,
         "packed-doorkeeper" => base.with_admission_doorkeeper(entries),
         "packed-adaptive" => base
@@ -341,19 +358,21 @@ fn packed_config(policy: &str, entries: usize) -> CacheConfig {
             .with_admission_doorkeeper(entries)
             .with_tiered_frequency_admission(2, 6_000, 8, 7_500),
         _ => panic!("unknown packed policy: {policy}"),
-    }
+    };
+    (config, maintenance_interval)
 }
 
 struct PackedSession<'cache> {
     cache: &'cache DirectPackedCache<u64>,
     guard: DirectCacheGuard<'cache, u64>,
+    maintenance_interval: usize,
     writes_since_maintenance: usize,
 }
 
 impl PackedSession<'_> {
     fn after_write(&mut self) {
         self.writes_since_maintenance += 1;
-        if self.writes_since_maintenance == MAINTENANCE_INTERVAL {
+        if self.writes_since_maintenance == self.maintenance_interval {
             self.guard.quiesce();
             self.cache.maintain().expect("maintenance succeeds");
             self.writes_since_maintenance = 0;
@@ -395,10 +414,12 @@ impl Session for PackedSession<'_> {
 }
 
 fn run_packed(policy: &str, trace: &Trace, entries: usize) -> Outcome {
-    let cache = DirectPackedCache::try_new(packed_config(policy, entries)).expect("cache builds");
+    let (config, maintenance_interval) = packed_config(policy, entries);
+    let cache = DirectPackedCache::try_new(config).expect("cache builds");
     let mut session = PackedSession {
         cache: &cache,
         guard: cache.pin(),
+        maintenance_interval,
         writes_since_maintenance: 0,
     };
     // Match the probe: preloaded keys are maintained before the measured run.
@@ -951,7 +972,7 @@ mod tests {
     #[test]
     fn packed_default_beats_exact_lru_and_tracks_quickcache() {
         let entries = 4_096;
-        for trace_name in ["turnover", "zipf:0.9", "scan-zipf:0.9"] {
+        for trace_name in ["turnover", "zipf:0.9", "scan-zipf:0.9", "shift:0.9"] {
             let trace = build_trace(trace_name, 4_096, 150_000, 3);
             let packed = run_policy("packed", &trace, entries).hit_ratio();
             let lru = run_policy("lru", &trace, entries).hit_ratio();
@@ -959,15 +980,17 @@ mod tests {
                 packed > lru,
                 "{trace_name}: packed hit ratio {packed:.4} is not above exact LRU {lru:.4}"
             );
-            if trace_name == "turnover" {
-                let quick = run_policy("quick", &trace, entries).hit_ratio();
-                assert!(
-                    1.0 - packed <= 1.15 * (1.0 - quick),
-                    "turnover: packed misses {:.4} exceed QuickCache's {:.4} by over 15%",
-                    1.0 - packed,
-                    1.0 - quick
-                );
+            if trace_name == "shift:0.9" {
+                continue;
             }
+            // Measured at 1.003-1.030; the original sampled CLOCK was 1.25.
+            let quick = run_policy("quick", &trace, entries).hit_ratio();
+            assert!(
+                1.0 - packed <= 1.06 * (1.0 - quick),
+                "{trace_name}: packed misses {:.4} exceed QuickCache's {:.4} by over 6%",
+                1.0 - packed,
+                1.0 - quick
+            );
         }
     }
 

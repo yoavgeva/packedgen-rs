@@ -170,8 +170,8 @@ rejected-experiment, and live-compaction results are in
 arbitrary-value caches on that adaptive index. They add epoch-protected values, caller-accounted weight,
 optional entry limits, per-item TTL (never before the TTL; up to ~100-200 ms
 after), compact sampled CLOCK
-eviction (behind a small probationary FIFO in the direct variant), statistics,
-and background maintenance. A reusable pinned guard is
+eviction (the direct variant marks every hit and adds a small probationary
+FIFO), statistics, and background maintenance. A reusable pinned guard is
 the fast read API; an owned thread-local guard keeps values stable after
 replacement or removal. The arena activates allocation partitions as the
 population grows, so callers do not need to predict a maximum item count.
@@ -621,12 +621,18 @@ oldest probationary key first: if it was read since publication it stays
 resident under the CLOCK sweep, otherwise it is evicted and remembered in a
 two-generation ghost filter (about two bytes per expected entry), and a
 remembered key that returns skips probation. One-hit keys therefore leave
-within a short window instead of displacing reused keys for a full sweep. In
-the deterministic `hit_ratio_sim` example at 50,000 entries this raised the
-default read hit rate from 87.47% to 89.86% on the `bounded_cache_probe`
-turnover trace (QuickCache 0.7: 89.89%) and from 59.78% to 64.80% on Zipf 0.9
-reads (QuickCache: 67.53%; exact LRU: 62.34%).
-`CacheConfig::with_probation(0)` restores plain sampled CLOCK.
+within a short window instead of displacing reused keys for a full sweep.
+Every direct-cache hit sets the entry's CLOCK mark (only the optional frequency
+sketch is sampled), and each sweep samples at least four candidates per
+removal so that marks still protect entries in caches above 65,536 entries,
+where the sweep previously evicted every candidate it sampled. In the
+deterministic `hit_ratio_sim` example at 50,000 entries, these changes raised
+the default read hit rate from 87.47% to 89.92% on the `bounded_cache_probe`
+turnover trace (QuickCache 0.7: 89.89%) and from 59.78% to 66.53% on Zipf 0.9
+reads (QuickCache: 67.53%; exact LRU: 62.34%); at 262,144 entries they match
+QuickCache within 0.1 point on both. A cyclic scan slightly larger than the
+cache regressed from 58.00% to 54.75% (QuickCache: 63.84%; LRU: 0%).
+`CacheConfig::with_probation(0)` disables probation.
 
 DirectPackedCache also has an opt-in, scan-resistant admission doorkeeper. It
 uses compact rotating membership generations and rejects a new key once after

@@ -117,6 +117,10 @@ const DIRECT_ADMISSION_RECLAIM_INTERVAL: usize = 512;
 const DIRECT_DOORKEEPER_CLEAR_WORDS: usize = 16;
 const DIRECT_DOORKEEPER_OBSERVATION_PUBLISH_INTERVAL: u64 = 16;
 const DIRECT_ASYNC_VICTIM_SAMPLE_MAX: usize = 1_024;
+/// Victim candidates sampled per requested removal. Sorting a window by its
+/// access marks only protects read entries while it holds several candidates
+/// per removal; an equal-sized window evicts every candidate it samples.
+const DIRECT_VICTIM_CANDIDATES_PER_REMOVAL: usize = 4;
 const DIRECT_DOORKEEPER_GROUP_LOCK: u64 = 1_u64 << 63;
 const DIRECT_DOORKEEPER_EPOCH_MASK: u64 = DIRECT_DOORKEEPER_GROUP_LOCK - 1;
 const DIRECT_DOORKEEPER_INVALID_EPOCH: u64 = DIRECT_DOORKEEPER_EPOCH_MASK;
@@ -2087,6 +2091,21 @@ impl DirectVictimBatch {
         });
     }
 
+    /// Merges repeated samples of one entry in O(n log n). A repeated sample
+    /// reads the access mark after the earlier sample already took it.
+    fn merge_repeated_samples(&mut self) {
+        self.victims.sort_unstable_by_key(|victim| victim.handle);
+        self.victims.dedup_by(|repeated, kept| {
+            if repeated.handle != kept.handle {
+                return false;
+            }
+            kept.expired |= repeated.expired;
+            kept.accessed |= repeated.accessed;
+            kept.frequency = kept.frequency.max(repeated.frequency);
+            true
+        });
+    }
+
     fn key(&self, victim: &DirectVictim) -> &[u8] {
         self.key_slice(victim.key)
     }
@@ -3902,9 +3921,14 @@ impl<'cache, V> DirectCacheGuard<'cache, V> {
                 self.cache.expire_handle(key, handle);
                 continue;
             }
-            if record_access && self.sample_access(entry.weight()) {
+            if record_access {
+                // Every hit marks: probation and the sweep both need it, and
+                // an already-set mark costs only a load of the metadata word
+                // just read for expiry. Only the frequency sketch is sampled.
                 entry.mark_accessed();
-                self.cache.note_frequency_access(key);
+                if self.sample_access(entry.weight()) {
+                    self.cache.note_frequency_access(key);
+                }
             }
             return Some(entry.value());
         }
@@ -3933,9 +3957,14 @@ impl<'cache, V> DirectCacheGuard<'cache, V> {
                 self.cache.expire_handle(key, handle);
                 continue;
             }
-            if record_access && self.sample_access(entry.weight()) {
+            if record_access {
+                // Every hit marks: probation and the sweep both need it, and
+                // an already-set mark costs only a load of the metadata word
+                // just read for expiry. Only the frequency sketch is sampled.
                 entry.mark_accessed();
-                self.cache.note_frequency_access(key);
+                if self.sample_access(entry.weight()) {
+                    self.cache.note_frequency_access(key);
+                }
             }
             return Some(entry.value());
         }
@@ -4029,9 +4058,14 @@ impl<V> DirectClonedCacheGuard<'_, V> {
                 self.cache.expire_handle(key, handle);
                 continue;
             }
-            if record_access && self.sample_access(entry.weight()) {
+            if record_access {
+                // Every hit marks: probation and the sweep both need it, and
+                // an already-set mark costs only a load of the metadata word
+                // just read for expiry. Only the frequency sketch is sampled.
                 entry.mark_accessed();
-                self.cache.note_frequency_access(key);
+                if self.sample_access(entry.weight()) {
+                    self.cache.note_frequency_access(key);
+                }
             }
             return Some(entry.value().clone());
         }
@@ -6974,13 +7008,14 @@ impl<V> DirectPackedCache<V> {
                 self.expire_handle(key, handle);
                 continue;
             }
-            if record_access
-                && self.counters_for(key).hits.load(Ordering::Relaxed)
+            if record_access {
+                entry.mark_accessed();
+                if self.counters_for(key).hits.load(Ordering::Relaxed)
                     & self.access_sample_mask(entry.weight())
                     == 0
-            {
-                entry.mark_accessed();
-                self.note_frequency_access(key);
+                {
+                    self.note_frequency_access(key);
+                }
             }
             return Some(DirectCacheValue {
                 // SAFETY: the still-published handle belongs to this cache pin.
@@ -7009,13 +7044,14 @@ impl<V> DirectPackedCache<V> {
                 self.expire_handle(key, handle);
                 continue;
             }
-            if record_access
-                && self.counters_for(key).hits.load(Ordering::Relaxed)
+            if record_access {
+                entry.mark_accessed();
+                if self.counters_for(key).hits.load(Ordering::Relaxed)
                     & self.access_sample_mask(entry.weight())
                     == 0
-            {
-                entry.mark_accessed();
-                self.note_frequency_access(key);
+                {
+                    self.note_frequency_access(key);
+                }
             }
             return Some(entry.value().clone());
         }
@@ -7910,13 +7946,17 @@ impl<V> DirectPackedCache<V> {
         force: bool,
     ) -> usize {
         let pin = self.arena.pin();
-        let victim_sample_window =
-            self.victim_sample_window(expired_only, requested_removal_target.is_none());
         let removal_target = if expired_only {
             self.config.eviction_batch
         } else {
             requested_removal_target.unwrap_or_else(|| self.proactive_eviction_target())
         };
+        let mut victim_sample_window =
+            self.victim_sample_window(expired_only, requested_removal_target.is_none());
+        if !expired_only {
+            victim_sample_window = victim_sample_window
+                .max(removal_target.saturating_mul(DIRECT_VICTIM_CANDIDATES_PER_REMOVAL));
+        }
         if !expired_only
             && protected_key.is_none()
             && let Some(probation) = &self.probation
@@ -8191,9 +8231,7 @@ impl<V> DirectPackedCache<V> {
             for offset in 0..indexed_samples {
                 let mut collect = |key: &[u8], scanned| {
                     let handle = published_direct_handle_from_index(scanned);
-                    if Some(handle) == protected
-                        || victims.victims.iter().any(|victim| victim.handle == handle)
-                    {
+                    if Some(handle) == protected {
                         return;
                     }
                     // SAFETY: sampled handle and pin belong to this cache.
@@ -8226,6 +8264,7 @@ impl<V> DirectPackedCache<V> {
             }
         }
         if !victims.is_empty() {
+            victims.merge_repeated_samples();
             return victims;
         }
 
@@ -9216,6 +9255,79 @@ mod tests {
         assert!(
             resident >= 900,
             "only {resident} of 999 reused entries survived a one-shot scan"
+        );
+    }
+
+    #[test]
+    fn direct_large_cache_sweep_evicts_unread_entries_before_read_ones() {
+        // From 65,536 entries the proactive removal target reaches the
+        // default 64-entry victim window, so a sweep that evicts its whole
+        // window cannot prefer unread entries at all.
+        const CAPACITY: u64 = 131_072;
+        let cache = DirectPackedCache::<u64>::try_new(
+            CacheConfig::new(u64::MAX)
+                .with_max_entries(usize::try_from(CAPACITY).unwrap())
+                .with_probation(0),
+        )
+        .unwrap();
+        for id in 0..CAPACITY {
+            cache
+                .insert_discard_with_options(&id.to_le_bytes(), id, 16, None)
+                .unwrap();
+        }
+        cache.maintain().unwrap();
+        {
+            let guard = cache.pin();
+            for id in (0..CAPACITY).step_by(2) {
+                assert_eq!(guard.get(&id.to_le_bytes()), Some(&id));
+            }
+        }
+        for id in CAPACITY..CAPACITY + CAPACITY / 4 {
+            cache
+                .insert_discard_with_options(&id.to_le_bytes(), id, 16, None)
+                .unwrap();
+            if id.is_multiple_of(4_096) {
+                cache.maintain().unwrap();
+            }
+        }
+
+        let read_lost = (0..CAPACITY)
+            .step_by(2)
+            .filter(|id| cache.peek(&id.to_le_bytes()).is_none())
+            .count();
+        assert!(
+            read_lost * 100 <= usize::try_from(CAPACITY).unwrap() / 2,
+            "the sweep evicted {read_lost} read entries while unread ones remained"
+        );
+    }
+
+    #[test]
+    fn direct_single_read_during_probation_keeps_a_key_resident() {
+        let cache = probation_test_cache();
+        for id in 0..1_024_u64 {
+            cache
+                .insert_discard_with_options(&id.to_le_bytes(), id, 16, None)
+                .unwrap();
+        }
+        let read_once = u64::MAX.to_le_bytes();
+        cache
+            .insert_discard_with_options(&read_once, 0, 16, None)
+            .unwrap();
+        {
+            let guard = cache.pin();
+            // Any read but the guard's first used to fall outside the sample.
+            assert_eq!(guard.get(&1_023_u64.to_le_bytes()), Some(&1_023));
+            assert_eq!(guard.get(&read_once), Some(&0));
+        }
+        for id in 10_000..10_300_u64 {
+            cache
+                .insert_discard_with_options(&id.to_le_bytes(), id, 16, None)
+                .unwrap();
+        }
+
+        assert!(
+            cache.peek(&read_once).is_some(),
+            "a key read during probation must stay resident"
         );
     }
 
