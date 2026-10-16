@@ -1,6 +1,6 @@
 use std::cell::{Cell, OnceCell};
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, VecDeque};
 use std::fmt;
 use std::hint::spin_loop;
 use std::ops::Deref;
@@ -31,6 +31,8 @@ const NEVER_EXPIRES: u64 = u64::MAX;
 const DEFAULT_OVERLAY_CAPACITY: usize = 65_536;
 const DEFAULT_ARENA_PARTITIONS: usize = 64;
 const DEFAULT_EVICTION_BATCH: usize = 64;
+const DEFAULT_PROBATION_BPS: u16 = 200;
+const MAX_PROBATION_BPS: u16 = 5_000;
 const MAX_EXPIRATION_BATCHES: usize = 16;
 const COUNTER_SHARDS: usize = 64;
 const DIRECT_RESERVOIR_KEY_CHUNK: usize = 64;
@@ -142,6 +144,7 @@ pub struct CacheConfig {
     default_ttl: Option<Duration>,
     rebuild_policy: AdaptiveRebuildPolicy,
     async_hard_limit_bps: Option<u16>,
+    probation_bps: u16,
 }
 
 impl CacheConfig {
@@ -170,6 +173,7 @@ impl CacheConfig {
                 max_short_key_spill_bps: 500,
             },
             async_hard_limit_bps: None,
+            probation_bps: DEFAULT_PROBATION_BPS,
         }
     }
 
@@ -300,6 +304,28 @@ impl CacheConfig {
     #[must_use]
     pub const fn with_async_eviction(mut self, hard_limit_bps: u16) -> Self {
         self.async_hard_limit_bps = Some(hard_limit_bps);
+        self
+    }
+
+    /// Sets the direct cache's probationary share, in basis points of the
+    /// live population. The default is `200` (2%); `0` disables probation.
+    ///
+    /// Newly published keys wait in a small FIFO. While it holds more than
+    /// this share, eviction takes its oldest key first: a key read since
+    /// publication stays resident under the ordinary approximate-LRU sweep,
+    /// and an unread key is evicted and remembered in a ghost filter of about
+    /// two bytes per expected entry. A remembered key that returns skips
+    /// probation. One-hit keys therefore leave within a short window instead
+    /// of displacing reused keys for a full sweep. Shares above 50% are
+    /// clamped to 50%. `PackedCache` currently ignores this direct-cache
+    /// option.
+    #[must_use]
+    pub const fn with_probation(mut self, share_bps: u16) -> Self {
+        self.probation_bps = if share_bps > MAX_PROBATION_BPS {
+            MAX_PROBATION_BPS
+        } else {
+            share_bps
+        };
         self
     }
 
@@ -1134,6 +1160,7 @@ pub struct DirectPackedCache<V> {
     maintenance_worker: Arc<ArcSwapOption<Thread>>,
     victim_scan_cursor: AtomicU64,
     victim_reservoir: Mutex<Vec<DirectVictimReservoirBatch>>,
+    probation: Option<DirectProbation>,
     admission_doorkeeper: Option<DirectAdmissionDoorkeeper>,
     frequency_reuse: AtomicU64,
     frequency_reuse_shards: Option<Box<[DirectFrequencyReuseShard]>>,
@@ -2135,6 +2162,190 @@ impl DirectVictimReservoirBatch {
 
     fn exhausted(&self) -> bool {
         self.next == self.key_ends.len()
+    }
+}
+
+const DIRECT_PROBATION_MAX_SHARDS: usize = 16;
+/// Round-robin pops across shards approximate one FIFO only when each shard
+/// holds many records, so small caches use fewer shards.
+const DIRECT_PROBATION_MIN_SHARD_RECORDS: usize = 64;
+/// Ghost filter bits per remembered key in each of its two generations.
+const DIRECT_GHOST_BITS_PER_KEY: usize = 16;
+
+/// Probationary FIFO and ghost history for newly published direct-cache keys.
+///
+/// Records copy the key beside its published handle and are validated against
+/// the index when popped, so removals and replacements leave only harmless
+/// stale records. The FIFO is capped near its share of the population; past
+/// the cap the oldest record is dropped, leaving that key to the ordinary
+/// sweep, so the cache never retains a second copy of every key.
+struct DirectProbation {
+    shards: Box<[Mutex<DirectProbationShard>]>,
+    len: AtomicUsize,
+    next_shard: AtomicUsize,
+    share_bps: u16,
+    record_limit: AtomicUsize,
+    ghost: DirectGhostFilter,
+}
+
+#[derive(Default)]
+struct DirectProbationShard {
+    records: VecDeque<(DirectHandle, usize)>,
+    key_bytes: VecDeque<u8>,
+}
+
+impl DirectProbation {
+    fn for_config(config: &CacheConfig) -> Option<Self> {
+        (config.probation_bps != 0).then(|| {
+            Self::new(
+                config.probation_bps,
+                config.max_entries.unwrap_or(config.overlay_capacity),
+            )
+        })
+    }
+
+    fn new(share_bps: u16, expected_entries: usize) -> Self {
+        let expected_target = expected_entries.saturating_mul(usize::from(share_bps)) / 10_000;
+        let shards = (expected_target / DIRECT_PROBATION_MIN_SHARD_RECORDS)
+            .next_power_of_two()
+            .clamp(1, DIRECT_PROBATION_MAX_SHARDS);
+        let probation = Self {
+            shards: std::iter::repeat_with(|| Mutex::new(DirectProbationShard::default()))
+                .take(shards)
+                .collect(),
+            len: AtomicUsize::new(0),
+            next_shard: AtomicUsize::new(0),
+            share_bps,
+            record_limit: AtomicUsize::new(0),
+            ghost: DirectGhostFilter::new(expected_entries.div_ceil(2)),
+        };
+        probation.note_population(expected_entries);
+        probation
+    }
+
+    /// The FIFO length above which eviction takes probationary keys first.
+    fn target(&self, population: usize) -> usize {
+        population.saturating_mul(usize::from(self.share_bps)) / 10_000
+    }
+
+    fn note_population(&self, population: usize) {
+        // Twice the target plus slack per shard absorbs bursts between
+        // evictions without retaining a copy of every resident key.
+        let limit = self
+            .target(population)
+            .saturating_mul(2)
+            .saturating_add(self.shards.len() * 4);
+        self.record_limit.store(limit, Ordering::Relaxed);
+    }
+
+    fn len(&self) -> usize {
+        self.len.load(Ordering::Relaxed)
+    }
+
+    fn enroll(&self, route: u64, key: &[u8], handle: DirectHandle) {
+        if self.ghost.contains(route) {
+            return;
+        }
+        let shard_index = usize::try_from(route >> 60).expect("four bits fit usize");
+        let mut shard = self.shards[shard_index % self.shards.len()].lock();
+        shard.records.push_back((handle, key.len()));
+        shard.key_bytes.extend(key);
+        if self.len.fetch_add(1, Ordering::Relaxed) >= self.record_limit.load(Ordering::Relaxed) {
+            let (_, dropped_len) = shard
+                .records
+                .pop_front()
+                .expect("the shard holds the record just enrolled");
+            shard.key_bytes.drain(..dropped_len);
+            self.len.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Pops an approximately oldest record, copying its key into `key`.
+    fn pop(&self, key: &mut Vec<u8>) -> Option<DirectHandle> {
+        let start = self.next_shard.fetch_add(1, Ordering::Relaxed);
+        for offset in 0..self.shards.len() {
+            let mut shard = self.shards[start.wrapping_add(offset) % self.shards.len()].lock();
+            if let Some((handle, key_len)) = shard.records.pop_front() {
+                key.clear();
+                key.extend(shard.key_bytes.drain(..key_len));
+                drop(shard);
+                self.len.fetch_sub(1, Ordering::Relaxed);
+                return Some(handle);
+            }
+        }
+        None
+    }
+}
+
+/// Two-generation approximate set of keys recently evicted from probation.
+///
+/// Each generation holds up to `rotate_every` keys before the older one is
+/// cleared, so a key is remembered for between one and two generations. A
+/// false positive lets a new key skip probation, which is the cache's
+/// behavior without probation; it never affects key/value correctness.
+struct DirectGhostFilter {
+    generations: [Box<[AtomicU64]>; 2],
+    current: AtomicUsize,
+    remembered: AtomicUsize,
+    rotate_every: usize,
+}
+
+impl DirectGhostFilter {
+    fn new(keys_per_generation: usize) -> Self {
+        let rotate_every = keys_per_generation.max(64);
+        let words = rotate_every
+            .saturating_mul(DIRECT_GHOST_BITS_PER_KEY)
+            .div_ceil(64)
+            .next_power_of_two();
+        let make_generation = || {
+            std::iter::repeat_with(|| AtomicU64::new(0))
+                .take(words)
+                .collect::<Box<[_]>>()
+        };
+        Self {
+            generations: [make_generation(), make_generation()],
+            current: AtomicUsize::new(0),
+            remembered: AtomicUsize::new(0),
+            rotate_every,
+        }
+    }
+
+    /// One word from the route and three bits from an independent mix, which
+    /// keeps false positives near 0.5% per full generation at 16 bits a key.
+    fn location(&self, route: u64) -> (usize, u64) {
+        let words = self.generations[0].len();
+        debug_assert!(words.is_power_of_two());
+        let word_mask = u64::try_from(words - 1).unwrap_or(u64::MAX);
+        let word = usize::try_from((route >> 6) & word_mask).unwrap_or(usize::MAX);
+        let bits = doorkeeper_mix64(route ^ 0x9e37_79b9_7f4a_7c15);
+        let mask = (0..3).fold(0_u64, |mask, lane| {
+            mask | 1_u64 << ((bits >> (lane * 6)) & 63)
+        });
+        (word, mask)
+    }
+
+    fn contains(&self, route: u64) -> bool {
+        let (word, mask) = self.location(route);
+        self.generations
+            .iter()
+            .any(|generation| generation[word].load(Ordering::Relaxed) & mask == mask)
+    }
+
+    fn remember(&self, route: u64) {
+        let (word, mask) = self.location(route);
+        let current = self.current.load(Ordering::Relaxed);
+        self.generations[current][word].fetch_or(mask, Ordering::Relaxed);
+        if self.remembered.fetch_add(1, Ordering::Relaxed) + 1 == self.rotate_every {
+            // Exactly one caller observes the boundary. Racing callers may
+            // land in either generation, which only shifts how long they are
+            // remembered.
+            let older = 1 - current;
+            for word in &self.generations[older] {
+                word.store(0, Ordering::Relaxed);
+            }
+            self.current.store(older, Ordering::Relaxed);
+            self.remembered.store(0, Ordering::Relaxed);
+        }
     }
 }
 
@@ -4095,6 +4306,7 @@ impl<V> DirectCacheAdmissionBatch<'_, '_, V> {
         };
         let outcome = if published == inserted.index_value() {
             cache.add_capacity(key, compact_weight);
+            cache.enroll_probation(key, inserted);
             hard_capacity.commit_add();
             cache.note_admission_population();
             context
@@ -4256,6 +4468,7 @@ impl<V> DirectCacheBulkAdmissionBatch<'_, '_, V> {
         let outcome = if published == inserted.index_value() {
             if *capacity_limited {
                 cache.add_capacity(key, compact_weight);
+                cache.enroll_probation(key, inserted);
                 batch.protected.set(Some(inserted));
             }
             hard_capacity.commit_add();
@@ -5059,6 +5272,7 @@ impl<V> DirectPackedCache<V> {
                 .collect()
         });
         let hard_capacity = DirectHardCapacity::new(&config, 0, 0);
+        let probation = DirectProbation::for_config(&config);
         Ok(Self {
             index,
             arena: DirectValueArena::new(config.arena_partitions),
@@ -5079,6 +5293,7 @@ impl<V> DirectPackedCache<V> {
             maintenance_worker: Arc::new(ArcSwapOption::empty()),
             victim_scan_cursor: AtomicU64::new(0),
             victim_reservoir: Mutex::new(Vec::new()),
+            probation,
             admission_doorkeeper,
             frequency_reuse: AtomicU64::new(0),
             frequency_reuse_shards,
@@ -5208,6 +5423,7 @@ impl<V> DirectPackedCache<V> {
             doorkeeper.note_population(entry_count);
         }
         let hard_capacity = DirectHardCapacity::new(&config, entry_count, total_weight);
+        let probation = DirectProbation::for_config(&config);
         Ok(Self {
             index,
             arena,
@@ -5224,6 +5440,7 @@ impl<V> DirectPackedCache<V> {
             maintenance_worker,
             victim_scan_cursor: AtomicU64::new(0),
             victim_reservoir: Mutex::new(Vec::new()),
+            probation,
             admission_doorkeeper,
             frequency_reuse: AtomicU64::new(0),
             frequency_reuse_shards,
@@ -5416,6 +5633,7 @@ impl<V> DirectPackedCache<V> {
         let result = match outcome {
             InsertOutcome::Inserted => {
                 self.add_capacity(key, compact_weight);
+                self.enroll_probation(key, replacement);
                 hard_capacity.commit_add();
                 self.counters_for(key)
                     .inserts
@@ -5503,6 +5721,7 @@ impl<V> DirectPackedCache<V> {
             match self.index.insert(key, replacement.index_value()) {
                 InsertOutcome::Inserted => {
                     self.add_capacity(key, compact_weight);
+                    self.enroll_probation(key, replacement);
                     hard_capacity.commit_add();
                     self.counters_for(key)
                         .inserts
@@ -5591,6 +5810,7 @@ impl<V> DirectPackedCache<V> {
         let result = match outcome {
             InsertOutcome::Inserted => {
                 self.add_capacity(key, compact_weight);
+                self.enroll_probation(key, replacement);
                 hard_capacity.commit_add();
                 self.counters_for(key)
                     .inserts
@@ -6073,6 +6293,7 @@ impl<V> DirectPackedCache<V> {
             return Ok(CacheAdmissionOutcome::Existing);
         }
         self.add_capacity(key, compact_weight);
+        self.enroll_probation(key, inserted);
         hard_capacity.commit_add();
         self.note_admission_population();
         if record_stats {
@@ -7381,6 +7602,12 @@ impl<V> DirectPackedCache<V> {
         }
     }
 
+    fn enroll_probation(&self, key: &[u8], handle: DirectHandle) {
+        if let Some(probation) = &self.probation {
+            probation.enroll(self.index.route_hash(key), key, handle);
+        }
+    }
+
     fn add_capacity(&self, key: &[u8], weight: u32) {
         #[cfg(feature = "cache-production-diagnostics")]
         self.diagnostics.add_capacity(
@@ -7669,8 +7896,9 @@ impl<V> DirectPackedCache<V> {
     }
 
     #[allow(
+        clippy::too_many_lines,
         unsafe_code,
-        reason = "victim validation pairs this cache's exact index handles with its arena pin"
+        reason = "keeps the probation, reservoir, and sweep stages in eviction order; victim validation pairs this cache's exact index handles with its arena pin"
     )]
     fn remove_victim_batch(
         &self,
@@ -7689,6 +7917,18 @@ impl<V> DirectPackedCache<V> {
         } else {
             requested_removal_target.unwrap_or_else(|| self.proactive_eviction_target())
         };
+        if !expired_only
+            && protected_key.is_none()
+            && let Some(probation) = &self.probation
+        {
+            // Unread probationary keys go first; when probation is within its
+            // share, eviction falls through to the reservoir and sweep.
+            let removed =
+                self.remove_probation_victims(probation, &pin, now, protected, removal_target);
+            if removed != 0 || (!self.over_limit() && !force) {
+                return removed;
+            }
+        }
         if !expired_only {
             // Reservoir entries survive across batches. The rare logical-key
             // protection path skips them, keeping ordinary reservoir eviction
@@ -8130,6 +8370,73 @@ impl<V> DirectPackedCache<V> {
                 );
             }
         });
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "probation validation pairs this cache's exact index handles with its arena pin"
+    )]
+    fn remove_probation_victims(
+        &self,
+        probation: &DirectProbation,
+        pin: &DirectArenaPin<'_, V>,
+        now: u64,
+        protected: Option<DirectHandle>,
+        removal_target: usize,
+    ) -> usize {
+        let population = self.len();
+        probation.note_population(population);
+        let target = probation.target(population);
+        let mut removed = 0;
+        let mut key = Vec::new();
+        while removed < removal_target && probation.len() > target {
+            let Some(handle) = probation.pop(&mut key) else {
+                break;
+            };
+            if Some(handle) == protected
+                || self.index.get_protected(&key) != Some(handle.index_value())
+            {
+                // Removed, replaced, or being published: no longer probationary.
+                continue;
+            }
+            let _reclaim_deferral = self.arena.defer_reclamation();
+            let _mutation = self.mutation_stripe(&key).lock();
+            if self.index.get_protected(&key) != Some(handle.index_value()) {
+                continue;
+            }
+            // SAFETY: the revalidated probation handle and pin belong to this cache.
+            let entry = unsafe { protected_direct_entry(pin, handle) };
+            let expired = Self::is_expired(entry, now);
+            let frequency = self.victim_frequency(&key, false);
+            if !expired && (entry.take_accessed() || self.frequency_protects_resident(frequency)) {
+                // Read during probation: it stays under the ordinary sweep.
+                continue;
+            }
+            let weight = entry.weight();
+            if self
+                .index
+                .remove_if(&key, |current| *current == handle.index_value())
+                .is_none()
+            {
+                continue;
+            }
+            self.remove_capacity(&key, weight);
+            // SAFETY: exact conditional removal transferred this victim once.
+            unsafe { pin.retire(removed_after_exact_index_transfer(handle)) };
+            if expired {
+                self.counters_for(&key)
+                    .expirations
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                probation.ghost.remember(self.index.route_hash(&key));
+                self.note_victim_frequency(frequency);
+                self.counters_for(&key)
+                    .evictions
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            removed += 1;
+        }
+        removed
     }
 
     #[allow(
@@ -8870,6 +9177,87 @@ mod tests {
         let expected = (0..300).filter(|index| index % 16 == 0).collect::<Vec<_>>();
 
         assert_eq!(sampled, expected);
+    }
+
+    fn probation_test_cache() -> DirectPackedCache<u64> {
+        DirectPackedCache::try_new(CacheConfig::new(u64::MAX).with_max_entries(1_024))
+            .expect("cache constructs")
+    }
+
+    #[test]
+    fn direct_one_shot_inserts_do_not_flush_reused_entries() {
+        let cache = probation_test_cache();
+        // 999 is coprime with the 1-in-16 access sample, so sixteen read
+        // rounds mark every reused key exactly once.
+        for id in 0..999_u64 {
+            cache
+                .insert_discard_with_options(&id.to_le_bytes(), id, 16, None)
+                .unwrap();
+        }
+        {
+            let guard = cache.pin();
+            for _ in 0..16 {
+                for id in 0..999_u64 {
+                    assert_eq!(guard.get(&id.to_le_bytes()), Some(&id));
+                }
+            }
+        }
+        for id in 1_000_000..1_004_096_u64 {
+            cache
+                .insert_discard_with_options(&id.to_le_bytes(), id, 16, None)
+                .unwrap();
+        }
+
+        let resident = (0..999_u64)
+            .filter(|id| cache.peek(&id.to_le_bytes()).is_some())
+            .count();
+        // The approximate ghost filter lets about 1% of one-shot keys skip
+        // probation and displace a reused key; 1,000 runs kept 944 to 983.
+        assert!(
+            resident >= 900,
+            "only {resident} of 999 reused entries survived a one-shot scan"
+        );
+    }
+
+    #[test]
+    fn direct_probation_ghost_returns_a_key_to_the_main_area() {
+        let cache = probation_test_cache();
+        for id in 0..1_024_u64 {
+            cache
+                .insert_discard_with_options(&id.to_le_bytes(), id, 16, None)
+                .unwrap();
+        }
+        let returning = u64::MAX.to_le_bytes();
+        cache
+            .insert_discard_with_options(&returning, 0, 16, None)
+            .unwrap();
+        for id in 10_000..10_300_u64 {
+            cache
+                .insert_discard_with_options(&id.to_le_bytes(), id, 16, None)
+                .unwrap();
+        }
+        assert!(
+            cache.peek(&returning).is_none(),
+            "an unread probationary key is evicted within its probation window"
+        );
+
+        // Free one slot so the returning insert cannot itself pop a record.
+        assert!(cache.remove_discard(&10_299_u64.to_le_bytes()));
+        let probation = cache
+            .probation
+            .as_ref()
+            .expect("probation is on by default");
+        let enrolled = probation.len();
+        cache
+            .insert_discard_with_options(&returning, 1, 16, None)
+            .unwrap();
+
+        assert_eq!(cache.peek(&returning).map(|value| *value), Some(1));
+        assert_eq!(
+            probation.len(),
+            enrolled,
+            "a key remembered by the ghost filter must skip probation"
+        );
     }
 
     #[test]

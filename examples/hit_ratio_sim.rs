@@ -949,6 +949,29 @@ mod tests {
     }
 
     #[test]
+    fn packed_default_beats_exact_lru_and_tracks_quickcache() {
+        let entries = 4_096;
+        for trace_name in ["turnover", "zipf:0.9", "scan-zipf:0.9"] {
+            let trace = build_trace(trace_name, 4_096, 150_000, 3);
+            let packed = run_policy("packed", &trace, entries).hit_ratio();
+            let lru = run_policy("lru", &trace, entries).hit_ratio();
+            assert!(
+                packed > lru,
+                "{trace_name}: packed hit ratio {packed:.4} is not above exact LRU {lru:.4}"
+            );
+            if trace_name == "turnover" {
+                let quick = run_policy("quick", &trace, entries).hit_ratio();
+                assert!(
+                    1.0 - packed <= 1.15 * (1.0 - quick),
+                    "turnover: packed misses {:.4} exceed QuickCache's {:.4} by over 15%",
+                    1.0 - packed,
+                    1.0 - quick
+                );
+            }
+        }
+    }
+
+    #[test]
     fn replays_are_reproducible() {
         let trace = turnover(256, 20_000, 11);
         for policy in ALL_POLICIES {
