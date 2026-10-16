@@ -5,8 +5,11 @@
 //! TRACE is `turnover`, `zipf:ALPHA`, `scan-zipf:ALPHA`, `shift:ALPHA`, `loop`,
 //! or `file:PATH` (one key per line; `OPERATIONS` of zero replays the whole
 //! file). POLICY defaults to every policy: `packed`, `packed-doorkeeper`,
-//! `packed-adaptive`, `packed-tiered`, `quick`, `lru`, and `opt`. One CSV row is
-//! printed per policy.
+//! `packed-adaptive`, `packed-tiered`, `quick`, `lru`, `opt`, and the reference
+//! models `model-clock`, `model-s3clock`, and `model-s3fifo`. One CSV row is
+//! printed per policy. A packed policy accepts `/batch=N` to set its eviction
+//! batch; a model accepts `/small=PCT`, `/ghost=PCT`, and `/sample=N` (see
+//! `ClockModel::parse`).
 //!
 //! Reads are look-aside, as in `bounded_cache_probe`: a miss admits the key.
 //! Writes admit unconditionally. Every record has the same charge, so each
@@ -20,7 +23,7 @@
 
 #![allow(clippy::cast_precision_loss)]
 
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::hash::{BuildHasherDefault, DefaultHasher};
 use std::ops::Range;
 
@@ -34,7 +37,7 @@ const CHARGE: u64 = 32 + VALUE_BYTES;
 const REFRESH_INTERVAL: usize = 512;
 const MAINTENANCE_INTERVAL: usize = 4096;
 const OCCUPANCY_STRIDE: usize = 64;
-const ALL_POLICIES: [&str; 7] = [
+const ALL_POLICIES: [&str; 10] = [
     "packed",
     "packed-doorkeeper",
     "packed-adaptive",
@@ -42,6 +45,9 @@ const ALL_POLICIES: [&str; 7] = [
     "quick",
     "lru",
     "opt",
+    "model-clock",
+    "model-s3clock",
+    "model-s3fifo",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -313,10 +319,18 @@ fn replay(trace: &Trace, session: &mut impl Session) -> Outcome {
     outcome
 }
 
+/// `POLICY[/batch=N]`; the suffix sets the eviction batch (victim window).
 fn packed_config(policy: &str, entries: usize) -> CacheConfig {
-    let base = CacheConfig::new(u64::try_from(entries).expect("entries fit u64") * CHARGE)
+    let mut base = CacheConfig::new(u64::try_from(entries).expect("entries fit u64") * CHARGE)
         .with_max_entries(entries)
         .with_overlay_capacity(entries.max(64));
+    let policy = match policy.split_once("/batch=") {
+        Some((policy, batch)) => {
+            base = base.with_eviction_batch(batch.parse().expect("batch is an integer"));
+            policy
+        }
+        None => policy,
+    };
     match policy {
         "packed" => base,
         "packed-doorkeeper" => base.with_admission_doorkeeper(entries),
@@ -627,10 +641,207 @@ impl Session for Opt {
     }
 }
 
+const EMPTY_SLOT: u64 = u64::MAX;
+
+#[derive(Clone, Copy)]
+struct ModelEntry {
+    frequency: u8,
+    /// Main-area slot, or `None` while the key is in the small FIFO.
+    slot: Option<usize>,
+}
+
+/// CLOCK, optionally behind S3-FIFO's small FIFO and ghost FIFO.
+///
+/// With a small FIFO, new keys enter it; a key not hit while there is evicted
+/// and remembered as a ghost, and a returning ghost goes straight to main.
+/// Main is a CLOCK over slots reused from a free list, so the hand visits keys
+/// in an order unrelated to insertion, like a sweep over an index.
+struct ClockModel {
+    capacity: usize,
+    small_capacity: usize,
+    max_frequency: u8,
+    ghost_capacity: usize,
+    /// Only every `sample_every`-th hit raises a frequency, like the packed cache's
+    /// sampled access marks.
+    sample_every: u64,
+    hits: u64,
+    resident: HashMap<u64, ModelEntry>,
+    slots: Vec<u64>,
+    free_slots: Vec<usize>,
+    hand: usize,
+    small: VecDeque<u64>,
+    ghost: VecDeque<u64>,
+    ghost_counts: HashMap<u64, u32>,
+}
+
+impl ClockModel {
+    /// `NAME[/small=PCT][/ghost=PCT][/sample=N]`: small FIFO and ghost FIFO
+    /// sizes are percentages of capacity; `sample` keeps every Nth hit.
+    fn parse(name: &str, capacity: usize) -> Self {
+        let mut parts = name.split('/');
+        let (mut small_percent, max_frequency) = match parts.next() {
+            Some("model-clock") => (0, 1),
+            Some("model-s3fifo") => (10, 3),
+            Some("model-s3clock") => (10, 1),
+            _ => panic!("unknown model: {name}"),
+        };
+        let mut ghost_percent = 100 - small_percent;
+        let mut sample_every = 1;
+        for part in parts {
+            let (option, value) = part.split_once('=').expect("model options are NAME=VALUE");
+            let value: usize = value.parse().expect("model option values are integers");
+            match option {
+                "small" => small_percent = value,
+                "ghost" => ghost_percent = value,
+                "sample" => sample_every = u64::try_from(value).expect("sample fits u64"),
+                _ => panic!("unknown model option: {option}"),
+            }
+        }
+        let mut model = Self::new(capacity, capacity * small_percent / 100, max_frequency);
+        model.ghost_capacity = capacity * ghost_percent / 100;
+        model.sample_every = sample_every.max(1);
+        model
+    }
+
+    fn new(capacity: usize, small_capacity: usize, max_frequency: u8) -> Self {
+        assert!(small_capacity < capacity && max_frequency > 0);
+        Self {
+            capacity,
+            small_capacity,
+            max_frequency,
+            ghost_capacity: capacity - small_capacity,
+            sample_every: 1,
+            hits: 0,
+            resident: HashMap::with_capacity(capacity),
+            slots: Vec::with_capacity(capacity),
+            free_slots: Vec::new(),
+            hand: 0,
+            small: VecDeque::with_capacity(small_capacity),
+            ghost: VecDeque::new(),
+            ghost_counts: HashMap::new(),
+        }
+    }
+
+    fn take_ghost(&mut self, id: u64) -> bool {
+        let Some(count) = self.ghost_counts.get_mut(&id) else {
+            return false;
+        };
+        *count -= 1;
+        if *count == 0 {
+            self.ghost_counts.remove(&id);
+        }
+        // The stale FIFO position expires harmlessly: its count is gone.
+        true
+    }
+
+    fn remember_ghost(&mut self, id: u64) {
+        *self.ghost_counts.entry(id).or_default() += 1;
+        self.ghost.push_back(id);
+        while self.ghost.len() > self.ghost_capacity {
+            let old = self.ghost.pop_front().expect("ghost FIFO is non-empty");
+            if let Some(count) = self.ghost_counts.get_mut(&old) {
+                *count -= 1;
+                if *count == 0 {
+                    self.ghost_counts.remove(&old);
+                }
+            }
+        }
+    }
+
+    fn place_in_main(&mut self, id: u64) {
+        let slot = if let Some(slot) = self.free_slots.pop() {
+            self.slots[slot] = id;
+            slot
+        } else {
+            self.slots.push(id);
+            self.slots.len() - 1
+        };
+        let entry = self.resident.get_mut(&id).expect("placed key is resident");
+        entry.frequency = 0;
+        entry.slot = Some(slot);
+    }
+
+    fn evict_one(&mut self) {
+        loop {
+            let main_len = self.slots.len() - self.free_slots.len();
+            if self.small_capacity != 0
+                && (self.small.len() >= self.small_capacity || main_len == 0)
+            {
+                let id = self.small.pop_front().expect("small FIFO is non-empty");
+                if self.resident[&id].frequency > 0 {
+                    self.place_in_main(id);
+                    continue;
+                }
+                self.resident.remove(&id);
+                self.remember_ghost(id);
+                return;
+            }
+            let id = self.slots[self.hand];
+            let slot = self.hand;
+            self.hand = (self.hand + 1) % self.slots.len();
+            if id == EMPTY_SLOT {
+                continue;
+            }
+            let entry = self.resident.get_mut(&id).expect("slot key is resident");
+            if entry.frequency > 0 {
+                entry.frequency -= 1;
+                continue;
+            }
+            self.resident.remove(&id);
+            self.slots[slot] = EMPTY_SLOT;
+            self.free_slots.push(slot);
+            return;
+        }
+    }
+
+    fn access(&mut self, id: u64) -> bool {
+        if let Some(entry) = self.resident.get_mut(&id) {
+            self.hits += 1;
+            if self.hits.is_multiple_of(self.sample_every) {
+                entry.frequency = (entry.frequency + 1).min(self.max_frequency);
+            }
+            return true;
+        }
+        if self.resident.len() == self.capacity {
+            self.evict_one();
+        }
+        self.resident.insert(
+            id,
+            ModelEntry {
+                frequency: 0,
+                slot: None,
+            },
+        );
+        if self.small_capacity == 0 || self.take_ghost(id) {
+            self.place_in_main(id);
+        } else {
+            self.small.push_back(id);
+        }
+        false
+    }
+}
+
+impl Session for ClockModel {
+    fn read(&mut self, id: u64) -> bool {
+        self.access(id)
+    }
+
+    fn write(&mut self, id: u64) {
+        self.access(id);
+    }
+
+    fn resident(&self) -> usize {
+        self.resident.len()
+    }
+}
+
 fn run_policy(policy: &str, trace: &Trace, entries: usize) -> Outcome {
     match policy {
         "quick" => run_quick(trace, entries),
         "lru" => replay(trace, &mut Lru::new(entries)),
+        model if model.starts_with("model-") => {
+            replay(trace, &mut ClockModel::parse(model, entries))
+        }
         "opt" => {
             let mut opt = Opt::new(trace, entries);
             let measured = Trace {
@@ -711,6 +922,7 @@ mod tests {
     fn a_cyclic_scan_defeats_lru_but_not_opt() {
         let trace = cyclic(64, 2_000);
         assert_eq!(run_policy("lru", &trace, 64).hits, 0);
+        assert_eq!(run_policy("model-clock", &trace, 64).hits, 0);
         assert!(run_policy("opt", &trace, 64).hits > 1_000);
     }
 
