@@ -2228,10 +2228,18 @@ impl DirectProbation {
         let shards = (expected_target / DIRECT_PROBATION_MIN_SHARD_RECORDS)
             .next_power_of_two()
             .clamp(1, DIRECT_PROBATION_MAX_SHARDS);
+        // Reserving each shard's share of the record limit up front avoids the
+        // doubling slack of growing to it one record at a time.
+        let shard_records = Self::record_limit(expected_target, shards).div_ceil(shards);
         let probation = Self {
-            shards: std::iter::repeat_with(|| Mutex::new(DirectProbationShard::default()))
-                .take(shards)
-                .collect(),
+            shards: std::iter::repeat_with(|| {
+                Mutex::new(DirectProbationShard {
+                    records: VecDeque::with_capacity(shard_records),
+                    key_bytes: VecDeque::new(),
+                })
+            })
+            .take(shards)
+            .collect(),
             len: AtomicUsize::new(0),
             next_shard: AtomicUsize::new(0),
             share_bps,
@@ -2247,13 +2255,14 @@ impl DirectProbation {
         population.saturating_mul(usize::from(self.share_bps)) / 10_000
     }
 
+    /// A quarter of the target plus slack per shard absorbs bursts between
+    /// evictions; each record copies its key, so the cap bounds that memory.
+    fn record_limit(target: usize, shards: usize) -> usize {
+        target.saturating_add(target / 4).saturating_add(shards * 4)
+    }
+
     fn note_population(&self, population: usize) {
-        // Twice the target plus slack per shard absorbs bursts between
-        // evictions without retaining a copy of every resident key.
-        let limit = self
-            .target(population)
-            .saturating_mul(2)
-            .saturating_add(self.shards.len() * 4);
+        let limit = Self::record_limit(self.target(population), self.shards.len());
         self.record_limit.store(limit, Ordering::Relaxed);
     }
 
@@ -2312,10 +2321,11 @@ struct DirectGhostFilter {
 impl DirectGhostFilter {
     fn new(keys_per_generation: usize) -> Self {
         let rotate_every = keys_per_generation.max(64);
+        // Exact sizing: the word is chosen by multiply-shift, not a mask, so
+        // there is no power-of-two rounding of up to 2x.
         let words = rotate_every
             .saturating_mul(DIRECT_GHOST_BITS_PER_KEY)
-            .div_ceil(64)
-            .next_power_of_two();
+            .div_ceil(64);
         let make_generation = || {
             std::iter::repeat_with(|| AtomicU64::new(0))
                 .take(words)
@@ -2332,10 +2342,9 @@ impl DirectGhostFilter {
     /// One word from the route and three bits from an independent mix, which
     /// keeps false positives near 0.5% per full generation at 16 bits a key.
     fn location(&self, route: u64) -> (usize, u64) {
-        let words = self.generations[0].len();
-        debug_assert!(words.is_power_of_two());
-        let word_mask = u64::try_from(words - 1).unwrap_or(u64::MAX);
-        let word = usize::try_from((route >> 6) & word_mask).unwrap_or(usize::MAX);
+        let words = u128::try_from(self.generations[0].len()).expect("usize fits u128");
+        let word = usize::try_from((u128::from(route) * words) >> 64)
+            .expect("the scaled word index is below the word count");
         let bits = doorkeeper_mix64(route ^ 0x9e37_79b9_7f4a_7c15);
         let mask = (0..3).fold(0_u64, |mask, lane| {
             mask | 1_u64 << ((bits >> (lane * 6)) & 63)
