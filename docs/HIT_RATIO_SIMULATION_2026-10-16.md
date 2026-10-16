@@ -5,8 +5,16 @@ on the bounded-cache turnover trace and fell below exact LRU on every skewed
 trace. A deterministic simulator traced this to three causes. The fixes bring
 the default within 0.1 point of QuickCache on turnover at 50,000 entries, and on
 turnover and Zipf 0.9 at 262,144 entries, with no consistent throughput cost.
-One pathological loop trace regressed. These are simulator and screening
-results on an unisolated host. They don't qualify a release.
+One pathological loop trace regressed.
+
+The synthetic parity does not carry over to real workloads. On six ARC-paper
+traces the new default is far better than the original policy: 1.5x to 4.6x
+the hit rate wherever the original was below 30%. But it reaches QuickCache
+in only 3 of 18 cache sizes. It is typically 1 to 4 points behind, and 9.7
+points behind on DS1 at 4,000,000 entries.
+
+These are simulator and screening results on an unisolated host. They don't
+qualify a release.
 
 ## Method
 
@@ -116,6 +124,86 @@ The loop regression is real. With selective sweeps, a cyclic scan just larger
 than the cache behaves like CLOCK, which is LRU's worst case, instead of like
 random eviction. `packed-tiered` keeps 67.73% on the loop.
 
+## Real traces
+
+The traces are six from the ARC paper: N. Megiddo and D. S. Modha, "ARC: A
+Self-Tuning, Low Overhead Replacement Cache," FAST 2003. The copies come from
+the `arc` directory of `github.com/moka-rs/cache-trace`; the trace files are
+not committed here. Each `.lis` line `START COUNT ...` reads `COUNT`
+consecutive blocks, and `arc:PATH` expands it the same way. The expanded
+request counts match the paper's table exactly. On OLTP at the paper's cache
+sizes, the simulator's exact LRU reproduces the paper's published LRU column:
+32.83%, 42.47%, 53.65%, 60.70%, and 64.63%.
+
+Read hit rate in percent. Original is the policy before this work, run with
+the simulator at `c3e769d`. Final is the default after all the changes here.
+
+| Trace | Entries | Original | Final | Tiered | QuickCache | LRU | OPT | Final vs QuickCache |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| OLTP | 1,000 | 30.00 | 35.43 | 26.00 | 35.15 | 32.83 | 53.62 | +0.28 |
+| OLTP | 5,000 | 48.87 | 52.94 | 46.94 | 54.29 | 53.65 | 68.27 | -1.36 |
+| OLTP | 15,000 | 61.72 | 63.22 | 58.03 | 64.83 | 64.63 | 75.14 | -1.61 |
+| P3 | 8,192 | 1.58 | 4.16 | 3.84 | 3.64 | 1.62 | 11.25 | +0.52 |
+| P3 | 32,768 | 5.04 | 14.41 | 13.78 | 12.94 | 3.56 | 32.25 | +1.48 |
+| P3 | 131,072 | 39.08 | 46.50 | 44.42 | 48.61 | 44.79 | 67.51 | -2.11 |
+| S1 | 65,536 | 1.56 | 5.80 | 5.69 | 6.17 | 1.56 | 18.14 | -0.37 |
+| S1 | 262,144 | 8.93 | 23.15 | 23.53 | 23.77 | 6.43 | 42.50 | -0.62 |
+| S1 | 524,288 | 27.60 | 40.24 | 41.63 | 41.99 | 23.71 | 59.01 | -1.74 |
+| P8 | 8,192 | 2.83 | 8.43 | 9.30 | 10.40 | 2.30 | 23.22 | -1.96 |
+| P8 | 32,768 | 17.14 | 28.47 | 30.67 | 32.41 | 17.18 | 49.36 | -3.95 |
+| P8 | 131,072 | 57.47 | 67.62 | 66.99 | 70.01 | 62.10 | 83.81 | -2.40 |
+| S3 | 100,000 | 2.40 | 11.09 | 11.68 | 12.67 | 2.33 | 25.42 | -1.58 |
+| S3 | 400,000 | 19.00 | 37.26 | 39.41 | 41.75 | 12.04 | 59.96 | -4.49 |
+| S3 | 800,000 | 51.15 | 64.30 | 64.75 | 66.99 | 56.60 | 81.27 | -2.69 |
+| DS1 | 1,000,000 | 4.90 | 13.31 | 13.58 | 14.86 | 3.09 | 20.19 | -1.55 |
+| DS1 | 4,000,000 | 23.01 | 35.10 | 42.88 | 44.80 | 20.24 | 48.09 | -9.70 |
+| DS1 | 8,000,000 | 57.43 | 67.68 | 67.69 | 69.22 | 43.04 | 74.93 | -1.54 |
+
+The final default beats exact LRU everywhere except OLTP at 5,000 and 15,000
+entries, where it trails by about 0.7 and 1.4 points. OLTP is a recency-heavy
+database trace.
+
+A model sweep on DS1, S3, P8, OLTP, and S1 shows that S3-FIFO-style probation
+is at its ceiling on these traces. The implementation matches
+`model-s3clock/small=2` on DS1 at 4M (35.10% vs 34.92%) and beats it on S3 and
+S1. It trails the model by about 1.5 points on P8 and OLTP. A 10% small FIFO
+or a ghost of twice the capacity loses 1.6 to 4.8 points on DS1, S3, P8, and
+S1, and gains at most 1.1 points on OLTP. S3-FIFO's two-bit frequency gains at
+most 1.6 points, on P8. Only frequency moves the large gaps:
+`packed-tiered`, the existing opt-in frequency admission, lifts DS1 at 4M from
+35.10% to 42.88%. But it costs 5 points on OLTP at 15,000 entries (58.03% vs
+63.22%). Closing the rest needs frequency admission that switches itself off
+on recency-heavy traffic, as Caffeine's adaptive W-TinyLFU window does.
+
+## Memory
+
+`tests/direct_cache_memory.rs` measures requested live bytes (`stats_alloc`,
+not RSS) for 32-byte keys and `u64` values, with and without probation. Each
+cache is measured once filled to capacity and once after inserting twice its
+capacity:
+
+| Entries | Filled, off | Filled, on | Probation, filled | After churn, off | After churn, on | Probation, churned |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 65,536 | 117.5 | 120.4 | +2.9 | 188.4 | 184.6 | -3.8 |
+| 200,000 | 120.1 | 125.5 | +5.4 | 233.5 | 225.6 | -8.0 |
+| 524,288 | 150.8 | 155.6 | +4.8 | 373.0 | 370.0 | -3.0 |
+
+All values are bytes per entry. The ghost filter and the reserved record
+buffers cost 2.4 B/entry before any insert. A full FIFO's key copies add the
+rest of the filled overhead; about 1 B/entry of that is not accounted for by
+the structure sizes and is probably growth slack. After churn the cache is
+smaller with probation. A likely reason is that FIFO eviction removes recently
+inserted keys, which still sit in the index's mutable overlay. The test bounds
+the overhead at 6 B/entry.
+
+The first implementation cost 6.1 to 8.3 B/entry filled. Its record cap was
+twice the target, its buffers grew by doubling, and its ghost filter was
+rounded up to a power of two. All three were fixed.
+
+Separately from probation, inserting twice the capacity grows the cache's
+requested footprint from 117 to 151 B/entry to 184 to 373 B/entry. That
+churn growth is unexplained and worth its own investigation.
+
 ## Throughput screen
 
 The test used `bounded_cache_probe` with `direct-owned`, 64-byte values, and
@@ -149,7 +237,12 @@ and -0.6%, with its hit rate rising from 89.49% to 89.92%.
 - The admission doorkeeper only gates `insert_if_absent`. Upserts bypass it,
   so the October probe, which fills misses by upserting, could never have
   measured any admission mode.
-- Real traces, such as Twitter or Meta cache traces in a one-key-per-line
+- On real ARC traces, the default trails QuickCache by 1 to 4 points in most
+  configurations and by 9.7 points on DS1 at 4,000,000 entries. Adaptive
+  frequency admission is the next design step.
+- Churn grows the cache's requested footprint by up to 2.5x, independently of
+  probation.
+- Larger traces, such as Twitter or Meta cache traces in a one-key-per-line
   format via `file:PATH`, and a quiet-host throughput qualification are still
   to do.
 
@@ -160,5 +253,8 @@ cargo build --release --example hit_ratio_sim
 target/release/examples/hit_ratio_sim turnover 50000 1000000 1
 target/release/examples/hit_ratio_sim zipf:0.9 50000 2000000 1 packed quick lru opt
 target/release/examples/hit_ratio_sim zipf:0.9 50000 2000000 1 packed/probation=0
+zstd -d OLTP.lis.zst
+target/release/examples/hit_ratio_sim arc:OLTP.lis 15000 0 1 packed quick lru opt
 cargo test --example hit_ratio_sim
+cargo test --release --test direct_cache_memory -- --nocapture
 ```

@@ -631,7 +631,12 @@ the default read hit rate from 87.47% to 89.92% on the `bounded_cache_probe`
 turnover trace (QuickCache 0.7: 89.89%) and from 59.78% to 66.53% on Zipf 0.9
 reads (QuickCache: 67.53%; exact LRU: 62.34%); at 262,144 entries they match
 QuickCache within 0.1 point on both. A cyclic scan slightly larger than the
-cache regressed from 58.00% to 54.75% (QuickCache: 63.84%; LRU: 0%).
+cache regressed from 58.00% to 54.75% (QuickCache: 63.84%; LRU: 0%). Real
+workloads are harder: on six ARC-paper traces the default improves on the old
+policy everywhere, but it trails QuickCache by 1 to 4 points in most
+configurations and by 9.7 points on DS1 at 4,000,000 entries. Probation adds
+about 3 to 5.5 requested bytes per entry to a filled cache. See
+[`docs/HIT_RATIO_SIMULATION_2026-10-16.md`](docs/HIT_RATIO_SIMULATION_2026-10-16.md).
 `CacheConfig::with_probation(0)` disables probation.
 
 DirectPackedCache also has an opt-in, scan-resistant admission doorkeeper. It
