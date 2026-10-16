@@ -2897,6 +2897,8 @@ impl<V> ValueArena<V> {
         let slot_index = if let Some(slot) = reused {
             slot
         } else {
+            // `try_update` is newer than the crate's 1.88 MSRV.
+            #[allow(deprecated)]
             partition
                 .next_slot
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |slot| {
