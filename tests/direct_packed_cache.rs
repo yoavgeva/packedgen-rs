@@ -2171,11 +2171,13 @@ fn async_eviction_allows_bounded_overshoot_and_enforces_the_hard_limit() {
 #[test]
 fn diagnostics_attribute_foreground_hard_limit_eviction() {
     const CAPACITY: usize = 128;
+    // Probation would evict these unread keys without a sampled collection.
     let cache = DirectPackedCache::try_new(
         CacheConfig::new(u64::MAX)
             .with_max_entries(CAPACITY)
             .with_overlay_capacity(512)
-            .with_async_eviction(11_000),
+            .with_async_eviction(11_000)
+            .with_probation(0),
     )
     .unwrap();
 

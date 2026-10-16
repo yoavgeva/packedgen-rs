@@ -8427,11 +8427,17 @@ impl<V> DirectPackedCache<V> {
         probation.note_population(population);
         let target = probation.target(population);
         let mut removed = 0;
+        #[cfg(feature = "cache-production-diagnostics")]
+        let mut examined = 0;
         let mut key = Vec::new();
         while removed < removal_target && probation.len() > target {
             let Some(handle) = probation.pop(&mut key) else {
                 break;
             };
+            #[cfg(feature = "cache-production-diagnostics")]
+            {
+                examined += 1;
+            }
             if Some(handle) == protected
                 || self.index.get_protected(&key) != Some(handle.index_value())
             {
@@ -8475,6 +8481,8 @@ impl<V> DirectPackedCache<V> {
             }
             removed += 1;
         }
+        #[cfg(feature = "cache-production-diagnostics")]
+        self.diagnostics.record_victim_batch(examined, removed);
         removed
     }
 
