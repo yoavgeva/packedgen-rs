@@ -545,8 +545,10 @@ impl<V> DirectArenaEntry<V> {
     }
 }
 
-pub(crate) struct DirectArenaValue<V> {
-    owner: Arc<DirectArenaOwner<V>>,
+/// A reader epoch borrowed from its arena rather than a clone of the arena's
+/// `Arc`: every reader thread would otherwise contend on one reference count.
+pub(crate) struct DirectArenaValue<'arena, V> {
+    owner: &'arena DirectArenaOwner<V>,
     reader_epoch: usize,
     reader_shard: usize,
     pointer: NonNull<DirectArenaEntry<V>>,
@@ -683,6 +685,11 @@ impl<V> DirectValueArena<V> {
             next: 0,
             len: count,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owner_references(&self) -> usize {
+        Arc::strong_count(&self.owner)
     }
 
     pub(crate) fn pin(&self) -> DirectArenaPin<'_, V> {
@@ -850,7 +857,7 @@ impl<V> Drop for DirectArenaReservation<'_, V> {
     }
 }
 
-impl<V> DirectArenaPin<'_, V> {
+impl<'arena, V> DirectArenaPin<'arena, V> {
     /// Binds a live direct handle to this pin's reader epoch.
     ///
     /// # Safety
@@ -917,14 +924,18 @@ impl<V> DirectArenaPin<'_, V> {
         unsafe_code,
         reason = "transfers one active reader epoch into an owned protected value"
     )]
-    pub(crate) unsafe fn into_protected(mut self, handle: DirectHandle) -> DirectArenaValue<V> {
+    pub(crate) unsafe fn into_protected(
+        mut self,
+        handle: DirectHandle,
+    ) -> DirectArenaValue<'arena, V> {
         self.active = false;
+        let arena: &'arena DirectValueArena<V> = self.arena;
         // SAFETY: this function's contract binds the live handle to this exact
         // pin. Disabling `self.active` transfers its one reader reservation to
-        // the returned owner, which keeps the arena allocation alive.
+        // the returned value, whose borrow keeps the arena allocation alive.
         unsafe {
             DirectArenaValue::protected(
-                &self.arena.owner,
+                &arena.owner,
                 self.reader_epoch,
                 self.reader_shard,
                 handle.pointer::<V>(),
@@ -943,7 +954,10 @@ impl<V> DirectArenaPin<'_, V> {
         unsafe_code,
         reason = "retires an exact allocation while transferring reader protection"
     )]
-    pub(crate) unsafe fn into_retired(self, handle: RemovedDirectHandle) -> DirectArenaValue<V> {
+    pub(crate) unsafe fn into_retired(
+        self,
+        handle: RemovedDirectHandle,
+    ) -> DirectArenaValue<'arena, V> {
         let published = handle.published();
         // SAFETY: this function's contract proves both operations use the same
         // pin/arena and the same uniquely removed allocation.
@@ -995,7 +1009,7 @@ impl<V> DirectArenaMutationPin<'_, V> {
     }
 }
 
-impl<V> DirectArenaValue<V> {
+impl<'arena, V> DirectArenaValue<'arena, V> {
     /// Transfers one active direct-reader epoch into an owned protected value.
     ///
     /// # Safety
@@ -1008,14 +1022,14 @@ impl<V> DirectArenaValue<V> {
         reason = "declares the raw pointer and reader-epoch ownership transfer"
     )]
     unsafe fn protected(
-        owner: &Arc<DirectArenaOwner<V>>,
+        owner: &'arena DirectArenaOwner<V>,
         reader_epoch: usize,
         reader_shard: usize,
         pointer: *mut DirectArenaEntry<V>,
     ) -> Self {
         let pointer = NonNull::new(pointer).expect("protected direct-arena pointer is non-null");
         Self {
-            owner: Arc::clone(owner),
+            owner,
             reader_epoch,
             reader_shard,
             pointer,
@@ -1027,7 +1041,7 @@ impl<V> DirectArenaValue<V> {
     unsafe_code,
     reason = "dereferences a pointer retained by an owned reader epoch"
 )]
-impl<V> Deref for DirectArenaValue<V> {
+impl<V> Deref for DirectArenaValue<'_, V> {
     type Target = DirectArenaEntry<V>;
 
     fn deref(&self) -> &Self::Target {
@@ -1037,7 +1051,7 @@ impl<V> Deref for DirectArenaValue<V> {
     }
 }
 
-impl<V> Drop for DirectArenaValue<V> {
+impl<V> Drop for DirectArenaValue<'_, V> {
     fn drop(&mut self) {
         self.owner.leave(self.reader_epoch, self.reader_shard);
     }

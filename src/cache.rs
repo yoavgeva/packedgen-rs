@@ -1398,12 +1398,25 @@ impl DirectPendingLengths {
     }
 }
 
-/// Owned epoch guard for a value returned by [`DirectPackedCache`].
-pub struct DirectCacheValue<V> {
-    entry: DirectArenaValue<V>,
+/// Epoch guard for a value returned by [`DirectPackedCache`].
+///
+/// The guard borrows its cache, so reads on many threads share no reference
+/// count. It cannot outlive the cache:
+///
+/// ```compile_fail,E0505
+/// use packedgen::{CacheConfig, DirectPackedCache};
+///
+/// let cache = DirectPackedCache::try_new(CacheConfig::new(1_024)).unwrap();
+/// cache.insert_discard_with_options(b"key", 7_u64, 16, None).unwrap();
+/// let value = cache.get(b"key").unwrap();
+/// drop(cache);
+/// assert_eq!(*value, 7);
+/// ```
+pub struct DirectCacheValue<'cache, V> {
+    entry: DirectArenaValue<'cache, V>,
 }
 
-impl<V> Deref for DirectCacheValue<V> {
+impl<V> Deref for DirectCacheValue<'_, V> {
     type Target = V;
 
     fn deref(&self) -> &Self::Target {
@@ -1411,13 +1424,13 @@ impl<V> Deref for DirectCacheValue<V> {
     }
 }
 
-impl<V> AsRef<V> for DirectCacheValue<V> {
+impl<V> AsRef<V> for DirectCacheValue<'_, V> {
     fn as_ref(&self) -> &V {
         self
     }
 }
 
-impl<V: fmt::Debug> fmt::Debug for DirectCacheValue<V> {
+impl<V: fmt::Debug> fmt::Debug for DirectCacheValue<'_, V> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.deref().fmt(formatter)
     }
@@ -5581,7 +5594,7 @@ impl<V> DirectPackedCache<V> {
 
     /// Reads and records access to a live value.
     #[must_use]
-    pub fn get(&self, key: &[u8]) -> Option<DirectCacheValue<V>> {
+    pub fn get(&self, key: &[u8]) -> Option<DirectCacheValue<'_, V>> {
         let value = self.lookup(key, true);
         let counters = &self.counters[direct_arena_thread() & (COUNTER_SHARDS - 1)];
         if value.is_some() {
@@ -5618,7 +5631,7 @@ impl<V> DirectPackedCache<V> {
 
     /// Reads without changing access or operation counters.
     #[must_use]
-    pub fn peek(&self, key: &[u8]) -> Option<DirectCacheValue<V>> {
+    pub fn peek(&self, key: &[u8]) -> Option<DirectCacheValue<'_, V>> {
         self.lookup(key, false)
     }
 
@@ -6357,7 +6370,7 @@ impl<V> DirectPackedCache<V> {
         unsafe_code,
         reason = "the exact removal and arena pin belong to this cache"
     )]
-    pub fn remove(&self, key: &[u8]) -> Option<DirectCacheValue<V>> {
+    pub fn remove(&self, key: &[u8]) -> Option<DirectCacheValue<'_, V>> {
         let pin = self.arena.pin();
         let handle = published_direct_handle_from_index(self.index.remove(key)?);
         // SAFETY: the exact removed handle and pin belong to this cache.
@@ -7005,7 +7018,7 @@ impl<V> DirectPackedCache<V> {
         unsafe_code,
         reason = "each lookup pairs this cache's unchanged index handle with its arena pin"
     )]
-    fn lookup(&self, key: &[u8], record_access: bool) -> Option<DirectCacheValue<V>> {
+    fn lookup(&self, key: &[u8], record_access: bool) -> Option<DirectCacheValue<'_, V>> {
         for _ in 0..16 {
             let pin = self.arena.pin();
             let raw = self.index.get_protected(key)?;
@@ -9233,6 +9246,25 @@ mod tests {
         let expected = (0..300).filter(|index| index % 16 == 0).collect::<Vec<_>>();
 
         assert_eq!(sampled, expected);
+    }
+
+    #[test]
+    fn direct_owned_reads_do_not_share_one_reference_count() {
+        let cache = DirectPackedCache::<u64>::try_new(CacheConfig::new(u64::MAX)).unwrap();
+        for id in 0..3_u64 {
+            cache
+                .insert_discard_with_options(&id.to_le_bytes(), id, 16, None)
+                .unwrap();
+        }
+        let baseline = cache.arena.owner_references();
+
+        // Every reader thread incremented and decremented this one count on
+        // each owned read, so owned reads lost throughput as threads grew.
+        let got = cache.get(&0_u64.to_le_bytes()).unwrap();
+        let peeked = cache.peek(&1_u64.to_le_bytes()).unwrap();
+        let removed = cache.remove(&2_u64.to_le_bytes()).unwrap();
+        assert_eq!(cache.arena.owner_references(), baseline);
+        assert_eq!((*got, *peeked, *removed), (0, 1, 2));
     }
 
     fn probation_test_cache() -> DirectPackedCache<u64> {
