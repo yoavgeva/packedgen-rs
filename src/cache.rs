@@ -498,15 +498,26 @@ impl fmt::Display for CacheInsertError {
 
 impl std::error::Error for CacheInsertError {}
 
-/// An owned epoch guard keeping a cache value stable after lookup or removal.
+/// An epoch guard keeping a cache value stable after lookup or removal.
 ///
 /// This guard is thread-local and is intentionally not `Send`. Use or drop it
-/// on the thread that created it.
-pub struct CacheValue<V> {
-    entry: ArenaValue<ArenaEntry<V>>,
+/// on the thread that created it. It borrows its cache, so reads on many
+/// threads share no reference count, and it cannot outlive the cache:
+///
+/// ```compile_fail,E0505
+/// use packedgen::{CacheConfig, PackedCache};
+///
+/// let cache = PackedCache::try_new(CacheConfig::new(1_024)).unwrap();
+/// cache.insert_discard_with_options(b"key", 7_u64, 16, None).unwrap();
+/// let value = cache.get(b"key").unwrap();
+/// drop(cache);
+/// assert_eq!(*value, 7);
+/// ```
+pub struct CacheValue<'cache, V> {
+    entry: ArenaValue<'cache, ArenaEntry<V>>,
 }
 
-impl<V> Deref for CacheValue<V> {
+impl<V> Deref for CacheValue<'_, V> {
     type Target = V;
 
     fn deref(&self) -> &Self::Target {
@@ -514,13 +525,13 @@ impl<V> Deref for CacheValue<V> {
     }
 }
 
-impl<V> AsRef<V> for CacheValue<V> {
+impl<V> AsRef<V> for CacheValue<'_, V> {
     fn as_ref(&self) -> &V {
         self
     }
 }
 
-impl<V: fmt::Debug> fmt::Debug for CacheValue<V> {
+impl<V: fmt::Debug> fmt::Debug for CacheValue<'_, V> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.deref().fmt(formatter)
     }
@@ -528,11 +539,11 @@ impl<V: fmt::Debug> fmt::Debug for CacheValue<V> {
 
 /// Result of a successful cache insertion.
 #[derive(Debug)]
-pub enum CacheInsertOutcome<V> {
+pub enum CacheInsertOutcome<'cache, V> {
     /// The key was absent.
     Inserted,
     /// The previous value was replaced and remains safely owned by this result.
-    Replaced(CacheValue<V>),
+    Replaced(CacheValue<'cache, V>),
 }
 
 /// Result of a cache insertion that does not retain the previous value.
@@ -2652,7 +2663,7 @@ impl<V> PackedCache<V> {
 
     /// Reads and records access to a live value.
     #[must_use]
-    pub fn get(&self, key: &[u8]) -> Option<CacheValue<V>> {
+    pub fn get(&self, key: &[u8]) -> Option<CacheValue<'_, V>> {
         let value = self.lookup(key, true);
         let counters = &self.counters[direct_arena_thread() & (COUNTER_SHARDS - 1)];
         if value.is_some() {
@@ -2666,7 +2677,7 @@ impl<V> PackedCache<V> {
     /// Reads a live value without changing its approximate-LRU timestamp or
     /// hit/miss counters.
     #[must_use]
-    pub fn peek(&self, key: &[u8]) -> Option<CacheValue<V>> {
+    pub fn peek(&self, key: &[u8]) -> Option<CacheValue<'_, V>> {
         self.lookup(key, false)
     }
 
@@ -2679,7 +2690,11 @@ impl<V> PackedCache<V> {
     ///
     /// Rejects a value whose estimated charge exceeds the cache budget or an
     /// insertion whose arena partition exhausted its handle slot domain.
-    pub fn insert(&self, key: &[u8], value: V) -> Result<CacheInsertOutcome<V>, CacheInsertError> {
+    pub fn insert(
+        &self,
+        key: &[u8],
+        value: V,
+    ) -> Result<CacheInsertOutcome<'_, V>, CacheInsertError> {
         let weight = (key.len() as u64).saturating_add(std::mem::size_of::<V>() as u64);
         self.insert_with_options(key, value, weight, self.config.default_ttl)
     }
@@ -2862,7 +2877,7 @@ impl<V> PackedCache<V> {
         value: V,
         weight: u64,
         ttl: Option<Duration>,
-    ) -> Result<CacheInsertOutcome<V>, CacheInsertError> {
+    ) -> Result<CacheInsertOutcome<'_, V>, CacheInsertError> {
         let compact_weight = self.validate_weight(key, weight)?;
         let entry = ArenaEntry::new(value, compact_weight, self.deadline(ttl));
         let (outcome, protected) = {
@@ -3009,7 +3024,7 @@ impl<V> PackedCache<V> {
         &self,
         key: &[u8],
         mut entry: Box<ArenaEntry<V>>,
-    ) -> Result<(CacheInsertOutcome<V>, ArenaHandle), CacheInsertError> {
+    ) -> Result<(CacheInsertOutcome<'_, V>, ArenaHandle), CacheInsertError> {
         if let Some(raw) = self.index.get(key) {
             let handle = ArenaHandle::from_index_value(raw);
             // SAFETY: the caller holds this key's mutation stripe, and the
@@ -3083,7 +3098,7 @@ impl<V> PackedCache<V> {
         &self,
         key: &[u8],
         indexed: &InsertOutcome<NonMaxU64>,
-    ) -> CacheInsertOutcome<V> {
+    ) -> CacheInsertOutcome<'_, V> {
         match indexed {
             InsertOutcome::Inserted => {
                 self.counters_for(key)
@@ -3111,7 +3126,7 @@ impl<V> PackedCache<V> {
         unsafe_code,
         reason = "removes the authoritative arena allocation under its same-key stripe"
     )]
-    pub fn remove(&self, key: &[u8]) -> Option<CacheValue<V>> {
+    pub fn remove(&self, key: &[u8]) -> Option<CacheValue<'_, V>> {
         let _mutation = self.mutation_stripe(key).lock();
         let handle = ArenaHandle::from_index_value(self.index.remove(key)?);
         // SAFETY: `_mutation` holds the stripe for `key`, and `handle` was just
@@ -3284,7 +3299,7 @@ impl<V> PackedCache<V> {
         }
     }
 
-    fn lookup(&self, key: &[u8], record_access: bool) -> Option<CacheValue<V>> {
+    fn lookup(&self, key: &[u8], record_access: bool) -> Option<CacheValue<'_, V>> {
         // A replacement publishes its new handle before retiring the old arena
         // slot. Readers that caught the old handle retry; the wider bound keeps
         // rapid same-key replacement from surfacing a transient false miss.
@@ -9246,6 +9261,28 @@ mod tests {
         let expected = (0..300).filter(|index| index % 16 == 0).collect::<Vec<_>>();
 
         assert_eq!(sampled, expected);
+    }
+
+    #[test]
+    fn packed_owned_reads_do_not_share_one_reference_count() {
+        let cache = PackedCache::<u64>::try_new(CacheConfig::new(u64::MAX)).unwrap();
+        for id in 0..4_u64 {
+            cache
+                .insert_discard_with_options(&id.to_le_bytes(), id, 16, None)
+                .unwrap();
+        }
+        let baseline = cache.arena.collector_references();
+
+        let got = cache.get(&0_u64.to_le_bytes()).unwrap();
+        let peeked = cache.peek(&1_u64.to_le_bytes()).unwrap();
+        let removed = cache.remove(&2_u64.to_le_bytes()).unwrap();
+        let CacheInsertOutcome::Replaced(replaced) =
+            cache.insert(&3_u64.to_le_bytes(), 30).unwrap()
+        else {
+            panic!("key 3 was resident");
+        };
+        assert_eq!(cache.arena.collector_references(), baseline);
+        assert_eq!((*got, *peeked, *removed, *replaced), (0, 1, 2, 3));
     }
 
     #[test]

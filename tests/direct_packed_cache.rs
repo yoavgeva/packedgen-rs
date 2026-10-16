@@ -3095,8 +3095,10 @@ fn miri_conditional_block_and_boxed_reclaimers_coexist() {
         assert!(guard.remove_discard(&[key]));
     }
     drop(guard);
-    drop(cache);
     assert_eq!(held.as_slice(), [99; 16]);
+    // Values borrow the cache, so teardown follows the last held value.
+    drop(held);
+    drop(cache);
 }
 
 #[cfg(miri)]

@@ -9,7 +9,7 @@
 use std::cell::{Cell, UnsafeCell};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
-use std::mem::{ManuallyDrop, MaybeUninit};
+use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -189,10 +189,11 @@ impl<V> ArenaEntry<V> {
     }
 }
 
-/// A pointer protected by a thread-local epoch guard.
-pub(crate) struct ArenaValue<T> {
-    guard: ManuallyDrop<LocalGuard<'static>>,
-    _collector: Arc<Collector>,
+/// A pointer protected by a thread-local epoch guard borrowed from its
+/// collector. Owning a clone of the collector's `Arc` instead made every reader
+/// thread contend on one reference count.
+pub(crate) struct ArenaValue<'arena, T> {
+    _guard: LocalGuard<'arena>,
     pointer: NonNull<T>,
     _value: PhantomData<T>,
 }
@@ -274,30 +275,18 @@ impl<V> ArenaPin<'_, V> {
     }
 }
 
-impl<T> ArenaValue<T> {
+impl<'arena, T> ArenaValue<'arena, T> {
     /// Takes ownership of one collector guard protecting `pointer`.
     ///
     /// # Safety
     ///
-    /// `guard` must have been entered from `collector`, and `pointer` must be a
-    /// live non-null allocation protected by that guard for the complete
-    /// lifetime transferred into the returned value.
-    #[allow(
-        unsafe_code,
-        reason = "owns a protected pointer and its transmuted collector guard"
-    )]
-    unsafe fn protected(
-        collector: &Arc<Collector>,
-        guard: LocalGuard<'_>,
-        pointer: *mut T,
-    ) -> Self {
+    /// `pointer` must be a live non-null allocation protected by `guard` for
+    /// the complete lifetime transferred into the returned value.
+    #[allow(unsafe_code, reason = "declares a guard-protected raw pointer")]
+    unsafe fn protected(guard: LocalGuard<'arena>, pointer: *mut T) -> Self {
         let pointer = NonNull::new(pointer).expect("protected arena pointer is non-null");
-        // SAFETY: the collector is heap-owned by the Arc stored in this value.
-        // Its address is stable, and Drop destroys the guard before that Arc.
-        let guard = unsafe { std::mem::transmute::<LocalGuard<'_>, LocalGuard<'static>>(guard) };
         Self {
-            guard: ManuallyDrop::new(guard),
-            _collector: Arc::clone(collector),
+            _guard: guard,
             pointer,
             _value: PhantomData,
         }
@@ -307,21 +296,21 @@ impl<T> ArenaValue<T> {
     ///
     /// # Safety
     ///
-    /// `guard` must have been entered from `collector`. `pointer` must be a
-    /// live allocation created for `reclaim::boxed`, must be unreachable to
-    /// future arena loads, and must not be retired anywhere else.
+    /// `pointer` must be a live allocation created for `reclaim::boxed`, must
+    /// be unreachable to future arena loads, and must not be retired anywhere
+    /// else.
     #[allow(
         unsafe_code,
         reason = "retires one unreachable pointer through its exact collector guard"
     )]
-    unsafe fn retired(collector: &Arc<Collector>, guard: LocalGuard<'_>, pointer: *mut T) -> Self {
+    unsafe fn retired(guard: LocalGuard<'arena>, pointer: *mut T) -> Self {
         // SAFETY: the caller has already made pointer unreachable to future
         // arena loads. It originated from Box::into_raw, and this guard keeps
         // the current protected access alive until the returned value drops.
         unsafe { guard.defer_retire(pointer, reclaim::boxed) };
-        // SAFETY: this function's contract carries the same collector, guard,
-        // liveness, and allocation proof required by `protected`.
-        unsafe { Self::protected(collector, guard, pointer) }
+        // SAFETY: this function's contract carries the same guard, liveness,
+        // and allocation proof required by `protected`.
+        unsafe { Self::protected(guard, pointer) }
     }
 }
 
@@ -329,25 +318,13 @@ impl<T> ArenaValue<T> {
     unsafe_code,
     reason = "dereferences a pointer retained by the owned collector guard"
 )]
-impl<T> Deref for ArenaValue<T> {
+impl<T> Deref for ArenaValue<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
         // SAFETY: construction requires a collector-protected pointer, and the
         // owned guard remains active for the complete lifetime of self.
         unsafe { self.pointer.as_ref() }
-    }
-}
-
-#[allow(
-    unsafe_code,
-    reason = "manually releases the owned collector guard after the pointer"
-)]
-impl<T> Drop for ArenaValue<T> {
-    fn drop(&mut self) {
-        // SAFETY: ManuallyDrop prevents automatic destruction; the guard must
-        // leave its reservation before the final collector Arc is released.
-        unsafe { ManuallyDrop::drop(&mut self.guard) };
     }
 }
 
@@ -2876,6 +2853,11 @@ pub(crate) struct ValueArena<V> {
 }
 
 impl<V> ValueArena<V> {
+    #[cfg(test)]
+    pub(crate) fn collector_references(&self) -> usize {
+        Arc::strong_count(&self.collector)
+    }
+
     pub(crate) fn new(partitions: usize) -> Self {
         let partitions = partitions.clamp(1, 256).next_power_of_two().min(256);
         Self {
@@ -2966,7 +2948,7 @@ impl<V> ValueArena<V> {
         unsafe_code,
         reason = "constructs a value only after collector protection and generation revalidation"
     )]
-    pub(crate) fn get(&self, handle: ArenaHandle) -> Option<ArenaValue<ArenaEntry<V>>> {
+    pub(crate) fn get(&self, handle: ArenaHandle) -> Option<ArenaValue<'_, ArenaEntry<V>>> {
         let partition = self.partitions.get(handle.shard())?;
         let (slot, generation) = partition.slot(handle.slot())?;
         let before = generation.load(Ordering::Acquire) & MAX_GENERATION;
@@ -2981,7 +2963,7 @@ impl<V> ValueArena<V> {
         }
         // SAFETY: `guard` came from this collector and protected the non-null
         // slot pointer across the matching generation validation above.
-        Some(unsafe { ArenaValue::protected(&self.collector, guard, pointer) })
+        Some(unsafe { ArenaValue::protected(guard, pointer) })
     }
 
     /// Removes a published allocation and returns ownership protected by the
@@ -2996,7 +2978,10 @@ impl<V> ValueArena<V> {
         unsafe_code,
         reason = "removes and retires one caller-proven exclusively mutable slot"
     )]
-    pub(crate) unsafe fn remove(&self, handle: ArenaHandle) -> Option<ArenaValue<ArenaEntry<V>>> {
+    pub(crate) unsafe fn remove(
+        &self,
+        handle: ArenaHandle,
+    ) -> Option<ArenaValue<'_, ArenaEntry<V>>> {
         let partition = self.partitions.get(handle.shard())?;
         let mut state = partition.state.lock();
         let (slot, generation) = partition.slot(handle.slot())?;
@@ -3022,7 +3007,7 @@ impl<V> ValueArena<V> {
         // authoritative slot. The generation advanced before the slot can be
         // reused, and this function's mutation contract excludes a second
         // remover for the same publication.
-        Some(unsafe { ArenaValue::retired(&self.collector, guard, pointer) })
+        Some(unsafe { ArenaValue::retired(guard, pointer) })
     }
 
     /// Replaces the allocation identified by `handle`.
@@ -3041,7 +3026,7 @@ impl<V> ValueArena<V> {
         &self,
         handle: ArenaHandle,
         replacement: Box<ArenaEntry<V>>,
-    ) -> Result<ArenaValue<ArenaEntry<V>>, Box<ArenaEntry<V>>> {
+    ) -> Result<ArenaValue<'_, ArenaEntry<V>>, Box<ArenaEntry<V>>> {
         let Some(partition) = self.partitions.get(handle.shard()) else {
             return Err(replacement);
         };
@@ -3071,7 +3056,7 @@ impl<V> ValueArena<V> {
         // SAFETY: the mutation-stripe contract makes `previous` the exact live
         // allocation protected above and the swap made it unreachable. This
         // guard belongs to the same collector and retirement occurs once.
-        Ok(unsafe { ArenaValue::retired(&self.collector, guard, previous) })
+        Ok(unsafe { ArenaValue::retired(guard, previous) })
     }
 
     /// Replaces and retires the allocation identified by `handle`.
