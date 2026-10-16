@@ -3,8 +3,9 @@
 //! Usage: `hit_ratio_sim TRACE ENTRIES OPERATIONS SEED [POLICY...]`.
 //!
 //! TRACE is `turnover`, `zipf:ALPHA`, `scan-zipf:ALPHA`, `shift:ALPHA`, `loop`,
-//! or `file:PATH` (one key per line; `OPERATIONS` of zero replays the whole
-//! file). POLICY defaults to every policy: `packed`, `packed-doorkeeper`,
+//! `file:PATH` (one key per line), or `arc:PATH` (an ARC-paper `.lis` trace,
+//! whose `START COUNT ...` lines each read `COUNT` consecutive blocks). For
+//! file traces, `OPERATIONS` of zero replays the whole file. POLICY defaults to every policy: `packed`, `packed-doorkeeper`,
 //! `packed-adaptive`, `packed-tiered`, `quick`, `lru`, `opt`, and the reference
 //! models `model-clock`, `model-s3clock`, and `model-s3fifo`. One CSV row is
 //! printed per policy. A packed policy accepts `/batch=N`, `/probation=BPS`,
@@ -241,6 +242,35 @@ fn file(path: &str, operations: u64) -> Trace {
     }
 }
 
+/// Expands an ARC-paper trace (Megiddo and Modha, FAST 2003): each line is
+/// `START COUNT IGNORED REQUEST` and reads blocks `START..START + COUNT`.
+fn arc(path: &str, operations: u64) -> Trace {
+    let text = std::fs::read_to_string(path).expect("trace file is readable UTF-8");
+    let limit = if operations == 0 {
+        usize::MAX
+    } else {
+        usize::try_from(operations).expect("operation count fits usize")
+    };
+    let mut requests = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.split_ascii_whitespace();
+        let (Some(start), Some(count)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let start: u64 = start.parse().expect("ARC start block is an integer");
+        let count: u64 = count.parse().expect("ARC block count is an integer");
+        requests.extend((start..start + count).map(read));
+        if requests.len() >= limit {
+            requests.truncate(limit);
+            break;
+        }
+    }
+    Trace {
+        preload: 0..0,
+        requests,
+    }
+}
+
 fn build_trace(name: &str, entries: u64, operations: u64, seed: u64) -> Trace {
     let alpha = |spec: &str| -> f64 { spec.parse().expect("ALPHA is a number") };
     match name.split_once(':') {
@@ -250,6 +280,7 @@ fn build_trace(name: &str, entries: u64, operations: u64, seed: u64) -> Trace {
         Some(("scan-zipf", spec)) => scan_zipf(entries, operations, seed, alpha(spec)),
         Some(("shift", spec)) => shift(entries, operations, seed, alpha(spec)),
         Some(("file", path)) => file(path, operations),
+        Some(("arc", path)) => arc(path, operations),
         _ => panic!("unknown trace: {name}"),
     }
 }
@@ -922,6 +953,18 @@ mod tests {
             preload: 0..0,
             requests: ids.iter().copied().map(read).collect(),
         }
+    }
+
+    #[test]
+    fn arc_lines_expand_into_consecutive_block_reads() {
+        let path =
+            std::env::temp_dir().join(format!("hit_ratio_sim_arc_{}.lis", std::process::id()));
+        std::fs::write(&path, "10 3 0 0\n7 1 0 1\n").unwrap();
+        let trace = arc(path.to_str().unwrap(), 0);
+        std::fs::remove_file(&path).unwrap();
+        let ids: Vec<u64> = trace.requests.iter().map(|request| request.id).collect();
+        assert_eq!(ids, [10, 11, 12, 7]);
+        assert!(trace.requests.iter().all(|request| !request.write));
     }
 
     #[test]
