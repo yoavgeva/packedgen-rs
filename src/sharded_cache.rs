@@ -1209,25 +1209,18 @@ where
 
     /// Drops the values of removed entries that no reader can still reach.
     ///
-    /// Writes reclaim a few removed entries each, in the shard they write, so
-    /// after a burst of writes some removed values wait for later writes to
-    /// their shards. Call this to drop them promptly. Readers holding a
-    /// [`ShardedCacheGuard`] or a racing operation's pin can delay it.
+    /// A write drops about as many removed values as it removes, from those
+    /// its thread removed earlier, so after a burst of writes some removed
+    /// values wait for later writes on their threads. Call this to drop them
+    /// promptly. Readers holding a [`ShardedCacheGuard`] or a racing
+    /// operation's pin can delay it.
     pub fn maintain(&self) {
         // Three advances age every entry removed before this call.
         for _ in 0..3 {
             self.epochs.try_advance();
         }
-        loop {
-            let mut reclaimed = Reclaimed::new();
-            let more = self
-                .retired
-                .reclaim_all(self.epochs.generation(), &mut reclaimed);
-            reclaimed.finish(&self.slots);
-            if !more {
-                break;
-            }
-        }
+        self.retired
+            .reclaim_all(self.epochs.generation(), &self.slots);
     }
 
     fn shard_index(&self, hash: u64) -> usize {

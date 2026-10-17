@@ -431,8 +431,8 @@ impl<T> RetiredSlots<T> {
         let foreign_queue = (queue.until_foreign_drain == 0).then(|| {
             queue.until_foreign_drain = FOREIGN_DRAIN_EVERY;
             let next = queue.next_foreign;
-            queue.next_foreign = next + 1;
-            next & (RETIRED_QUEUES - 1)
+            queue.next_foreign = next.wrapping_add(1);
+            next
         });
         let advance = if queue.unreported >= REPORT_EVERY {
             epochs.note_retired(std::mem::take(&mut queue.unreported))
@@ -440,27 +440,41 @@ impl<T> RetiredSlots<T> {
             false
         };
         drop(queue);
-        if let Some(index) = foreign_queue.filter(|index| *index != own)
+        if let Some(next) = foreign_queue
+            && let index = next & (RETIRED_QUEUES - 1)
+            && index != own
             && let Some(mut queue) = self.queues[index].0.try_lock()
             // Only a queue whose newest slot is aged: its thread has retired
             // nothing for three advances, so it is not draining the queue.
             && queue.slots.back().is_some_and(|&(due, _)| due <= generation)
         {
             Self::take_aged(&mut queue, generation, foreign, RECLAIM_BATCH);
+            drop(queue);
+            // Return to this queue until it is drained.
+            self.queues[own].0.lock().next_foreign = next;
         }
         advance
     }
 
-    /// Moves aged slots from every queue into `reclaimed` while it has room;
-    /// returns whether it filled up.
-    pub(crate) fn reclaim_all(&self, generation: usize, reclaimed: &mut Reclaimed<T>) -> bool {
+    /// Reclaims every slot aged by `generation`, a batch at a time, dropping
+    /// values outside the queue locks.
+    pub(crate) fn reclaim_all(&self, generation: usize, store: &SlotStore<T>) {
         for queue in &self.queues {
-            Self::take_aged(&mut queue.0.lock(), generation, reclaimed, RECLAIM_BATCH);
-            if reclaimed.is_full() {
-                return true;
+            loop {
+                let mut reclaimed = Reclaimed::new();
+                Self::take_aged(
+                    &mut queue.0.lock(),
+                    generation,
+                    &mut reclaimed,
+                    RECLAIM_BATCH,
+                );
+                let full = reclaimed.is_full();
+                reclaimed.finish(store);
+                if !full {
+                    break;
+                }
             }
         }
-        false
     }
 
     /// Moves up to `limit` aged slots from one queue while `reclaimed` has
@@ -477,7 +491,7 @@ impl<T> RetiredSlots<T> {
             match queue.slots.front() {
                 Some(&(due, slot)) if due <= generation => {
                     queue.slots.pop_front();
-                    reclaimed.slots[reclaimed.len] = Some(slot);
+                    reclaimed.slots[reclaimed.len] = slot;
                     reclaimed.len += 1;
                 }
                 _ => break,
@@ -692,47 +706,46 @@ impl<T> SlotStore<T> {
     }
 }
 
-/// Up to `RECLAIM_BATCH` aged slots collected under a shard lock, whose
-/// values are dropped and slots freed after it is released.
+/// Up to `RECLAIM_BATCH` aged slots collected under a queue lock, whose
+/// values are dropped and slots given to the thread's stack after it is
+/// released.
 pub(crate) struct Reclaimed<T> {
-    slots: [Option<NonNull<Slot<T>>>; RECLAIM_BATCH],
+    slots: [NonNull<Slot<T>>; RECLAIM_BATCH],
     len: usize,
 }
 
-/// Aged slots one operation reclaims at most.
-pub(crate) const RECLAIM_BATCH: usize = 16;
+/// Aged slots one batch holds. A write reclaims about as many as it retires,
+/// one or two, so batches stay small enough to hand on by value cheaply.
+pub(crate) const RECLAIM_BATCH: usize = 4;
 
 impl<T> Reclaimed<T> {
     pub(crate) const fn new() -> Self {
         Self {
-            slots: [None; RECLAIM_BATCH],
+            slots: [NonNull::dangling(); RECLAIM_BATCH],
             len: 0,
         }
     }
 
-    pub(crate) const fn is_full(&self) -> bool {
+    const fn is_full(&self) -> bool {
         self.len == RECLAIM_BATCH
     }
 
     /// Drops each value and gives the vacant slots to this thread's stack.
-    /// If a value panics while dropping, the slots not yet given leak.
+    /// If a value panics while dropping, the batch's slots leak, with the
+    /// values after it.
     #[allow(unsafe_code, reason = "drops values of slots no pin reaches")]
-    pub(crate) fn finish(mut self, store: &SlotStore<T>) {
-        let mut vacant = [NonNull::<Slot<T>>::dangling(); RECLAIM_BATCH];
-        let mut len = 0;
-        for index in 0..self.len {
-            let Some(slot) = self.slots[index].take() else {
-                continue;
-            };
+    #[inline]
+    pub(crate) fn finish(self, store: &SlotStore<T>) {
+        if self.len == 0 {
+            return;
+        }
+        let slots = &self.slots[..self.len];
+        for slot in slots {
             // SAFETY: an aged retired slot holds an initialized value that no
-            // pin reaches and that only this list owns.
-            unsafe { drop_value(slot) };
-            vacant[len] = slot;
-            len += 1;
+            // pin reaches and that only this batch owns.
+            unsafe { drop_value(*slot) };
         }
-        if len != 0 {
-            store.give(&vacant[..len]);
-        }
+        store.give(slots);
     }
 }
 
@@ -879,6 +892,13 @@ mod tests {
             assert_eq!(retired.queued(other), 0, "the idle queue was not drained");
             drop(to_other);
         });
+    }
+
+    #[test]
+    fn a_writes_reclamation_batch_fits_a_cache_line() {
+        // Every write sets up two, its own and a foreign drain's, and hands
+        // them on by value.
+        assert!(std::mem::size_of::<Reclaimed<u64>>() <= 64);
     }
 
     #[test]
