@@ -407,7 +407,15 @@ impl<K: Hash + Eq, V, W: Weighter<K, V>, S: BuildHasher> ShardedCache<K, V, W, S
                     };
                     retired.push(victim);
                 }
-                let slot = shard.place(hash, handle);
+                let slot = if let Some(slot) = shard.place(hash, handle) {
+                    slot
+                } else {
+                    // Both candidate buckets are full: make room in them.
+                    retired.push(self.evict_candidate(shard, &mut writer, &pin, hash));
+                    shard
+                        .place(hash, handle)
+                        .expect("evicting from a candidate bucket frees a slot")
+                };
                 writer.len += 1;
                 writer.weight += weight;
                 if !writer.ghost.contains(hash) {
@@ -511,8 +519,9 @@ impl<K: Hash + Eq, V, W: Weighter<K, V>, S: BuildHasher> ShardedCache<K, V, W, S
         }
         let slots = shard.buckets.len() * SLOTS;
         // Each pass takes one access mark from every entry, and entries hold
-        // at most two, so three passes always find a victim.
-        for _ in 0..3 * slots {
+        // at most two, so the third pass finds an unread victim unless
+        // readers keep marking; it then evicts regardless.
+        for step in 0..3 * slots {
             let slot = writer.hand;
             writer.hand = if slot + 1 == slots { 0 } else { slot + 1 };
             let raw = shard.bucket(slot).handles[slot % SLOTS].load(Ordering::Relaxed);
@@ -522,7 +531,7 @@ impl<K: Hash + Eq, V, W: Weighter<K, V>, S: BuildHasher> ShardedCache<K, V, W, S
             let handle = handle_from_raw(raw);
             // SAFETY: the shard lock keeps this published handle in the table.
             let entry = unsafe { entry(pin, handle) };
-            if entry.take_accessed() {
+            if entry.take_accessed() && step < 2 * slots {
                 continue;
             }
             let hash = self.hash_builder.hash_one(&entry.value().0);
@@ -532,6 +541,41 @@ impl<K: Hash + Eq, V, W: Weighter<K, V>, S: BuildHasher> ShardedCache<K, V, W, S
             return Some(removed);
         }
         None
+    }
+
+    /// Removes the first unread entry, sweeping access marks, from the two
+    /// buckets `hash` may occupy. Used only when both are full.
+    #[allow(
+        unsafe_code,
+        reason = "dereferences handles published in this shard while `pin` is held"
+    )]
+    fn evict_candidate(
+        &self,
+        shard: &Shard,
+        writer: &mut ShardWriter,
+        pin: &DirectArenaPin<'_, (K, V)>,
+        hash: u64,
+    ) -> DirectHandle {
+        let (home, alternate) = shard.candidates(hash);
+        let slots = [home, alternate].map(|bucket| bucket * SLOTS);
+        // Entries hold at most two access marks, so a third pass finds an
+        // unread one unless readers keep marking; then it takes the first.
+        for pass in 0..3 {
+            for slot in slots.iter().flat_map(|first| *first..*first + SLOTS) {
+                let raw = shard.bucket(slot).handles[slot % SLOTS].load(Ordering::Relaxed);
+                debug_assert_ne!(raw, 0, "both candidate buckets are full");
+                // SAFETY: the shard lock keeps this published handle in the table.
+                let entry = unsafe { entry(pin, handle_from_raw(raw)) };
+                if entry.take_accessed() && pass < 2 {
+                    continue;
+                }
+                let victim_home = shard.home(self.hash_builder.hash_one(&entry.value().0));
+                writer.len -= 1;
+                writer.weight -= entry.weight();
+                return shard.clear(slot, victim_home);
+            }
+        }
+        unreachable!("the third pass evicts its first slot")
     }
 }
 
@@ -639,75 +683,113 @@ impl Shard {
         }
     }
 
-    /// Finds the slot whose handle `matches`, scanning from the key's home
-    /// bucket while earlier keys probed past it. Lock-free.
+    /// The two buckets a key may live in: its home and an alternate chosen
+    /// from independent hash bits, so a full region never chains into the
+    /// next and displacement cannot grow.
+    fn candidates(&self, hash: u64) -> (usize, usize) {
+        let home = self.home(hash);
+        let mixed = (hash ^ (hash >> 29)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let alternate = self.home(mixed >> 32);
+        (
+            home,
+            if alternate == home {
+                self.next(home)
+            } else {
+                alternate
+            },
+        )
+    }
+
+    /// Finds the slot whose handle `matches` in the key's home bucket, then
+    /// in its alternate if any key from that home lives in its alternate.
+    /// Lock-free.
     fn find(
         &self,
         hash: u64,
         mut matches: impl FnMut(DirectHandle) -> bool,
     ) -> Option<(usize, DirectHandle)> {
         let tag = tag(hash);
-        let mut bucket = self.home(hash);
-        for _ in 0..self.buckets.len() {
-            let current = &self.buckets[bucket];
-            let control = current.control.load(Ordering::Acquire);
-            let mut candidates = zero_tag_bytes(control ^ (BYTE_ONES * u64::from(tag)));
-            while candidates != 0 {
-                let slot = candidates.trailing_zeros() as usize / 8;
-                candidates &= candidates - 1;
-                // Acquire pairs with the release store of a replacement
-                // handle, which does not touch the control word.
-                let raw = current.handles[slot].load(Ordering::Acquire);
-                if raw != 0 {
-                    let handle = handle_from_raw(raw);
-                    if matches(handle) {
-                        return Some((bucket * SLOTS + slot, handle));
-                    }
+        let (home, alternate) = self.candidates(hash);
+        let control = self.buckets[home].control.load(Ordering::Acquire);
+        if let Some(found) = self.find_in(home, control, tag, &mut matches) {
+            return Some(found);
+        }
+        if control >> OVERFLOW_SHIFT & OVERFLOW_MAX == 0 {
+            return None;
+        }
+        let control = self.buckets[alternate].control.load(Ordering::Acquire);
+        self.find_in(alternate, control, tag, &mut matches)
+    }
+
+    fn find_in(
+        &self,
+        bucket: usize,
+        control: u64,
+        tag: u8,
+        matches: &mut impl FnMut(DirectHandle) -> bool,
+    ) -> Option<(usize, DirectHandle)> {
+        let current = &self.buckets[bucket];
+        let mut candidates = zero_tag_bytes(control ^ (BYTE_ONES * u64::from(tag)));
+        while candidates != 0 {
+            let slot = candidates.trailing_zeros() as usize / 8;
+            candidates &= candidates - 1;
+            // Acquire pairs with the release store of a replacement handle,
+            // which does not touch the control word.
+            let raw = current.handles[slot].load(Ordering::Acquire);
+            if raw != 0 {
+                let handle = handle_from_raw(raw);
+                if matches(handle) {
+                    return Some((bucket * SLOTS + slot, handle));
                 }
             }
-            if control >> OVERFLOW_SHIFT & OVERFLOW_MAX == 0 {
-                return None;
-            }
-            bucket = self.next(bucket);
         }
         None
     }
 
-    /// Publishes `handle` in the first free slot from the key's home bucket,
-    /// counting the overflow on every full bucket it passes first. Requires
-    /// the shard lock and a free slot.
-    fn place(&self, hash: u64, handle: DirectHandle) -> usize {
-        let mut bucket = self.home(hash);
-        loop {
-            let current = &self.buckets[bucket];
-            let control = current.control.load(Ordering::Relaxed);
-            let empty = zero_tag_bytes(control);
-            if empty != 0 {
-                // The lowest flagged byte of `zero_tag_bytes` is always exact.
-                let slot = empty.trailing_zeros() as usize / 8;
-                current.handles[slot].store(handle.index_value().get(), Ordering::Release);
-                current.control.store(
-                    control | u64::from(tag(hash)) << (slot * 8),
-                    Ordering::Release,
-                );
-                return bucket * SLOTS + slot;
-            }
-            let overflow = control >> OVERFLOW_SHIFT & OVERFLOW_MAX;
-            if overflow < OVERFLOW_MAX {
-                // A saturated count stays saturated: lookups past it are
-                // only slower, never wrong.
-                current
-                    .control
-                    .store(control + (1 << OVERFLOW_SHIFT), Ordering::Release);
-            }
-            bucket = self.next(bucket);
+    /// Publishes `handle` in a free slot of the key's home bucket, or else of
+    /// its alternate, counting it in the home's overflow first. Returns
+    /// `None` when both are full. Requires the shard lock.
+    fn place(&self, hash: u64, handle: DirectHandle) -> Option<usize> {
+        let (home, alternate) = self.candidates(hash);
+        if let Some(slot) = self.place_in(home, hash, handle) {
+            return Some(slot);
         }
+        let alternate_control = self.buckets[alternate].control.load(Ordering::Relaxed);
+        if zero_tag_bytes(alternate_control) == 0 {
+            return None;
+        }
+        let home_bucket = &self.buckets[home];
+        let control = home_bucket.control.load(Ordering::Relaxed);
+        if control >> OVERFLOW_SHIFT & OVERFLOW_MAX < OVERFLOW_MAX {
+            // A saturated count stays saturated: lookups past it are only
+            // slower, never wrong. Six keys per bucket keep it far below.
+            home_bucket
+                .control
+                .store(control + (1 << OVERFLOW_SHIFT), Ordering::Release);
+        }
+        self.place_in(alternate, hash, handle)
     }
 
-    /// Unpublishes `slot`, whose key's home bucket is `home`, and releases
-    /// the overflow counts its placement added. Returns the handle swapped
-    /// out, which a lock-free replacement may have changed since the caller
-    /// read it. Requires the shard lock.
+    fn place_in(&self, bucket: usize, hash: u64, handle: DirectHandle) -> Option<usize> {
+        let current = &self.buckets[bucket];
+        let control = current.control.load(Ordering::Relaxed);
+        let empty = zero_tag_bytes(control);
+        if empty == 0 {
+            return None;
+        }
+        // The lowest flagged byte of `zero_tag_bytes` is always exact.
+        let slot = empty.trailing_zeros() as usize / 8;
+        current.handles[slot].store(handle.index_value().get(), Ordering::Release);
+        current.control.store(
+            control | (u64::from(tag(hash)) << (slot * 8)),
+            Ordering::Release,
+        );
+        Some(bucket * SLOTS + slot)
+    }
+
+    /// Unpublishes `slot`, whose key's home bucket is `home`, releasing the
+    /// home's overflow count if the key lived in its alternate. Returns the
+    /// handle swapped out. Requires the shard lock.
     fn clear(&self, slot: usize, home: usize) -> DirectHandle {
         let bucket = slot / SLOTS;
         let current = &self.buckets[bucket];
@@ -717,21 +799,16 @@ impl Shard {
             Ordering::Release,
         );
         let removed = handle_from_raw(current.handles[slot % SLOTS].swap(0, Ordering::AcqRel));
-        let mut passed = home;
-        while passed != bucket {
-            let passed_bucket = &self.buckets[passed];
-            let control = passed_bucket.control.load(Ordering::Relaxed);
+        if bucket != home {
+            let home_bucket = &self.buckets[home];
+            let control = home_bucket.control.load(Ordering::Relaxed);
             let overflow = control >> OVERFLOW_SHIFT & OVERFLOW_MAX;
-            debug_assert_ne!(
-                overflow, 0,
-                "a displaced key counted every bucket it passed"
-            );
+            debug_assert_ne!(overflow, 0, "a key in its alternate is counted at home");
             if overflow < OVERFLOW_MAX {
-                passed_bucket
+                home_bucket
                     .control
                     .store(control - (1 << OVERFLOW_SHIFT), Ordering::Release);
             }
-            passed = self.next(passed);
         }
         removed
     }
@@ -966,6 +1043,41 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        unsafe_code,
+        reason = "reads entries the table publishes under the test's pin"
+    )]
+    fn live_keys_stay_in_their_two_candidate_buckets_under_long_churn() {
+        // Linear probing with holes clustered under this churn until keys
+        // lived hundreds of buckets from home and every probe scanned the
+        // table.
+        let cache: ShardedCache<u64, u64> = ShardedCacheBuilder::new(800).shards(1).build();
+        let shard = &cache.shards[0];
+        for key in 0..1_000_000_u64 {
+            cache.insert(key, key);
+            if key % 5 == 0 {
+                let _ = cache.get(&(key / 3));
+            }
+        }
+        let pin = cache.arena.pin();
+        for (bucket, current) in shard.buckets.iter().enumerate() {
+            for handle in &current.handles {
+                let raw = handle.load(Ordering::Relaxed);
+                if raw == 0 {
+                    continue;
+                }
+                // SAFETY: the table publishes this handle while `pin` is held.
+                let key = unsafe { entry(&pin, handle_from_raw(raw)) }.value().0;
+                let (home, alternate) = shard.candidates(cache.hash_builder.hash_one(key));
+                assert!(
+                    bucket == home || bucket == alternate,
+                    "key {key} lives in bucket {bucket}, outside {home} and {alternate}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn borrowed_keys_find_owned_keys() {
         let cache: ShardedCache<String, u32> = ShardedCache::new(16);
         cache.insert("alpha".to_owned(), 1);
@@ -1019,38 +1131,43 @@ mod tests {
     }
 
     #[test]
-    fn colliding_keys_chain_through_overflow_and_unlink_cleanly() {
+    fn colliding_keys_fill_their_two_buckets_and_unlink_cleanly() {
+        // Every key shares one home bucket, so keys beyond its six slots
+        // live in the alternate and count in the home's overflow.
         let cache = ShardedCacheBuilder::new(40).hasher(Colliding).build();
-        for key in 0..40_u64 {
+        for key in 0..12_u64 {
             cache.insert(key, key);
         }
-        for key in 0..40_u64 {
-            assert_eq!(cache.get(&key), Some(key));
-        }
-        for key in (0..40_u64).step_by(2) {
-            assert!(cache.remove(&key));
-        }
-        for key in 0..40_u64 {
-            assert_eq!(cache.get(&key), (key % 2 == 1).then_some(key));
-        }
-        // Freed slots are reused without disturbing the displaced survivors.
-        for key in 100..120_u64 {
-            cache.insert(key, key);
-        }
-        for key in (1..40_u64).step_by(2).chain(100..120) {
+        for key in 0..12_u64 {
             assert_eq!(cache.get(&key), Some(key));
         }
         let shard = &cache.shards[0];
-        let overflow: u64 = shard
-            .buckets
-            .iter()
-            .map(|bucket| bucket.control.load(Ordering::Relaxed) >> OVERFLOW_SHIFT & OVERFLOW_MAX)
-            .sum();
-        for key in (1..40_u64).step_by(2).chain(100..120) {
+        let overflow = |bucket: usize| {
+            shard.buckets[bucket].control.load(Ordering::Relaxed) >> OVERFLOW_SHIFT & OVERFLOW_MAX
+        };
+        let (home, _) = shard.candidates(0);
+        assert_eq!(overflow(home), 6);
+        for key in (0..12_u64).step_by(2) {
+            assert!(cache.remove(&key));
+        }
+        for key in 0..12_u64 {
+            assert_eq!(cache.get(&key), (key % 2 == 1).then_some(key));
+        }
+        // Freed slots are reused; a thirteenth colliding key evicts one.
+        for key in 100..107_u64 {
+            cache.insert(key, key);
+        }
+        assert_eq!(cache.len(), 12);
+        assert_eq!(cache.get(&106), Some(106));
+        let resident: Vec<u64> = (0..12_u64)
+            .chain(100..107)
+            .filter(|key| cache.get(key).is_some())
+            .collect();
+        assert_eq!(resident.len(), 12);
+        for key in resident {
             assert!(cache.remove(&key));
         }
         assert!(cache.is_empty());
-        assert!(overflow > 0, "the fixture must displace keys");
         assert!(
             shard
                 .buckets
