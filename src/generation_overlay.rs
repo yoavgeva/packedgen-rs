@@ -13,6 +13,41 @@ use crate::dynamic_entry::DynamicEntrySlot;
 use crate::generation_hash::{GenerationHashBuilder, GenerationKeyHash};
 use crate::overlay_cell::StableCell;
 
+// Bound eager initialization and arithmetic, independent of allocator overcommit.
+pub(crate) const MAX_OVERLAY_CAPACITY: usize = 1 << 32;
+
+pub(crate) fn validate_overlay_capacity(capacity: usize) -> Result<(), crate::FrozenBuildError> {
+    if capacity > MAX_OVERLAY_CAPACITY {
+        return Err(crate::FrozenBuildError::AllocationFailed);
+    }
+    Ok(())
+}
+
+fn atomic_table_layout(capacity: usize) -> Result<(usize, usize), crate::FrozenBuildError> {
+    validate_overlay_capacity(capacity)?;
+    let target_slots = capacity
+        .checked_mul(ATOMIC_TARGET_NUMERATOR)
+        .ok_or(crate::FrozenBuildError::AllocationFailed)?
+        .div_ceil(ATOMIC_TARGET_DENOMINATOR);
+    let buckets = target_slots.div_ceil(ATOMIC_BUCKET_SLOTS);
+    let slots = buckets
+        .checked_mul(ATOMIC_BUCKET_SLOTS)
+        .ok_or(crate::FrozenBuildError::AllocationFailed)?;
+    Ok((buckets, slots))
+}
+
+fn try_initialized_slice<T>(
+    len: usize,
+    mut init: impl FnMut() -> T,
+) -> Result<Box<[T]>, crate::FrozenBuildError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(len)
+        .map_err(|_| crate::FrozenBuildError::AllocationFailed)?;
+    values.extend((0..len).map(|_| init()));
+    Ok(values.into_boxed_slice())
+}
+
 const COMPACT_KEY_BYTES: usize = 32;
 const TARGET_NUMERATOR: usize = 5;
 const TARGET_DENOMINATOR: usize = 4;
@@ -241,8 +276,9 @@ impl<C: StableCell> GenerationOverlay<C> {
         capacity: usize,
         mode: GenerationOverlayMode,
         atomic_hash_builder: GenerationHashBuilder,
-    ) -> Self {
-        match mode {
+    ) -> Result<Self, crate::FrozenBuildError> {
+        validate_overlay_capacity(capacity)?;
+        Ok(match mode {
             GenerationOverlayMode::Papaya => Self {
                 adaptive: None,
                 atomic_fixed8: None,
@@ -260,17 +296,19 @@ impl<C: StableCell> GenerationOverlay<C> {
                 ),
             },
             GenerationOverlayMode::AtomicFixed32 => {
-                Self::with_atomic32(capacity, atomic_hash_builder, AtomicKeyMode::Exact)
+                Self::with_atomic32(capacity, atomic_hash_builder, AtomicKeyMode::Exact)?
             }
-            GenerationOverlayMode::AtomicUpTo8 => Self::with_atomic8(capacity, atomic_hash_builder),
+            GenerationOverlayMode::AtomicUpTo8 => {
+                Self::with_atomic8(capacity, atomic_hash_builder)?
+            }
             GenerationOverlayMode::AtomicUpTo16 => {
-                Self::with_atomic16(capacity, atomic_hash_builder)
+                Self::with_atomic16(capacity, atomic_hash_builder)?
             }
             GenerationOverlayMode::AtomicAdaptive => {
-                Self::with_atomic_adaptive(capacity, atomic_hash_builder)
+                Self::with_atomic_adaptive(capacity, atomic_hash_builder)?
             }
             GenerationOverlayMode::AtomicUpTo32 => {
-                Self::with_atomic32(capacity, atomic_hash_builder, AtomicKeyMode::UpTo)
+                Self::with_atomic32(capacity, atomic_hash_builder, AtomicKeyMode::UpTo)?
             }
             GenerationOverlayMode::CompactFixed32 => Self {
                 adaptive: None,
@@ -318,20 +356,23 @@ impl<C: StableCell> GenerationOverlay<C> {
                 atomic_overflow32: None,
                 fixed32: None,
                 inline_variable: None,
-                arc_swap_fixed32: Some(CompactOverlay::with_capacity(capacity)),
+                arc_swap_fixed32: Some(CompactOverlay::with_capacity(capacity)?),
                 fallback: HashMap::with_hasher(DefaultHashBuilder::default()),
             },
-        }
+        })
     }
 
-    fn with_atomic8(capacity: usize, hash_builder: GenerationHashBuilder) -> Self {
-        Self {
+    fn with_atomic8(
+        capacity: usize,
+        hash_builder: GenerationHashBuilder,
+    ) -> Result<Self, crate::FrozenBuildError> {
+        Ok(Self {
             adaptive: None,
             atomic_fixed8: Some(AtomicFixed8Overlay::with_capacity_mode(
                 capacity,
                 hash_builder.clone(),
                 AtomicKeyMode::UpTo,
-            )),
+            )?),
             atomic_overflow8: Some(AtomicOverflow8::new(
                 capacity,
                 hash_builder,
@@ -345,11 +386,14 @@ impl<C: StableCell> GenerationOverlay<C> {
             inline_variable: None,
             arc_swap_fixed32: None,
             fallback: HashMap::with_hasher(DefaultHashBuilder::default()),
-        }
+        })
     }
 
-    fn with_atomic16(capacity: usize, hash_builder: GenerationHashBuilder) -> Self {
-        Self {
+    fn with_atomic16(
+        capacity: usize,
+        hash_builder: GenerationHashBuilder,
+    ) -> Result<Self, crate::FrozenBuildError> {
+        Ok(Self {
             adaptive: None,
             atomic_fixed8: None,
             atomic_overflow8: None,
@@ -357,7 +401,7 @@ impl<C: StableCell> GenerationOverlay<C> {
                 capacity,
                 hash_builder.clone(),
                 AtomicKeyMode::UpTo,
-            )),
+            )?),
             atomic_overflow16: Some(AtomicOverflow16::new(
                 capacity,
                 hash_builder,
@@ -369,15 +413,15 @@ impl<C: StableCell> GenerationOverlay<C> {
             inline_variable: None,
             arc_swap_fixed32: None,
             fallback: HashMap::with_hasher(DefaultHashBuilder::default()),
-        }
+        })
     }
 
     fn with_atomic32(
         capacity: usize,
         hash_builder: GenerationHashBuilder,
         key_mode: AtomicKeyMode,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, crate::FrozenBuildError> {
+        Ok(Self {
             adaptive: None,
             atomic_fixed8: None,
             atomic_overflow8: None,
@@ -387,18 +431,21 @@ impl<C: StableCell> GenerationOverlay<C> {
                 capacity,
                 hash_builder.clone(),
                 key_mode,
-            )),
+            )?),
             atomic_overflow32: Some(AtomicOverflow32::new(capacity, hash_builder, key_mode)),
             fixed32: None,
             inline_variable: None,
             arc_swap_fixed32: None,
             fallback: HashMap::with_hasher(DefaultHashBuilder::default()),
-        }
+        })
     }
 
-    fn with_atomic_adaptive(capacity: usize, hash_builder: GenerationHashBuilder) -> Self {
-        Self {
-            adaptive: Some(AdaptiveAtomicOverlay::new(capacity, hash_builder)),
+    fn with_atomic_adaptive(
+        capacity: usize,
+        hash_builder: GenerationHashBuilder,
+    ) -> Result<Self, crate::FrozenBuildError> {
+        Ok(Self {
+            adaptive: Some(AdaptiveAtomicOverlay::new(capacity, hash_builder)?),
             atomic_fixed8: None,
             atomic_overflow8: None,
             atomic_fixed16: None,
@@ -409,7 +456,7 @@ impl<C: StableCell> GenerationOverlay<C> {
             inline_variable: None,
             arc_swap_fixed32: None,
             fallback: HashMap::with_hasher(DefaultHashBuilder::default()),
-        }
+        })
     }
 
     pub(crate) fn with_cell<R>(&self, key: &[u8], read: impl FnOnce(Option<&C>) -> R) -> R {
@@ -1077,6 +1124,10 @@ impl<C: StableCell> GenerationOverlay<C> {
         cell: C,
         occupied: impl FnOnce(&C) -> R,
     ) -> OverlayInsert<R> {
+        assert!(
+            key.len() <= crate::arena::MAX_PACKED_KEY_BYTES,
+            "generation map key exceeds MAX_PACKED_KEY_BYTES (64 KiB)"
+        );
         let mut occupied = Some(occupied);
         if let Some(adaptive) = &self.adaptive {
             let result = self.insert_or_visit_adaptive(
@@ -1250,6 +1301,10 @@ impl<C: StableCell> GenerationOverlay<C> {
         cell: C,
         occupied: impl FnOnce(&C) -> R,
     ) -> OverlayInsert<R> {
+        assert!(
+            key.len() <= crate::arena::MAX_PACKED_KEY_BYTES,
+            "generation map key exceeds MAX_PACKED_KEY_BYTES (64 KiB)"
+        );
         let mut occupied = Some(occupied);
         if let Some(adaptive) = &self.adaptive {
             let result = self.insert_or_visit_adaptive(
@@ -1576,6 +1631,10 @@ impl<C: StableCell> GenerationOverlay<C> {
         cell: C,
         occupied: impl FnOnce(&C) -> R,
     ) -> OverlayInsert<R> {
+        assert!(
+            key.len() <= crate::arena::MAX_PACKED_KEY_BYTES,
+            "generation map key exceeds MAX_PACKED_KEY_BYTES (64 KiB)"
+        );
         let mut occupied = Some(occupied);
         if adaptive.sample_may_contain(key_hash) {
             let sample = adaptive
@@ -1854,18 +1913,22 @@ struct AdaptiveSamplingGuard<'a, C> {
 }
 
 impl<C: StableCell> AdaptiveAtomicOverlay<C> {
-    fn new(capacity: usize, hash_builder: GenerationHashBuilder) -> Self {
+    fn new(
+        capacity: usize,
+        hash_builder: GenerationHashBuilder,
+    ) -> Result<Self, crate::FrozenBuildError> {
+        validate_overlay_capacity(capacity)?;
         let sample_target = adaptive_sample_target(capacity);
         // Only sampled/fallback keys set this filter. Bounding it by the
         // sample target keeps a fixed 64 filter bits per sampled key once the
         // 4,096-key learning cap applies, instead of scaling a mostly empty
         // filter with the full configured overlay capacity.
         let fallback_filter_words = capacity.div_ceil(64).min(sample_target);
-        Self {
+        Ok(Self {
             capacity,
             sample_target,
             hash_builder,
-            sample_fallback: AtomicDynamicFallback::with_capacity(sample_target),
+            sample_fallback: AtomicDynamicFallback::with_capacity(sample_target)?,
             tables: OnceLock::new(),
             dynamic_fallback: OnceLock::new(),
             sample_gate: AtomicUsize::new(0),
@@ -1874,15 +1937,9 @@ impl<C: StableCell> AdaptiveAtomicOverlay<C> {
             physical_insertions: OnceLock::new(),
             physical_baseline: OnceLock::new(),
             class_counts: std::array::from_fn(|_| AtomicUsize::new(0)),
-            sample_filter: (0..fallback_filter_words)
-                .map(|_| AtomicU64::new(0))
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            fallback_filter: (0..fallback_filter_words)
-                .map(|_| AtomicU64::new(0))
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-        }
+            sample_filter: try_initialized_slice(fallback_filter_words, || AtomicU64::new(0))?,
+            fallback_filter: try_initialized_slice(fallback_filter_words, || AtomicU64::new(0))?,
+        })
     }
 
     fn hash(&self, key: &[u8]) -> u64 {
@@ -2061,9 +2118,10 @@ impl<C: StableCell> AdaptiveAtomicOverlay<C> {
             .saturating_sub(sampled)
             .saturating_sub(atomic_capacity);
         self.dynamic_fallback
-            .set(AtomicDynamicFallback::with_capacity(
-                dynamic_fallback_capacity,
-            ))
+            .set(
+                AtomicDynamicFallback::with_capacity(dynamic_fallback_capacity)
+                    .expect("bounded lazy atomic tier allocation failed"),
+            )
             .unwrap_or_else(|_| unreachable!("one adaptive builder publishes the fallback"));
         let tables = AdaptiveAtomicTables::new(capacities, self.hash_builder.clone());
         self.tables
@@ -2136,30 +2194,35 @@ impl<C: StableCell> AdaptiveAtomicTables<C> {
                 capacities[0],
                 hash.clone(),
                 AtomicKeyMode::UpTo,
-            ),
+            )
+            .expect("bounded lazy atomic tier allocation failed"),
             overflow8: AtomicOverflow8::new(capacities[0], hash.clone(), AtomicKeyMode::UpTo),
             fixed16: AtomicFixed16Overlay::with_capacity_mode(
                 capacities[1],
                 hash.clone(),
                 AtomicKeyMode::UpTo,
-            ),
+            )
+            .expect("bounded lazy atomic tier allocation failed"),
             overflow16: AtomicOverflow16::new(capacities[1], hash.clone(), AtomicKeyMode::UpTo),
             fixed24: AtomicFixed24Overlay::with_capacity_mode(
                 capacities[2],
                 hash.clone(),
                 AtomicKeyMode::UpTo,
-            ),
+            )
+            .expect("bounded lazy atomic tier allocation failed"),
             overflow24: AtomicOverflow24::new(capacities[2], hash.clone(), AtomicKeyMode::UpTo),
             fixed32: AtomicFixed32Overlay::with_capacity_mode(
                 capacities[3],
                 hash.clone(),
                 AtomicKeyMode::UpTo,
-            ),
+            )
+            .expect("bounded lazy atomic tier allocation failed"),
             fixed48: AtomicFixed48Overlay::with_capacity_mode(
                 capacities[4],
                 hash.clone(),
                 AtomicKeyMode::Exact,
-            ),
+            )
+            .expect("bounded lazy atomic tier allocation failed"),
             overflow48: AtomicOverflow48::new(capacities[4], hash.clone(), AtomicKeyMode::Exact),
             overflow32: AtomicOverflow32::new(capacities[3], hash, AtomicKeyMode::UpTo),
         }
@@ -2341,12 +2404,8 @@ enum AtomicDynamicInsert<C> {
 }
 
 impl<C: StableCell> AtomicDynamicFallback<C> {
-    fn with_capacity(capacity: usize) -> Self {
-        let target_slots = capacity
-            .saturating_mul(ATOMIC_TARGET_NUMERATOR)
-            .div_ceil(ATOMIC_TARGET_DENOMINATOR);
-        let bucket_count = target_slots.div_ceil(ATOMIC_BUCKET_SLOTS);
-        let slots = bucket_count.saturating_mul(ATOMIC_BUCKET_SLOTS);
+    fn with_capacity(capacity: usize) -> Result<Self, crate::FrozenBuildError> {
+        let (bucket_count, slots) = atomic_table_layout(capacity)?;
         let len_shards = if capacity == 0 {
             0
         } else {
@@ -2356,20 +2415,14 @@ impl<C: StableCell> AtomicDynamicFallback<C> {
                 .checked_next_power_of_two()
                 .unwrap_or(64)
         };
-        Self {
-            controls: (0..bucket_count)
-                .map(|_| AtomicU64::new(0))
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            slots: (0..slots)
-                .map(|_| DynamicEntrySlot::empty())
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
+        Ok(Self {
+            controls: try_initialized_slice(bucket_count, || AtomicU64::new(0))?,
+            slots: try_initialized_slice(slots, DynamicEntrySlot::empty)?,
             bucket_count,
-            len_shards: (0..len_shards)
-                .map(|_| AtomicDynamicLen(AtomicUsize::new(0)))
-                .collect(),
-        }
+            len_shards: try_initialized_slice(len_shards, || {
+                AtomicDynamicLen(AtomicUsize::new(0))
+            })?,
+        })
     }
 
     fn len(&self) -> usize {
@@ -2761,11 +2814,14 @@ impl<C: StableCell, const KEY_BYTES: usize, const KEY_WORDS: usize>
         if let Some(table) = self.tables[segment].load_full() {
             return table;
         }
-        let candidate = Arc::new(AtomicFixedOverlay::with_capacity_mode(
-            self.capacities[segment],
-            self.hash_builder.clone(),
-            self.key_mode,
-        ));
+        let candidate = Arc::new(
+            AtomicFixedOverlay::with_capacity_mode(
+                self.capacities[segment],
+                self.hash_builder.clone(),
+                self.key_mode,
+            )
+            .expect("bounded lazy atomic tier allocation failed"),
+        );
         let previous = self.tables[segment].compare_and_swap(
             &None::<Arc<AtomicFixedOverlay<C, KEY_BYTES, KEY_WORDS>>>,
             Some(Arc::clone(&candidate)),
@@ -2805,36 +2861,26 @@ impl<C: StableCell, const KEY_BYTES: usize, const KEY_WORDS: usize>
 {
     #[cfg(test)]
     fn with_capacity(capacity: usize, hash_builder: GenerationHashBuilder) -> Self {
-        Self::with_capacity_mode(capacity, hash_builder, AtomicKeyMode::Exact)
+        Self::with_capacity_mode(capacity, hash_builder, AtomicKeyMode::Exact).unwrap()
     }
 
     fn with_capacity_mode(
         capacity: usize,
         hash_builder: GenerationHashBuilder,
         key_mode: AtomicKeyMode,
-    ) -> Self {
+    ) -> Result<Self, crate::FrozenBuildError> {
         debug_assert_eq!(KEY_BYTES, KEY_WORDS * size_of::<u64>());
-        let target_slots = capacity
-            .saturating_mul(ATOMIC_TARGET_NUMERATOR)
-            .div_ceil(ATOMIC_TARGET_DENOMINATOR);
-        let bucket_count = target_slots.div_ceil(ATOMIC_BUCKET_SLOTS);
-        let slots = bucket_count.saturating_mul(ATOMIC_BUCKET_SLOTS);
-        Self {
-            controls: (0..bucket_count)
-                .map(|_| AtomicU64::new(0))
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            slots: (0..slots)
-                .map(|_| AtomicFixedSlot {
-                    key_words: std::array::from_fn(|_| AtomicU64::new(0)),
-                    cell: C::deleted(),
-                })
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
+        let (bucket_count, slots) = atomic_table_layout(capacity)?;
+        Ok(Self {
+            controls: try_initialized_slice(bucket_count, || AtomicU64::new(0))?,
+            slots: try_initialized_slice(slots, || AtomicFixedSlot {
+                key_words: std::array::from_fn(|_| AtomicU64::new(0)),
+                cell: C::deleted(),
+            })?,
             bucket_count,
             hash_builder,
             key_mode,
-        }
+        })
     }
 
     fn supports(&self, key: &[u8]) -> bool {
@@ -2976,12 +3022,18 @@ impl<C: StableCell, const KEY_BYTES: usize, const KEY_WORDS: usize>
         key: &[u8],
         read: impl FnOnce(&C) -> R,
     ) -> Option<R> {
+        let key_bytes = key.len();
         let key = self.encode_key(key)?;
         let slot = self.slots.get(index)?;
         let bucket = index / ATOMIC_BUCKET_SLOTS;
         let offset = index % ATOMIC_BUCKET_SLOTS;
         let control = self.controls.get(bucket)?.load(Ordering::Acquire);
-        if control_byte(control, offset) < 2 || !self.key_matches(index, &key) {
+        let tag = control_byte(control, offset);
+        if tag < 2
+            || (matches!(self.key_mode, AtomicKeyMode::UpTo)
+                && (tag >= 128) != (key_bytes == KEY_BYTES))
+            || !self.key_matches(index, &key)
+        {
             return None;
         }
         Some(read(&slot.cell))
@@ -3812,25 +3864,30 @@ struct CompactOverlay<C> {
 }
 
 impl<C> CompactOverlay<C> {
-    fn with_capacity(capacity: usize) -> Self {
+    fn with_capacity(capacity: usize) -> Result<Self, crate::FrozenBuildError> {
+        validate_overlay_capacity(capacity)?;
         let shard_count = capacity
             .div_ceil(TARGET_ENTRIES_PER_SHARD)
-            .max(1)
-            .next_power_of_two()
-            .min(MAX_SHARDS);
+            .clamp(1, MAX_SHARDS)
+            .checked_next_power_of_two()
+            .ok_or(crate::FrozenBuildError::AllocationFailed)?;
         let target_slots = capacity
-            .saturating_mul(TARGET_NUMERATOR)
+            .checked_mul(TARGET_NUMERATOR)
+            .ok_or(crate::FrozenBuildError::AllocationFailed)?
             .div_ceil(TARGET_DENOMINATOR)
             .max(shard_count);
         let slots_per_shard = target_slots.div_ceil(shard_count);
-        let shards = (0..shard_count)
-            .map(|_| CompactShard::with_slots(slots_per_shard))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        Self {
-            shards,
-            hash_builder: DefaultHashBuilder::default(),
+        let mut shards = Vec::new();
+        shards
+            .try_reserve_exact(shard_count)
+            .map_err(|_| crate::FrozenBuildError::AllocationFailed)?;
+        for _ in 0..shard_count {
+            shards.push(CompactShard::with_slots(slots_per_shard)?);
         }
+        Ok(Self {
+            shards: shards.into_boxed_slice(),
+            hash_builder: DefaultHashBuilder::default(),
+        })
     }
 
     fn with_cell<R>(&self, key: &[u8], read: impl FnOnce(&C) -> R) -> Option<R> {
@@ -3865,13 +3922,10 @@ struct CompactShard<C> {
 }
 
 impl<C> CompactShard<C> {
-    fn with_slots(slots: usize) -> Self {
-        Self {
-            slots: (0..slots)
-                .map(|_| ArcSwapOption::empty())
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-        }
+    fn with_slots(slots: usize) -> Result<Self, crate::FrozenBuildError> {
+        Ok(Self {
+            slots: try_initialized_slice(slots, ArcSwapOption::empty)?,
+        })
     }
 
     fn with_cell<R>(&self, hash: u64, key: &[u8], read: impl FnOnce(&C) -> R) -> Option<R> {
@@ -3958,6 +4012,28 @@ mod tests {
 
     fn copied_u64(value: Option<&u64>) -> Option<u64> {
         value.copied()
+    }
+
+    #[test]
+    fn atomic_allocations_reject_oversized_layouts_and_reservations() {
+        for capacity in [usize::MAX, 1_usize << 40] {
+            assert!(matches!(
+                AtomicDynamicFallback::<OverlayCell<u64>>::with_capacity(capacity),
+                Err(crate::FrozenBuildError::AllocationFailed)
+            ));
+            assert!(matches!(
+                AtomicFixed32Overlay::<OverlayCell<u64>>::with_capacity_mode(
+                    capacity,
+                    GenerationHashBuilder::default(),
+                    AtomicKeyMode::Exact,
+                ),
+                Err(crate::FrozenBuildError::AllocationFailed)
+            ));
+        }
+        assert!(matches!(
+            try_initialized_slice(usize::MAX, || 0_u64),
+            Err(crate::FrozenBuildError::AllocationFailed)
+        ));
     }
 
     #[test]
@@ -4084,7 +4160,7 @@ mod tests {
 
     #[test]
     fn dynamic_fallback_round_trips_and_samples_distinct_variable_keys() {
-        let table = AtomicDynamicFallback::<OverlayCell<u64>>::with_capacity(512);
+        let table = AtomicDynamicFallback::<OverlayCell<u64>>::with_capacity(512).unwrap();
         let hash_builder = GenerationHashBuilder::default();
         let keys = (0..300_u64)
             .map(|index| {
@@ -4146,7 +4222,7 @@ mod tests {
 
     #[test]
     fn dynamic_fallback_concurrent_equal_key_has_one_physical_winner() {
-        let table = AtomicDynamicFallback::<OverlayCell<u64>>::with_capacity(64);
+        let table = AtomicDynamicFallback::<OverlayCell<u64>>::with_capacity(64).unwrap();
         let hash_builder = GenerationHashBuilder::default();
         let key = vec![7_u8; 73];
         let hash = GenerationKeyHash::new(&hash_builder, &key).route();
@@ -4183,7 +4259,8 @@ mod tests {
         let large = AdaptiveAtomicOverlay::<OverlayCell<u64>>::new(
             1_000_000,
             GenerationHashBuilder::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(large.sample_target, ADAPTIVE_SAMPLE_MAX);
         assert_eq!(large.fallback_filter.len(), ADAPTIVE_SAMPLE_MAX);
         assert!(large.fallback_filter.len() < large.capacity.div_ceil(64));
@@ -4196,20 +4273,23 @@ mod tests {
         }
 
         let small =
-            AdaptiveAtomicOverlay::<OverlayCell<u64>>::new(1_000, GenerationHashBuilder::default());
+            AdaptiveAtomicOverlay::<OverlayCell<u64>>::new(1_000, GenerationHashBuilder::default())
+                .unwrap();
         assert_eq!(small.fallback_filter.len(), 1_000_usize.div_ceil(64));
     }
 
     #[test]
     fn adaptive_sample_and_dynamic_fallback_hints_remain_independent() {
         let sample =
-            AdaptiveAtomicOverlay::<OverlayCell<u64>>::new(1_000, GenerationHashBuilder::default());
+            AdaptiveAtomicOverlay::<OverlayCell<u64>>::new(1_000, GenerationHashBuilder::default())
+                .unwrap();
         sample.mark_sample(42);
         assert!(sample.sample_may_contain(42));
         assert!(!sample.fallback_may_contain(42));
 
         let fallback =
-            AdaptiveAtomicOverlay::<OverlayCell<u64>>::new(1_000, GenerationHashBuilder::default());
+            AdaptiveAtomicOverlay::<OverlayCell<u64>>::new(1_000, GenerationHashBuilder::default())
+                .unwrap();
         fallback.mark_fallback(42);
         assert!(!fallback.sample_may_contain(42));
         assert!(fallback.fallback_may_contain(42));
@@ -4223,7 +4303,8 @@ mod tests {
             CAPACITY,
             GenerationOverlayMode::AtomicAdaptive,
             hash_builder.clone(),
-        );
+        )
+        .unwrap();
         let adaptive = overlay.adaptive.as_ref().unwrap();
 
         for index in 0..64_u64 {
@@ -4344,7 +4425,8 @@ mod tests {
             ATOMIC_BUCKET_SLOTS,
             GenerationHashBuilder::default(),
             AtomicKeyMode::UpTo,
-        );
+        )
+        .unwrap();
         let key = vec![3_u8; 29];
         let encoded = overlay.encode_key(&key).expect("29-byte key is supported");
         overlay.write_key(0, &encoded);

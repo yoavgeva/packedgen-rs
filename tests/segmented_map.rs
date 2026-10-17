@@ -133,3 +133,19 @@ fn mix(mut value: u64) -> u64 {
     value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
 }
+
+#[test]
+fn removed_keys_do_not_exhaust_arena_segments() {
+    let mut map = SegmentedSwissMap::with_capacity(16);
+    let mut key = vec![0; 63 * 1024];
+    for cycle in 0_u64..40_000 {
+        key[..8].copy_from_slice(&cycle.to_le_bytes());
+        assert_eq!(
+            map.try_insert(&key, cycle),
+            Ok(InsertOutcome::Inserted),
+            "insert failed after {cycle} removal cycles"
+        );
+        assert_eq!(map.remove(&key), Some(cycle));
+    }
+    assert!(map.is_empty());
+}

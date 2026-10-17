@@ -2,6 +2,8 @@
 
 #![allow(
     clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
     clippy::too_many_arguments,
     clippy::too_many_lines,
     missing_docs
@@ -17,6 +19,7 @@ use hashbrown::DefaultHashBuilder;
 use packedgen::{CacheConfig, DirectPackedCache};
 use papaya::HashMap as PapayaHashMap;
 
+const TIMING_BATCH: usize = 64;
 const VALUE_BYTES: usize = 64;
 const REFRESH_INTERVAL: usize = 16_384;
 const NEW_KEY_OFFSET: usize = 1_000_000_000;
@@ -43,6 +46,7 @@ struct Measurement {
     read_hit_pct: f64,
     final_entries: usize,
     rebuilds: u64,
+    evictions: u64,
 }
 
 trait Backend: Send + Sync + 'static {
@@ -52,9 +56,11 @@ trait Backend: Send + Sync + 'static {
     fn write_range(&self, corpus: &Corpus, begin: usize, end: usize);
     fn maintain(&self) -> bool;
     fn len(&self) -> usize;
+    fn capacity(&self) -> usize;
+    fn evictions(&self) -> u64;
 }
 
-struct DirectBackend(DirectPackedCache<[u8; VALUE_BYTES]>);
+struct DirectBackend(DirectPackedCache<[u8; VALUE_BYTES]>, usize);
 
 struct PapayaControlValue {
     value: [u8; VALUE_BYTES],
@@ -65,10 +71,30 @@ struct PapayaControlValue {
 
 type PapayaCache = PapayaHashMap<Box<[u8]>, PapayaControlValue, DefaultHashBuilder>;
 
-struct PapayaBackend(PapayaCache);
+struct PapayaBackend(PapayaCache, usize, AtomicU64);
 
 fn main() {
+    let mut positional = Vec::new();
+    let mut capacity_ratio = 0.8_f64;
     let mut arguments = std::env::args().skip(1);
+    while let Some(argument) = arguments.next() {
+        if argument == "--capacity-ratio" {
+            capacity_ratio = arguments
+                .next()
+                .expect("capacity ratio value required")
+                .parse()
+                .expect("capacity ratio must be numeric");
+        } else if let Some(value) = argument.strip_prefix("--capacity-ratio=") {
+            capacity_ratio = value.parse().expect("capacity ratio must be numeric");
+        } else {
+            positional.push(argument);
+        }
+    }
+    assert!(
+        capacity_ratio.is_finite() && capacity_ratio > 0.0,
+        "capacity ratio must be finite and positive"
+    );
+    let mut arguments = positional.into_iter();
     let entries = argument(&mut arguments, 200_000).max(1);
     let read_operations = argument(&mut arguments, 1_000_000).max(1);
     let write_operations = argument(&mut arguments, 200_000).max(1);
@@ -85,7 +111,14 @@ fn main() {
     let new_entries = (0..write_operations)
         .filter(|operation| mutation_kind(*operation) >= 90)
         .count();
-    let final_capacity = entries + new_entries;
+    let final_capacity = (((entries + new_entries) as f64 * capacity_ratio) as usize).max(1);
+    println!(
+        "# closed-loop service time, not open-loop latency; batch mean ns/op over {TIMING_BATCH} ops (partial final batches use their actual count)"
+    );
+    println!(
+        "# capacity_ratio={capacity_ratio}; capacity={final_capacity}; working_set={}; eviction counters include preload; papaya eviction policy=second-chance scan",
+        entries + new_entries
+    );
     let mut direct = Vec::with_capacity(samples);
     let mut papaya = Vec::with_capacity(samples);
 
@@ -128,7 +161,7 @@ fn main() {
     }
 
     println!(
-        "strategy,entries,read_operations,write_operations,readers,writers,samples,read_mops,p50_ns,p95_ns,p99_ns,p999_ns,max_ns,read_hit_pct,final_entries,median_rebuilds"
+        "strategy,entries,read_operations,write_operations,readers,writers,samples,read_mops,p50_ns,p95_ns,p99_ns,p999_ns,max_ns,read_hit_pct,final_entries,median_rebuilds,median_evictions"
     );
     print_summary::<DirectBackend>(
         entries,
@@ -152,9 +185,10 @@ fn build_direct(corpus: &Corpus, capacity: usize, new_entries: usize) -> DirectB
     let records = corpus
         .hits
         .iter()
+        .take(capacity)
         .enumerate()
         .map(|(index, key)| (key.clone(), value(index), charge(key), None::<Duration>));
-    DirectBackend(
+    let backend = DirectBackend(
         DirectPackedCache::try_from_entries_with_options(
             CacheConfig::new(u64::MAX)
                 .with_max_entries(capacity)
@@ -162,7 +196,15 @@ fn build_direct(corpus: &Corpus, capacity: usize, new_entries: usize) -> DirectB
             records,
         )
         .unwrap(),
-    )
+        capacity,
+    );
+    for (index, key) in corpus.hits.iter().enumerate().skip(capacity) {
+        backend
+            .0
+            .insert_discard_with_options(key, value(index), charge(key), None)
+            .unwrap();
+    }
+    backend
 }
 
 fn build_papaya(corpus: &Corpus, capacity: usize) -> PapayaBackend {
@@ -172,7 +214,9 @@ fn build_papaya(corpus: &Corpus, capacity: usize) -> PapayaBackend {
         guard.insert(key.clone(), PapayaControlValue::new(index, key));
     }
     drop(guard);
-    PapayaBackend(cache)
+    let backend = PapayaBackend(cache, capacity, AtomicU64::new(0));
+    backend.maintain();
+    backend
 }
 
 fn run_once<B: Backend>(
@@ -253,12 +297,9 @@ fn run_once<B: Backend>(
     });
 
     latencies.sort_unstable();
+    backend.maintain();
     let final_entries = backend.len();
-    let expected_entries = corpus.hits.len()
-        + (0..write_operations)
-            .filter(|operation| mutation_kind(*operation) >= 90)
-            .count();
-    assert_eq!(final_entries, expected_entries);
+    assert!(final_entries <= backend.capacity());
     Measurement {
         read_mops: read_operations as f64 / elapsed.as_secs_f64() / 1e6,
         p50_ns: percentile(&latencies, 500),
@@ -269,6 +310,7 @@ fn run_once<B: Backend>(
         read_hit_pct: hits as f64 / read_operations as f64 * 100.0,
         final_entries,
         rebuilds: rebuilds.load(Ordering::Relaxed),
+        evictions: backend.evictions(),
     }
 }
 
@@ -280,18 +322,20 @@ impl Backend for DirectBackend {
         let mut latencies_ns = Vec::with_capacity(end - begin);
         let mut hits = 0_u64;
         let mut checksum = 0_u64;
-        for operation in begin..end {
-            if operation != begin && operation.is_multiple_of(REFRESH_INTERVAL) {
+        for batch_begin in (begin..end).step_by(TIMING_BATCH) {
+            if batch_begin != begin && batch_begin.is_multiple_of(REFRESH_INTERVAL) {
                 guard.refresh();
             }
-            let key = read_key(corpus, operation);
+            let batch_end = (batch_begin + TIMING_BATCH).min(end);
             let started = Instant::now();
-            let found = guard.get(key);
-            latencies_ns.push(elapsed_ns(started));
-            if let Some(value) = found {
-                hits += 1;
-                checksum ^= u64::from(value[0]);
+            for operation in batch_begin..batch_end {
+                if let Some(value) = guard.get(read_key(corpus, operation)) {
+                    hits += 1;
+                    checksum ^= u64::from(value[0]);
+                }
             }
+            let average = elapsed_ns(started) / (batch_end - batch_begin) as u64;
+            latencies_ns.extend(std::iter::repeat_n(average, batch_end - batch_begin));
         }
         ReaderResult {
             latencies_ns,
@@ -334,6 +378,13 @@ impl Backend for DirectBackend {
     fn len(&self) -> usize {
         self.0.len()
     }
+
+    fn capacity(&self) -> usize {
+        self.1
+    }
+    fn evictions(&self) -> u64 {
+        self.0.stats().evictions
+    }
 }
 
 impl Backend for PapayaBackend {
@@ -346,20 +397,22 @@ impl Backend for PapayaBackend {
         for block_begin in (begin..end).step_by(REFRESH_INTERVAL) {
             let block_end = (block_begin + REFRESH_INTERVAL).min(end);
             let guard = self.0.pin();
-            for operation in block_begin..block_end {
-                let key = read_key(corpus, operation);
+            for batch_begin in (block_begin..block_end).step_by(TIMING_BATCH) {
+                let batch_end = (batch_begin + TIMING_BATCH).min(block_end);
                 let started = Instant::now();
-                let found = guard.get(key);
-                latencies_ns.push(elapsed_ns(started));
-                if let Some(entry) = found {
-                    if operation.is_multiple_of(16) {
-                        entry.accessed.store(true, Ordering::Relaxed);
+                for operation in batch_begin..batch_end {
+                    if let Some(entry) = guard.get(read_key(corpus, operation)) {
+                        if operation.is_multiple_of(16) {
+                            entry.accessed.store(true, Ordering::Relaxed);
+                        }
+                        black_box(entry.expires_at.load(Ordering::Relaxed));
+                        black_box(entry.weight);
+                        hits += 1;
+                        checksum ^= u64::from(entry.value[0]);
                     }
-                    black_box(entry.expires_at.load(Ordering::Relaxed));
-                    black_box(entry.weight);
-                    hits += 1;
-                    checksum ^= u64::from(entry.value[0]);
                 }
+                let average = elapsed_ns(started) / (batch_end - batch_begin) as u64;
+                latencies_ns.extend(std::iter::repeat_n(average, batch_end - batch_begin));
             }
         }
         ReaderResult {
@@ -377,7 +430,7 @@ impl Backend for PapayaBackend {
                 let kind = mutation_kind(operation);
                 if kind < 80 {
                     let key = write_hit_key(corpus, operation);
-                    guard.update(key.into(), |_| PapayaControlValue::new(operation, key));
+                    guard.insert(key.into(), PapayaControlValue::new(operation, key));
                 } else if kind < 90 {
                     let key = write_hit_key(corpus, operation);
                     guard.remove(key);
@@ -392,11 +445,30 @@ impl Backend for PapayaBackend {
     }
 
     fn maintain(&self) -> bool {
-        false
+        let guard = self.0.pin();
+        // A first pass clears recently-accessed bits; a second can evict those entries.
+        for _ in 0..2 {
+            for (key, entry) in &guard {
+                if self.0.len() <= self.1 {
+                    return false;
+                }
+                if !entry.accessed.swap(false, Ordering::Relaxed) && guard.remove(key).is_some() {
+                    self.2.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        false // Papaya never rebuilds a packed generation.
     }
 
     fn len(&self) -> usize {
         self.0.len()
+    }
+
+    fn capacity(&self) -> usize {
+        self.1
+    }
+    fn evictions(&self) -> u64 {
+        self.2.load(Ordering::Relaxed)
     }
 }
 
@@ -424,7 +496,7 @@ fn print_summary<B: Backend>(
     }
     let samples = measurements.len();
     println!(
-        "{},{entries},{read_operations},{write_operations},{readers},{writers},{samples},{:.3},{},{},{},{},{},{:.3},{},{}",
+        "{},{entries},{read_operations},{write_operations},{readers},{writers},{samples},{:.3},{},{},{},{},{},{:.3},{},{},{}",
         B::NAME,
         median_by(measurements, |measurement| measurement.read_mops),
         median_by(measurements, |measurement| measurement.p50_ns),
@@ -435,6 +507,7 @@ fn print_summary<B: Backend>(
         median_by(measurements, |measurement| measurement.read_hit_pct),
         median_by(measurements, |measurement| measurement.final_entries),
         median_by(measurements, |measurement| measurement.rebuilds),
+        median_by(measurements, |measurement| measurement.evictions),
     );
 }
 

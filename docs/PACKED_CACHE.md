@@ -149,7 +149,8 @@ hash state are fixed map overhead, not per-entry metadata.
   need an explicit complete charge.
 - Per-entry weight is limited to `u32::MAX`. This saves four bytes per value
   entry; larger charges return `WeightNotCompact`.
-- Expiration uses 100 ms ticks and supports about 13.6 years from cache
+- Expiration uses 100 ms ticks: never before the TTL; up to ~100-200 ms after.
+  It supports about 13.6 years from cache
   creation. A zero TTL expires immediately; nonzero TTLs round up to a tick.
 - Compact CLOCK eviction uses one sampled access bit in the generation word.
   A hit marks approximately once per 16 reads. Eviction first chooses
@@ -806,6 +807,10 @@ benchmark.
 | Rejected warm guarded-delete placement | Removing `#[cold]` from the adaptive guard delete wrapper kept exact concurrent delete/readmission accounting and binary size unchanged. It did not improve its target consistently: exact-32 delete hits lost 1.6%/6.4% at 1T/4T, while variable delete hits were -0.5%/+0.3%. Variable pressure lost 6.2%/5.2%, variable 4T insertion lost 2.3%, and exact 4T insertion lost 1.6% | **Reject and restore cold placement**: the adaptive precheck wrapper is better kept away from the main guard body; explicit removal scopes remain the optimized delete-heavy API |
 | Rejected narrow guard access counter | A `u8` guard-local counter preserved the exact 1-in-16 CLOCK schedule across its modulo-256 wrap, with a new 300-operation regression proving every sample position. Scalar variable-key resident reads improved in all three pairs (+12.9% median), but 4T reads were flat, read misses lost all scalar pairs, scalar delete hits lost 7.7%, and pressure lost 2.2%/0.7% at 1T/4T | **Reject and restore `u64`**: narrower operations and changed guard layout improve one isolated read shape but fail the miss/delete/pressure gates. Keep the schedule-wrap regression; it adds no release code or resident state |
 | Rejected match-shaped tracked read accounting | `DirectCacheGuard::get` returned directly from a hit/miss `match`, shortening the source-level `Option` live range while preserving exact buffered statistics in a new regression. The target tracked scalar hit and 95%-read workloads lost 1.9% and 1.0%; tracked 4T mix gained 13.3%, but the unrelated 4T new-insert control lost all three pairs (-10.2% median) and 4T pressure lost 1.1% | **Reject and restore `is_some` plus return**: a multicore tracked-mix layout win cannot tax scalar tracking or insertion. Keep the exact hit/miss flush regression; production code and RAM return unchanged |
+| Rejected TTL retry-loop outline | The borrowed guard's normal lookup was split into a one-attempt path and a cold retry helper used only after expiration. The focused stale-read regression passed; five-pair 4T medians were effectively flat for version churn and large objects, while resident hits changed about -0.5% | **Reject and fully revert**: the rare branch is not large enough to justify a second lookup body or a changed code layout; retain the simple bounded retry loop |
+| Rejected route-stripe integer cast | Replacing the checked route-to-stripe conversion with a truncating cast preserved the low-bit masking proof and passed generation-map tests, but five-pair resident-hot throughput fell about 4% on the same host | **Reject and fully revert**: the optimizer already removes the checked-conversion cost; keep the portable checked conversion |
+| Rejected cold expiration helper | Marking direct-cache expiration removal `#[cold] #[inline(never)]` changed no state or synchronization and passed the TTL suite. Five-pair medians improved pressure about 2.5%, but resident-hot fell about 1% and version churn about 1.8% | **Reject and fully revert**: pressure-only layout wins do not pass the balanced cache gate |
+| Rejected forced-inline access sampling | Forcing the guard-local sampling helper inline changed no semantics and passed all direct-cache tests, but five-pair medians fell about 1% on resident-hot and 3.7% on pressure despite a small version-churn gain | **Reject and fully revert**: retain the compiler-selected boundary for the sampled-read helper |
 
 ## Publication boundary
 

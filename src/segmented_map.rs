@@ -146,7 +146,13 @@ where
             )));
         }
 
-        let key_ref = self.arena.insert(key)?;
+        let key_ref = match self.arena.insert(key) {
+            Err(ArenaError::TooManySegments) if self.arena.len() > self.len() => {
+                self.compact_keys()?;
+                self.arena.insert(key)?
+            }
+            result => result?,
+        };
         self.live_key_bytes += key.len();
         let arena = &self.arena;
         let hash_builder = &self.hash_builder;
@@ -207,7 +213,8 @@ where
 
     /// Removes `key` and returns its value.
     ///
-    /// Removed bytes remain in the append-only arena until [`Self::clear`].
+    /// Removed bytes remain until explicit clearing or compaction. Insertion
+    /// automatically compacts removed keys if the arena exhausts its segments.
     pub fn remove(&mut self, key: &[u8]) -> Option<V> {
         let hash = self.hash_key(key);
         self.remove_prehashed(hash, key)

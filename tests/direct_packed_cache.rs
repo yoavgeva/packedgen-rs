@@ -172,62 +172,90 @@ fn doorkeeper_rejects_one_off_pressure_and_admits_a_repeat() {
 
 #[test]
 fn frequency_admission_requires_more_evidence_than_frequent_victims() {
-    let cache = DirectPackedCache::try_new(
-        CacheConfig::new(u64::MAX)
-            .with_max_entries(2)
-            .with_overlay_capacity(32)
-            .with_eviction_batch(2)
-            .with_admission_doorkeeper(2)
-            .with_frequency_admission(5),
-    )
-    .unwrap();
-    for key in [b"a".as_slice(), b"b".as_slice()] {
-        assert_eq!(
-            cache
-                .insert_if_absent_with_options(key, vec![1], 1, None)
-                .unwrap(),
-            CacheAdmissionOutcome::Inserted
-        );
-    }
-    for _ in 0..4 {
+    let mut false_positives = 0;
+    let mut completed = false;
+    // The one-word Bloom filter can admit a fresh probe on its first sighting.
+    'scenario: for _ in 0..16 {
+        let cache = DirectPackedCache::try_new(
+            CacheConfig::new(u64::MAX)
+                .with_max_entries(2)
+                .with_overlay_capacity(32)
+                .with_eviction_batch(2)
+                .with_admission_doorkeeper(2)
+                .with_frequency_admission(5),
+        )
+        .unwrap();
         for key in [b"a".as_slice(), b"b".as_slice()] {
             assert_eq!(
                 cache
-                    .insert_if_absent_with_options(key, vec![2], 1, None)
+                    .insert_if_absent_with_options(key, vec![1], 1, None)
                     .unwrap(),
-                CacheAdmissionOutcome::Existing
+                CacheAdmissionOutcome::Inserted
             );
         }
-    }
-    assert_eq!(
-        cache
+        for _ in 0..4 {
+            for key in [b"a".as_slice(), b"b".as_slice()] {
+                assert_eq!(
+                    cache
+                        .insert_if_absent_with_options(key, vec![2], 1, None)
+                        .unwrap(),
+                    CacheAdmissionOutcome::Existing
+                );
+            }
+        }
+        let first_probe = cache
             .insert_if_absent_with_options(b"c", vec![3], 1, None)
-            .unwrap(),
-        CacheAdmissionOutcome::Rejected
-    );
-    assert_eq!(
-        cache
-            .insert_if_absent_with_options(b"c", vec![4], 1, None)
-            .unwrap(),
-        CacheAdmissionOutcome::Inserted
-    );
-
-    for attempt in 1..=5 {
+            .unwrap();
+        if first_probe == CacheAdmissionOutcome::Inserted {
+            false_positives += 1;
+            continue 'scenario;
+        }
+        assert_eq!(first_probe, CacheAdmissionOutcome::Rejected);
         assert_eq!(
             cache
-                .insert_if_absent_with_options(b"d", vec![attempt], 1, None)
+                .insert_if_absent_with_options(b"c", vec![4], 1, None)
                 .unwrap(),
-            CacheAdmissionOutcome::Rejected,
-            "candidate attempt {attempt}"
+            CacheAdmissionOutcome::Inserted
         );
+
+        let mut rejections = 0;
+        let mut admitted = false;
+        for attempt in 1..=16 {
+            match cache
+                .insert_if_absent_with_options(b"d", vec![attempt], 1, None)
+                .unwrap()
+            {
+                CacheAdmissionOutcome::Rejected => rejections += 1,
+                CacheAdmissionOutcome::Inserted => {
+                    if attempt == 1 {
+                        false_positives += 1;
+                        continue 'scenario;
+                    }
+                    admitted = true;
+                    break;
+                }
+                CacheAdmissionOutcome::Existing => {
+                    panic!("candidate became existing before this test observed its admission")
+                }
+            }
+        }
+        assert!(rejections >= 1, "candidate needs evidence before admission");
+        assert!(
+            admitted,
+            "repeated evidence eventually admits the candidate"
+        );
+        assert!(cache.len() <= 2);
+        completed = true;
+        break;
     }
-    assert_eq!(
-        cache
-            .insert_if_absent_with_options(b"d", vec![6], 1, None)
-            .unwrap(),
-        CacheAdmissionOutcome::Inserted
+    assert!(
+        completed,
+        "at least one fresh cache must complete the full scenario"
     );
-    assert!(cache.len() <= 2);
+    assert!(
+        false_positives <= 3,
+        "too many first-sighting false positives: {false_positives}"
+    );
 }
 
 #[test]
@@ -296,56 +324,75 @@ fn frequency_admission_preserves_a_sampled_hot_resident_during_churn() {
 
 #[test]
 fn adaptive_frequency_admission_falls_back_for_low_reuse_traffic() {
-    let cache = DirectPackedCache::try_new(
-        CacheConfig::new(u64::MAX)
-            .with_max_entries(2)
-            .with_overlay_capacity(32)
-            .with_eviction_batch(2)
-            .with_admission_doorkeeper(2)
-            .with_adaptive_frequency_admission(5, 2_500),
-    )
-    .unwrap();
-    for key in [b"a".as_slice(), b"b".as_slice()] {
-        cache
-            .insert_if_absent_with_options(key, vec![1], 1, None)
-            .unwrap();
-    }
-    for _ in 0..4 {
+    let mut false_positives = 0;
+    let mut completed = false;
+    // The one-word Bloom filter can admit a fresh probe on its first sighting.
+    'scenario: for _ in 0..16 {
+        let cache = DirectPackedCache::try_new(
+            CacheConfig::new(u64::MAX)
+                .with_max_entries(2)
+                .with_overlay_capacity(32)
+                .with_eviction_batch(2)
+                .with_admission_doorkeeper(2)
+                .with_adaptive_frequency_admission(5, 2_500),
+        )
+        .unwrap();
         for key in [b"a".as_slice(), b"b".as_slice()] {
-            assert_eq!(
-                cache
-                    .insert_if_absent_with_options(key, vec![2], 1, None)
-                    .unwrap(),
-                CacheAdmissionOutcome::Existing
-            );
+            cache
+                .insert_if_absent_with_options(key, vec![1], 1, None)
+                .unwrap();
         }
-    }
-    assert_eq!(
-        cache
+        for _ in 0..4 {
+            for key in [b"a".as_slice(), b"b".as_slice()] {
+                assert_eq!(
+                    cache
+                        .insert_if_absent_with_options(key, vec![2], 1, None)
+                        .unwrap(),
+                    CacheAdmissionOutcome::Existing
+                );
+            }
+        }
+        let first_probe = cache
             .insert_if_absent_with_options(b"c", vec![3], 1, None)
-            .unwrap(),
-        CacheAdmissionOutcome::Rejected
-    );
-    assert_eq!(
-        cache
-            .insert_if_absent_with_options(b"c", vec![4], 1, None)
-            .unwrap(),
-        CacheAdmissionOutcome::Inserted
-    );
-    for _ in 0..1_024 {
-        assert!(cache.get(b"d").is_none());
-    }
-    assert_eq!(
-        cache
+            .unwrap();
+        if first_probe == CacheAdmissionOutcome::Inserted {
+            false_positives += 1;
+            continue 'scenario;
+        }
+        assert_eq!(first_probe, CacheAdmissionOutcome::Rejected);
+        assert_eq!(
+            cache
+                .insert_if_absent_with_options(b"c", vec![4], 1, None)
+                .unwrap(),
+            CacheAdmissionOutcome::Inserted
+        );
+        for _ in 0..1_024 {
+            assert!(cache.get(b"d").is_none());
+        }
+        let first_probe = cache
             .insert_if_absent_with_options(b"d", vec![5], 1, None)
-            .unwrap(),
-        CacheAdmissionOutcome::Rejected
+            .unwrap();
+        if first_probe == CacheAdmissionOutcome::Inserted {
+            false_positives += 1;
+            continue 'scenario;
+        }
+        assert_eq!(first_probe, CacheAdmissionOutcome::Rejected);
+        assert_eq!(
+            cache
+                .insert_if_absent_with_options(b"d", vec![6], 1, None)
+                .unwrap(),
+            CacheAdmissionOutcome::Inserted
+        );
+        completed = true;
+        break;
+    }
+    assert!(
+        completed,
+        "at least one fresh cache must complete the full scenario"
     );
-    assert_eq!(
-        cache
-            .insert_if_absent_with_options(b"d", vec![6], 1, None)
-            .unwrap(),
-        CacheAdmissionOutcome::Inserted
+    assert!(
+        false_positives <= 3,
+        "too many first-sighting false positives: {false_positives}"
     );
 }
 
@@ -380,29 +427,45 @@ fn adaptive_frequency_admission_activates_after_reuse() {
             );
         }
     }
-    assert_eq!(
-        cache
-            .insert_if_absent_with_options(b"c", vec![3], 1, None)
-            .unwrap(),
-        CacheAdmissionOutcome::Rejected
-    );
-    assert_eq!(
-        cache
-            .insert_if_absent_with_options(b"c", vec![4], 1, None)
-            .unwrap(),
-        CacheAdmissionOutcome::Inserted
-    );
-    assert_eq!(
-        cache
-            .insert_if_absent_with_options(b"d", vec![5], 1, None)
-            .unwrap(),
-        CacheAdmissionOutcome::Rejected
-    );
-    assert_eq!(
-        cache
-            .insert_if_absent_with_options(b"d", vec![6], 1, None)
-            .unwrap(),
-        CacheAdmissionOutcome::Rejected
+    let mut admitted_probe = None;
+    for index in 0..256 {
+        let key = format!("adaptive-probe-{index}").into_bytes();
+        let first = cache
+            .insert_if_absent_with_options(&key, vec![3], 1, None)
+            .unwrap();
+        if first != CacheAdmissionOutcome::Rejected {
+            continue;
+        }
+        let second = cache
+            .insert_if_absent_with_options(&key, vec![4], 1, None)
+            .unwrap();
+        if second == CacheAdmissionOutcome::Inserted {
+            admitted_probe = Some(key);
+            break;
+        }
+    }
+    admitted_probe.expect("doorkeeper admits a repeated candidate");
+
+    let mut frequency_rejected = false;
+    for index in 256..512 {
+        let key = format!("adaptive-probe-{index}").into_bytes();
+        let first = cache
+            .insert_if_absent_with_options(&key, vec![5], 1, None)
+            .unwrap();
+        if first != CacheAdmissionOutcome::Rejected {
+            continue;
+        }
+        let second = cache
+            .insert_if_absent_with_options(&key, vec![6], 1, None)
+            .unwrap();
+        if second == CacheAdmissionOutcome::Rejected {
+            frequency_rejected = true;
+            break;
+        }
+    }
+    assert!(
+        frequency_rejected,
+        "adaptive gate rejects a low-frequency retry"
     );
     #[cfg(feature = "cache-production-diagnostics")]
     {
@@ -1709,6 +1772,23 @@ fn bulk_loaded_expired_entry_is_removed_on_read() {
 }
 
 #[test]
+fn guarded_expiration_path_does_not_return_stale_value() {
+    let cache = cache(1_024, 16);
+    cache
+        .insert_discard_with_options(b"ttl", vec![1], 1, Some(Duration::ZERO))
+        .unwrap();
+
+    let guard = cache.pin();
+    assert!(guard.get(b"ttl").is_none());
+    drop(guard);
+
+    cache
+        .insert_discard_with_options(b"ttl", vec![2], 1, None)
+        .unwrap();
+    assert_eq!(&*cache.get(b"ttl").unwrap(), &vec![2]);
+}
+
+#[test]
 fn protected_value_survives_replacement_and_cache_drop() {
     let cache = Arc::new(cache(1_024, 16));
     cache
@@ -2275,6 +2355,295 @@ fn async_eviction_enforces_the_weight_hard_limit() {
     assert_eq!(cache.weight(), 140);
 }
 
+#[cfg(feature = "cache-production-diagnostics")]
+#[test]
+fn async_eviction_never_publishes_weight_above_the_configured_hard_limit() {
+    const CAPACITY: u64 = 128;
+    const HARD_LIMIT: u64 = 141;
+    let cache = DirectPackedCache::try_new(
+        CacheConfig::new(CAPACITY)
+            .with_overlay_capacity(512)
+            .with_async_eviction(11_000),
+    )
+    .unwrap();
+
+    for key in 0_u64..142 {
+        cache
+            .insert_discard_with_options(&key.to_le_bytes(), vec![0; 8], 1, None)
+            .unwrap();
+    }
+
+    assert!(cache.weight() <= HARD_LIMIT);
+    assert!(cache.production_diagnostics().peak_weight <= HARD_LIMIT);
+}
+
+#[cfg(feature = "cache-production-diagnostics")]
+#[test]
+fn concurrent_async_admission_never_crosses_the_configured_hard_limit() {
+    const CAPACITY: usize = 256;
+    const HARD_LIMIT: usize = 282;
+    const WRITERS: usize = 8;
+    const INSERTS_PER_WRITER: usize = 256;
+    let cache = Arc::new(
+        DirectPackedCache::try_new(
+            CacheConfig::new(u64::try_from(CAPACITY).unwrap())
+                .with_max_entries(CAPACITY)
+                .with_overlay_capacity(4_096)
+                .with_async_eviction(11_000),
+        )
+        .unwrap(),
+    );
+    let start = Arc::new(Barrier::new(WRITERS));
+
+    thread::scope(|scope| {
+        for writer in 0..WRITERS {
+            let cache = Arc::clone(&cache);
+            let start = Arc::clone(&start);
+            scope.spawn(move || {
+                start.wait();
+                for insertion in 0..INSERTS_PER_WRITER {
+                    let key = ((writer as u64) << 32) | insertion as u64;
+                    cache
+                        .insert_discard_with_options(&key.to_le_bytes(), vec![0; 8], 1, None)
+                        .unwrap();
+                }
+            });
+        }
+    });
+
+    let observed_len = cache.len();
+    let observed_weight = cache.weight();
+    let hard_limit_weight = u64::try_from(HARD_LIMIT).unwrap();
+    let diagnostics = cache.production_diagnostics();
+    assert!(
+        observed_len <= HARD_LIMIT,
+        "live entry count crossed hard limit: observed_len={observed_len}, hard_limit={HARD_LIMIT}, diagnostics={diagnostics:?}"
+    );
+    assert!(
+        observed_weight <= hard_limit_weight,
+        "live weight crossed hard limit: observed_weight={observed_weight}, hard_limit_weight={hard_limit_weight}, diagnostics={diagnostics:?}"
+    );
+    assert!(
+        diagnostics.peak_entries <= HARD_LIMIT,
+        "diagnostic peak entries crossed hard limit: peak_entries={}, hard_limit={HARD_LIMIT}, diagnostics={diagnostics:?}",
+        diagnostics.peak_entries
+    );
+    assert!(
+        diagnostics.peak_weight <= hard_limit_weight,
+        "diagnostic peak weight crossed hard limit: peak_weight={}, hard_limit_weight={hard_limit_weight}, diagnostics={diagnostics:?}",
+        diagnostics.peak_weight
+    );
+}
+
+#[test]
+fn async_large_replacement_reserves_only_the_net_weight_change() {
+    let cache = DirectPackedCache::try_new(
+        CacheConfig::new(128)
+            .with_overlay_capacity(64)
+            .with_async_eviction(11_000),
+    )
+    .unwrap();
+    cache
+        .insert_discard_with_options(b"large", vec![1; 100], 100, None)
+        .unwrap();
+
+    assert!(
+        cache
+            .replace_discard_with_options(b"large", vec![2; 120], 120, None)
+            .unwrap()
+    );
+    assert_eq!(cache.peek(b"large").unwrap().as_slice(), [2; 120]);
+    assert_eq!(cache.weight(), 120);
+}
+
+#[test]
+fn async_large_upsert_preserves_replacement_semantics() {
+    let cache = DirectPackedCache::try_new(
+        CacheConfig::new(128)
+            .with_overlay_capacity(64)
+            .with_async_eviction(11_000),
+    )
+    .unwrap();
+    cache
+        .insert_discard_with_options(b"large", vec![1; 100], 100, None)
+        .unwrap();
+
+    assert_eq!(
+        cache
+            .insert_discard_with_options(b"large", vec![2; 120], 120, None)
+            .unwrap(),
+        CacheWriteOutcome::Replaced
+    );
+    assert_eq!(cache.peek(b"large").unwrap().as_slice(), [2; 120]);
+    assert_eq!(cache.weight(), 120);
+}
+
+#[test]
+fn existing_admission_at_the_hard_limit_does_not_evict_a_resident() {
+    let cache = DirectPackedCache::try_new(
+        CacheConfig::new(2)
+            .with_overlay_capacity(64)
+            .with_async_eviction(15_000),
+    )
+    .unwrap();
+    for key in [
+        b"alpha".as_slice(),
+        b"bravo".as_slice(),
+        b"charlie".as_slice(),
+    ] {
+        cache
+            .insert_discard_with_options(key, vec![1], 1, None)
+            .unwrap();
+    }
+
+    assert_eq!(
+        cache
+            .insert_if_absent_with_options(b"alpha", vec![2], 1, None)
+            .unwrap(),
+        CacheAdmissionOutcome::Existing
+    );
+    assert_eq!(cache.len(), 3);
+    assert_eq!(cache.weight(), 3);
+    for key in [
+        b"alpha".as_slice(),
+        b"bravo".as_slice(),
+        b"charlie".as_slice(),
+    ] {
+        assert!(cache.peek(key).is_some(), "resident {key:?} must survive");
+    }
+}
+
+#[test]
+fn concurrent_async_large_replacements_keep_exact_capacity() {
+    const WRITERS: usize = 4;
+    const REPLACEMENTS: usize = 256;
+    let cache = Arc::new(
+        DirectPackedCache::try_new(
+            CacheConfig::new(128)
+                .with_overlay_capacity(64)
+                .with_async_eviction(11_000),
+        )
+        .unwrap(),
+    );
+    cache
+        .insert_discard_with_options(b"large", vec![1; 100], 100, None)
+        .unwrap();
+    let start = Arc::new(Barrier::new(WRITERS));
+
+    thread::scope(|scope| {
+        for writer in 0..WRITERS {
+            let cache = Arc::clone(&cache);
+            let start = Arc::clone(&start);
+            scope.spawn(move || {
+                start.wait();
+                for replacement in 0..REPLACEMENTS {
+                    let length = if (writer + replacement).is_multiple_of(2) {
+                        100
+                    } else {
+                        120
+                    };
+                    assert!(
+                        cache
+                            .replace_discard_with_options(
+                                b"large",
+                                vec![u8::try_from(writer).unwrap(); length],
+                                u64::try_from(length).unwrap(),
+                                None,
+                            )
+                            .unwrap()
+                    );
+                }
+            });
+        }
+    });
+
+    let value = cache.peek(b"large").unwrap();
+    assert_eq!(cache.len(), 1);
+    assert_eq!(cache.weight(), u64::try_from(value.len()).unwrap());
+    assert!(cache.weight() <= 128);
+}
+
+#[cfg(feature = "prepared-keys")]
+#[test]
+fn async_large_replacement_batch_reserves_net_weight_without_evicting_targets() {
+    let keys = [b"alpha".as_slice(), b"bravo".as_slice()];
+    let cache = DirectPackedCache::try_from_entries_with_options(
+        CacheConfig::new(128)
+            .with_max_entries(2)
+            .with_overlay_capacity(64)
+            .with_async_eviction(11_000),
+        keys.iter().map(|key| (*key, vec![1; 50], 50, None)),
+    )
+    .unwrap();
+    let prepared = keys.map(|key| cache.prepare_key(key));
+    let mut guard = cache.pin();
+    let mut replaced = [false; 2];
+    {
+        let mut batch = guard.prepared_replacement_batch();
+        batch
+            .replace_discard_batch_with_options(
+                &keys,
+                [(vec![2; 60], 60, None), (vec![3; 60], 60, None)],
+                &mut replaced,
+            )
+            .unwrap();
+    }
+
+    assert_eq!(replaced, [true; 2]);
+    assert_eq!(cache.peek(keys[0]).unwrap().as_slice(), [2; 60]);
+    assert_eq!(cache.peek(keys[1]).unwrap().as_slice(), [3; 60]);
+    assert_eq!(cache.weight(), 120);
+
+    {
+        let mut batch = guard.prepared_replacement_batch();
+        batch
+            .replace_discard_prepared_batch_with_options(
+                &keys,
+                &prepared,
+                [(vec![4; 55], 55, None), (vec![5; 55], 55, None)],
+                &mut replaced,
+            )
+            .unwrap();
+    }
+    assert_eq!(replaced, [true; 2]);
+    assert_eq!(cache.peek(keys[0]).unwrap().as_slice(), [4; 55]);
+    assert_eq!(cache.peek(keys[1]).unwrap().as_slice(), [5; 55]);
+    assert_eq!(cache.weight(), 110);
+}
+
+#[cfg(feature = "prepared-keys")]
+#[test]
+fn failed_batch_replacement_releases_capacity_before_the_next_item() {
+    let cache = DirectPackedCache::try_from_entries_with_options(
+        CacheConfig::new(100)
+            .with_max_entries(3)
+            .with_overlay_capacity(64)
+            .with_async_eviction(11_000),
+        [
+            (b"target".as_slice(), vec![1; 50], 50, None),
+            (b"resident".as_slice(), vec![2; 50], 50, None),
+        ],
+    )
+    .unwrap();
+    let mut guard = cache.pin();
+    let mut replaced = [false; 2];
+    {
+        let mut batch = guard.prepared_replacement_batch();
+        batch
+            .replace_discard_batch_with_options(
+                &[b"absent".as_slice(), b"target".as_slice()],
+                [(vec![3; 10], 10, None), (vec![4; 60], 60, None)],
+                &mut replaced,
+            )
+            .unwrap();
+    }
+
+    assert_eq!(replaced, [false, true]);
+    assert_eq!(cache.peek(b"target").unwrap().as_slice(), [4; 60]);
+    assert_eq!(cache.peek(b"resident").unwrap().as_slice(), [2; 50]);
+    assert_eq!(cache.weight(), 110);
+}
+
 #[test]
 fn async_worker_wakes_to_drain_soft_limit_debt() {
     const CAPACITY: usize = 256;
@@ -2773,4 +3142,192 @@ fn miri_concurrent_replacement_and_reclamation_smoke() {
     }
     assert_eq!(cache.len(), WRITERS);
     assert_eq!(cache.weight(), (WRITERS * 8) as u64);
+}
+
+#[test]
+fn eviction_destructor_can_reenter_same_cache() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Weak, mpsc};
+
+    struct Reenter {
+        cache: Weak<DirectPackedCache<Reenter>>,
+        armed: Arc<AtomicBool>,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for Reenter {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+            if self.armed.swap(false, Ordering::SeqCst) {
+                let cache = self.cache.upgrade().unwrap();
+                cache
+                    .insert_discard_with_options(
+                        b"from-drop",
+                        Self {
+                            cache: self.cache.clone(),
+                            armed: Arc::clone(&self.armed),
+                            drops: Arc::clone(&self.drops),
+                        },
+                        1,
+                        None,
+                    )
+                    .unwrap();
+            }
+        }
+    }
+    let (send, receive) = mpsc::channel();
+    thread::spawn(move || {
+        let cache = Arc::new(
+            DirectPackedCache::try_new(
+                CacheConfig::new(u64::MAX)
+                    .with_max_entries(64)
+                    .with_overlay_capacity(4096),
+            )
+            .unwrap(),
+        );
+        let armed = Arc::new(AtomicBool::new(false));
+        let drops = Arc::new(AtomicUsize::new(0));
+        for key in 0..20_000_u64 {
+            if key == 64 {
+                armed.store(true, Ordering::SeqCst);
+            }
+            cache
+                .insert_discard_with_options(
+                    &key.to_le_bytes(),
+                    Reenter {
+                        cache: Arc::downgrade(&cache),
+                        armed: Arc::clone(&armed),
+                        drops: Arc::clone(&drops),
+                    },
+                    1,
+                    None,
+                )
+                .unwrap();
+        }
+        assert!(!armed.load(Ordering::SeqCst));
+        assert!(drops.load(Ordering::Relaxed) >= 1000);
+        send.send(()).unwrap();
+    });
+    receive
+        .recv_timeout(Duration::from_secs(10))
+        .expect("eviction destructor deadlocked");
+}
+
+#[test]
+fn striped_insert_tolerates_lock_free_same_key_writers() {
+    for replacement_batch in [false, true] {
+        let cache = Arc::new(
+            DirectPackedCache::try_new(CacheConfig::new(u64::MAX).with_overlay_capacity(64))
+                .unwrap(),
+        );
+        cache
+            .insert_discard_with_options(b"key", 0_u64, 1, None)
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let writer_cache = Arc::clone(&cache);
+        let writer_barrier = Arc::clone(&barrier);
+        let writer = thread::spawn(move || {
+            writer_barrier.wait();
+            for value in 0..20_000_u64 {
+                writer_cache
+                    .insert_discard_with_options(b"key", value, 1, None)
+                    .unwrap();
+            }
+        });
+        let competitor_cache = Arc::clone(&cache);
+        let competitor = thread::spawn(move || {
+            let mut guard = competitor_cache.pin();
+            barrier.wait();
+            for value in 0..20_000_u64 {
+                if replacement_batch {
+                    guard
+                        .replacement_batch()
+                        .replace_discard_with_options(b"key", value, 1, None)
+                        .unwrap();
+                } else {
+                    competitor_cache.remove_discard(b"key");
+                    competitor_cache
+                        .insert_if_absent_with_options(b"key", value, 1, None)
+                        .unwrap();
+                }
+            }
+        });
+        let writer_result = writer.join();
+        competitor.join().unwrap();
+        writer_result.expect("striped insert must accept concurrent lock-free replacement");
+        let resident = cache.peek(b"key").is_some();
+        assert!(cache.len() <= 1);
+        assert_eq!(cache.len(), usize::from(resident));
+        assert_eq!(cache.weight(), u64::from(resident));
+    }
+}
+
+fn reservation_rebuild_cache() -> DirectPackedCache<u64> {
+    DirectPackedCache::try_new(
+        CacheConfig::new(u64::MAX)
+            .with_max_entries(64)
+            .with_overlay_capacity(64)
+            .with_rebuild_policy(packedgen::AdaptiveRebuildPolicy {
+                max_slot_utilization_bps: 1,
+                min_learned_insertions: 1,
+                max_distribution_drift_bps: 1,
+                max_short_key_spill_bps: 1,
+            }),
+    )
+    .unwrap()
+}
+
+#[test]
+fn maintenance_defers_rebuild_for_same_thread_guard_reservation() {
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        let cache = reservation_rebuild_cache();
+        for key in 0..64_u64 {
+            cache
+                .insert_discard_with_options(&key.to_le_bytes(), key, 1, None)
+                .unwrap();
+        }
+        let mut guard = cache.pin();
+        guard
+            .insert_if_absent_with_options(&0_u64.to_le_bytes(), 0, 1, None)
+            .unwrap();
+        assert!(!cache.maintain().unwrap().rebuilt);
+        assert_eq!(guard.get(&0_u64.to_le_bytes()), Some(&0));
+        guard.quiesce();
+        assert!(cache.maintain().unwrap().rebuilt);
+        assert_eq!(cache.len(), 64);
+        assert_eq!(cache.weight(), 64);
+        send.send(()).unwrap();
+    });
+    receive
+        .recv_timeout(Duration::from_secs(5))
+        .expect("same-thread guard reservation blocked maintenance");
+    worker.join().unwrap();
+}
+
+#[test]
+fn maintenance_shutdown_returns_with_live_guard_reservation() {
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        let cache = Arc::new(reservation_rebuild_cache());
+        for key in 0..64_u64 {
+            cache
+                .insert_discard_with_options(&key.to_le_bytes(), key, 1, None)
+                .unwrap();
+        }
+        let mut guard = cache.pin();
+        guard
+            .insert_if_absent_with_options(&0_u64.to_le_bytes(), 0, 1, None)
+            .unwrap();
+        let maintenance = cache.spawn_maintenance(Duration::from_millis(1));
+        thread::sleep(Duration::from_millis(100));
+        drop(maintenance);
+        assert_eq!(guard.get(&0_u64.to_le_bytes()), Some(&0));
+        guard.quiesce();
+        assert!(cache.maintain().unwrap().rebuilt);
+        send.send(()).unwrap();
+    });
+    receive
+        .recv_timeout(Duration::from_secs(5))
+        .expect("live guard reservation blocked worker shutdown");
+    worker.join().unwrap();
 }

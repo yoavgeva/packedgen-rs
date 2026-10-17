@@ -178,7 +178,7 @@ impl Strategy {
     const fn name(self) -> &'static str {
         match self {
             Self::Overlay(mode) => mode_name(mode),
-            Self::DirectPapaya => "papaya-0.2.4-direct",
+            Self::DirectPapaya => "papaya-0.2.5-direct",
             Self::Scc => "scc-3.8.5",
             Self::Flurry => "flurry-0.5.2",
             Self::DashMap => "dashmap-6.2.1",

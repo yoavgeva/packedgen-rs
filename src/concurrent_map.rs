@@ -156,12 +156,13 @@ impl<V> ConcurrentSwissMap<V> {
 
     /// Runs `read` with an optional value while holding its shard read lock.
     ///
-    /// This avoids cloning large values. The closure must be short and must
-    /// not call a write operation on this map: re-entering the same shard for
-    /// writing can deadlock.
+    /// This avoids cloning large values. Re-entrant reads of this shard are
+    /// allowed even when a writer is queued. Keep the closure short: recursive
+    /// reads can delay writers. Do not call write operations on this map from
+    /// the closure, because re-entering the same shard for writing can deadlock.
     pub fn with_value<R>(&self, key: &[u8], read: impl FnOnce(Option<&V>) -> R) -> R {
         let hash = self.route_hasher.hash_one(key);
-        let map = self.shard(hash).map.read();
+        let map = self.shard(hash).map.read_recursive();
         read(map.get_prehashed(hash, key))
     }
 
@@ -174,7 +175,8 @@ impl<V> ConcurrentSwissMap<V> {
     /// Atomically updates an existing value and returns the closure result.
     ///
     /// Returns `None` without running `update` when the key is absent. Keep the
-    /// closure short and do not re-enter this map from it.
+    /// closure short and do not re-enter this map from it, even for reads:
+    /// the closure holds its shard's write lock.
     pub fn update<R>(&self, key: &[u8], update: impl FnOnce(&mut V) -> R) -> Option<R> {
         let hash = self.route_hasher.hash_one(key);
         let mut map = self.shard(hash).map.write();
@@ -185,7 +187,8 @@ impl<V> ConcurrentSwissMap<V> {
     ///
     /// The returned outcome distinguishes which path ran and carries the
     /// update closure's return value. Keep `update` short and do not re-enter
-    /// this map from it.
+    /// this map from it, even for reads: the closure holds its shard's write
+    /// lock.
     ///
     /// # Errors
     ///
@@ -224,7 +227,8 @@ impl<V> ConcurrentSwissMap<V> {
     ///
     /// This supports race-free lazy expiry: a concurrent refresh cannot occur
     /// between the predicate check and deletion. Keep the predicate short and
-    /// do not re-enter this map from it.
+    /// do not re-enter this map from it, even for reads: the predicate holds
+    /// its shard's write lock.
     #[must_use]
     pub fn remove_if(&self, key: &[u8], predicate: impl FnOnce(&V) -> bool) -> Option<V> {
         let hash = self.route_hasher.hash_one(key);
@@ -312,7 +316,11 @@ impl<V> ConcurrentSwissMap<V> {
     /// Normal point operations never acquire more than one shard lock.
     #[must_use]
     pub fn stats(&self) -> ConcurrentMapStats {
-        let maps: Vec<_> = self.shards.iter().map(|shard| shard.map.read()).collect();
+        let maps: Vec<_> = self
+            .shards
+            .iter()
+            .map(|shard| shard.map.read_recursive())
+            .collect();
         let mut stats = ConcurrentMapStats {
             len: 0,
             shards: maps.len(),

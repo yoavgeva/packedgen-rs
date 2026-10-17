@@ -367,3 +367,10 @@ fn background_worker_can_be_started_and_stopped() {
     maintenance.shutdown();
     assert!(cache.is_empty());
 }
+
+#[test]
+fn shared_values_make_cache_send_and_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<PackedCache<u64>>();
+    assert_send_sync::<PackedCache<std::sync::Arc<str>>>();
+}

@@ -73,28 +73,28 @@ static NEXT_DIRECT_ARENA_THREAD: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     static DIRECT_ARENA_THREAD: Cell<usize> = const { Cell::new(usize::MAX) };
-    // Non-zero only while this thread is running user destructors with one
-    // direct arena's collector gate held. The exact owner identity matters:
-    // destruction may re-enter a different cache, whose gate must still be
-    // acquired normally.
-    static DIRECT_RECLAIM_OWNER: Cell<usize> = const { Cell::new(0) };
+    static DIRECT_RECLAIM_DEFERRAL_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
-struct DirectReclaimOwnerScope {
-    previous: usize,
+pub(crate) struct DirectReclaimDeferral<'arena, V> {
+    owner: &'arena DirectArenaOwner<V>,
+    _not_send: PhantomData<*mut ()>,
 }
 
-impl DirectReclaimOwnerScope {
-    fn enter(owner: usize) -> Self {
-        debug_assert_ne!(owner, 0);
-        let previous = DIRECT_RECLAIM_OWNER.with(|current| current.replace(owner));
-        Self { previous }
-    }
-}
-
-impl Drop for DirectReclaimOwnerScope {
+impl<V> Drop for DirectReclaimDeferral<'_, V> {
     fn drop(&mut self) {
-        DIRECT_RECLAIM_OWNER.with(|current| current.set(self.previous));
+        let outermost = DIRECT_RECLAIM_DEFERRAL_DEPTH.with(|depth| {
+            depth.set(depth.get() - 1);
+            depth.get() == 0
+        });
+        if outermost {
+            let pending = self.owner.deferred_reclaim.swap(0, Ordering::Relaxed);
+            if pending != 0 {
+                for _ in 0..if pending == 2 { DIRECT_EPOCHS } else { 1 } {
+                    self.owner.try_advance(pending == 2);
+                }
+            }
+        }
     }
 }
 
@@ -754,9 +754,17 @@ impl<V> DirectValueArena<V> {
         }
     }
 
+    pub(crate) fn defer_reclamation(&self) -> DirectReclaimDeferral<'_, V> {
+        DIRECT_RECLAIM_DEFERRAL_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        DirectReclaimDeferral {
+            owner: &self.owner,
+            _not_send: PhantomData,
+        }
+    }
+
     pub(crate) fn reclaim_retired(&self) {
         for _ in 0..DIRECT_EPOCHS {
-            self.owner.try_advance(true);
+            self.owner.advance_or_defer(true);
         }
     }
 
@@ -1260,7 +1268,7 @@ unsafe impl<V: Send + Sync> Send for DirectAvailableBlock<V> {}
 // pointee requires `V: Send + Sync`.
 unsafe impl<V: Send + Sync> Sync for DirectAvailableBlock<V> {}
 
-#[repr(align(64))]
+#[repr(align(128))]
 struct DirectArenaPartition<V> {
     state: Mutex<DirectArenaPartitionState<V>>,
 }
@@ -1741,7 +1749,7 @@ fn direct_mark_partition_available(availability: &[AtomicU64], partition: usize,
     }
 }
 
-#[repr(align(64))]
+#[repr(align(128))]
 struct DirectReaderCounter(AtomicUsize);
 
 impl DirectReaderCounter {
@@ -1750,7 +1758,7 @@ impl DirectReaderCounter {
     }
 }
 
-#[repr(align(64))]
+#[repr(align(128))]
 struct DirectMutatorSlot(AtomicBool);
 
 impl DirectMutatorSlot {
@@ -1759,7 +1767,7 @@ impl DirectMutatorSlot {
     }
 }
 
-#[repr(align(64))]
+#[repr(align(128))]
 struct DirectRetiredQueue(Mutex<Vec<RemovedDirectHandle>>);
 
 impl DirectRetiredQueue {
@@ -1801,6 +1809,15 @@ impl<'a> DirectRetiredBatch<'a> {
     fn disarm(mut self) -> Vec<RemovedDirectHandle> {
         std::mem::take(&mut self.handles)
     }
+}
+
+fn collect_direct_arena_pointers<V>(
+    handles: Vec<RemovedDirectHandle>,
+) -> Vec<*mut DirectArenaEntry<V>> {
+    handles
+        .into_iter()
+        .map(|handle| handle.published().pointer::<V>())
+        .collect()
 }
 
 impl Drop for DirectRetiredBatch<'_> {
@@ -1865,6 +1882,7 @@ struct DirectArenaOwner<V> {
     peak_retired_values: AtomicUsize,
     #[cfg(feature = "cache-production-diagnostics")]
     peak_retired_bytes: AtomicU64,
+    deferred_reclaim: AtomicUsize,
     reclaim_gate: Mutex<()>,
 }
 
@@ -1895,6 +1913,7 @@ impl<V> DirectArenaOwner<V> {
             peak_retired_values: AtomicUsize::new(0),
             #[cfg(feature = "cache-production-diagnostics")]
             peak_retired_bytes: AtomicU64::new(0),
+            deferred_reclaim: AtomicUsize::new(0),
             reclaim_gate: Mutex::new(()),
         }
     }
@@ -2117,16 +2136,6 @@ impl<V> DirectArenaOwner<V> {
         if self.mutator_activity.load(Ordering::SeqCst) {
             return;
         }
-        let owner = ptr::from_ref(self).addr();
-        if DIRECT_RECLAIM_OWNER.with(|current| current.get() == owner) {
-            // A value destructor has re-entered this exact arena while the
-            // current thread already owns `reclaim_gate`. Announce mutation
-            // observation directly: trying to acquire the non-reentrant gate
-            // again would deadlock. This is still serialized by that gate and
-            // affects only the first reentrant mutation, not a hot path.
-            self.mutator_activity.store(true, Ordering::SeqCst);
-            return;
-        }
         // First use synchronizes once with the collector gate before any index
         // mutation. A collector either finishes first or observes the
         // permanent flag; it can never skip a concurrently active first slot.
@@ -2210,7 +2219,7 @@ impl<V> DirectArenaOwner<V> {
                 .fetch_add(DIRECT_RECLAIM_PUBLISH_BATCH, Ordering::Relaxed)
                 + DIRECT_RECLAIM_PUBLISH_BATCH;
             if published >= DIRECT_RECLAIM_BATCH {
-                self.try_advance(false);
+                self.advance_or_defer(false);
             }
         }
     }
@@ -2255,7 +2264,7 @@ impl<V> DirectArenaOwner<V> {
             let published =
                 self.retired_count[epoch].fetch_add(publish, Ordering::Relaxed) + publish;
             if published >= DIRECT_RECLAIM_BATCH {
-                self.try_advance(false);
+                self.advance_or_defer(false);
             }
         }
     }
@@ -2291,6 +2300,19 @@ impl<V> DirectArenaOwner<V> {
             .any(|queue| !queue.0.lock().is_empty())
     }
 
+    fn advance_or_defer(&self, force: bool) {
+        if DIRECT_RECLAIM_DEFERRAL_DEPTH.with(|depth| depth.get() != 0) {
+            self.deferred_reclaim
+                .fetch_max(if force { 2 } else { 1 }, Ordering::Relaxed);
+        } else {
+            let pending = self.deferred_reclaim.swap(0, Ordering::Relaxed);
+            let force = force || pending == 2;
+            for _ in 0..if force { DIRECT_EPOCHS } else { 1 } {
+                self.try_advance(force);
+            }
+        }
+    }
+
     fn try_advance(&self, force: bool) {
         let observed = direct_epoch_slot(self.current_epoch.load(Ordering::SeqCst));
         if !force && self.retired_count[observed].load(Ordering::Relaxed) < DIRECT_RECLAIM_BATCH {
@@ -2324,11 +2346,10 @@ impl<V> DirectArenaOwner<V> {
         // removal and readers admitted during one racing rotation have left.
         if self.epoch_has_retired(advance.next_epoch) {
             self.retired_count[advance.next_epoch].swap(0, Ordering::Relaxed);
-            // Reclamation invokes arbitrary `V::drop` code while this thread
-            // owns `reclaim_gate`. Mark the exact owner only for that cold
-            // interval so a destructor's first same-arena mutation can
-            // announce itself without recursively locking the gate.
-            let _owner_scope = DirectReclaimOwnerScope::enter(ptr::from_ref(self).addr());
+            // Destructors may nest through another arena before this arena's
+            // first mutation. Publish the permanent flag under reclaim_gate
+            // before user code so reentrant activation never relocks the gate.
+            self.mutator_activity.store(true, Ordering::SeqCst);
             self.drain_retired_epoch(advance.next_epoch);
         }
         debug_assert_eq!(
@@ -2369,10 +2390,7 @@ impl<V> DirectArenaOwner<V> {
             // SAFETY: the quiescent retired batch still owns initialized entries.
             total.saturating_add(unsafe { (*pointer).weight() })
         });
-        let arena_pointers = arena_handles
-            .iter()
-            .map(|handle| handle.published().pointer::<V>())
-            .collect::<Vec<_>>();
+        let arena_pointers = collect_direct_arena_pointers::<V>(arena_handles);
         // SAFETY: the handles came from this owner's retired queues, the
         // selected epoch is quiescent, and the queue owns each retirement once.
         unsafe {
@@ -2718,7 +2736,7 @@ impl<V> DirectArenaState<V> {
     }
 }
 
-fn direct_arena_thread() -> usize {
+pub(crate) fn direct_arena_thread() -> usize {
     DIRECT_ARENA_THREAD.with(|thread| {
         let current = thread.get();
         if current != usize::MAX {
@@ -2787,7 +2805,7 @@ struct PartitionState {
     free: Vec<u32>,
 }
 
-#[repr(align(64))]
+#[repr(align(128))]
 struct ArenaPartition<V> {
     directory: OnceLock<Box<ArenaDirectory<V>>>,
     state: Mutex<PartitionState>,
@@ -2836,6 +2854,8 @@ pub(crate) enum ArenaAllocationError {
 }
 
 pub(crate) struct ValueArena<V> {
+    // Values are owned here, shared by readers, and reclaimed on other threads.
+    _marker: PhantomData<Arc<ArenaEntry<V>>>,
     partitions: Box<[ArenaPartition<V>]>,
     active_partitions: AtomicUsize,
     collector: Arc<Collector>,
@@ -2850,6 +2870,7 @@ impl<V> ValueArena<V> {
                 .collect(),
             active_partitions: AtomicUsize::new(1),
             collector: Arc::new(Collector::new().batch_size(512)),
+            _marker: PhantomData,
         }
     }
 
@@ -3270,6 +3291,15 @@ fn adjust_weight(total: &AtomicU64, previous: u64, replacement: u64) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn hot_shards_have_128_byte_alignment() {
+        assert!(std::mem::align_of::<DirectArenaPartition<u64>>() >= 128);
+        assert!(std::mem::align_of::<DirectReaderCounter>() >= 128);
+        assert!(std::mem::align_of::<DirectMutatorSlot>() >= 128);
+        assert!(std::mem::align_of::<DirectRetiredQueue>() >= 128);
+        assert!(std::mem::align_of::<ArenaPartition<u64>>() >= 128);
+    }
     use super::*;
 
     #[test]
@@ -3450,6 +3480,99 @@ mod tests {
     #[test]
     #[allow(
         unsafe_code,
+        reason = "retires exclusively owned unpublished test values"
+    )]
+    fn different_value_arena_deferred_reclamation_resumes_on_maintenance() {
+        struct CountDrop(Arc<AtomicUsize>);
+        impl Drop for CountDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let outer = DirectValueArena::<u64>::new(1);
+        let inner = DirectValueArena::new(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        {
+            let _deferral = outer.defer_reclamation();
+            for _ in 0..1024 {
+                let handle = inner.allocate(CountDrop(Arc::clone(&drops)), 1, u64::MAX);
+                let pin = inner.pin();
+                // SAFETY: the unpublished handle is exclusively owned and protected by its arena pin.
+                unsafe {
+                    pin.retire(RemovedDirectHandle::from_exact_removal(handle));
+                }
+            }
+            inner.reclaim_retired();
+            assert_eq!(drops.load(Ordering::Relaxed), 0);
+        }
+        inner.reclaim_retired();
+        assert_eq!(drops.load(Ordering::Relaxed), 1024);
+    }
+
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "retires exclusively owned unpublished test values"
+    )]
+    fn nested_retired_value_drop_can_activate_outer_arena() {
+        struct Action(Option<Box<dyn FnOnce() + Send + Sync>>);
+        impl Drop for Action {
+            fn drop(&mut self) {
+                if let Some(action) = self.0.take() {
+                    action();
+                }
+            }
+        }
+        let outer = DirectValueArena::new(1);
+        let inner = DirectValueArena::new(1);
+        let outer_owner = Arc::downgrade(&outer.owner);
+        let inner_handle = inner.allocate(
+            Action(Some(Box::new(move || {
+                let owner = outer_owner.upgrade().unwrap();
+                owner.activate_mutators();
+                let reservation = owner.enter_mutator(0);
+                owner.leave_mutator(reservation);
+            }))),
+            1,
+            u64::MAX,
+        );
+        let inner_pin = inner.pin();
+        // SAFETY: the unpublished handle is exclusively owned and protected by its arena pin.
+        unsafe {
+            inner_pin.retire(RemovedDirectHandle::from_exact_removal(inner_handle));
+        }
+        drop(inner_pin);
+        let outer_handle = outer.allocate(
+            Action(Some(Box::new(move || {
+                inner.reclaim_retired();
+            }))),
+            1,
+            u64::MAX,
+        );
+        let outer_pin = outer.pin();
+        // SAFETY: the unpublished handle is exclusively owned and protected by its arena pin.
+        unsafe {
+            outer_pin.retire(RemovedDirectHandle::from_exact_removal(outer_handle));
+        }
+        drop(outer_pin);
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            outer.reclaim_retired();
+            send.send(()).unwrap();
+        });
+        receive
+            .recv_timeout(std::time::Duration::from_secs(if cfg!(miri) {
+                120
+            } else {
+                2
+            }))
+            .expect("nested destruction must not deadlock the outer collector gate");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    #[allow(
+        unsafe_code,
         reason = "the test protects one unpublished handle from this exact arena"
     )]
     fn partial_direct_reservation_releases_only_unused_slots() {
@@ -3585,6 +3708,55 @@ mod tests {
         assert!(result.is_err());
         drop(arena);
         assert_eq!(drops.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "the test inspects live entries through converted raw pointers"
+    )]
+    fn direct_arena_pointer_collection_reuses_handle_buffer() {
+        assert_eq!(
+            std::mem::size_of::<RemovedDirectHandle>(),
+            std::mem::size_of::<*mut DirectArenaEntry<()>>()
+        );
+        assert_eq!(
+            std::mem::align_of::<RemovedDirectHandle>(),
+            std::mem::align_of::<*mut DirectArenaEntry<()>>()
+        );
+
+        for count in [0, 1, 17, DIRECT_RECLAIM_PUBLISH_BATCH + 1] {
+            let arena = DirectValueArena::new(1);
+            let mut handles = Vec::with_capacity(count);
+            let count_u64 = u64::try_from(count).expect("test count fits u64");
+            for value in 0_u64..count_u64 {
+                let handle = arena.allocate(value, 1, u64::MAX);
+                // The test transfers each distinct unpublished allocation's
+                // sole ownership into the private retirement marker without
+                // claiming that an index removal occurred.
+                handles.push(RemovedDirectHandle(handle));
+            }
+            let handle_storage = handles.as_ptr();
+
+            let pointers = collect_direct_arena_pointers::<u64>(handles);
+
+            assert_eq!(pointers.len(), count);
+            if count != 0 {
+                assert_eq!(
+                    pointers.as_ptr().cast::<RemovedDirectHandle>(),
+                    handle_storage,
+                    "pointer conversion should reuse the owning handle allocation"
+                );
+            }
+            for (value, pointer) in (0_u64..count_u64).zip(pointers.iter()) {
+                // SAFETY: every pointer came from the live arena immediately
+                // above, and the arena remains alive through this assertion.
+                let entry = unsafe { &**pointer };
+                assert_eq!(entry.value(), &value);
+            }
+            drop(pointers);
+            drop(arena);
+        }
     }
 
     #[test]

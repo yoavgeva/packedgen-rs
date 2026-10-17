@@ -56,7 +56,8 @@ pub use cache::{
     CacheValue, CacheWriteOutcome, DirectAdaptiveAdmission, DirectCacheAdmissionBatch,
     DirectCacheBulkAdmissionBatch, DirectCacheGuard, DirectCacheRemovalBatch,
     DirectCacheReplacementBatch, DirectCacheUntrackedRemovalBatch,
-    DirectCacheUntrackedReplacementBatch, DirectCacheValue, DirectPackedCache, PackedCache,
+    DirectCacheUntrackedReplacementBatch, DirectCacheValue, DirectClonedCacheGuard,
+    DirectPackedCache, DirectShareableCacheGuard, PackedCache,
 };
 pub use concurrent_map::{
     ConcurrentConfigError, ConcurrentMapStats, ConcurrentSwissMap, UpsertOutcome,

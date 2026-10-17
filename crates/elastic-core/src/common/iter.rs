@@ -8,6 +8,16 @@ use super::config::GROUP_SIZE;
 use super::control::ControlByte;
 use super::simd;
 
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static SCAN_VISITS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn note_scan_visits(count: usize) {
+    SCAN_VISITS.with(|visits| visits.set(visits.get() + count));
+}
+
 /// Projects the `K` from a borrowing `(&K, &V)` iterator.
 pub struct Keys<I> {
     inner: I,
@@ -256,6 +266,8 @@ impl OccupiedSlots {
             // `next_ctrl` never advances beyond its one-past-end pointer.
             let remaining = usize::try_from(unsafe { self.end_ctrl.offset_from(self.next_ctrl) })
                 .expect("iterator control pointers remain ordered");
+            #[cfg(test)]
+            note_scan_visits(remaining.min(GROUP_SIZE));
             if remaining >= GROUP_SIZE {
                 // SAFETY: the remaining extent contains a complete readable
                 // control group.

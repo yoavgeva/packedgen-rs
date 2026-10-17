@@ -77,6 +77,7 @@ fn main() {
         SegmentedLoad::Fast,
     );
 
+    println!("# lookup keys precomputed; query corpus excluded from map live-byte budget");
     println!(
         "implementation,budget_bytes,entries,live_bytes,budget_utilization,lookups,samples,median_ns_per_lookup,lookups_per_second"
     );
@@ -284,24 +285,28 @@ fn median_hit_time(
         entries > 0,
         "positive RAM budget must fit at least one entry"
     );
-    run_hits(entries, lookups.min(100_000), &mut get);
+    let entry_count = u64::try_from(entries).expect("entry count must fit u64");
+    let keys = (0..lookups)
+        .map(|query| {
+            let query = u64::try_from(query).expect("lookup index must fit u64");
+            binary_key(mix(query) % entry_count)
+        })
+        .collect::<Vec<_>>();
+    run_hits(&keys[..lookups.min(100_000)], &mut get);
     let mut elapsed = Vec::with_capacity(samples);
     for _ in 0..samples {
         let started = Instant::now();
-        run_hits(entries, lookups, &mut get);
+        run_hits(&keys, &mut get);
         elapsed.push(started.elapsed());
     }
     elapsed.sort_unstable();
     elapsed[elapsed.len() / 2]
 }
 
-fn run_hits(entries: usize, lookups: usize, get: &mut impl FnMut(&[u8]) -> Option<u64>) {
+fn run_hits(keys: &[[u8; 32]], get: &mut impl FnMut(&[u8]) -> Option<u64>) {
     let mut checksum = 0_u64;
-    for query in 0..lookups {
-        let query = u64::try_from(query).expect("lookup index must fit u64");
-        let entry_count = u64::try_from(entries).expect("entry count must fit u64");
-        let index = mix(query) % entry_count;
-        checksum ^= get(&binary_key(index)).expect("generated hit key must exist");
+    for key in keys {
+        checksum ^= get(key).expect("generated hit key must exist");
     }
     black_box(checksum);
 }

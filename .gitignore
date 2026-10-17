@@ -1,5 +1,8 @@
 /target/
+# Keep the repository workspace lockfile tracked; nested workspaces may still
+# keep their own Cargo.lock files ignored.
 Cargo.lock
+!/Cargo.lock
 *.profraw
 criterion/
 

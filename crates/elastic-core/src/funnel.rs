@@ -351,9 +351,8 @@ unsafe fn scan_clean_funnel_bucket<T>(
         // SAFETY: the same contract provides a complete readable SIMD group.
         let matches = unsafe { simd::eq_mask_group(group, fingerprint) };
         // SAFETY: the same contract provides a complete readable SIMD group.
-        let first_empty = unsafe { simd::free_mask_group(group) }
-            .into_iter()
-            .find(|&lane| lane < logical_lanes);
+        let first_empty =
+            unsafe { simd::free_mask_group(group) }.find(|&lane| lane < logical_lanes);
         let semantic_lanes = first_empty.unwrap_or(logical_lanes);
 
         for lane in matches {
@@ -1168,6 +1167,8 @@ where
         while *scan < self.shape.n {
             let slot = *scan;
             *scan += 1;
+            #[cfg(test)]
+            crate::common::iter::note_scan_visits(1);
             // SAFETY: the loop condition proves `slot < shape.n`, the exact
             // storage capacity.
             if unsafe { self.storage.control_at(slot) }.is_occupied() {
@@ -1176,6 +1177,10 @@ where
             }
         }
         None
+    }
+
+    fn pop_next(&self, hint: &mut [usize; 2]) -> Option<usize> {
+        self.scan_next(&mut hint[0]).map(|(_, loc)| loc)
     }
 
     fn with_capacity_and_reserve_and_hasher_in(
@@ -1229,24 +1234,45 @@ where
     }
 
     fn clear(&mut self) {
-        for slot in 0..self.shape.n {
-            // SAFETY: the loop spans the storage's exact slot/control extent.
-            if unsafe { self.storage.control_at(slot) } == CTRL_TOMBSTONE {
-                // SAFETY: the same loop bound proves `slot` is in-bounds.
-                unsafe { self.storage.set_control(slot, CTRL_EMPTY) };
+        // Clearing controls breaks Funnel's probe chains. The guard finishes
+        // dropping remaining slots on unwind, leaving no unreachable entries.
+        struct ClearGuard<'a, T>(&'a mut FlatStorage<T>);
+        impl<T> Drop for ClearGuard<'_, T> {
+            fn drop(&mut self) {
+                self.0.clear_occupied_slots_with(|slot| {
+                    #[cfg(feature = "std")]
+                    {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            // SAFETY: each occupied slot is initialized and its
+                            // control is cleared before this callback.
+                            unsafe { core::ptr::drop_in_place(slot) };
+                        }));
+                        // A second panic (including its payload's destructor)
+                        // must not abort cleanup while the first is unwinding.
+                        if let Err(payload) = result {
+                            core::mem::forget(payload);
+                        }
+                    }
+                    #[cfg(not(feature = "std"))]
+                    // SAFETY: the same callback initialization contract holds.
+                    unsafe {
+                        core::ptr::drop_in_place(slot)
+                    };
+                });
             }
         }
+
+        self.len = 0;
         self.tombstones = 0;
-        let len = &mut self.len;
-        self.storage.clear_occupied_slots_with(|slot| {
-            *len -= 1;
-            // SAFETY: the arena callback yields each initialized slot exactly
-            // once after clearing its control byte.
-            unsafe { core::ptr::drop_in_place(slot) };
-        });
-        debug_assert_eq!(self.len, 0);
         self.exceptional_placement = false;
         self.epoch.start(EpochTransition::Clear, 0);
+        let guard = ClearGuard(&mut self.storage);
+        guard.0.clear_occupied_slots_with(|slot| {
+            // SAFETY: the arena callback yields each initialized slot exactly
+            // once after clearing its control byte. On unwind the guard drops
+            // only the remaining occupied slots, preventing double drops.
+            unsafe { core::ptr::drop_in_place(slot) };
+        });
     }
 
     fn wipe_all(&mut self) {

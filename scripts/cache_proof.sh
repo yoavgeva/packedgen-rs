@@ -11,10 +11,11 @@ result_dir="$result_root/$run_id"
 
 quick() {
   cargo fmt --all -- --check
-  cargo test --test direct_cache_differential
-  cargo test --test direct_packed_cache
-  cargo test --test cache_concurrency_model
-  cargo clippy --all-targets --all-features -- -D warnings
+  cargo test --locked --test direct_cache_differential
+  cargo test --locked --test direct_packed_cache
+  cargo test --locked --test direct_cache_allocations
+  cargo test --locked --test cache_concurrency_model
+  cargo clippy --locked --all-targets --all-features -- -D warnings
 }
 
 msrv() {
@@ -55,28 +56,28 @@ bench() {
   for workload in $workloads; do
     for thread_count in $threads; do
       append_csv "$result_dir/throughput.csv" \
-        cargo run --quiet --release --features "$features" --example cache_probe -- \
+        cargo run --locked --quiet --release --features "$features" --example cache_probe -- \
         "$entries" "$operations" "$thread_count" "$samples" "$workload"
     done
   done
 
   for count in $memory_entries; do
     append_csv "$result_dir/memory.csv" \
-      cargo run --quiet --release --features "$features" --example memory_probe -- \
+      cargo run --locked --quiet --release --features "$features" --example memory_probe -- \
       direct-packed-cache-mixed-value64 "$count"
     append_csv "$result_dir/memory.csv" \
-      cargo run --quiet --release --features "$features" --example memory_probe -- \
+      cargo run --locked --quiet --release --features "$features" --example memory_probe -- \
       direct-packed-cache-batch-admission-mixed-value64 "$count"
     append_csv "$result_dir/memory.csv" \
-      cargo run --quiet --release --features "$features" --example memory_probe -- \
+      cargo run --locked --quiet --release --features "$features" --example memory_probe -- \
       papaya-cache-compact-mixed-value64 "$count"
     append_csv "$result_dir/memory.csv" \
-      cargo run --quiet --release --features "$features" --example memory_probe -- \
+      cargo run --locked --quiet --release --features "$features" --example memory_probe -- \
       papaya-cache-inline-compact-mixed-value64 "$count"
   done
 
   append_csv "$result_dir/latency.csv" \
-    cargo run --quiet --release --features "$features" --example cache_latency_probe -- \
+    cargo run --locked --quiet --release --features "$features" --example cache_latency_probe -- \
     "$entries" "$operations" "$write_operations" 8 2 "$samples"
 
   printf 'PackedGen cache proof results: %s\n' "$result_dir"
@@ -102,6 +103,21 @@ miri() {
   MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
     cargo +nightly miri test --lib \
     generation_map::tests::mutable_only_guarded_insert_automatically_uses_route_hash_and_preserves_length -- --exact
+  MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
+    cargo +nightly miri test --lib \
+    cache::tests::direct_cloned_read_releases_reclamation_without_borrowing_the_cache -- --exact
+  MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
+    cargo +nightly miri test --lib \
+    cache::tests::direct_cloned_guard_keeps_no_arena_epoch_between_reads -- --exact
+  MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
+    cargo +nightly miri test --lib \
+    cache::tests::direct_shareable_guard_automatically_bounds_its_reader_epoch -- --exact
+  # PtrHash's global Rayon pool retains worker threads through process exit and
+  # currently trips Stacked Borrows inside Crossbeam. Tree Borrows validates
+  # PackedGen's deferred-drop path; leak-ignore applies only to that global pool.
+  MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance} -Zmiri-tree-borrows -Zmiri-ignore-leaks" \
+    cargo +nightly miri test --lib \
+    generation_map::tests::deferred_generation_drop_waits_for_read_cache_and_explicit_reclaim -- --exact
   MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
     cargo +nightly miri test --test direct_packed_cache \
     protected_value_survives_replacement_and_cache_drop -- --exact

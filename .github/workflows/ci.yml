@@ -70,6 +70,21 @@ jobs:
       - name: Verify publishable package chain
         run: scripts/package_release.sh
 
+  test-macos-arm:
+    name: Stable tests on Apple Silicon
+    # Exercise ARM's weak memory ordering independently of x86 CI.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: PackedGen default-feature tests
+        run: cargo test --locked -p packedgen --all-targets
+      - name: PackedGen prepared-key and cache diagnostic tests
+        run: cargo test --locked -p packedgen --all-targets --features prepared-keys,prepared-batch-gate,cache-production-diagnostics
+
   memory-safety:
     name: Loom, Miri, and sanitizers
     runs-on: ubuntu-latest

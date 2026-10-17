@@ -13,6 +13,13 @@ categories = ["data-structures", "database-implementations"]
 members = [".", "crates/elastic-core"]
 resolver = "3"
 
+# Keep release code generation while retaining locations for allocation and
+# CPU profiles. This is opt-in and does not change release/bench defaults.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"
+
 [features]
 default = []
 gxhash = ["ptr_hash/gxhash", "ph?/gxhash"]
@@ -54,6 +61,7 @@ flurry = "=0.5.2"
 scc = "=3.8.5"
 stats_alloc = { version = "0.1.10", features = ["nightly"] }
 loom = "0.7.2"
+quick_cache = "=0.7.0"
 
 [[example]]
 name = "phast_frozen_probe"

@@ -1,5 +1,6 @@
 use core::fmt;
 use std::mem;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use opthash::{ElasticHashMap, EpochSnapshot, Equivalent, ReserveFraction, TryBuildError};
 
@@ -8,6 +9,8 @@ use crate::{
     ArenaError, CapacityError, ElasticConfig, InsertOutcome, MaintenanceMode, PackedKeyArena,
     PackedKeyRef,
 };
+
+static NEXT_MAP_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Binary-key elastic map backed by a segmented packed-key arena.
 ///
@@ -25,6 +28,7 @@ pub struct PackedBinaryMap<V> {
     maintenance_runs: usize,
     compaction_failures: usize,
     arena_allocated_bytes_reclaimed: usize,
+    instance_id: u64,
     structural_revision: u64,
     generation: PackedGeneration,
     soft_delete_threshold: usize,
@@ -67,6 +71,7 @@ impl<V> PackedBinaryMap<V> {
             maintenance_runs: 0,
             compaction_failures: 0,
             arena_allocated_bytes_reclaimed: 0,
+            instance_id: NEXT_MAP_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             structural_revision: 0,
             generation: PackedGeneration::INITIAL,
             soft_delete_threshold: threshold_count(
@@ -130,6 +135,7 @@ impl<V> PackedBinaryMap<V> {
             maintenance_runs: 0,
             compaction_failures: 0,
             arena_allocated_bytes_reclaimed: 0,
+            instance_id: NEXT_MAP_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             structural_revision: 0,
             generation: PackedGeneration::INITIAL,
             soft_delete_threshold: threshold_count(
@@ -345,6 +351,7 @@ impl<V> PackedBinaryMap<V> {
             .try_reserve_exact(self.inner.len())
             .map_err(|_| ArenaError::AllocationFailed)?;
         Ok(PackedMaintenancePlan {
+            source_instance_id: self.instance_id,
             source_revision: self.structural_revision,
             source_generation: self.generation,
             pending_refs,
@@ -354,10 +361,12 @@ impl<V> PackedBinaryMap<V> {
         })
     }
 
-    /// Returns whether structural mutation invalidated a staged plan.
+    /// Returns whether a plan belongs to another map or structural mutation
+    /// invalidated it.
     #[must_use]
     pub fn maintenance_plan_is_stale(&self, plan: &PackedMaintenancePlan) -> bool {
-        plan.source_revision != self.structural_revision
+        plan.source_instance_id != self.instance_id
+            || plan.source_revision != self.structural_revision
             || plan.source_generation != self.generation
     }
 
@@ -381,13 +390,14 @@ impl<V> PackedBinaryMap<V> {
 
     /// Copies at most `max_entries` live keys into a staged compact arena.
     ///
-    /// A structural mutation after the plan began returns
-    /// [`MaintenanceError::StalePlan`]. A zero budget performs no copying.
+    /// A plan from another map or a structural mutation after the plan began
+    /// returns [`MaintenanceError::StalePlan`]. A zero budget performs no copying.
     ///
     /// # Errors
     ///
-    /// Returns [`MaintenanceError::StalePlan`] after structural mutation or
-    /// [`MaintenanceError::Arena`] when staged key storage cannot grow.
+    /// Returns [`MaintenanceError::StalePlan`] for a plan from another map or
+    /// after structural mutation, or [`MaintenanceError::Arena`] when staged
+    /// key storage cannot grow.
     pub fn prepare_maintenance_step(
         &self,
         plan: &mut PackedMaintenancePlan,
@@ -423,7 +433,8 @@ impl<V> PackedBinaryMap<V> {
     /// # Errors
     ///
     /// Returns [`MaintenanceError::PlanNotReady`] when keys remain or
-    /// [`MaintenanceError::StalePlan`] after structural mutation.
+    /// [`MaintenanceError::StalePlan`] for a plan from another map or after
+    /// structural mutation.
     pub fn finish_maintenance(
         &mut self,
         plan: &mut PackedMaintenancePlan,
@@ -592,6 +603,7 @@ impl<V> PackedBinaryMap<V> {
 
 /// Opaque staged key-compaction work for a [`PackedBinaryMap`].
 pub struct PackedMaintenancePlan {
+    source_instance_id: u64,
     source_revision: u64,
     source_generation: PackedGeneration,
     pending_refs: Vec<PackedKeyRef>,
@@ -642,7 +654,8 @@ impl MaintenanceProgress {
 pub enum MaintenanceError {
     /// Key-arena allocation failed while staging compacted bytes.
     Arena(ArenaError),
-    /// The map was structurally mutated after the plan began.
+    /// The plan belongs to another map, or its source map was structurally
+    /// mutated after the plan began.
     StalePlan,
     /// Cutover was requested before all live keys were copied.
     PlanNotReady {

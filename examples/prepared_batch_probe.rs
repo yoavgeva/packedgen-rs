@@ -197,7 +197,7 @@ impl Strategy {
             Self::Prepared => "atomic-prepared-scalar",
             Self::Batch(_) => "atomic-prepared-batch",
             Self::Dash => "dashmap",
-            Self::Papaya => "papaya-0.2.4-direct",
+            Self::Papaya => "papaya-0.2.5-direct",
         }
     }
 
