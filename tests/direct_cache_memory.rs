@@ -96,7 +96,9 @@ fn filled_cache(entries: usize, capacities: u64, probation: bool) -> DirectPacke
 // would count it twice.
 fn live_bytes(region: &Region<'_, System>) -> usize {
     let stats = region.change();
-    stats.bytes_allocated.saturating_sub(stats.bytes_deallocated)
+    stats
+        .bytes_allocated
+        .saturating_sub(stats.bytes_deallocated)
 }
 
 fn key32(value: u64) -> [u8; 32] {
