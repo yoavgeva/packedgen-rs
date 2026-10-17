@@ -9,10 +9,12 @@
 //! - A writer that unpublishes a slot queues it in its shard with the epoch
 //!   generation read after the unpublication, while its pin from before the
 //!   unpublication is still held.
-//! - A writer of the same shard reclaims a queued slot once the generation
-//!   has advanced three times past its tag: the advance that reuses the tag's
+//! - The writer's thread reclaims a queued slot once the generation has
+//!   advanced three times past its tag: the advance that reuses the tag's
 //!   epoch slot found that slot and the one after it quiescent, which is the
-//!   direct arena's two-rotation aging.
+//!   direct arena's two-rotation aging. Each write reclaims as many slots as
+//!   it retires, one more while a backlog is due, and other writers drain the
+//!   queue of a thread that stopped retiring.
 //! - Values are dropped outside the shard lock by the reclaiming thread, and
 //!   their slots join that thread's stack, so it refills slots it just
 //!   touched.
@@ -384,9 +386,11 @@ impl<T> RetiredSlots<T> {
     }
 
     /// Queues `slots`, unpublished by this thread while it held a pin taken
-    /// before unpublishing them, and moves aged slots from this thread's
-    /// queue into `reclaimed`. Periodically it also moves aged slots from
-    /// another queue into `foreign`. Reads the generation that tags the slots
+    /// before unpublishing them, and moves as many aged slots as it queued,
+    /// one more while a backlog is due, from this thread's queue into
+    /// `reclaimed`. Periodically it also
+    /// moves aged slots into `foreign` from another queue, if that queue's
+    /// thread has stopped retiring. Reads the generation that tags the slots
     /// here, so the caller must still hold that pin. Returns whether enough
     /// retirements are pending across the cache to try advancing.
     pub(crate) fn retire(
@@ -400,12 +404,25 @@ impl<T> RetiredSlots<T> {
         let generation = epochs.generation();
         let due = reclaim_at(generation);
         let mut queue = self.queues[own].0.lock();
-        let before = queue.slots.len();
-        queue.slots.extend(slots.map(|slot| (due, slot)));
-        let retired = queue.slots.len() - before;
-        Self::take_aged(&mut queue, generation, reclaimed);
+        let mut retired = 0;
+        for slot in slots {
+            queue.slots.push_back((due, slot));
+            retired += 1;
+        }
         if retired == 0 {
             return false;
+        }
+        // Reclaim as many slots as this write retired, so values are dropped
+        // as steadily as writes allocate them, which allocators' per-thread
+        // caches absorb. Slots due since an earlier advance are a backlog,
+        // and each write drains one more of it.
+        Self::take_aged(&mut queue, generation, reclaimed, retired);
+        if queue
+            .slots
+            .front()
+            .is_some_and(|&(due, _)| due < generation)
+        {
+            Self::take_aged(&mut queue, generation, reclaimed, 1);
         }
         queue.unreported += retired;
         queue.until_foreign_drain = queue.until_foreign_drain.saturating_sub(1);
@@ -423,8 +440,11 @@ impl<T> RetiredSlots<T> {
         drop(queue);
         if let Some(index) = foreign_queue.filter(|index| *index != own)
             && let Some(mut queue) = self.queues[index].0.try_lock()
+            // Only a queue whose newest slot is aged: its thread has retired
+            // nothing for three advances, so it is not draining the queue.
+            && queue.slots.back().is_some_and(|&(due, _)| due <= generation)
         {
-            Self::take_aged(&mut queue, generation, foreign);
+            Self::take_aged(&mut queue, generation, foreign, RECLAIM_BATCH);
         }
         advance
     }
@@ -433,7 +453,7 @@ impl<T> RetiredSlots<T> {
     /// returns whether it filled up.
     pub(crate) fn reclaim_all(&self, generation: usize, reclaimed: &mut Reclaimed<T>) -> bool {
         for queue in &self.queues {
-            Self::take_aged(&mut queue.0.lock(), generation, reclaimed);
+            Self::take_aged(&mut queue.0.lock(), generation, reclaimed, RECLAIM_BATCH);
             if reclaimed.is_full() {
                 return true;
             }
@@ -441,10 +461,17 @@ impl<T> RetiredSlots<T> {
         false
     }
 
-    /// Moves aged slots from one queue while `reclaimed` has room.
+    /// Moves up to `limit` aged slots from one queue while `reclaimed` has
+    /// room.
     #[inline]
-    fn take_aged(queue: &mut QueueState<T>, generation: usize, reclaimed: &mut Reclaimed<T>) {
-        while reclaimed.len < reclaimed.slots.len() {
+    fn take_aged(
+        queue: &mut QueueState<T>,
+        generation: usize,
+        reclaimed: &mut Reclaimed<T>,
+        limit: usize,
+    ) {
+        let end = (reclaimed.len + limit).min(RECLAIM_BATCH);
+        while reclaimed.len < end {
             match queue.slots.front() {
                 Some(&(due, slot)) if due <= generation => {
                     queue.slots.pop_front();
@@ -709,6 +736,9 @@ impl<T> Reclaimed<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+    use std::thread;
+
     use super::*;
 
     impl<T> RetiredSlots<T> {
@@ -733,6 +763,120 @@ mod tests {
         assert_eq!(reclaim_at(2), 6);
         assert_eq!(reclaim_at(4), 8);
         assert_eq!(reclaim_at(usize::MAX - 1), usize::MAX);
+    }
+
+    /// Retires `count` filled slots from this thread, as one write would,
+    /// and returns how many aged slots the write reclaimed.
+    #[allow(unsafe_code, reason = "fills slots taken from the test's store")]
+    fn retire_filled(
+        epochs: &Epochs,
+        retired: &RetiredSlots<u64>,
+        store: &SlotStore<u64>,
+        count: usize,
+    ) -> usize {
+        let pin = epochs.pin();
+        let slots: Vec<_> = (0..count)
+            .map(|value| {
+                let slot = store.take();
+                // SAFETY: `take` handed the vacant slot to this test alone.
+                unsafe { fill(slot, value as u64, 1, NEVER_EXPIRES) };
+                slot
+            })
+            .collect();
+        let mut reclaimed = Reclaimed::new();
+        let mut foreign = Reclaimed::new();
+        retired.retire(epochs, slots.into_iter(), &mut reclaimed, &mut foreign);
+        let count = reclaimed.len + foreign.len;
+        reclaimed.finish(store);
+        foreign.finish(store);
+        drop(pin);
+        count
+    }
+
+    #[test]
+    fn writes_reclaim_as_many_slots_as_they_retire() {
+        let epochs = Epochs::new();
+        let retired = RetiredSlots::new();
+        let store = SlotStore::new();
+        assert_eq!(retire_filled(&epochs, &retired, &store, 64), 0);
+        for _ in 0..3 {
+            assert!(epochs.try_advance());
+        }
+        // All 64 are due. Dropping them in bursts would overflow allocators'
+        // per-thread caches, so each write frees as many as it retires.
+        for _ in 0..32 {
+            assert_eq!(retire_filled(&epochs, &retired, &store, 1), 1);
+        }
+        assert!(epochs.try_advance());
+        // The 32 left became due before the latest advance: a backlog, which
+        // each write drains by one more.
+        for _ in 0..16 {
+            assert_eq!(retire_filled(&epochs, &retired, &store, 1), 2);
+        }
+        assert_eq!(
+            retire_filled(&epochs, &retired, &store, 1),
+            0,
+            "only the backlog was due"
+        );
+    }
+
+    #[test]
+    fn foreign_drains_leave_a_retiring_threads_queue_alone() {
+        let epochs = Epochs::new();
+        let retired = RetiredSlots::new();
+        let store = SlotStore::new();
+        let (to_other, other_requests) = mpsc::channel::<usize>();
+        let (to_main, other_retired) = mpsc::channel();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                for count in other_requests {
+                    retire_filled(&epochs, &retired, &store, count);
+                    to_main
+                        .send(retired_queue_index())
+                        .expect("the test thread listens");
+                }
+            });
+            let retire_on_other = |count| {
+                to_other.send(count).expect("the other thread listens");
+                other_retired.recv().expect("the other thread retires")
+            };
+            let other = retire_on_other(64);
+            if other == retired_queue_index() {
+                // Thread indices 64 apart share a queue; nothing to compare.
+                return;
+            }
+            for _ in 0..3 {
+                assert!(epochs.try_advance());
+            }
+            // The other thread retires again, so its queue is its own to
+            // drain, at its own pace.
+            retire_on_other(1);
+            let visit_every_queue = RETIRED_QUEUES * FOREIGN_DRAIN_EVERY as usize;
+            for _ in 0..visit_every_queue {
+                retire_filled(&epochs, &retired, &store, 1);
+            }
+            // Its own write reclaimed one of the 64 and queued one.
+            assert_eq!(
+                retired.queued(other),
+                64,
+                "a writer took aged slots from a thread still retiring"
+            );
+            // Three advances later, the other thread has retired nothing
+            // since: writers drain its queue.
+            for _ in 0..3 {
+                assert!(epochs.try_advance());
+            }
+            for _ in 0..8 {
+                for _ in 0..visit_every_queue {
+                    retire_filled(&epochs, &retired, &store, 1);
+                }
+                if retired.queued(other) == 0 {
+                    break;
+                }
+            }
+            assert_eq!(retired.queued(other), 0, "the idle queue was not drained");
+            drop(to_other);
+        });
     }
 
     #[test]

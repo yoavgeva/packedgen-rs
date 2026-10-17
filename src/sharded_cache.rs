@@ -1038,6 +1038,9 @@ where
     /// values of entries aged enough to reclaim, unpins, and advances the
     /// epoch generation if enough retirements are pending.
     fn after_write(&self, removed: &Removed<(K, V)>, pin: EpochPin<'_>) {
+        if removed.len == 0 {
+            return;
+        }
         removed.notify(&self.listener, &pin);
         let mut reclaimed = Reclaimed::new();
         let mut foreign = Reclaimed::new();
