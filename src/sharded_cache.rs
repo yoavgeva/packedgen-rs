@@ -40,6 +40,8 @@ const SLOTS_PER_ENTRY_DENOMINATOR: usize = 4;
 const MIN_SHARD_CAPACITY: usize = 64;
 /// Main-queue records encode a slot in 24 bits.
 const MAX_SHARD_SLOTS: usize = 1 << 24;
+/// Stale main-queue records examined per cleanup step.
+const MAIN_CLEANUP_CHUNK: usize = 64;
 const NEVER_EXPIRES: u64 = u64::MAX;
 /// Probation's default share of each shard, in basis points.
 const DEFAULT_PROBATION_BPS: u16 = 200;
@@ -280,9 +282,9 @@ struct ShardWriter {
     weight_limit: u64,
     /// The CLOCK hand: the next slot the main-area sweep examines.
     hand: usize,
-    /// Probationary keys in insertion order, as (handle, key hash). A pop
-    /// finds the handle in the key's two buckets, wherever it was moved.
-    probation: VecDeque<(u64, u64)>,
+    /// Probationary keys in insertion order, as (slot record, key hash).
+    /// A key moved to its other bucket leaves probation for the main area.
+    probation: VecDeque<(u32, u64)>,
     probation_target: usize,
     /// Past this many records the oldest is dropped, leaving its key to the
     /// main sweep, so records never copy more than a share of the keys.
@@ -295,14 +297,34 @@ struct ShardWriter {
 }
 
 impl ShardWriter {
-    /// Appends `slot`'s key to the main area's queue, first dropping stale
-    /// records once the queue outgrows its preallocated quarter of slack.
-    fn enter_main(&mut self, shard: &Shard, slot: usize) {
+    /// Appends a slot record to the main area's queue. Past its quarter of
+    /// slack, stale records are dropped from the front in order-preserving
+    /// chunks, so no write holds the shard lock for a whole-queue pass; only
+    /// a chunk with nothing stale falls back to compacting the whole queue.
+    fn enter_main(&mut self, shard: &Shard, record: u32) {
         if self.main.len() >= self.main_limit() {
-            self.main
-                .retain(|record| shard.live_record(*record).is_some());
+            let mut kept = [0_u32; MAIN_CLEANUP_CHUNK];
+            let mut live = 0;
+            let mut examined = 0;
+            while examined < MAIN_CLEANUP_CHUNK {
+                let Some(front) = self.main.pop_front() else {
+                    break;
+                };
+                examined += 1;
+                if shard.live_record(front).is_some() {
+                    kept[live] = front;
+                    live += 1;
+                }
+            }
+            for front in kept[..live].iter().rev() {
+                self.main.push_front(*front);
+            }
+            if live == examined {
+                self.main
+                    .retain(|record| shard.live_record(*record).is_some());
+            }
         }
-        self.main.push_back(shard.record(slot));
+        self.main.push_back(record);
     }
 
     fn main_limit(&self) -> usize {
@@ -470,7 +492,9 @@ impl<K: Hash + Eq, V, W: Weighter<K, V>, S: BuildHasher> ShardedCache<K, V, W, S
                     };
                     retired.push(victim);
                 }
-                if shard.place(hash, handle).is_none() {
+                let slot = if let Some(slot) = shard.place(hash, handle) {
+                    slot
+                } else {
                     // Both candidate buckets are full: move a resident key to
                     // its other bucket, or else evict one of them.
                     if !self.relocate_candidate(shard, &mut writer, &pin, hash) {
@@ -483,29 +507,24 @@ impl<K: Hash + Eq, V, W: Weighter<K, V>, S: BuildHasher> ShardedCache<K, V, W, S
                         placed.is_some(),
                         "relocation or eviction frees a candidate slot"
                     );
-                }
+                    placed.unwrap_or_default()
+                };
                 writer.len += 1;
                 writer.weight += weight;
+                let record = shard.record(slot);
                 if writer.ghost.contains(hash) {
                     // Remembered from a recent eviction: straight to main.
-                    let raw = handle.index_value().get();
-                    if let Some(slot) = shard.slot_of(hash, raw) {
-                        writer.enter_main(shard, slot);
-                    }
+                    writer.enter_main(shard, record);
                 } else {
                     if writer.probation.len() >= writer.probation_limit {
-                        let (raw, hash) = writer
+                        // An overflowing record's key joins the main area.
+                        let (overflow, _) = writer
                             .probation
                             .pop_front()
                             .expect("probation is at its limit");
-                        // An overflowing record's key joins the main area.
-                        if let Some(slot) = shard.slot_of(hash, raw) {
-                            writer.enter_main(shard, slot);
-                        }
+                        writer.enter_main(shard, overflow);
                     }
-                    writer
-                        .probation
-                        .push_back((handle.index_value().get(), hash));
+                    writer.probation.push_back((record, hash));
                 }
             }
             writer.publish(shard);
@@ -571,14 +590,15 @@ impl<K: Hash + Eq, V, W: Weighter<K, V>, S: BuildHasher> ShardedCache<K, V, W, S
         protected: Option<DirectHandle>,
     ) -> Option<DirectHandle> {
         while writer.probation.len() > writer.probation_target {
-            let (raw, hash) = writer
+            let (record, hash) = writer
                 .probation
                 .pop_front()
                 .expect("probation is above its target");
-            let Some(slot) = shard.slot_of(hash, raw) else {
-                // Removed or replaced since it was enrolled.
+            let Some(slot) = shard.live_record(record) else {
+                // Removed, or moved to its other bucket, since enrolling.
                 continue;
             };
+            let raw = shard.bucket(slot).handles[slot % SLOTS].load(Ordering::Relaxed);
             if protected.is_some_and(|protected| protected.index_value().get() == raw) {
                 continue;
             }
@@ -586,7 +606,7 @@ impl<K: Hash + Eq, V, W: Weighter<K, V>, S: BuildHasher> ShardedCache<K, V, W, S
             // SAFETY: the shard lock keeps this published handle in the table.
             if unsafe { entry(pin, handle) }.take_accessed() {
                 // Read during probation: it joins the main area.
-                writer.enter_main(shard, slot);
+                writer.enter_main(shard, record);
                 continue;
             }
             let removed = shard.clear(slot, shard.home(hash));
@@ -689,7 +709,7 @@ impl<K: Hash + Eq, V, W: Weighter<K, V>, S: BuildHasher> ShardedCache<K, V, W, S
                     // Its old record no longer matches; a probationary key
                     // gains a main record it does not need, which only
                     // gives it a second life after probation.
-                    writer.enter_main(shard, moved_to);
+                    writer.enter_main(shard, shard.record(moved_to));
                     return true;
                 }
             }
@@ -954,21 +974,9 @@ impl Shard {
             .then_some(slot)
     }
 
-    /// The slot in the key's two buckets that holds `raw`, if any.
-    fn slot_of(&self, hash: u64, raw: u64) -> Option<usize> {
-        let (home, alternate) = self.candidates(hash);
-        [home, alternate].into_iter().find_map(|bucket| {
-            self.buckets[bucket]
-                .handles
-                .iter()
-                .position(|handle| handle.load(Ordering::Relaxed) == raw)
-                .map(|slot| bucket * SLOTS + slot)
-        })
-    }
-
     /// Publishes `handle` in `bucket`, one of the key's candidates, counting
-    /// it in its home's overflow when `bucket` is the alternate. Returns
-    /// whether `bucket` had a free slot. Requires the shard lock.
+    /// it in its home's overflow when `bucket` is the alternate. Returns the
+    /// slot, or `None` when `bucket` is full. Requires the shard lock.
     fn place_at(
         &self,
         bucket: usize,
