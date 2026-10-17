@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use hashbrown::DefaultHashBuilder;
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use crate::cache_arena::direct_arena_thread;
 use crate::sharded_arena::{
@@ -483,19 +483,18 @@ struct Bucket {
     generations: AtomicU64,
 }
 
-/// Readers load only `buckets`; the counters and the writer lock change on
-/// every write, so each sits on its own cache line.
+/// Readers load only `buckets`; the writer lock and its counters change on
+/// every write, so they sit on cache lines of their own.
 struct Shard<T> {
     buckets: Box<[Bucket]>,
     weight_limit: u64,
-    counters: ShardCounters,
     writer: ShardLock,
     /// Tables publish handles to `Slot<T>`s; the cache's `RetiredSlots` and
     /// `SlotStore` carry the ownership bounds.
     _entries: PhantomData<fn() -> T>,
 }
 
-#[repr(align(128))]
+/// Counters writers publish for lock-free `len`, `weight`, and `stats`.
 struct ShardCounters {
     len: AtomicUsize,
     weight: AtomicU64,
@@ -503,8 +502,20 @@ struct ShardCounters {
     expirations: AtomicU64,
 }
 
-#[repr(align(128))]
-struct ShardLock(Mutex<ShardWriter>);
+/// The writer lock, after the counters published under it. They share the
+/// lock word's cache line, which a writer owns while it holds the lock, so
+/// publishing them moves no other line between writers' cores.
+#[repr(C, align(128))]
+struct ShardLock {
+    counters: ShardCounters,
+    writer: Mutex<ShardWriter>,
+}
+
+impl ShardLock {
+    fn lock(&self) -> MutexGuard<'_, ShardWriter> {
+        self.writer.lock()
+    }
+}
 
 struct ShardWriter {
     len: usize,
@@ -569,13 +580,19 @@ impl ShardWriter {
     }
 
     fn publish<T>(&self, shard: &Shard<T>) {
-        shard.counters.len.store(self.len, Ordering::Relaxed);
-        shard.counters.weight.store(self.weight, Ordering::Relaxed);
+        shard.writer.counters.len.store(self.len, Ordering::Relaxed);
         shard
+            .writer
+            .counters
+            .weight
+            .store(self.weight, Ordering::Relaxed);
+        shard
+            .writer
             .counters
             .evictions
             .store(self.evictions, Ordering::Relaxed);
         shard
+            .writer
             .counters
             .expirations
             .store(self.expirations, Ordering::Relaxed);
@@ -629,7 +646,7 @@ where
     pub fn len(&self) -> usize {
         self.shards
             .iter()
-            .map(|shard| shard.counters.len.load(Ordering::Relaxed))
+            .map(|shard| shard.writer.counters.len.load(Ordering::Relaxed))
             .sum()
     }
 
@@ -638,7 +655,7 @@ where
     pub fn weight(&self) -> u64 {
         self.shards
             .iter()
-            .map(|shard| shard.counters.weight.load(Ordering::Relaxed))
+            .map(|shard| shard.writer.counters.weight.load(Ordering::Relaxed))
             .sum()
     }
 
@@ -657,8 +674,8 @@ where
             stats.misses += stripe.misses.load(Ordering::Relaxed);
         }
         for shard in &self.shards {
-            stats.evictions += shard.counters.evictions.load(Ordering::Relaxed);
-            stats.expirations += shard.counters.expirations.load(Ordering::Relaxed);
+            stats.evictions += shard.writer.counters.evictions.load(Ordering::Relaxed);
+            stats.expirations += shard.writer.counters.expirations.load(Ordering::Relaxed);
         }
         stats
     }
@@ -954,7 +971,7 @@ where
         let key = &unsafe { entry(&pin, handle) }.value().0;
         let mut removed = Removed::new();
         {
-            let mut writer = shard.writer.0.lock();
+            let mut writer = shard.writer.lock();
             let found = shard.find(hash, |current| {
                 // SAFETY: published in this table while `pin` is held.
                 unsafe { entry(&pin, current) }.value().0 == *key
@@ -1075,7 +1092,7 @@ where
         let mut removed = Removed::new();
         let mut live = false;
         {
-            let mut writer = shard.writer.0.lock();
+            let mut writer = shard.writer.lock();
             let found = shard.find(hash, |handle| {
                 // SAFETY: published in this table while `pin` is held.
                 unsafe { entry(&pin, handle) }.value().0.borrow() == key
@@ -1107,7 +1124,7 @@ where
             let pin = self.epochs.pin();
             let mut removed = Removed::new();
             {
-                let mut writer = shard.writer.0.lock();
+                let mut writer = shard.writer.lock();
                 for bucket in &shard.buckets {
                     if bucket.control.load(Ordering::Relaxed) == 0 {
                         continue;
@@ -1426,27 +1443,29 @@ impl<T> Shard<T> {
                     generations: AtomicU64::new(0),
                 })
                 .collect(),
-            counters: ShardCounters {
-                len: AtomicUsize::new(0),
-                weight: AtomicU64::new(0),
-                evictions: AtomicU64::new(0),
-                expirations: AtomicU64::new(0),
-            },
             weight_limit,
-            writer: ShardLock(Mutex::new(ShardWriter {
-                len: 0,
-                capacity,
-                weight: 0,
-                weight_limit,
-                evictions: 0,
-                expirations: 0,
-                hand: 0,
-                probation: VecDeque::new(),
-                probation_target,
-                probation_limit: probation_target + probation_target / 4 + 4,
-                main: VecDeque::with_capacity(capacity + capacity / 4 + 17),
-                ghost: Ghost::new(capacity.div_ceil(GHOST_GENERATION_DIVISOR)),
-            })),
+            writer: ShardLock {
+                counters: ShardCounters {
+                    len: AtomicUsize::new(0),
+                    weight: AtomicU64::new(0),
+                    evictions: AtomicU64::new(0),
+                    expirations: AtomicU64::new(0),
+                },
+                writer: Mutex::new(ShardWriter {
+                    len: 0,
+                    capacity,
+                    weight: 0,
+                    weight_limit,
+                    evictions: 0,
+                    expirations: 0,
+                    hand: 0,
+                    probation: VecDeque::new(),
+                    probation_target,
+                    probation_limit: probation_target + probation_target / 4 + 4,
+                    main: VecDeque::with_capacity(capacity + capacity / 4 + 17),
+                    ghost: Ghost::new(capacity.div_ceil(GHOST_GENERATION_DIVISOR)),
+                }),
+            },
             _entries: PhantomData,
         }
     }
@@ -2065,7 +2084,6 @@ mod tests {
         for key in 0..256_u64 {
             if cache.shards[0]
                 .writer
-                .0
                 .lock()
                 .probation
                 .iter()
@@ -2758,6 +2776,21 @@ mod tests {
         drop(first);
         go.send(()).expect("the worker waits");
         worker.join().expect("the worker completes");
+    }
+
+    #[test]
+    fn published_counters_share_the_writer_locks_cache_line() {
+        // Every write publishes them, so a line of their own would move
+        // between writers' cores on every write.
+        let shard = Shard::<(u64, u64)>::new(64, u64::MAX, DEFAULT_PROBATION_BPS);
+        let line = |address: usize| address / 64;
+        let counters = std::ptr::addr_of!(shard.writer.counters) as usize;
+        let lock = std::ptr::addr_of!(shard.writer.writer) as usize;
+        assert_eq!(line(counters), line(lock));
+        assert_eq!(
+            line(counters + std::mem::size_of::<ShardCounters>() - 1),
+            line(lock)
+        );
     }
 
     #[test]
