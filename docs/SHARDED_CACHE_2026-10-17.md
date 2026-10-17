@@ -33,8 +33,13 @@ entry. Tables are sized once and never rebuilt.
 
 - **Shards.** By default there are four per available thread, rounded to a power
   of two, and fewer for small caches so that each shard holds at least 64
-  entries. A shard has a fixed table of 64-byte buckets and holds its share of
-  the entry and weight limits. Writers take the shard's mutex.
+  entries. Caches large enough to give every shard at least 256 entries split
+  further, up to sixteen shards per thread, so writers rarely wait on one
+  shard's lock. A shard holds its share of the entry and weight limits, and
+  writers take its mutex.
+- **One bucket table.** All shards' 64-byte buckets form one table, in
+  stretches of equal length. A read computes its bucket from the hash and two
+  fields of the cache, without loading the shard.
 - **Buckets.** A control word carries six tag bytes and an overflow count, and
   the bucket holds six atomic handles. Tags are matched with one word-wide
   zero-byte test.
@@ -50,7 +55,9 @@ entry. Tables are sized once and never rebuilt.
     buckets. This happened on fewer than 0.1% of inserts into a full shard.
 - **Eviction.** Each shard uses an S3-FIFO-style policy:
   - New keys wait in a probationary FIFO, 2% of the shard by default. Its
-    records hold the entry handle and the key hash.
+    records hold the key's slot record, its hash, and the handle it was
+    published with. A writer that takes a full shard's lock prefetches the
+    next victim's bucket and entry together.
   - An unread probationary key leaves first and goes into a ghost filter. The
     ghost has four generations and remembers three eighths to half of the
     shard.
@@ -76,12 +83,15 @@ entry. Tables are sized once and never rebuilt.
     the unpublication, aged three advances. The advance that reuses the
     tag's epoch slot found that slot and the next one quiescent, the direct
     arena's two-rotation aging.
-  - In the same queue lock, the writer takes up to 16 aged entries, drops
-    their values, and pushes the slots onto its own stack, so it refills
-    slots whose lines it just touched.
-  - Every 64 retirements a writer also drains one other queue, so a thread
-    that stops writing does not strand its retirements. `maintain()` drains
-    every queue.
+  - In the same queue lock, the writer takes as many aged entries as it
+    retired, plus one while entries due since an earlier advance remain. It
+    drops their values and pushes the slots onto its own stack, so it refills
+    slots whose lines it just touched. Paced this way, frees keep step with
+    the writes' allocations (see "Write path").
+  - Every 16 retirements a writer visits one other queue. It drains it only
+    if the queue's newest entry is aged, meaning its thread has retired
+    nothing for three advances, and then returns to it until it is empty.
+    `maintain()` drains every queue.
   - A thread's stack overflows into a shared depot, draws from it in batches
     of 32, and returns to it when the thread exits. Chunks are freed when the
     cache drops; a stack left for a dropped cache is forgotten without
@@ -157,7 +167,15 @@ entry. Tables are sized once and never rebuilt.
   - an exiting thread returning its vacant slots;
   - a dropped cache leaving other threads' stacks harmless;
   - other writers dropping an idle thread's retired values (verified to fail
-    without the foreign drains).
+    without the foreign drains), and leaving a retiring thread's alone;
+  - writes reclaiming as many entries as they retire, and one more while a
+    backlog is due;
+  - a write's reclamation batch fitting one cache line.
+- **Layout and sizing tests.** They check that a write's shard state spans
+  two cache lines, that shards share one bucket table, that the default
+  shard count gives every extra shard at least 256 entries, that a cache
+  with more shards than entries stays bounded, and that probation records
+  name the entries evictions prefetch.
 - **Allocation contract.** `tests/sharded_cache_allocations.rs` counts
   allocations: 100,000 inserts into a warm, full cache must allocate fewer
   than 1,000 times. Boxed entries allocated about 50,000 times.
@@ -176,13 +194,15 @@ rounding of the boxed entries is not included.
 
 | Entries | Key | Value | ShardedCache | DirectPackedCache | quick_cache |
 | ---: | --- | --- | ---: | ---: | ---: |
-| 100,000 | 8 B | `u64` | 46.7 | 46.8 | 118.0 |
-| 100,000 | 32 B | `[u8; 64]` | 127.4 | 128.2 | 306.7 |
-| 1,000,000 | 8 B | `u64` | 45.0 | 44.2 | 94.4 |
-| 1,000,000 | 32 B | `u64` | 69.0 | 69.0 | 144.7 |
-| 1,000,000 | 32 B | `[u8; 64]` | 125.1 | 125.1 | 245.4 |
+| 100,000 | 8 B | `u64` | 48.1 | 46.8 | 118.0 |
+| 100,000 | 32 B | `[u8; 64]` | 129.4 | 128.2 | 306.7 |
+| 1,000,000 | 8 B | `u64` | 45.5 | 44.2 | 94.4 |
+| 1,000,000 | 32 B | `u64` | 69.5 | 69.0 | 144.7 |
+| 1,000,000 | 32 B | `[u8; 64]` | 125.6 | 125.1 | 245.4 |
 
-Overhead beyond the key and value is 29 to 31.4 bytes per entry:
+Overhead beyond the key and value is 29.5 to 33.4 bytes per entry. On a
+16-thread machine, a 100,000-entry cache now has 256 shards, and their fixed
+state adds about 1.4 bytes per entry; at 1,000,000 entries it adds about 0.5:
 
 | Component | Bytes per entry |
 | --- | ---: |
@@ -190,7 +210,7 @@ Overhead beyond the key and value is 29 to 31.4 bytes per entry:
 | Entry metadata | 8 |
 | Main queue, with its slack | about 4 to 5 |
 | Ghost filter | about 2 |
-| Probation records | about 2 |
+| Probation records, 24 bytes each | about 2 to 3 |
 
 For comparison, the overhead is 28 to 32 for `DirectPackedCache` and 78 to 210
 for quick_cache. The main queue added about 3.5 bytes per entry and bought
@@ -211,6 +231,9 @@ headers and rounding:
 | Linux, glibc | `[u8; 32]`, `[u8; 64]` | 133.5 | 125.6 | 191.0 |
 | macOS | `u64`, `u64` | 54.8 | 47.1 | 120.5 |
 | macOS | `[u8; 32]`, `[u8; 64]` | 135.5 | 135.3 | 332.2 |
+
+After the write-path work, the slab figures are 45.8 and 126.0 on Linux
+(quick_cache 82.9 and 191.3 in the same run) and 47.8 and 136.0 on macOS.
 
 Throughput of slab storage against boxed entries, paired medians of three
 runs with 50,000 entries and 64-byte `Arc<[u8]>` values; positive means the
@@ -242,36 +265,101 @@ A read microbenchmark separates the effects:
 - A `get` pays memory latency in full: its pin's `SeqCst` RMW keeps one
   call's misses from overlapping the next call's.
 
+## Write path
+
+On the Linux VM at eight threads, a shard's lock was held for 138 ns per
+replace and 290 ns per cold-fill insert, against 48 and 64 ns on one thread,
+and writers waited about 100 ns to take it. The difference is cache misses:
+each line of shard state a write touches was last written on another core.
+These changes followed, each measured against the one before:
+
+- **Paced reclamation.** Writes reclaimed up to 16 aged entries, and an
+  advance makes a whole batch of retirements due at once, so values were
+  freed in bursts. glibc's per-thread cache holds seven blocks; frees past it
+  went to the arenas, and 15% of eight-thread cold-fill time was spent in
+  free's compare-and-swap loops, with 8% in calloc. A write now frees as many
+  entries as it retires: at eight threads, cold fill +18% and
+  delete-reinsert +8%.
+- **Shard state in two cache lines.** The counts were kept twice, and the
+  writer's state spanned four lines of the lock block. `len`, `weight`, and
+  the eviction count now sit beside the lock word, followed by the probation
+  queue; the ghost and the main queue fill the next line, and the limits moved
+  to the shard's read-only header. At eight threads: replace +13%,
+  delete-reinsert +11.5%, cold fill +7%. Replace's hold time fell to 95 ns.
+- **Four-slot reclamation batches.** Two 16-slot batches per write, zeroed
+  and handed on by value, took most of a single-thread replace's time after
+  the lock. Single-thread replace on macOS: +12%.
+- **Prefetching the victim's entry.** Evicting followed the probation
+  record, then the victim's bucket, then the entry its handle names: three
+  misses in series. Records now carry the handle, and a writer that takes a
+  full shard's lock prefetches the bucket and the entry together. Eight-thread
+  cold fill: +6% on Linux, +8.5% on macOS.
+- **More shards over one bucket table.** Going from 64 to 1,024 shards made
+  eight-thread replace 45% faster and cold fill 28%. Large caches now default
+  to up to sixteen shards per thread, as long as each holds at least 256
+  entries; the trace hit-ratio sum moved from 654.28 to 654.15. More shards
+  alone cost reads up to 13%, as each read loaded its shard to find the
+  bucket table. With one shared table, a read loads no shard state. On macOS
+  at eight threads: delete-reinsert +17%, replace +14%, turnover +6%, cold
+  fill +4%, and reads +4%.
+
+Pacing is a trade-off between allocators and workloads. Freeing up to four
+entries per write instead changed Linux throughput by:
+
+| Workload | 1T | 2T | 8T |
+| --- | ---: | ---: | ---: |
+| Cold fill | +1% | −15% | −17% |
+| Turnover (95% reads) | −1% | −1% | −8% |
+| Replace | +20% | +27% | +6% |
+| Delete and reinsert | +14% | +11% | +4% |
+
+Cold fill and turnover free values other threads allocated, and they are a
+full cache's steady state, so pacing stays. On macOS, two-thread cold fill
+was 14% faster freeing four at a time and eight threads were equal.
+
+After these changes, an eight-thread cold-fill insert still holds the lock
+for about 267 ns: 60 to find the key, 141 to evict, 77 to place, and 60 for
+the ghost and the probation queue, each including about 10 ns of timer
+overhead.
+
 ## Throughput against quick_cache 0.7
 
-Measured with `bounded_cache_probe` on the slab storage: 32-byte keys,
-64-byte `Arc<[u8]>` values, and 50,000 entries. Reads ran 16 million
+Measured with `bounded_cache_probe` after the write-path changes: 32-byte
+keys, 64-byte `Arc<[u8]>` values, and 50,000 entries. Reads ran 16 million
 requests and writes 8 million on macOS, and half that on Linux. Each figure is
 the paired median of three runs; positive means `ShardedCache` is faster.
 
 Hosts:
-- macOS: a shared 16-core Apple Silicon machine.
+- macOS: a shared 16-core Apple Silicon machine, with other containers and
+  services using about four cores during the runs.
 - Linux: an aarch64 Docker VM on the same machine, using glibc's allocator.
+
+Two-thread cells varied most between runs, by up to 30% for one build, as
+threads landed on performance or efficiency cores.
 
 | Workload | macOS 1T | macOS 2T | macOS 8T | Linux 1T | Linux 2T | Linux 8T |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Resident hit | −39% | −3% | +153% | +16% | +36% | +155% |
-| Read miss | +84% | +174% | +638% | +72% | +155% | +530% |
-| Turnover (95% reads) | −27% | −8% | +7% | −18% | −10% | +9% |
-| Cold fill | −10% | −14% | −34% | −25% | −41% | −53% |
-| Replace | −3% | −4% | −25% | −9% | −27% | −42% |
-| Delete and reinsert | −14% | −11% | −10% | −27% | −31% | −23% |
+| Resident hit | −42% | −9% | +151% | +12% | +47% | +136% |
+| Read miss | +73% | +187% | +624% | +65% | +163% | +521% |
+| Turnover (95% reads) | −22% | −11% | +27% | −16% | −6% | +50% |
+| Cold fill | −9% | −24% | −20% | −21% | −16% | −29% |
+| Replace | +3% | +38% | +18% | −15% | −23% | −5% |
+| Delete and reinsert | +3% | −3% | +28% | −13% | −5% | +25% |
 
-Eight-thread resident hits reached 275 Mops/s on macOS against quick_cache's
-109, and 233 against 94 on Linux.
+Before the write-path changes, the write rows read −10 to −53% for cold
+fill, −3 to −42% for replace, −10 to −31% for delete and reinsert, and −27
+to +9% for turnover.
 
-Writes still trail. Lock-free reads require deferred reclamation: an insert
-cannot reuse the evicted entry's memory until three epoch advances later,
-where quick_cache frees under its shard lock. Every operation also pays an
-epoch pin, a full barrier, and a write takes its shard lock and its thread's
-retired-queue lock. A guard read through `pin()` took 11 ns at 50,000 entries,
-against 34 to 41 ns for `get`, whose pin keeps one call's cache misses from
-overlapping the next call's.
+Eight-thread resident hits reached 272 Mops/s on macOS against quick_cache's
+109, and 228 against 96 on Linux.
+
+Cold fill still trails: every insert into a full shard evicts under the lock
+(see "Write path"), and single-thread writes pay what lock-free reads
+require. An insert cannot reuse the evicted entry's memory until three epoch
+advances later, where quick_cache frees under its shard lock, and every
+write pays an epoch pin and its thread's retired-queue lock. A guard read
+through `pin()` took 11 ns at 50,000 entries, against 34 to 41 ns for `get`,
+whose pin keeps one call's cache misses from overlapping the next call's.
 
 The earlier boxed-entry storage measured macOS resident hits at −32%, +2%,
 and +241%. On macOS those boxes often sat beside their values (see "Slab
@@ -309,6 +397,9 @@ quick_cache, and DirectPackedCache is 15.43 behind. ShardedCache is within
 about one point in every cell and ahead in 9. The largest gaps are OLTP at
 5,000 entries (−1.19) and DS1 at 8,000,000 (−1.14).
 
+The table predates the larger default shard count for big caches, which
+moved ShardedCache's sum by −0.13 points; no cell moved by more than 0.08.
+
 The insertion-order main queue closed most of the gap. A CLOCK over the
 table's own slots sweeps in hash order and loses recency: before the queue,
 the sum was −3.44 and P3 at 131,072 entries read 46.80%.
@@ -333,8 +424,21 @@ the sum was −3.44 and P3 at 131,072 entries read 46.80%.
   frees.
 - **Looking keys up before taking the shard lock.** −6% on single-writer
   fills, no gain on replace.
-- **Prefetching the next probation victim's bucket.** +4–7% on single-writer
-  fills, −5% elsewhere.
+- **Prefetching only the next probation victim's bucket.** +4–7% on
+  single-writer fills, −5% elsewhere. Prefetching its entry too, from the
+  handle its record now carries, and only for a full shard, is kept (see
+  "Write path").
+- **Looking keys up before the lock, again at eight threads.** No change.
+- **Spinning longer before parking.** Within noise: writers waited on the
+  holder's misses, not on parking.
+- **Checking the ghost before the lock.** With atomic ghost words, the check
+  left the lock, but eight-thread cold fill did not move and delete-reinsert
+  fell 11%.
+- **Prefetching all of an insert's lines for writing.** The ghost word and
+  probation tail go unused when replacing, and taking them exclusive cost
+  eight-thread replace 6%.
+- **Freeing up to four entries per write.** See the trade-off under "Write
+  path".
 - **A CLOCK over the table's slots as the main policy.** Hash order cost 3.4
   points of trace hit rate against the insertion-order queue.
 - **Compacting the whole main queue in one pass.** Without evictions, as
@@ -373,5 +477,6 @@ PROBE=target/release/examples/bounded_cache_probe
 $PROBE sharded turnover 50000 8000000 8 64 1
 $PROBE quickcache turnover 50000 8000000 8 64 1
 target/release/examples/hit_ratio_sim file:PATH/DS1.keys 8000000 0 1 sharded quick
+target/release/examples/hit_ratio_sim arc:PATH/P3.lis 131072 0 1 sharded/shards=64 sharded
 cargo test --release --lib sharded_cache
 ```
