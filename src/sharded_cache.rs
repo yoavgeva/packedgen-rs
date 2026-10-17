@@ -226,8 +226,9 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
         self
     }
 
-    /// Sets the shard count, rounded up to a power of two. By default it is
-    /// four per available thread, and fewer for small caches.
+    /// Sets the shard count, rounded up to a power of two and capped so each
+    /// shard holds at least one entry. By default it is four per available
+    /// thread, and fewer for small caches.
     #[must_use]
     pub fn shards(mut self, shards: usize) -> Self {
         self.shards = Some(shards.max(1).next_power_of_two());
@@ -324,8 +325,10 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
                     .next_power_of_two(),
             )
         });
+        // Every shard holds an entry: a shard with none would admit one.
+        let most = 1 << max_entries.ilog2();
         // Main-queue records hold a slot in 24 bits.
-        let mut shards = shards;
+        let mut shards = shards.min(most);
         while (max_entries / shards).saturating_mul(SLOTS_PER_ENTRY_NUMERATOR)
             / SLOTS_PER_ENTRY_DENOMINATOR
             >= MAX_SHARD_SLOTS - SLOTS
@@ -2880,6 +2883,15 @@ mod tests {
         drop(first);
         go.send(()).expect("the worker waits");
         worker.join().expect("the worker completes");
+    }
+
+    #[test]
+    fn more_shards_than_entries_still_bound_the_cache() {
+        let cache = ShardedCacheBuilder::new(100).shards(1024).build::<u64, u64>();
+        for key in 0..10_000 {
+            cache.insert(key, key);
+        }
+        assert!(cache.len() <= 100, "{} entries in a cache of 100", cache.len());
     }
 
     #[test]
