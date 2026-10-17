@@ -2339,44 +2339,53 @@ impl<V> DirectArenaOwner<V> {
     }
 
     fn try_advance(&self, force: bool) {
+        // Destructors and slot releases run after the gate is released, so
+        // other threads keep advancing and reclaiming their own batches.
+        if let Some((epoch, taken)) = self.advance_taking_quiescent(force) {
+            self.reclaim_taken(epoch, taken);
+        }
+    }
+
+    fn advance_taking_quiescent(
+        &self,
+        force: bool,
+    ) -> Option<(usize, Vec<(usize, Vec<RemovedDirectHandle>)>)> {
         let observed = direct_epoch_slot(self.current_epoch.load(Ordering::SeqCst));
         if !force && self.retired_count[observed].load(Ordering::Relaxed) < DIRECT_RECLAIM_BATCH {
-            return;
+            return None;
         }
-        let Some(_reclaim) = self.reclaim_gate.try_lock() else {
-            return;
-        };
+        let _reclaim = self.reclaim_gate.try_lock()?;
         // A successful standalone removal announces its short publication
         // window here. A racing mutation may overlap one rotation, but the
         // next scan must observe it before a second rotation can proceed.
         if self.mutator_activity.load(Ordering::SeqCst) && !self.mutators_are_quiescent() {
-            return;
+            return None;
         }
         let current_generation = self.current_epoch.load(Ordering::SeqCst);
         let current = direct_epoch_slot(current_generation);
         if !force && self.retired_count[current].load(Ordering::Relaxed) < DIRECT_RECLAIM_BATCH {
-            return;
+            return None;
         }
         // A rotation may leave current readers behind, but every older slot
         // must first be quiescent. Consequently a mutator pin spanning index
         // publication through retirement prevents a second rotation, while
         // continuous readers in the current slot do not block the first.
-        let Some(advance) =
-            plan_epoch_advance(current_generation, |epoch| self.epoch_is_quiescent(epoch))
-        else {
-            return;
-        };
+        let advance =
+            plan_epoch_advance(current_generation, |epoch| self.epoch_is_quiescent(epoch))?;
         // `next_epoch` was current two rotations ago. Checking every
         // non-current slot above proves that both readers already present at
         // removal and readers admitted during one racing rotation have left.
-        if self.epoch_has_retired(advance.next_epoch) {
+        let taken = self.epoch_has_retired(advance.next_epoch).then(|| {
             self.retired_count[advance.next_epoch].swap(0, Ordering::Relaxed);
             // Destructors may nest through another arena before this arena's
-            // first mutation. Publish the permanent flag under reclaim_gate
-            // before user code so reentrant activation never relocks the gate.
+            // first mutation. Publish the permanent flag before user code so
+            // reentrant activation finds mutators already active.
             self.mutator_activity.store(true, Ordering::SeqCst);
-            self.drain_retired_epoch(advance.next_epoch);
-        }
+            (
+                advance.next_epoch,
+                self.take_retired_epoch(advance.next_epoch),
+            )
+        });
         debug_assert_eq!(
             advance.next_epoch,
             direct_epoch_slot(advance.next_generation)
@@ -2389,22 +2398,42 @@ impl<V> DirectArenaOwner<V> {
                 Ordering::SeqCst,
             )
             .unwrap_or_else(|_| std::process::abort());
+        taken
     }
 
+    /// Empties one quiescent epoch's retirement queues.
+    fn take_retired_epoch(&self, epoch: usize) -> Vec<(usize, Vec<RemovedDirectHandle>)> {
+        let begin = epoch * DIRECT_RETIRED_SHARDS;
+        self.retired[begin..begin + DIRECT_RETIRED_SHARDS]
+            .iter()
+            .enumerate()
+            .filter_map(|(shard, retired)| {
+                let handles = std::mem::take(&mut *retired.0.lock());
+                (!handles.is_empty()).then_some((shard, handles))
+            })
+            .collect()
+    }
+
+    fn drain_retired_epoch(&self, epoch: usize) {
+        let taken = self.take_retired_epoch(epoch);
+        self.reclaim_taken(epoch, taken);
+    }
+
+    /// Destroys and releases handles taken from one quiescent epoch. Handles
+    /// left unprocessed by a panicking destructor return to that epoch's
+    /// queues, which then belong to a later epoch: they age further, which
+    /// is always safe.
     #[allow(
         unsafe_code,
         reason = "reclaims only one quiescent owner-controlled retirement epoch"
     )]
-    fn drain_retired_epoch(&self, epoch: usize) {
+    fn reclaim_taken(&self, epoch: usize, taken: Vec<(usize, Vec<RemovedDirectHandle>)>) {
         let begin = epoch * DIRECT_RETIRED_SHARDS;
         let fallback_queue = &self.retired[begin];
         let retired_count = &self.retired_count[epoch];
         let mut arena_handles = DirectRetiredBatch::new(Vec::new(), fallback_queue, retired_count);
-        for (shard, retired) in self.retired[begin..begin + DIRECT_RETIRED_SHARDS]
-            .iter()
-            .enumerate()
-        {
-            let handles = std::mem::take(&mut *retired.0.lock());
+        for (shard, handles) in taken {
+            let retired = &self.retired[begin + shard];
             let mut handles = DirectRetiredBatch::new(handles, retired, retired_count);
             self.reclaim_handles(&mut handles, shard, &mut arena_handles);
         }
@@ -3514,6 +3543,51 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("reentrant value destruction must not deadlock the collector gate");
         worker.join().expect("reclamation worker must not panic");
+    }
+
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "retires exclusively owned unpublished test values"
+    )]
+    fn retired_values_are_destroyed_outside_the_reclaim_gate() {
+        // While one thread destroys and releases a retired batch, others must
+        // still be able to advance epochs and reclaim their own batches.
+        struct GateProbe {
+            owner: std::sync::Weak<DirectArenaOwner<GateProbe>>,
+            gate_free: Arc<AtomicUsize>,
+        }
+
+        impl Drop for GateProbe {
+            fn drop(&mut self) {
+                if let Some(owner) = self.owner.upgrade()
+                    && owner.reclaim_gate.try_lock().is_some()
+                {
+                    self.gate_free.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let arena = DirectValueArena::new(1);
+        let gate_free = Arc::new(AtomicUsize::new(0));
+        for _ in 0..DIRECT_RECLAIM_BATCH {
+            let handle = arena.allocate(
+                GateProbe {
+                    owner: Arc::downgrade(&arena.owner),
+                    gate_free: Arc::clone(&gate_free),
+                },
+                1,
+                u64::MAX,
+            );
+            let pin = arena.pin();
+            // SAFETY: the unpublished handle is exclusively owned and
+            // protected by its arena pin.
+            unsafe {
+                pin.retire(RemovedDirectHandle::from_exact_removal(handle));
+            }
+        }
+        arena.reclaim_retired();
+        assert_eq!(gate_free.load(Ordering::Relaxed), DIRECT_RECLAIM_BATCH);
     }
 
     #[test]
