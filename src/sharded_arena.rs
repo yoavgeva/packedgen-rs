@@ -820,8 +820,9 @@ mod tests {
     #[test]
     fn writes_reclaim_as_many_slots_as_they_retire() {
         let epochs = Epochs::new();
-        let retired = RetiredSlots::new();
+        // Declared first so it drops last: retired values live in its chunks.
         let store = SlotStore::new();
+        let retired = RetiredSlots::new();
         assert_eq!(retire_filled(&epochs, &retired, &store, 64), 0);
         for _ in 0..3 {
             assert!(epochs.try_advance());
@@ -847,8 +848,9 @@ mod tests {
     #[test]
     fn foreign_drains_leave_a_retiring_threads_queue_alone() {
         let epochs = Epochs::new();
-        let retired = RetiredSlots::new();
+        // Declared first so it drops last: retired values live in its chunks.
         let store = SlotStore::new();
+        let retired = RetiredSlots::new();
         let (to_other, other_requests) = mpsc::channel::<usize>();
         let (to_main, other_retired) = mpsc::channel();
         thread::scope(|scope| {
