@@ -1134,7 +1134,9 @@ where
         let mut removed = Removed::new();
         {
             let mut writer = shard.lock();
-            shard.prefetch_next_victim(&writer);
+            if writer.over_limit(weight) {
+                shard.prefetch_next_victim(&writer);
+            }
             let found = shard.find(hash, |current| {
                 // SAFETY: published in this table while `pin` is held.
                 unsafe { entry(&pin, current) }.value().0 == *key
@@ -1625,7 +1627,8 @@ impl<T> Shard<T> {
 impl<T> ShardView<'_, T> {
     /// Starts loading the next probationary victim's bucket and entry, so an
     /// eviction finds both while the key is looked up, rather than loading
-    /// the entry only once its bucket names it.
+    /// the entry only once its bucket names it. Writers call it only for a
+    /// full shard, so writes that evict nothing fetch nothing extra.
     #[inline]
     fn prefetch_next_victim(&self, writer: &ShardWriter) {
         if let Some(next) = writer.probation.front() {
