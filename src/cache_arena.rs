@@ -639,7 +639,16 @@ enum DirectMutationReservation {
 impl<V> DirectValueArena<V> {
     pub(crate) fn new(partitions: usize) -> Self {
         Self {
-            owner: Arc::new(DirectArenaOwner::new(partitions)),
+            owner: Arc::new(DirectArenaOwner::new(partitions, false)),
+        }
+    }
+
+    /// An arena whose reclaimed recycled boxes go to the reclaiming thread's
+    /// lock-free stash for `allocate_recycled`, rather than to the shard
+    /// pools that prepared reservations draw from.
+    pub(crate) fn new_stashing(partitions: usize) -> Self {
+        Self {
+            owner: Arc::new(DirectArenaOwner::new(partitions, true)),
         }
     }
 
@@ -1997,6 +2006,8 @@ struct DirectArenaOwner<V> {
     state: DirectArenaState<V>,
     /// Tags this arena's boxes in thread stashes; never reused.
     id: u64,
+    /// Whether reclaimed recycled boxes go to thread stashes first.
+    stashes_boxes: bool,
     // Monotonic token. The low two bits select physical slot 0, 1, or 2; the
     // remaining bits prevent a stalled reader from accepting a slot after the
     // collector completes a full cycle. Encoding the slot avoids division on
@@ -2029,10 +2040,11 @@ struct DirectArenaOwner<V> {
 }
 
 impl<V> DirectArenaOwner<V> {
-    fn new(partitions: usize) -> Self {
+    fn new(partitions: usize, stashes_boxes: bool) -> Self {
         Self {
             state: DirectArenaState::new(partitions),
             id: NEXT_DIRECT_ARENA_ID.fetch_add(1, Ordering::Relaxed),
+            stashes_boxes,
             current_epoch: AtomicUsize::new(0),
             mutator_overflow: AtomicUsize::new(0),
             mutator_activity: AtomicBool::new(false),
@@ -2702,9 +2714,10 @@ impl<V> DirectArenaOwner<V> {
                 unsafe { ptr::drop_in_place(pointer) };
                 // The value is gone, so no user code runs while the stash is
                 // borrowed; overflow goes to the shard pool reservations use.
-                let stashed = NonNull::new(pointer.cast::<u8>()).is_some_and(|box_pointer| {
-                    direct_stash_put(self.id, box_pointer, Layout::new::<DirectArenaEntry<V>>())
-                });
+                let stashed = self.stashes_boxes
+                    && NonNull::new(pointer.cast::<u8>()).is_some_and(|box_pointer| {
+                        direct_stash_put(self.id, box_pointer, Layout::new::<DirectArenaEntry<V>>())
+                    });
                 if stashed {
                     std::mem::forget(allocation);
                 } else {
@@ -3668,7 +3681,7 @@ mod tests {
 
     #[test]
     fn direct_mutation_slots_fall_back_and_release_exactly() {
-        let owner = DirectArenaOwner::<u64>::new(1);
+        let owner = DirectArenaOwner::<u64>::new(1, false);
         owner.activate_mutators();
         let reservations = (0..=DIRECT_READER_SHARDS)
             .map(|_| owner.enter_mutator(0))
@@ -3741,66 +3754,99 @@ mod tests {
     fn each_thread_destroys_the_values_it_retired() {
         // A retiring thread allocated what it retires when it replaces its
         // own values; freeing on that thread keeps allocator frees local.
+        // Two scripted workers each force one epoch advance per step, so the
+        // queues fill and drain in a fixed order whatever the scheduling.
         struct DropThread {
-            retired_on: std::thread::ThreadId,
-            dropped_elsewhere: Arc<AtomicUsize>,
+            retired_by: usize,
+            drops: Arc<[AtomicUsize; 4]>,
         }
 
         impl Drop for DropThread {
             fn drop(&mut self) {
-                if std::thread::current().id() != self.retired_on {
-                    self.dropped_elsewhere.fetch_add(1, Ordering::Relaxed);
-                }
+                let on = DROPPING_WORKER.with(Cell::get);
+                let slot = if on == self.retired_by { 0 } else { 1 };
+                self.drops[self.retired_by * 2 + slot].fetch_add(1, Ordering::Relaxed);
             }
         }
 
+        thread_local! {
+            static DROPPING_WORKER: Cell<usize> = const { Cell::new(usize::MAX) };
+        }
+
         let arena = Arc::new(DirectValueArena::new(4));
-        let dropped_elsewhere = Arc::new(AtomicUsize::new(0));
-        // Counted when the first worker finishes, while both are active.
-        let while_both_active = Arc::new(AtomicUsize::new(usize::MAX));
-        let barrier = Arc::new(std::sync::Barrier::new(2));
-        let workers: Vec<_> = (0..2)
-            .map(|_| {
+        // [worker 0 local, worker 0 elsewhere, worker 1 local, worker 1 elsewhere]
+        let drops: Arc<[AtomicUsize; 4]> = Arc::new(std::array::from_fn(|_| AtomicUsize::new(0)));
+        let (shard_tx, shard_rx) = std::sync::mpsc::channel();
+        let workers: Vec<_> = (0..2_usize)
+            .map(|worker| {
                 let arena = Arc::clone(&arena);
-                let dropped_elsewhere = Arc::clone(&dropped_elsewhere);
-                let while_both_active = Arc::clone(&while_both_active);
-                let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    for _ in 0..20 * DIRECT_RECLAIM_BATCH {
-                        let handle = arena.allocate_boxed(
-                            DropThread {
-                                retired_on: std::thread::current().id(),
-                                dropped_elsewhere: Arc::clone(&dropped_elsewhere),
-                            },
-                            1,
-                            u64::MAX,
-                        );
-                        let pin = arena.pin();
-                        // SAFETY: the unpublished handle is exclusively
-                        // owned and protected by its arena pin.
-                        unsafe {
-                            pin.retire(RemovedDirectHandle::from_exact_removal(handle));
+                let drops = Arc::clone(&drops);
+                let shard_tx = shard_tx.clone();
+                let (command_tx, command_rx) = std::sync::mpsc::channel::<usize>();
+                let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+                let handle = std::thread::spawn(move || {
+                    DROPPING_WORKER.with(|cell| cell.set(worker));
+                    shard_tx
+                        .send(
+                            DirectValueArena::<DropThread>::thread_id()
+                                & (DIRECT_RETIRED_SHARDS - 1),
+                        )
+                        .unwrap();
+                    while let Ok(count) = command_rx.recv() {
+                        for _ in 0..count {
+                            let handle = arena.allocate_boxed(
+                                DropThread {
+                                    retired_by: worker,
+                                    drops: Arc::clone(&drops),
+                                },
+                                1,
+                                u64::MAX,
+                            );
+                            let pin = arena.pin();
+                            // SAFETY: the unpublished handle is exclusively
+                            // owned and protected by its arena pin.
+                            unsafe {
+                                pin.retire(RemovedDirectHandle::from_exact_removal(handle));
+                            }
                         }
+                        done_tx.send(()).unwrap();
                     }
-                    let _ = while_both_active.compare_exchange(
-                        usize::MAX,
-                        dropped_elsewhere.load(Ordering::Relaxed),
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    );
-                    barrier.wait();
-                })
+                });
+                (command_tx, done_rx, handle)
             })
             .collect();
-        for worker in workers {
-            worker.join().expect("worker completes");
+        let shards = [shard_rx.recv().unwrap(), shard_rx.recv().unwrap()];
+        if shards[0] == shards[1] {
+            // Thread ids 64 apart share a retired shard; nothing to compare.
+            return;
         }
+        let step = |worker: usize, count: usize| {
+            workers[worker].0.send(count).unwrap();
+            workers[worker].1.recv().unwrap();
+        };
+        let count = |index: usize| drops[index].load(Ordering::Relaxed);
+        // Each full batch advances one epoch: worker 0's batch sits in the
+        // slot the third advance drains into worker 0's ready queue.
+        step(0, DIRECT_RECLAIM_BATCH);
+        step(1, DIRECT_RECLAIM_BATCH);
+        step(1, DIRECT_RECLAIM_BATCH);
         assert_eq!(
-            while_both_active.load(Ordering::Relaxed),
+            count(0) + count(1),
             0,
-            "values retired by an active thread were destroyed on another"
+            "worker 0's values wait for worker 0"
         );
+        // Worker 0's next retirement drains its own ready queue.
+        step(0, 1);
+        assert_eq!(count(0), DIRECT_RECLAIM_BATCH);
+        // The next advance readies worker 1's first batch for worker 1.
+        step(0, DIRECT_RECLAIM_BATCH);
+        step(1, 1);
+        assert_eq!(count(2), DIRECT_RECLAIM_BATCH);
+        assert_eq!(count(1) + count(3), 0, "no value was destroyed elsewhere");
+        for (command_tx, _, handle) in workers {
+            drop(command_tx);
+            handle.join().expect("worker completes");
+        }
     }
 
     #[test]
@@ -4253,7 +4299,7 @@ mod tests {
             for _ in 0..8 {
                 scope.spawn(|| {
                     for _ in 0..1_000 {
-                        drop(DirectArenaOwner::<u64>::new(1));
+                        drop(DirectArenaOwner::<u64>::new(1, false));
                     }
                 });
             }

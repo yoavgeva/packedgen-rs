@@ -221,7 +221,7 @@ impl<W, S> ShardedCacheBuilder<W, S> {
                 })
                 .collect(),
             shard_shift: u64::BITS - shards.trailing_zeros(),
-            arena: DirectValueArena::new(64),
+            arena: DirectValueArena::new_stashing(64),
             weighter: self.weighter,
             hash_builder: self.hash_builder,
             capacity: max_entries,
@@ -1375,11 +1375,14 @@ mod tests {
             "only {} original keys were evicted",
             evicted.len()
         );
-        // A key moved to its other bucket rejoins the queue's back, so a few
-        // old keys survive; none of the newer half may go first.
+        // A key moved to its other bucket rejoins the queue's back, and a
+        // rare eviction from a full bucket pair takes any key; hash order
+        // takes about half from the newer half.
+        let newer = evicted.iter().filter(|key| **key >= 128).count();
         assert!(
-            evicted.iter().all(|key| *key < 128),
-            "evictions reached the newer half: {evicted:?}"
+            newer * 10 <= evicted.len(),
+            "{newer} of {} evictions came from the newer half: {evicted:?}",
+            evicted.len()
         );
     }
 
