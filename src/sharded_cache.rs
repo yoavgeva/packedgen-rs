@@ -541,9 +541,9 @@ impl ShardLock {
 
 #[repr(C)]
 struct ShardWriter {
-    /// Probationary keys in insertion order, as (slot record, key hash).
-    /// A key moved to its other bucket leaves probation for the main area.
-    probation: VecDeque<(u32, u64)>,
+    /// Probationary keys in insertion order. A key moved to its other bucket
+    /// leaves probation for the main area.
+    probation: VecDeque<Probationary>,
     ghost: Ghost,
     /// Main-area keys in the order they entered it, as `slot << 8 |
     /// generation`. Stale records (removed, replaced by another key, or
@@ -551,6 +551,38 @@ struct ShardWriter {
     main: VecDeque<u32>,
     /// The CLOCK hand: the next slot the main-area sweep examines.
     hand: usize,
+}
+
+/// A probationary key: its slot record, its hash, and the handle it was
+/// published with, whose entry evictions prefetch alongside its bucket.
+#[derive(Clone, Copy)]
+struct Probationary {
+    record: u32,
+    hash: u64,
+    handle: u64,
+}
+
+/// Starts loading the cache line at `address`. A prefetch reads nothing in
+/// the language's sense, so any address is allowed, a stale one included.
+#[inline]
+#[allow(unsafe_code, reason = "issues a prefetch hint")]
+fn prefetch<T>(address: *const T) {
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    // SAFETY: a prefetch hint never faults and changes no program state.
+    unsafe {
+        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(address.cast());
+    }
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    // SAFETY: as above.
+    unsafe {
+        core::arch::asm!(
+            "prfm pldl1keep, [{address}]",
+            address = in(reg) address,
+            options(nostack, preserves_flags, readonly)
+        );
+    }
+    #[cfg(any(miri, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
+    let _ = address;
 }
 
 /// A shard's writer state under its lock, with the counts kept beside it.
@@ -1033,6 +1065,7 @@ where
         let mut removed = Removed::new();
         {
             let mut writer = shard.lock();
+            shard.prefetch_next_victim(&writer);
             let found = shard.find(hash, |current| {
                 // SAFETY: published in this table while `pin` is held.
                 unsafe { entry(&pin, current) }.value().0 == *key
@@ -1096,13 +1129,17 @@ where
                 } else {
                     if writer.probation.len() >= shard.limits.probation_limit {
                         // An overflowing record's key joins the main area.
-                        let (overflow, _) = writer
+                        let overflow = writer
                             .probation
                             .pop_front()
                             .expect("probation is at its limit");
-                        writer.enter_main(shard, overflow);
+                        writer.enter_main(shard, overflow.record);
                     }
-                    writer.probation.push_back((record, hash));
+                    writer.probation.push_back(Probationary {
+                        record,
+                        hash,
+                        handle: handle.raw(),
+                    });
                 }
             }
         }
@@ -1249,7 +1286,7 @@ where
         now: &mut Option<u64>,
     ) -> Option<(Handle<(K, V)>, RemovalCause)> {
         while writer.probation.len() > shard.limits.probation_target {
-            let (record, hash) = writer
+            let Probationary { record, hash, .. } = writer
                 .probation
                 .pop_front()
                 .expect("probation is above its target");
@@ -1512,6 +1549,19 @@ impl<T> Shard<T> {
                 expirations: AtomicU64::new(0),
             },
             _entries: PhantomData,
+        }
+    }
+
+    /// Starts loading the next probationary victim's bucket and entry, so an
+    /// eviction finds both while the key is looked up, rather than loading
+    /// the entry only once its bucket names it.
+    #[inline]
+    fn prefetch_next_victim(&self, writer: &ShardWriter) {
+        if let Some(next) = writer.probation.front() {
+            let slot = usize::try_from(next.record >> 8).expect("a slot fits usize");
+            prefetch(self.buckets.as_ptr().wrapping_add(slot / SLOTS));
+            let handle = usize::try_from(next.handle).expect("a handle fits usize");
+            prefetch(ptr::without_provenance::<u8>(handle));
         }
     }
 
@@ -2141,7 +2191,7 @@ mod tests {
                 .lock()
                 .probation
                 .iter()
-                .any(|(_, hash)| *hash == cache.hash_builder.hash_one(key))
+                .any(|probationary| probationary.hash == cache.hash_builder.hash_one(key))
             {
                 let _ = cache.get(&key);
             }
@@ -2833,6 +2883,23 @@ mod tests {
     }
 
     #[test]
+    fn probation_records_name_the_entries_evictions_prefetch() {
+        let cache = ShardedCacheBuilder::new(256).shards(1).build::<u64, u64>();
+        for key in 0..1_000 {
+            cache.insert(key, key);
+        }
+        let shard = &cache.shards[0];
+        let writer = shard.lock();
+        assert!(!writer.probation.is_empty());
+        for probationary in &writer.probation {
+            if let Some(slot) = shard.live_record(probationary.record) {
+                let published = shard.bucket(slot).handles[slot % SLOTS].load(Ordering::Relaxed);
+                assert_eq!(probationary.handle, published);
+            }
+        }
+    }
+
+    #[test]
     fn keys_evicted_from_probation_return_to_the_main_area() {
         let cache = ShardedCacheBuilder::new(256).shards(1).build::<u64, u64>();
         let in_probation = |key: u64| {
@@ -2841,7 +2908,7 @@ mod tests {
                 .lock()
                 .probation
                 .iter()
-                .any(|(_, probationary)| *probationary == hash)
+                .any(|probationary| probationary.hash == hash)
         };
         for key in 0..1_000 {
             cache.insert(key, key);
