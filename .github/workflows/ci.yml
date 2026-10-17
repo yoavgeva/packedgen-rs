@@ -36,7 +36,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy,rustfmt
+      # The every-feature steps build with target-cpu=native. Runners differ
+      # in CPU, and restoring another CPU's artifacts can run instructions
+      # this one lacks (SIGILL), so the cache is keyed by CPU model.
+      - name: CPU model cache key
+        id: cpu
+        run: echo "model=$(grep -m1 'model name' /proc/cpuinfo | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: cpu-${{ steps.cpu.outputs.model }}
       - name: Formatting
         run: cargo fmt --all -- --check
       - name: Tests
