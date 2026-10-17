@@ -16,6 +16,42 @@ native pointers in compact 64-bit handles, and unsupported pointer widths fail
 with an explicit compile-time error rather than relying on incidental layout
 or shift failures.
 
+## ShardedCache
+
+`ShardedCache<K, V>` is a bounded concurrent cache for any `K: Hash + Eq`.
+Reads are lock-free and its fixed per-shard tables never rebuild. Writers use
+sharded locks and evict S3-FIFO style. Its overhead beyond the key and value is
+29 to 31 requested bytes per entry, against 78 to 210 for quick_cache 0.7.
+
+Against quick_cache, ShardedCache leads concurrent reads. With eight threads
+on a 16-core machine it ran 2.6 to 3.4 times quick_cache's resident-hit
+throughput and 6 to 7.3 times its miss throughput, and it was 6 to 9% ahead on
+a 95%-read turnover mix. It trails on writes at one or two threads, and on
+cold fills and replacements at every thread count measured.
+
+On the ARC paper traces, its summed hit rate over 18 cells was within 0.06
+points of quick_cache.
+
+Design, correctness evidence, tables, and rejected alternatives are in
+[`docs/SHARDED_CACHE_2026-10-17.md`](docs/SHARDED_CACHE_2026-10-17.md).
+
+```rust
+use packedgen::{ShardedCache, ShardedCacheBuilder};
+
+let cache: ShardedCache<u64, String> = ShardedCache::new(10_000);
+cache.insert(1, "one".to_owned());
+assert_eq!(cache.get(&1).as_deref(), Some("one"));
+
+// Weighted limits, and borrowed reads that pin once for many lookups.
+let weighted = ShardedCacheBuilder::new(10_000)
+    .max_weight(1 << 20)
+    .weighter(|_key: &u64, value: &String| value.len() as u64)
+    .build();
+weighted.insert(2, "two".to_owned());
+let guard = weighted.pin();
+assert_eq!(guard.get(&2).map(String::as_str), Some("two"));
+```
+
 ## Status
 
 For the current direct-cache implementation/practices assessment, remaining

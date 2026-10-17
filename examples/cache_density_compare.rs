@@ -18,7 +18,7 @@
 use std::alloc::System;
 use std::hint::black_box;
 
-use packedgen::{CacheConfig, DirectPackedCache};
+use packedgen::{CacheConfig, DirectPackedCache, ShardedCache};
 use quick_cache::{UnitWeighter, sync::Cache};
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 
@@ -57,6 +57,18 @@ fn direct<const K: usize, V: Send + Sync>(entries: usize, value: impl Fn(u64) ->
     bytes as f64 / resident as f64
 }
 
+fn sharded<const K: usize, V: Send + Sync>(entries: usize, value: impl Fn(u64) -> V) -> f64 {
+    let region = Region::new(GLOBAL);
+    let cache = ShardedCache::new(entries);
+    for id in 0..(2 * entries) as u64 {
+        cache.insert(key::<K>(id), value(id));
+    }
+    let bytes = live(&region);
+    let resident = cache.len();
+    drop(black_box(cache));
+    bytes as f64 / resident as f64
+}
+
 fn quick<const K: usize, V: Clone + Send + Sync>(entries: usize, value: impl Fn(u64) -> V) -> f64 {
     let region = Region::new(GLOBAL);
     let cache: Cache<[u8; K], V, UnitWeighter> = Cache::new(entries);
@@ -75,13 +87,14 @@ fn row<const K: usize, V: Clone + Send + Sync>(
     value: impl Fn(u64) -> V + Copy,
 ) {
     let direct = direct::<K, V>(entries, value);
+    let sharded = sharded::<K, V>(entries, value);
     let quick = quick::<K, V>(entries, value);
     let payload = (K + size_of::<V>()) as f64;
     println!(
-        "| {entries} | {K} | {label} | {direct:.1} | {:.1} | {quick:.1} | {:.1} | {:.3} |",
+        "| {entries} | {K} | {label} | {direct:.1} | {sharded:.1} | {quick:.1} | {:.1} | {:.1} | {:.1} |",
         direct - payload,
+        sharded - payload,
         quick - payload,
-        direct / quick,
     );
 }
 
@@ -98,9 +111,9 @@ fn main() {
     // Start rayon's global pool (used by index rebuilds) outside the regions.
     let _ = direct::<8, u64>(4_096, |id| id);
     println!(
-        "| Entries | Key B | Value | Direct B/entry | Direct overhead | QuickCache B/entry | QuickCache overhead | Direct/Quick |"
+        "| Entries | Key B | Value | Direct B/entry | Sharded B/entry | quick_cache B/entry | Direct overhead | Sharded overhead | quick_cache overhead |"
     );
-    println!("| ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |");
+    println!("| ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |");
     for entries in sizes {
         row::<8, u64>(entries, "u64", |id| id);
         row::<16, u64>(entries, "u64", |id| id);
