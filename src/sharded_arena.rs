@@ -333,8 +333,9 @@ pub(crate) unsafe fn drop_value<T>(slot: NonNull<Slot<T>>) {
 }
 
 /// Retired queues per cache: threads map to queues by their arena thread
-/// index, so each thread's queue stays in its own cache lines.
-const RETIRED_QUEUES: usize = 64;
+/// index, as to reader shards, so each thread's queue stays in its own cache
+/// lines.
+const RETIRED_QUEUES: usize = READER_SHARDS;
 
 /// The retired queue this thread uses in every cache.
 #[inline]
@@ -387,22 +388,25 @@ impl<T> RetiredSlots<T> {
         }
     }
 
-    /// Queues `slots`, unpublished by this thread while it held a pin taken
+    /// Queues `slots`, unpublished by this thread while it held `pin`, taken
     /// before unpublishing them, and moves as many aged slots as it queued,
     /// one more while a backlog is due, from this thread's queue into
     /// `reclaimed`. Periodically it also
     /// moves aged slots into `foreign` from another queue, if that queue's
     /// thread has stopped retiring. Reads the generation that tags the slots
-    /// here, so the caller must still hold that pin. Returns whether enough
+    /// here, while the caller still holds `pin`. Returns whether enough
     /// retirements are pending across the cache to try advancing.
     pub(crate) fn retire(
         &self,
-        epochs: &Epochs,
+        pin: &EpochPin<'_>,
         slots: impl Iterator<Item = NonNull<Slot<T>>>,
         reclaimed: &mut Reclaimed<T>,
         foreign: &mut Reclaimed<T>,
     ) -> bool {
-        let own = retired_queue_index();
+        let epochs = pin.epochs;
+        // The pin's reader shard is the thread's index, as is its queue's.
+        let own = pin.shard;
+        debug_assert_eq!(own, retired_queue_index());
         let generation = epochs.generation();
         let due = reclaim_at(generation);
         let mut queue = self.queues[own].0.lock();
@@ -691,17 +695,22 @@ impl<T> SlotStore<T> {
     }
 
     /// Gives this thread vacant slots, overflowing into the depot.
+    #[inline]
     fn give(&self, slots: &[NonNull<Slot<T>>]) {
-        let erased = slots.iter().map(|slot| slot.cast::<u8>());
         let given = self.with_stack(|stack| {
-            stack.extend(erased.clone());
+            for slot in slots {
+                stack.push(slot.cast());
+            }
             if stack.len() > THREAD_LIMIT {
                 let keep = stack.len() - THREAD_BATCH;
                 self.depot.state.lock().vacant.extend(stack.drain(keep..));
             }
         });
         if given.is_none() {
-            self.depot.state.lock().vacant.extend(erased);
+            let mut depot = self.depot.state.lock();
+            for slot in slots {
+                depot.vacant.push(slot.cast());
+            }
         }
     }
 }
@@ -800,7 +809,7 @@ mod tests {
             .collect();
         let mut reclaimed = Reclaimed::new();
         let mut foreign = Reclaimed::new();
-        retired.retire(epochs, slots.into_iter(), &mut reclaimed, &mut foreign);
+        retired.retire(&pin, slots.into_iter(), &mut reclaimed, &mut foreign);
         let count = reclaimed.len + foreign.len;
         reclaimed.finish(store);
         foreign.finish(store);

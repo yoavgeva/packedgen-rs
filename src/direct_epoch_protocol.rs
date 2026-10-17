@@ -13,12 +13,14 @@ pub(crate) struct EpochAdvance {
     pub(crate) next_epoch: usize,
 }
 
+#[inline]
 pub(crate) const fn epoch_slot(token: usize) -> usize {
     let slot = token & EPOCH_SLOT_MASK;
     debug_assert!(slot < EPOCHS);
     slot
 }
 
+#[inline]
 pub(crate) const fn next_epoch_token(token: usize) -> Option<usize> {
     match epoch_slot(token) {
         0 | 1 => token.checked_add(1),

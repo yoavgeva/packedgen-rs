@@ -1122,7 +1122,7 @@ where
         let mut reclaimed = Reclaimed::new();
         let mut foreign = Reclaimed::new();
         let advance = self.retired.retire(
-            &self.epochs,
+            &pin,
             removed.iter().map(|(handle, _)| handle.0),
             &mut reclaimed,
             &mut foreign,
