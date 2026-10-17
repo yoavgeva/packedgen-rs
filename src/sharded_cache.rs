@@ -1217,6 +1217,9 @@ mod tests {
 
     /// Interpreted and sanitized runs keep the same races, fewer of them.
     const STRESS_ROUNDS: u64 = if cfg!(miri) { 300 } else { 40_000 };
+    /// Miri takes tens of milliseconds per insert, so interpreted runs churn
+    /// a few capacities' worth of keys instead of many.
+    const CHURN_SCALE: u64 = if cfg!(miri) { 1 } else { 10 };
 
     #[test]
     fn inserts_reads_replaces_and_removes() {
@@ -1397,7 +1400,8 @@ mod tests {
     #[test]
     fn never_exceeds_its_capacity_and_keeps_recent_keys_findable() {
         let cache = ShardedCache::new(500);
-        for key in 0..20_000_u64 {
+        let keys = 2_000 * CHURN_SCALE;
+        for key in 0..keys {
             cache.insert(key, key * 3);
             assert_eq!(
                 cache.get(&key),
@@ -1406,7 +1410,7 @@ mod tests {
             );
             assert!(cache.len() <= 500);
         }
-        let resident = (0..20_000_u64)
+        let resident = (0..keys)
             .filter(|key| cache.get(key) == Some(key * 3))
             .count();
         assert!(resident >= 400, "only {resident} of 500 entries resident");
@@ -1488,22 +1492,23 @@ mod tests {
 
     #[test]
     fn unread_probationary_keys_leave_before_read_ones() {
-        let cache = ShardedCache::new(1_000);
+        let capacity = 100 * CHURN_SCALE;
+        let cache = ShardedCache::new(usize::try_from(capacity).expect("a test capacity fits"));
         // Per-shard limits leave some room unused, so the working set is
         // whatever stayed resident after one pass.
-        for key in 0..1_000_u64 {
+        for key in 0..capacity {
             cache.insert(key, key);
         }
-        let working_set: Vec<u64> = (0..1_000_u64)
+        let working_set: Vec<u64> = (0..capacity)
             .filter(|key| cache.get(key).is_some())
             .collect();
         assert!(
-            working_set.len() >= 900,
+            working_set.len() as u64 * 10 >= capacity * 9,
             "{} keys resident",
             working_set.len()
         );
         // A scan of one-hit keys displaces itself, not the read working set.
-        for key in 10_000..20_000_u64 {
+        for key in capacity * 10..capacity * 20 {
             cache.insert(key, key);
         }
         let survivors = working_set
