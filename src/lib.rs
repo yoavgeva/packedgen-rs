@@ -43,6 +43,7 @@ mod packed_map;
 mod route_cache;
 mod segment_cache;
 mod segmented_map;
+mod sharded_arena;
 mod sharded_cache;
 mod swiss_map;
 

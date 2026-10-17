@@ -2,13 +2,13 @@
 //!
 //! Each shard is a fixed table of 64-byte buckets. A bucket holds six slots:
 //! one control word with a tag byte per slot and an overflow count, and six
-//! atomic handles to entries in an epoch-reclaimed arena. Keys live in the
-//! entries, not in the table, and an entry never changes after publication,
-//! so a reader compares keys only in memory that its epoch pin keeps alive.
-//! Writers can therefore reuse a freed slot immediately: a reader racing the
-//! reuse sees an old or a new handle, both live for its epoch, and checks the
-//! key in that entry. Tables are sized once for the shard's capacity and never
-//! rebuilt.
+//! atomic handles to entries in the shard's epoch-reclaimed slab (see
+//! `sharded_arena`). Keys live in the entries, not in the table, and an entry
+//! never changes after publication, so a reader compares keys only in memory
+//! that its epoch pin keeps alive. Writers can therefore reuse a freed table
+//! slot immediately: a reader racing the reuse sees an old or a new handle,
+//! both live for its epoch, and checks the key in that entry. Tables are sized
+//! once for the shard's capacity and never rebuilt.
 //!
 //! Writers take their shard's mutex. A shard at its limit evicts in the
 //! S3-FIFO style: new keys wait in a small probationary FIFO and leave unless
@@ -20,6 +20,8 @@ use std::borrow::Borrow;
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::hash::{BuildHasher, Hash};
+use std::marker::PhantomData;
+use std::ptr::{self, NonNull};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -27,10 +29,10 @@ use std::time::{Duration, Instant};
 use hashbrown::DefaultHashBuilder;
 use parking_lot::{Condvar, Mutex};
 
-use crate::NonMaxU64;
-use crate::cache_arena::{
-    DIRECT_MAX_EXPIRY_TICK, DIRECT_MAX_WEIGHT, DirectArenaEntry, DirectArenaPin, DirectHandle,
-    DirectValueArena, RemovedDirectHandle, direct_arena_thread,
+use crate::cache_arena::direct_arena_thread;
+use crate::sharded_arena::{
+    EpochPin, Epochs, MAX_EXPIRY_TICK, MAX_WEIGHT, Reclaimed, RetiredSlots, Slot, SlotStore,
+    drop_value, fill,
 };
 
 const SLOTS: usize = 6;
@@ -350,7 +352,9 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
                 })
                 .collect(),
             shard_shift: u64::BITS - shards.trailing_zeros(),
-            arena: DirectValueArena::new_stashing(64),
+            epochs: Epochs::new(),
+            retired: RetiredSlots::new(),
+            slots: SlotStore::new(),
             weighter: self.weighter,
             hash_builder: self.hash_builder,
             listener: self.listener,
@@ -377,9 +381,13 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
 /// the entry and weight limits, as in other sharded caches, so a cache can
 /// evict a little before it is full overall.
 pub struct ShardedCache<K, V, W = UnitWeighter, S = DefaultHashBuilder, L = NoListener> {
-    shards: Box<[Shard]>,
+    shards: Box<[Shard<(K, V)>]>,
     shard_shift: u32,
-    arena: DirectValueArena<(K, V)>,
+    epochs: Epochs,
+    /// Unpublished entries awaiting reclamation. Declared before `slots`:
+    /// it drops the queued values, and `slots` then frees the chunks.
+    retired: RetiredSlots<(K, V)>,
+    slots: SlotStore<(K, V)>,
     weighter: W,
     hash_builder: S,
     listener: L,
@@ -477,11 +485,14 @@ struct Bucket {
 
 /// Readers load only `buckets`; the counters and the writer lock change on
 /// every write, so each sits on its own cache line.
-struct Shard {
+struct Shard<T> {
     buckets: Box<[Bucket]>,
     weight_limit: u64,
     counters: ShardCounters,
     writer: ShardLock,
+    /// Tables publish handles to `Slot<T>`s; the cache's `RetiredSlots` and
+    /// `SlotStore` carry the ownership bounds.
+    _entries: PhantomData<fn() -> T>,
 }
 
 #[repr(align(128))]
@@ -523,7 +534,7 @@ impl ShardWriter {
     /// slack, stale records are dropped from the front in order-preserving
     /// chunks, so no write holds the shard lock for a whole-queue pass; only
     /// a chunk with nothing stale falls back to compacting the whole queue.
-    fn enter_main(&mut self, shard: &Shard, record: u32) {
+    fn enter_main<T>(&mut self, shard: &Shard<T>, record: u32) {
         if self.main.len() >= self.main_limit() {
             let mut kept = [0_u32; MAIN_CLEANUP_CHUNK];
             let mut live = 0;
@@ -557,7 +568,7 @@ impl ShardWriter {
         self.len >= self.capacity || self.weight.saturating_add(incoming_weight) > self.weight_limit
     }
 
-    fn publish(&self, shard: &Shard) {
+    fn publish<T>(&self, shard: &Shard<T>) {
         shard.counters.len.store(self.len, Ordering::Relaxed);
         shard.counters.weight.store(self.weight, Ordering::Relaxed);
         shard
@@ -659,7 +670,7 @@ where
         Q: Hash + Eq + ?Sized,
         V: Clone,
     {
-        let pin = self.arena.pin();
+        let pin = self.epochs.pin();
         let value = self
             .lookup(&pin, key, self.hash_builder.hash_one(key))
             .cloned();
@@ -675,7 +686,7 @@ where
         Q: Hash + Eq + ?Sized,
         V: Clone,
     {
-        let pin = self.arena.pin();
+        let pin = self.epochs.pin();
         self.live_entry(&pin, key, self.hash_builder.hash_one(key))
             .map(|entry| entry.value().1.clone())
     }
@@ -686,7 +697,7 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let pin = self.arena.pin();
+        let pin = self.epochs.pin();
         self.live_entry(&pin, key, self.hash_builder.hash_one(key))
             .is_some()
     }
@@ -730,7 +741,7 @@ where
         V: Clone,
     {
         let hash = self.hash_builder.hash_one(key);
-        let cached = self.lookup(&self.arena.pin(), key, hash).cloned();
+        let cached = self.lookup(&self.epochs.pin(), key, hash).cloned();
         self.count(cached.is_some());
         if let Some(value) = cached {
             return Ok(value);
@@ -748,7 +759,7 @@ where
                 } else {
                     // A load that landed after this caller missed has
                     // inserted its value; flights unlist only after that.
-                    if let Some(value) = self.lookup(&self.arena.pin(), key, hash).cloned() {
+                    if let Some(value) = self.lookup(&self.epochs.pin(), key, hash).cloned() {
                         return Ok(value);
                     }
                     let flight = Arc::new(Flight {
@@ -791,19 +802,15 @@ where
     pub fn pin(&self) -> ShardedCacheGuard<'_, K, V, W, S, L> {
         ShardedCacheGuard {
             cache: self,
-            pin: self.arena.pin(),
+            pin: self.epochs.pin(),
         }
     }
 
     /// Finds `key`'s live value and marks it read.
-    fn lookup<'pin, Q>(
-        &self,
-        pin: &'pin DirectArenaPin<'_, (K, V)>,
-        key: &Q,
-        hash: u64,
-    ) -> Option<&'pin V>
+    fn lookup<'pin, Q>(&self, pin: &'pin EpochPin<'_>, key: &Q, hash: u64) -> Option<&'pin V>
     where
-        K: Borrow<Q>,
+        K: Borrow<Q> + 'pin,
+        V: 'pin,
         Q: Hash + Eq + ?Sized,
     {
         let entry = self.find_entry(pin, key, hash)?;
@@ -816,10 +823,10 @@ where
     /// Finds `key`'s live entry without marking it read.
     fn live_entry<'pin, Q>(
         &self,
-        pin: &'pin DirectArenaPin<'_, (K, V)>,
+        pin: &'pin EpochPin<'_>,
         key: &Q,
         hash: u64,
-    ) -> Option<&'pin DirectArenaEntry<(K, V)>>
+    ) -> Option<Entry<'pin, (K, V)>>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -834,10 +841,10 @@ where
     )]
     fn find_entry<'pin, Q>(
         &self,
-        pin: &'pin DirectArenaPin<'_, (K, V)>,
+        pin: &'pin EpochPin<'_>,
         key: &Q,
         hash: u64,
-    ) -> Option<&'pin DirectArenaEntry<(K, V)>>
+    ) -> Option<Entry<'pin, (K, V)>>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -871,7 +878,7 @@ where
     fn now(&self) -> u64 {
         u64::try_from(self.elapsed_nanos() / EXPIRY_TICK_NANOS)
             .unwrap_or(u64::MAX)
-            .min(DIRECT_MAX_EXPIRY_TICK)
+            .min(MAX_EXPIRY_TICK)
     }
 
     /// The first tick at which an entry stored now with `ttl` reads as
@@ -883,12 +890,12 @@ where
         let ticks = (self.elapsed_nanos() + ttl.as_nanos()).div_ceil(EXPIRY_TICK_NANOS);
         u64::try_from(ticks)
             .unwrap_or(u64::MAX)
-            .min(DIRECT_MAX_EXPIRY_TICK)
+            .min(MAX_EXPIRY_TICK)
     }
 
     /// Whether `entry` has expired, reading the clock at most once per
     /// operation through `now`.
-    fn expired(&self, entry: &DirectArenaEntry<(K, V)>, now: &mut Option<u64>) -> bool {
+    fn expired(&self, entry: Entry<'_, (K, V)>, now: &mut Option<u64>) -> bool {
         let expires_at = entry.expires_at();
         expires_at != NEVER_EXPIRES && expires_at <= *now.get_or_insert_with(|| self.now())
     }
@@ -922,37 +929,39 @@ where
 
     #[allow(
         unsafe_code,
-        reason = "publishes, replaces, and retires arena handles under the shard lock"
+        reason = "fills, publishes, and unpublishes slab slots under the shard lock"
     )]
     fn insert_expiring(&self, key: K, value: V, ttl: Option<Duration>) -> bool {
         let hash = self.hash_builder.hash_one(&key);
         let shard = self.shard(hash);
         let weight = self.weighter.weight(&key, &value);
-        let Some(compact_weight) = u32::try_from(weight).ok().filter(|weight| {
-            *weight <= DIRECT_MAX_WEIGHT && u64::from(*weight) <= shard.weight_limit
-        }) else {
+        let Some(compact_weight) = u32::try_from(weight)
+            .ok()
+            .filter(|weight| *weight <= MAX_WEIGHT && u64::from(*weight) <= shard.weight_limit)
+        else {
             self.remove(&key);
             return false;
         };
         let expires_at = ttl.map_or(NEVER_EXPIRES, |ttl| self.deadline(ttl));
         let mut now = None;
-        let pin = self.arena.pin();
-        let handle = self
-            .arena
-            .allocate_recycled((key, value), compact_weight, expires_at);
-        // SAFETY: the handle is this arena's own unpublished allocation.
+        let pin = self.epochs.pin();
+        let slot = self.slots.take();
+        // SAFETY: `take` handed this vacant slot to this caller alone, and
+        // nothing can reach it before it is published below.
+        unsafe { fill(slot, (key, value), compact_weight, expires_at) };
+        let handle = Handle(slot);
+        // SAFETY: the caller's own filled slot, published below or never.
         let key = &unsafe { entry(&pin, handle) }.value().0;
-        let same_key = |current| {
-            // SAFETY: published in this table while `pin` is held.
-            unsafe { entry(&pin, current) }.value().0 == *key
-        };
-        let mut retired = Retired::new(&pin);
+        let mut removed = Removed::new();
         {
             let mut writer = shard.writer.0.lock();
-            if let Some((slot, _)) = shard.find(hash, same_key) {
-                let previous = handle_from_raw(
-                    shard.bucket(slot).handles[slot % SLOTS]
-                        .swap(handle.index_value().get(), Ordering::AcqRel),
+            let found = shard.find(hash, |current| {
+                // SAFETY: published in this table while `pin` is held.
+                unsafe { entry(&pin, current) }.value().0 == *key
+            });
+            if let Some((index, _)) = found {
+                let previous = Handle::from_raw(
+                    shard.bucket(index).handles[index % SLOTS].swap(handle.raw(), Ordering::AcqRel),
                 );
                 // SAFETY: the swap unpublished `previous` while `pin` is held.
                 let previous_entry = unsafe { entry(&pin, previous) };
@@ -963,14 +972,14 @@ where
                 } else {
                     RemovalCause::Replaced
                 };
-                retired.push(previous, cause);
+                removed.push(previous, cause);
                 while writer.weight > writer.weight_limit {
                     let Some((victim, cause)) =
                         self.evict(shard, &mut writer, &pin, Some(handle), &mut now)
                     else {
                         break;
                     };
-                    retired.push(victim, cause);
+                    removed.push(victim, cause);
                 }
             } else {
                 while writer.over_limit(weight) {
@@ -979,10 +988,10 @@ where
                     else {
                         break;
                     };
-                    retired.push(victim, cause);
+                    removed.push(victim, cause);
                 }
-                let slot = if let Some(slot) = shard.place(hash, handle) {
-                    slot
+                let index = if let Some(index) = shard.place(hash, handle) {
+                    index
                 } else {
                     // Both candidate buckets are full: move a resident key to
                     // its other bucket, or else evict one of them.
@@ -991,7 +1000,7 @@ where
                         WINDOW_EVICTIONS.with(|count| count.set(count.get() + 1));
                         let (victim, cause) =
                             self.evict_candidate(shard, &mut writer, &pin, hash, &mut now);
-                        retired.push(victim, cause);
+                        removed.push(victim, cause);
                     }
                     let placed = shard.place(hash, handle);
                     assert!(
@@ -1002,7 +1011,7 @@ where
                 };
                 writer.len += 1;
                 writer.weight += weight;
-                let record = shard.record(slot);
+                let record = shard.record(index);
                 if writer.ghost.contains(hash) {
                     // Remembered from a recent eviction: straight to main.
                     writer.enter_main(shard, record);
@@ -1020,15 +1029,37 @@ where
             }
             writer.publish(shard);
         }
-        retired.finish(&self.listener);
+        self.after_write(&removed, pin);
         true
+    }
+
+    /// Ends a write after its shard lock, still pinned: tells the listener
+    /// what left, queues the unpublished entries for reclamation, drops the
+    /// values of entries aged enough to reclaim, unpins, and advances the
+    /// epoch generation if enough retirements are pending.
+    fn after_write(&self, removed: &Removed<(K, V)>, pin: EpochPin<'_>) {
+        removed.notify(&self.listener, &pin);
+        let mut reclaimed = Reclaimed::new();
+        let mut foreign = Reclaimed::new();
+        let advance = self.retired.retire(
+            &self.epochs,
+            removed.iter().map(|(handle, _)| handle.0),
+            &mut reclaimed,
+            &mut foreign,
+        );
+        reclaimed.finish(&self.slots);
+        foreign.finish(&self.slots);
+        drop(pin);
+        if advance {
+            self.epochs.try_advance();
+        }
     }
 
     /// Removes `key`, returning whether it held a live value. An expired
     /// entry is removed too, but reported absent.
     #[allow(
         unsafe_code,
-        reason = "dereferences and retires handles removed under the shard lock"
+        reason = "dereferences handles unpublished under the shard lock"
     )]
     pub fn remove<Q>(&self, key: &Q) -> bool
     where
@@ -1037,8 +1068,8 @@ where
     {
         let hash = self.hash_builder.hash_one(key);
         let shard = self.shard(hash);
-        let pin = self.arena.pin();
-        let mut retired = Retired::new(&pin);
+        let pin = self.epochs.pin();
+        let mut removed = Removed::new();
         let mut live = false;
         {
             let mut writer = shard.writer.0.lock();
@@ -1046,10 +1077,10 @@ where
                 // SAFETY: published in this table while `pin` is held.
                 unsafe { entry(&pin, handle) }.value().0.borrow() == key
             });
-            if let Some((slot, _)) = found {
-                let removed = shard.clear(slot, shard.home(hash));
-                // SAFETY: the clear unpublished `removed` while `pin` is held.
-                let removed_entry = unsafe { entry(&pin, removed) };
+            if let Some((index, _)) = found {
+                let handle = shard.clear(index, shard.home(hash));
+                // SAFETY: the clear unpublished `handle` while `pin` is held.
+                let removed_entry = unsafe { entry(&pin, handle) };
                 writer.len -= 1;
                 writer.weight -= removed_entry.weight();
                 live = !self.expired(removed_entry, &mut None);
@@ -1059,19 +1090,19 @@ where
                     writer.expirations += 1;
                     RemovalCause::Expired
                 };
-                retired.push(removed, cause);
-                writer.publish(shard);
+                removed.push(handle, cause);
             }
+            writer.publish(shard);
         }
-        retired.finish(&self.listener);
+        self.after_write(&removed, pin);
         live
     }
 
     /// Removes every entry. Inserts racing the sweep may survive it.
     pub fn clear(&self) {
         for shard in &self.shards {
-            let pin = self.arena.pin();
-            let mut retired = Retired::new(&pin);
+            let pin = self.epochs.pin();
+            let mut removed = Removed::new();
             {
                 let mut writer = shard.writer.0.lock();
                 for bucket in &shard.buckets {
@@ -1083,7 +1114,7 @@ where
                     for handle in &bucket.handles {
                         let raw = handle.swap(0, Ordering::AcqRel);
                         if raw != 0 {
-                            retired.push(handle_from_raw(raw), RemovalCause::Explicit);
+                            removed.push(Handle::from_raw(raw), RemovalCause::Explicit);
                         }
                     }
                 }
@@ -1095,7 +1126,30 @@ where
                 writer.ghost.clear();
                 writer.publish(shard);
             }
-            retired.finish(&self.listener);
+            self.after_write(&removed, pin);
+        }
+    }
+
+    /// Drops the values of removed entries that no reader can still reach.
+    ///
+    /// Writes reclaim a few removed entries each, in the shard they write, so
+    /// after a burst of writes some removed values wait for later writes to
+    /// their shards. Call this to drop them promptly. Readers holding a
+    /// [`ShardedCacheGuard`] or a racing operation's pin can delay it.
+    pub fn maintain(&self) {
+        // Three advances age every entry removed before this call.
+        for _ in 0..3 {
+            self.epochs.try_advance();
+        }
+        loop {
+            let mut reclaimed = Reclaimed::new();
+            let more = self
+                .retired
+                .reclaim_all(self.epochs.generation(), &mut reclaimed);
+            reclaimed.finish(&self.slots);
+            if !more {
+                break;
+            }
         }
     }
 
@@ -1105,7 +1159,7 @@ where
         usize::try_from(shard).expect("a shard index fits usize")
     }
 
-    fn shard(&self, hash: u64) -> &Shard {
+    fn shard(&self, hash: u64) -> &Shard<(K, V)> {
         &self.shards[self.shard_index(hash)]
     }
 
@@ -1118,12 +1172,12 @@ where
     )]
     fn evict(
         &self,
-        shard: &Shard,
+        shard: &Shard<(K, V)>,
         writer: &mut ShardWriter,
-        pin: &DirectArenaPin<'_, (K, V)>,
-        protected: Option<DirectHandle>,
+        pin: &EpochPin<'_>,
+        protected: Option<Handle<(K, V)>>,
         now: &mut Option<u64>,
-    ) -> Option<(DirectHandle, RemovalCause)> {
+    ) -> Option<(Handle<(K, V)>, RemovalCause)> {
         while writer.probation.len() > writer.probation_target {
             let (record, hash) = writer
                 .probation
@@ -1134,11 +1188,11 @@ where
                 continue;
             };
             let raw = shard.bucket(slot).handles[slot % SLOTS].load(Ordering::Relaxed);
-            if protected.is_some_and(|protected| protected.index_value().get() == raw) {
+            if protected.is_some_and(|protected| protected.raw() == raw) {
                 continue;
             }
             // SAFETY: the shard lock keeps this published handle in the table.
-            let entry = unsafe { entry(pin, handle_from_raw(raw)) };
+            let entry = unsafe { entry(pin, Handle::<(K, V)>::from_raw(raw)) };
             let expired = self.expired(entry, now);
             if !expired && entry.take_accessed() {
                 // Read during probation: it joins the main area.
@@ -1164,9 +1218,9 @@ where
             };
             let raw = shard.bucket(slot).handles[slot % SLOTS].load(Ordering::Relaxed);
             // SAFETY: the shard lock keeps this published handle in the table.
-            let entry = unsafe { entry(pin, handle_from_raw(raw)) };
+            let entry = unsafe { entry(pin, Handle::<(K, V)>::from_raw(raw)) };
             let expired = self.expired(entry, now);
-            if protected.is_some_and(|protected| protected.index_value().get() == raw)
+            if protected.is_some_and(|protected| protected.raw() == raw)
                 || (!expired && entry.take_accessed())
             {
                 writer.main.push_back(record);
@@ -1186,11 +1240,11 @@ where
             let slot = writer.hand;
             writer.hand = if slot + 1 == slots { 0 } else { slot + 1 };
             let raw = shard.bucket(slot).handles[slot % SLOTS].load(Ordering::Relaxed);
-            if raw == 0 || protected.is_some_and(|protected| protected.index_value().get() == raw) {
+            if raw == 0 || protected.is_some_and(|protected| protected.raw() == raw) {
                 continue;
             }
             // SAFETY: the shard lock keeps this published handle in the table.
-            let entry = unsafe { entry(pin, handle_from_raw(raw)) };
+            let entry = unsafe { entry(pin, Handle::<(K, V)>::from_raw(raw)) };
             let expired = self.expired(entry, now);
             if !expired && entry.take_accessed() && step < 2 * slots {
                 continue;
@@ -1211,16 +1265,16 @@ where
     )]
     fn relocate_candidate(
         &self,
-        shard: &Shard,
+        shard: &Shard<(K, V)>,
         writer: &mut ShardWriter,
-        pin: &DirectArenaPin<'_, (K, V)>,
+        pin: &EpochPin<'_>,
         hash: u64,
     ) -> bool {
         let (home, alternate) = shard.candidates(hash);
         for bucket in [home, alternate] {
             for slot in bucket * SLOTS..(bucket + 1) * SLOTS {
                 let raw = shard.bucket(slot).handles[slot % SLOTS].load(Ordering::Relaxed);
-                let handle = handle_from_raw(raw);
+                let handle = Handle::<(K, V)>::from_raw(raw);
                 // SAFETY: the shard lock keeps this published handle in the table.
                 let resident = unsafe { entry(pin, handle) };
                 let resident_hash = self.hash_builder.hash_one(&resident.value().0);
@@ -1236,7 +1290,7 @@ where
                 if let Some(moved_to) = shard.place_at(other, resident_home, resident_hash, handle)
                 {
                     let moved = shard.clear(slot, resident_home);
-                    debug_assert_eq!(moved.index_value(), handle.index_value());
+                    debug_assert_eq!(moved.raw(), handle.raw());
                     // Its old record no longer matches; a probationary key
                     // gains a main record it does not need, which only
                     // gives it a second life after probation.
@@ -1257,12 +1311,12 @@ where
     )]
     fn evict_candidate(
         &self,
-        shard: &Shard,
+        shard: &Shard<(K, V)>,
         writer: &mut ShardWriter,
-        pin: &DirectArenaPin<'_, (K, V)>,
+        pin: &EpochPin<'_>,
         hash: u64,
         now: &mut Option<u64>,
-    ) -> (DirectHandle, RemovalCause) {
+    ) -> (Handle<(K, V)>, RemovalCause) {
         let (home, alternate) = shard.candidates(hash);
         let slots = [home, alternate].map(|bucket| bucket * SLOTS);
         // The first pass takes an expired entry. Entries hold at most two
@@ -1273,7 +1327,7 @@ where
                 let raw = shard.bucket(slot).handles[slot % SLOTS].load(Ordering::Relaxed);
                 debug_assert_ne!(raw, 0, "both candidate buckets are full");
                 // SAFETY: the shard lock keeps this published handle in the table.
-                let entry = unsafe { entry(pin, handle_from_raw(raw)) };
+                let entry = unsafe { entry(pin, Handle::<(K, V)>::from_raw(raw)) };
                 let expired = self.expired(entry, now);
                 let keep = match pass {
                     0 => !expired,
@@ -1296,7 +1350,7 @@ where
 pub struct ShardedCacheGuard<'cache, K, V, W = UnitWeighter, S = DefaultHashBuilder, L = NoListener>
 {
     cache: &'cache ShardedCache<K, V, W, S, L>,
-    pin: DirectArenaPin<'cache, (K, V)>,
+    pin: EpochPin<'cache>,
 }
 
 impl<K, V, W, S, L> ShardedCacheGuard<'_, K, V, W, S, L>
@@ -1328,22 +1382,21 @@ where
 impl<K, V, W, S, L> Drop for ShardedCache<K, V, W, S, L> {
     #[allow(
         unsafe_code,
-        reason = "exclusive drop retires every handle still published in the tables"
+        reason = "exclusive drop destroys every value still published in the tables"
     )]
     fn drop(&mut self) {
-        let pin = self.arena.pin();
+        // Exclusive access: no pin exists, so every published value can be
+        // dropped now; each slab drops its retired values and frees its
+        // chunks when the shards drop.
         for shard in &self.shards {
             for bucket in &shard.buckets {
                 for handle in &bucket.handles {
                     let raw = handle.load(Ordering::Relaxed);
                     if raw != 0 {
-                        // SAFETY: exclusive drop makes every published handle
-                        // unreachable, and each slot holds a handle once.
-                        unsafe {
-                            pin.retire(RemovedDirectHandle::from_exact_removal(handle_from_raw(
-                                raw,
-                            )));
-                        }
+                        // SAFETY: a published slot holds an initialized value,
+                        // each slot is published once, and nothing reaches it
+                        // after this exclusive drop.
+                        unsafe { drop_value(Handle::<(K, V)>::from_raw(raw).0) };
                     }
                 }
             }
@@ -1351,7 +1404,7 @@ impl<K, V, W, S, L> Drop for ShardedCache<K, V, W, S, L> {
     }
 }
 
-impl Shard {
+impl<T> Shard<T> {
     fn new(capacity: usize, weight_limit: u64, probation_bps: u16) -> Self {
         let probation_target = capacity * usize::from(probation_bps) / 10_000;
         let slots = (capacity.max(1) * SLOTS_PER_ENTRY_NUMERATOR)
@@ -1391,6 +1444,7 @@ impl Shard {
                 main: VecDeque::with_capacity(capacity + capacity / 4 + 17),
                 ghost: Ghost::new(capacity.div_ceil(GHOST_GENERATION_DIVISOR)),
             })),
+            _entries: PhantomData,
         }
     }
 
@@ -1451,8 +1505,8 @@ impl Shard {
     fn find(
         &self,
         hash: u64,
-        mut matches: impl FnMut(DirectHandle) -> bool,
-    ) -> Option<(usize, DirectHandle)> {
+        mut matches: impl FnMut(Handle<T>) -> bool,
+    ) -> Option<(usize, Handle<T>)> {
         let tag = tag(hash);
         let home = self.home(hash);
         let control = self.buckets[home].control.load(Ordering::Acquire);
@@ -1473,8 +1527,8 @@ impl Shard {
         bucket: usize,
         control: u64,
         tag: u8,
-        matches: &mut impl FnMut(DirectHandle) -> bool,
-    ) -> Option<(usize, DirectHandle)> {
+        matches: &mut impl FnMut(Handle<T>) -> bool,
+    ) -> Option<(usize, Handle<T>)> {
         let current = &self.buckets[bucket];
         let mut candidates = zero_tag_bytes(control ^ (BYTE_ONES * u64::from(tag)));
         while candidates != 0 {
@@ -1484,7 +1538,7 @@ impl Shard {
             // which does not touch the control word.
             let raw = current.handles[slot].load(Ordering::Acquire);
             if raw != 0 {
-                let handle = handle_from_raw(raw);
+                let handle = Handle::from_raw(raw);
                 if matches(handle) {
                     return Some((bucket * SLOTS + slot, handle));
                 }
@@ -1497,7 +1551,7 @@ impl Shard {
     /// its alternate, counting it in the home's overflow first. Returns
     /// `None` when both are full. Requires the shard lock.
     #[inline]
-    fn place(&self, hash: u64, handle: DirectHandle) -> Option<usize> {
+    fn place(&self, hash: u64, handle: Handle<T>) -> Option<usize> {
         let (home, alternate) = self.candidates(hash);
         if let Some(slot) = self.place_in(home, hash, handle) {
             return Some(slot);
@@ -1542,13 +1596,7 @@ impl Shard {
     /// it in its home's overflow when `bucket` is the alternate. Returns the
     /// slot, or `None` when `bucket` is full. Requires the shard lock.
     #[inline]
-    fn place_at(
-        &self,
-        bucket: usize,
-        home: usize,
-        hash: u64,
-        handle: DirectHandle,
-    ) -> Option<usize> {
+    fn place_at(&self, bucket: usize, home: usize, hash: u64, handle: Handle<T>) -> Option<usize> {
         if zero_tag_bytes(self.buckets[bucket].control.load(Ordering::Relaxed)) == 0 {
             return None;
         }
@@ -1565,7 +1613,7 @@ impl Shard {
     }
 
     #[inline]
-    fn place_in(&self, bucket: usize, hash: u64, handle: DirectHandle) -> Option<usize> {
+    fn place_in(&self, bucket: usize, hash: u64, handle: Handle<T>) -> Option<usize> {
         let current = &self.buckets[bucket];
         let control = current.control.load(Ordering::Relaxed);
         let empty = zero_tag_bytes(control);
@@ -1574,7 +1622,7 @@ impl Shard {
         }
         // The lowest flagged byte of `zero_tag_bytes` is always exact.
         let slot = empty.trailing_zeros() as usize / 8;
-        current.handles[slot].store(handle.index_value().get(), Ordering::Release);
+        current.handles[slot].store(handle.raw(), Ordering::Release);
         current.control.store(
             control | (u64::from(tag(hash)) << (slot * 8)),
             Ordering::Release,
@@ -1592,7 +1640,7 @@ impl Shard {
     /// home's overflow count if the key lived in its alternate. Returns the
     /// handle swapped out. Requires the shard lock.
     #[inline]
-    fn clear(&self, slot: usize, home: usize) -> DirectHandle {
+    fn clear(&self, slot: usize, home: usize) -> Handle<T> {
         let bucket = slot / SLOTS;
         let current = &self.buckets[bucket];
         let control = current.control.load(Ordering::Relaxed);
@@ -1600,7 +1648,7 @@ impl Shard {
             control & !(TAG_MASK << ((slot % SLOTS) * 8)),
             Ordering::Release,
         );
-        let removed = handle_from_raw(current.handles[slot % SLOTS].swap(0, Ordering::AcqRel));
+        let removed = Handle::from_raw(current.handles[slot % SLOTS].swap(0, Ordering::AcqRel));
         if bucket != home {
             let home_bucket = &self.buckets[home];
             let control = home_bucket.control.load(Ordering::Relaxed);
@@ -1651,60 +1699,114 @@ fn tag(hash: u64) -> u8 {
     (hash >> 32).to_le_bytes()[0].max(1)
 }
 
-#[inline]
-fn handle_from_raw(raw: u64) -> DirectHandle {
-    #[allow(
-        unsafe_code,
-        reason = "tables store only the index values of this cache's arena handles"
-    )]
-    // SAFETY: every nonzero slot value is an unchanged `index_value` of a
-    // handle allocated by this cache's arena.
-    unsafe {
-        DirectHandle::from_index_value(NonMaxU64::new(raw).expect("a handle is never u64::MAX"))
+/// A table handle: the address of an entry's slot, stored in the table as a
+/// nonzero `u64`.
+struct Handle<T>(NonNull<Slot<T>>);
+
+impl<T> Clone for Handle<T> {
+    fn clone(&self) -> Self {
+        *self
     }
 }
 
-/// Dereferences a handle published in this cache's table, or allocated and
-/// not yet published, while `pin` is held.
+impl<T> Copy for Handle<T> {}
+
+impl<T> Handle<T> {
+    #[inline]
+    fn raw(self) -> u64 {
+        // Targets are 64-bit, so an address fits.
+        self.0.as_ptr().expose_provenance() as u64
+    }
+
+    #[inline]
+    fn from_raw(raw: u64) -> Self {
+        let address = usize::try_from(raw).expect("a handle fits usize");
+        Self(NonNull::new(ptr::with_exposed_provenance_mut(address)).expect("a handle is nonzero"))
+    }
+}
+
+/// An entry reached through its handle for the life of an epoch pin.
+struct Entry<'pin, T> {
+    slot: &'pin Slot<T>,
+}
+
+impl<T> Clone for Entry<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for Entry<'_, T> {}
+
+impl<'pin, T> Entry<'pin, T> {
+    #[inline]
+    #[allow(
+        unsafe_code,
+        reason = "relies on `entry`'s proof that the value outlives the pin"
+    )]
+    fn value(self) -> &'pin T {
+        // SAFETY: `entry` required the slot's value to stay initialized and
+        // unmodified for the pin's life.
+        unsafe { self.slot.value() }
+    }
+
+    #[inline]
+    fn weight(self) -> u64 {
+        self.slot.weight()
+    }
+
+    #[inline]
+    fn expires_at(self) -> u64 {
+        self.slot.expires_at()
+    }
+
+    #[inline]
+    fn mark_accessed_if_live(self, now: impl FnOnce() -> u64) -> bool {
+        self.slot.mark_accessed_if_live(now)
+    }
+
+    #[inline]
+    fn take_accessed(self) -> bool {
+        self.slot.take_accessed()
+    }
+}
+
+/// Reaches the entry behind `handle` for the life of `pin`.
 ///
 /// # Safety
 ///
-/// `handle` must belong to the arena that created `pin` and stay allocated
-/// for the pin's epoch: it was in a table slot while `pin` was held, or it is
-/// the caller's own unpublished allocation.
+/// `handle` must name a slot of this cache whose value stays initialized
+/// while `pin` is held: published in a table while `pin` was held, or
+/// unpublished under a shard lock while `pin` was held, or filled by the
+/// caller under the shard lock that still guards it.
+#[inline]
 #[allow(unsafe_code, reason = "centralizes the table-handle and pin proof")]
-unsafe fn entry<'pin, T>(
-    pin: &'pin DirectArenaPin<'_, T>,
-    handle: DirectHandle,
-) -> &'pin DirectArenaEntry<T> {
-    // SAFETY: the caller proves the handle stays allocated for this epoch.
-    unsafe { pin.protect(handle) }.entry()
+unsafe fn entry<'pin, T>(_pin: &'pin EpochPin<'_>, handle: Handle<T>) -> Entry<'pin, T> {
+    // SAFETY: the caller proves the slot and its value outlive the pin.
+    let slot = unsafe { handle.0.as_ref() };
+    Entry { slot }
 }
 
-/// Entries unpublished under a shard lock, announced to the removal listener
-/// and retired after the lock is released. Dropping it unannounced, as when
-/// a listener panics, still retires every entry it holds.
-struct Retired<'pin, 'arena, T> {
-    pin: &'pin DirectArenaPin<'arena, T>,
-    first: [Option<(DirectHandle, RemovalCause)>; 4],
+/// Entries one operation unpublished under a shard lock, with why each left.
+/// They are queued for reclamation under that lock, and the removal listener
+/// hears about them after it is released, while the operation's pin keeps
+/// them readable.
+struct Removed<T> {
+    first: [Option<(Handle<T>, RemovalCause)>; 4],
     len: usize,
-    more: Vec<(DirectHandle, RemovalCause)>,
-    /// Entries of `more` already announced and retired.
-    finished: usize,
+    more: Vec<(Handle<T>, RemovalCause)>,
 }
 
-impl<'pin, 'arena, T> Retired<'pin, 'arena, T> {
-    const fn new(pin: &'pin DirectArenaPin<'arena, T>) -> Self {
+impl<T> Removed<T> {
+    const fn new() -> Self {
         Self {
-            pin,
             first: [None; 4],
             len: 0,
             more: Vec::new(),
-            finished: 0,
         }
     }
 
-    fn push(&mut self, handle: DirectHandle, cause: RemovalCause) {
+    fn push(&mut self, handle: Handle<T>, cause: RemovalCause) {
         if self.len < self.first.len() {
             self.first[self.len] = Some((handle, cause));
             self.len += 1;
@@ -1712,55 +1814,30 @@ impl<'pin, 'arena, T> Retired<'pin, 'arena, T> {
             self.more.push((handle, cause));
         }
     }
+
+    fn iter(&self) -> impl Iterator<Item = (Handle<T>, RemovalCause)> + '_ {
+        self.first[..self.len]
+            .iter()
+            .flatten()
+            .copied()
+            .chain(self.more.iter().copied())
+    }
 }
 
-impl<K, V> Retired<'_, '_, (K, V)> {
-    /// Announces each entry to `listener`, then retires it.
+impl<K, V> Removed<(K, V)> {
+    /// Tells `listener` about each entry.
     #[allow(
         unsafe_code,
         reason = "reads entries this operation unpublished while `pin` was held"
     )]
-    fn finish(mut self, listener: &impl RemovalListener<K, V>) {
-        for index in 0..self.len {
-            if let Some((handle, cause)) = self.first[index] {
-                // SAFETY: unpublished while `pin` was held and not yet
-                // retired, so the entry is live.
-                let (key, value) = unsafe { entry(self.pin, handle) }.value();
-                listener.on_removal(key, value, cause);
-                self.first[index] = None;
-                retire(self.pin, handle);
-            }
-        }
-        while let Some(&(handle, cause)) = self.more.get(self.finished) {
-            // SAFETY: as above.
-            let (key, value) = unsafe { entry(self.pin, handle) }.value();
+    fn notify(&self, listener: &impl RemovalListener<K, V>, pin: &EpochPin<'_>) {
+        for (handle, cause) in self.iter() {
+            // SAFETY: unpublished while `pin` was held, and `pin` still
+            // blocks the reclamation of every entry retired since.
+            let (key, value) = unsafe { entry(pin, handle) }.value();
             listener.on_removal(key, value, cause);
-            self.finished += 1;
-            retire(self.pin, handle);
         }
     }
-}
-
-impl<T> Drop for Retired<'_, '_, T> {
-    fn drop(&mut self) {
-        for (handle, _) in self.first.iter_mut().filter_map(Option::take) {
-            retire(self.pin, handle);
-        }
-        for (handle, _) in &self.more[self.finished..] {
-            retire(self.pin, *handle);
-        }
-    }
-}
-
-/// Retires a handle a shard writer unpublished while `pin` was held.
-#[allow(
-    unsafe_code,
-    reason = "retires handles an operation unpublished while `pin` was held"
-)]
-fn retire<T>(pin: &DirectArenaPin<'_, T>, handle: DirectHandle) {
-    // SAFETY: a shard writer cleared or replaced the only slot holding this
-    // handle while `pin` was held, and `Retired` retires each handle once.
-    unsafe { pin.retire(RemovedDirectHandle::from_exact_removal(handle)) };
 }
 
 /// Approximate set of recently evicted probationary keys, in a ring of
@@ -1932,7 +2009,7 @@ mod tests {
                 let _ = cache.get(&(key / 3));
             }
         }
-        let pin = cache.arena.pin();
+        let pin = cache.epochs.pin();
         for (bucket, current) in shard.buckets.iter().enumerate() {
             for handle in &current.handles {
                 let raw = handle.load(Ordering::Relaxed);
@@ -1940,7 +2017,9 @@ mod tests {
                     continue;
                 }
                 // SAFETY: the table publishes this handle while `pin` is held.
-                let key = unsafe { entry(&pin, handle_from_raw(raw)) }.value().0;
+                let key = unsafe { entry(&pin, Handle::<(u64, u64)>::from_raw(raw)) }
+                    .value()
+                    .0;
                 let (home, alternate) = shard.candidates(cache.hash_builder.hash_one(key));
                 assert!(
                     bucket == home || bucket == alternate,
@@ -2119,18 +2198,22 @@ mod tests {
     #[test]
     fn unread_probationary_keys_leave_before_read_ones() {
         let capacity = 100 * CHURN_SCALE;
-        let cache = ShardedCache::new(usize::try_from(capacity).expect("a test capacity fits"));
-        // Per-shard limits leave some room unused, so the working set is
-        // whatever stayed resident after one pass.
+        // One shard: with several, a hash seed that loads one shard heavily
+        // evicts during the first pass, which is not what this test probes.
+        let cache =
+            ShardedCacheBuilder::new(usize::try_from(capacity).expect("a test capacity fits"))
+                .shards(1)
+                .build();
         for key in 0..capacity {
             cache.insert(key, key);
         }
         let working_set: Vec<u64> = (0..capacity)
             .filter(|key| cache.get(key).is_some())
             .collect();
+        // A full bucket pair can force an eviction before the shard fills.
         assert!(
-            working_set.len() as u64 * 10 >= capacity * 9,
-            "{} keys resident",
+            working_set.len() as u64 * 100 >= capacity * 99,
+            "only {} keys resident after the first pass",
             working_set.len()
         );
         // A scan of one-hit keys displaces itself, not the read working set.
@@ -2297,10 +2380,10 @@ mod tests {
 
     /// Whether `key`'s entry carries an access mark.
     fn is_marked(cache: &ShardedCache<u64, u64>, key: u64) -> bool {
-        let pin = cache.arena.pin();
+        let pin = cache.epochs.pin();
         cache
             .live_entry(&pin, &key, cache.hash_builder.hash_one(key))
-            .is_some_and(DirectArenaEntry::accessed)
+            .is_some_and(|entry| entry.slot.accessed())
     }
 
     /// Waits until exactly `waiters` callers besides the leader wait on the
@@ -2562,7 +2645,7 @@ mod tests {
             cache.insert(key, Arc::clone(&value));
         }
         assert!(cache.len() as u64 <= capacity);
-        let pin = cache.arena.pin();
+        let pin = cache.epochs.pin();
         let mut resident = 0;
         for shard in &cache.shards {
             for current in &shard.buckets {
@@ -2571,7 +2654,9 @@ mod tests {
                     if raw != 0 {
                         // SAFETY: the table publishes this handle while
                         // `pin` is held.
-                        let key = unsafe { entry(&pin, handle_from_raw(raw)) }.value().0;
+                        let key = unsafe { entry(&pin, Handle::<(u64, Arc<()>)>::from_raw(raw)) }
+                            .value()
+                            .0;
                         assert!(key >= refill, "cleared key {key} is still published");
                         assert!(cache.contains_key(&key), "key {key} is not findable");
                         resident += 1;
@@ -2594,5 +2679,115 @@ mod tests {
         assert!(!is_marked(&cache, 1));
         assert_eq!(cache.get(&1), Some(1));
         assert!(is_marked(&cache, 1));
+    }
+
+    #[test]
+    fn maintain_drops_removed_values() {
+        let value = Arc::new(());
+        let cache = ShardedCacheBuilder::new(64)
+            .shards(1)
+            .build::<u64, Arc<()>>();
+        for key in 0..1_000 {
+            cache.insert(key, Arc::clone(&value));
+        }
+        cache.clear();
+        assert!(
+            Arc::strong_count(&value) > 1,
+            "a write reclaims only entries aged past three advances"
+        );
+        cache.maintain();
+        assert_eq!(
+            Arc::strong_count(&value),
+            1,
+            "maintain dropped every removed value"
+        );
+    }
+
+    #[test]
+    // Threads take turns, so no parking_lot lock is ever contended.
+    fn a_thread_that_exits_returns_its_vacant_slots() {
+        let cache = Arc::new(ShardedCacheBuilder::new(64).shards(1).build::<u64, u64>());
+        {
+            let cache = Arc::clone(&cache);
+            thread::spawn(move || {
+                for key in 0..2_000 {
+                    cache.insert(key, key);
+                }
+                cache.clear();
+                cache.maintain();
+            })
+            .join()
+            .expect("the writer completes");
+        }
+        assert!(
+            cache.slots.depot_len() > 0,
+            "the exited thread's stack returned to the depot"
+        );
+    }
+
+    #[test]
+    // Threads take turns, so no parking_lot lock is ever contended.
+    fn dropping_a_cache_leaves_other_threads_stacks_harmless() {
+        let first = Arc::new(ShardedCache::<u64, u64>::new(64));
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        let worker = {
+            let first = Arc::clone(&first);
+            thread::spawn(move || {
+                for key in 0..500 {
+                    first.insert(key, key);
+                }
+                first.clear();
+                first.maintain();
+                drop(first);
+                done.send(()).expect("the test waits");
+                // The first cache is gone; this thread's stack for it holds
+                // freed slots that must never be touched again.
+                wait.recv().expect("the test releases the worker");
+                let second = ShardedCache::<u64, u64>::new(64);
+                for key in 0..500 {
+                    second.insert(key, key + 1);
+                }
+                assert_eq!(second.get(&499), Some(500));
+            })
+        };
+        finished.recv().expect("the worker used the first cache");
+        drop(first);
+        go.send(()).expect("the worker waits");
+        worker.join().expect("the worker completes");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "parking_lot's futex wait fails Miri's variadic check")]
+    fn other_writers_drain_the_retired_queue_of_an_idle_thread() {
+        let cache = Arc::new(ShardedCacheBuilder::new(256).shards(4).build::<u64, u64>());
+        let idle_queue = {
+            let cache = Arc::clone(&cache);
+            thread::spawn(move || {
+                for key in 0..5_000 {
+                    cache.insert(key, key);
+                }
+                crate::sharded_arena::retired_queue_index()
+            })
+            .join()
+            .expect("the idle thread's writes complete")
+        };
+        if idle_queue == crate::sharded_arena::retired_queue_index() {
+            // Thread indices 64 apart share a queue; nothing to compare.
+            return;
+        }
+        assert!(
+            cache.retired.queued(idle_queue) > 0,
+            "the idle thread left retirements"
+        );
+        // Only this thread's periodic foreign drains reach the idle queue.
+        for key in 10_000..10_000 + 40_000 * CHURN_SCALE {
+            cache.insert(key, key);
+        }
+        assert_eq!(
+            cache.retired.queued(idle_queue),
+            0,
+            "the idle thread's queue was not drained"
+        );
     }
 }

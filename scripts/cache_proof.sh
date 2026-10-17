@@ -137,7 +137,7 @@ miri() {
     cargo +nightly miri test --test direct_packed_cache \
     unbounded_admission_batch_publishes_length_immediately -- --exact
   MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
-    cargo +nightly miri test --lib sharded_cache::tests
+    cargo +nightly miri test --lib -- sharded_cache::tests sharded_arena::tests
 }
 
 sanitizers() {
@@ -153,11 +153,13 @@ sanitizers() {
     --test direct_packed_cache \
     concurrent_prepared_replacement_batches_recycle_without_lost_values -- --exact
   RUSTFLAGS="-Zsanitizer=address" RUSTDOCFLAGS="-Zsanitizer=address" \
-    cargo +nightly test --target "$target" --lib sharded_cache::tests
+    cargo +nightly test --target "$target" --lib -- sharded_cache::tests sharded_arena::tests
   RUSTFLAGS="-Zsanitizer=thread" RUSTDOCFLAGS="-Zsanitizer=thread" \
-    cargo +nightly test -Zbuild-std --target "$target" --lib sharded_cache::tests::racing
-  RUSTFLAGS="-Zsanitizer=thread" RUSTDOCFLAGS="-Zsanitizer=thread" \
-    cargo +nightly test -Zbuild-std --target "$target" --lib sharded_cache::tests::concurrent
+    cargo +nightly test -Zbuild-std --target "$target" --lib -- \
+    sharded_cache::tests::racing sharded_cache::tests::concurrent \
+    sharded_cache::tests::get_or_insert_with sharded_cache::tests::a_failed \
+    sharded_cache::tests::a_thread_that_exits sharded_cache::tests::dropping_a_cache \
+    sharded_cache::tests::other_writers_drain
 }
 
 memory_soak() {
