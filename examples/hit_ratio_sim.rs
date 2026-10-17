@@ -6,7 +6,8 @@
 //! `file:PATH` (one key per line), or `arc:PATH` (an ARC-paper `.lis` trace,
 //! whose `START COUNT ...` lines each read `COUNT` consecutive blocks). For
 //! file traces, `OPERATIONS` of zero replays the whole file. POLICY defaults to every policy: `packed`, `packed-doorkeeper`,
-//! `packed-adaptive`, `packed-tiered`, `quick`, `lru`, `opt`, and the reference
+//! `packed-adaptive`, `packed-tiered`, `sharded` (`ShardedCache`), `quick`,
+//! `quick-sync` (`QuickCache`'s sharded cache), `lru`, `opt`, and the reference
 //! models `model-clock`, `model-s3clock`, `model-s3fifo`, `model-quick`
 //! (`QuickCache` 0.7's policy), and `model-tinylfu` (W-TinyLFU). One CSV row is
 //! printed per policy. A packed policy accepts `/batch=N`, `/probation=BPS`,
@@ -29,7 +30,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasherDefault, DefaultHasher};
 use std::ops::Range;
 
-use packedgen::{CacheConfig, DirectCacheGuard, DirectPackedCache};
+use packedgen::{CacheConfig, DirectCacheGuard, DirectPackedCache, ShardedCache};
 use quick_cache::Weighter;
 use quick_cache::unsync::{Cache as QuickCache, DefaultLifecycle};
 
@@ -39,12 +40,14 @@ const CHARGE: u64 = 32 + VALUE_BYTES;
 const REFRESH_INTERVAL: usize = 512;
 const MAINTENANCE_INTERVAL: usize = 4096;
 const OCCUPANCY_STRIDE: usize = 64;
-const ALL_POLICIES: [&str; 12] = [
+const ALL_POLICIES: [&str; 14] = [
     "packed",
     "packed-doorkeeper",
     "packed-adaptive",
     "packed-tiered",
+    "sharded",
     "quick",
+    "quick-sync",
     "lru",
     "opt",
     "model-clock",
@@ -498,6 +501,52 @@ impl Session for QuickSession {
     fn read(&mut self, id: u64) -> bool {
         let key = key(id);
         if let Some(&value) = self.0.get(&key) {
+            assert_eq!(value, id, "cache returned another key's value");
+            true
+        } else {
+            self.0.insert(key, id);
+            false
+        }
+    }
+
+    fn write(&mut self, id: u64) {
+        self.0.insert(key(id), id);
+    }
+
+    fn resident(&self) -> usize {
+        self.0.len()
+    }
+}
+
+struct ShardedSession(ShardedCache<Key, u64>);
+
+impl Session for ShardedSession {
+    fn read(&mut self, id: u64) -> bool {
+        let key = key(id);
+        if let Some(value) = self.0.get(&key) {
+            assert_eq!(value, id, "cache returned another key's value");
+            true
+        } else {
+            self.0.insert(key, id);
+            false
+        }
+    }
+
+    fn write(&mut self, id: u64) {
+        self.0.insert(key(id), id);
+    }
+
+    fn resident(&self) -> usize {
+        self.0.len()
+    }
+}
+
+struct QuickSyncSession(quick_cache::sync::Cache<Key, u64, ConstantWeighter>);
+
+impl Session for QuickSyncSession {
+    fn read(&mut self, id: u64) -> bool {
+        let key = key(id);
+        if let Some(value) = self.0.get(&key) {
             assert_eq!(value, id, "cache returned another key's value");
             true
         } else {
@@ -1197,6 +1246,15 @@ impl Session for ClockModel {
 fn run_policy(policy: &str, trace: &Trace, entries: usize) -> Outcome {
     match policy {
         "quick" => run_quick(trace, entries),
+        "quick-sync" => replay(
+            trace,
+            &mut QuickSyncSession(quick_cache::sync::Cache::with_weighter(
+                entries,
+                u64::try_from(entries).expect("entries fit u64") * CHARGE,
+                ConstantWeighter,
+            )),
+        ),
+        "sharded" => replay(trace, &mut ShardedSession(ShardedCache::new(entries))),
         "lru" => replay(trace, &mut Lru::new(entries)),
         model if model.starts_with("model-") => {
             replay(trace, &mut ClockModel::parse(model, entries))
@@ -1352,7 +1410,7 @@ mod tests {
         for policy in ALL_POLICIES {
             let first = run_policy(policy, &trace, 256);
             let second = run_policy(policy, &trace, 256);
-            if policy.starts_with("packed") {
+            if policy.starts_with("packed") || policy == "sharded" || policy == "quick-sync" {
                 // Each cache seeds its index hasher randomly, which changes
                 // the victim scan order; the policy itself must stay stable.
                 assert!(

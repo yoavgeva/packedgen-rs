@@ -396,10 +396,10 @@ impl Shard {
         for _ in 0..self.buckets.len() {
             let current = &self.buckets[bucket];
             let control = current.control.load(Ordering::Acquire);
-            for slot in 0..SLOTS {
-                if (control >> (slot * 8)) & TAG_MASK != u64::from(tag) {
-                    continue;
-                }
+            let mut candidates = zero_tag_bytes(control ^ BYTE_ONES * u64::from(tag));
+            while candidates != 0 {
+                let slot = candidates.trailing_zeros() as usize / 8;
+                candidates &= candidates - 1;
                 // Acquire pairs with the release store of a replacement
                 // handle, which does not touch the control word.
                 let raw = current.handles[slot].load(Ordering::Acquire);
@@ -426,7 +426,10 @@ impl Shard {
         loop {
             let current = &self.buckets[bucket];
             let control = current.control.load(Ordering::Relaxed);
-            if let Some(slot) = (0..SLOTS).find(|slot| (control >> (slot * 8)) & TAG_MASK == 0) {
+            let empty = zero_tag_bytes(control);
+            if empty != 0 {
+                // The lowest flagged byte of `zero_tag_bytes` is always exact.
+                let slot = empty.trailing_zeros() as usize / 8;
                 current.handles[slot].store(handle.index_value().get(), Ordering::Release);
                 current.control.store(
                     control | u64::from(tag(hash)) << (slot * 8),
@@ -474,6 +477,18 @@ impl Shard {
             passed = self.next(passed);
         }
     }
+}
+
+const BYTE_ONES: u64 = 0x0101_0101_0101_0101;
+/// High bits of the six tag bytes.
+const TAG_HIGH_BITS: u64 = 0x0000_8080_8080_8080;
+
+/// Flags tag bytes of `word` that are zero in their high bit. The lowest flag
+/// is exact; a borrow can also flag a 0x01 byte above a zero byte, which
+/// callers tolerate: a candidate tag is checked against the entry's key, and
+/// only the lowest empty slot is used.
+const fn zero_tag_bytes(word: u64) -> u64 {
+    word.wrapping_sub(BYTE_ONES) & !word & TAG_HIGH_BITS
 }
 
 /// A slot tag: eight hash bits other than the shard and home-bucket bits,
