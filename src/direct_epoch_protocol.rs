@@ -35,6 +35,7 @@ pub(crate) const AGING_ADVANCES: usize = 3;
 /// tag's epoch slot found that slot and the next quiescent. Saturates, never
 /// reclaiming, past the last representable token.
 #[allow(dead_code, reason = "each including crate uses a different subset")]
+#[inline]
 pub(crate) fn reclaim_at(tag: usize) -> usize {
     let mut aged = tag;
     for _ in 0..AGING_ADVANCES {

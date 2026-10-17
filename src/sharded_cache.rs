@@ -506,6 +506,7 @@ struct ShardLimits {
 }
 
 impl ShardLimits {
+    #[inline]
     fn main_limit(&self) -> usize {
         self.capacity + self.capacity / 4 + 16
     }
@@ -528,6 +529,7 @@ struct ShardLock {
 }
 
 impl ShardLock {
+    #[inline]
     fn lock<'shard>(&'shard self, limits: &'shard ShardLimits) -> LockedShard<'shard> {
         LockedShard {
             counts: self,
@@ -561,12 +563,14 @@ struct LockedShard<'shard> {
 impl Deref for LockedShard<'_> {
     type Target = ShardWriter;
 
+    #[inline]
     fn deref(&self) -> &ShardWriter {
         &self.writer
     }
 }
 
 impl DerefMut for LockedShard<'_> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut ShardWriter {
         &mut self.writer
     }
@@ -574,50 +578,60 @@ impl DerefMut for LockedShard<'_> {
 
 /// Adds one to a count. Counts change only under the shard lock, so a load
 /// and a store suffice.
+#[inline]
 fn increment(count: &AtomicU64) {
     count.store(count.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
 }
 
 impl LockedShard<'_> {
+    #[inline]
     fn len(&self) -> usize {
         self.counts.len.load(Ordering::Relaxed)
     }
 
+    #[inline]
     fn weight(&self) -> u64 {
         self.counts.weight.load(Ordering::Relaxed)
     }
 
+    #[inline]
     fn over_limit(&self, incoming_weight: u64) -> bool {
         self.len() >= self.limits.capacity
             || self.weight().saturating_add(incoming_weight) > self.limits.weight
     }
 
+    #[inline]
     fn set_len(&mut self, len: usize) {
         self.counts.len.store(len, Ordering::Relaxed);
     }
 
+    #[inline]
     fn set_weight(&mut self, weight: u64) {
         self.counts.weight.store(weight, Ordering::Relaxed);
     }
 
     /// Accounts for an entry published in the table.
+    #[inline]
     fn entered(&mut self, weight: u64) {
         self.set_len(self.len() + 1);
         self.set_weight(self.weight() + weight);
     }
 
     /// Accounts for an entry cleared from the table.
+    #[inline]
     fn left(&mut self, weight: u64) {
         self.set_len(self.len() - 1);
         self.set_weight(self.weight() - weight);
     }
 
+    #[inline]
     fn count_expiration(&mut self) {
         increment(&self.counts.expirations);
     }
 
     /// Accounts for an entry that eviction cleared from the table, and says
     /// why it left.
+    #[inline]
     fn evicted(&mut self, weight: u64, expired: bool) -> RemovalCause {
         self.left(weight);
         if expired {
@@ -1508,6 +1522,7 @@ impl<T> Shard<T> {
         }
     }
 
+    #[inline]
     fn lock(&self) -> LockedShard<'_> {
         self.writer.lock(&self.limits)
     }
@@ -1929,6 +1944,7 @@ impl Ghost {
         }
     }
 
+    #[inline]
     fn location(&self, hash: u64) -> (usize, u64) {
         let low = hash & 0xffff_ffff;
         let mixed = low.wrapping_mul(0x9e37_79b9_7f4a_7c15);
@@ -1939,6 +1955,7 @@ impl Ghost {
         (word * GHOST_GENERATIONS, mask)
     }
 
+    #[inline]
     fn contains(&self, hash: u64) -> bool {
         let (base, mask) = self.location(hash);
         self.words[base..base + GHOST_GENERATIONS]
@@ -1946,6 +1963,7 @@ impl Ghost {
             .any(|word| word & mask == mask)
     }
 
+    #[inline]
     fn remember(&mut self, hash: u64) {
         let (base, mask) = self.location(hash);
         self.words[base + self.current] |= mask;

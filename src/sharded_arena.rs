@@ -91,6 +91,7 @@ impl Epochs {
 
     /// Reports `count` retirements; returns whether enough are pending
     /// across the cache to try advancing the generation.
+    #[inline]
     pub(crate) fn note_retired(&self, count: usize) -> bool {
         self.pending.0.fetch_add(count, Ordering::Relaxed) + count >= ADVANCE_AFTER
     }
@@ -138,6 +139,7 @@ impl Epochs {
     }
 
     /// The generation to tag slots unpublished before this call.
+    #[inline]
     pub(crate) fn generation(&self) -> usize {
         self.generation.load(Ordering::SeqCst)
     }
