@@ -1,5 +1,10 @@
 # Direct cache hit ratio: simulation, diagnosis, and policy fix
 
+> **Update, October 17:** the real-trace gap below was not missing frequency
+> admission. It came from the ghost filter's window, single access marks, a
+> fixed victim window, and the default index overlay. See
+> [HIT_RATIO_REAL_TRACES_2026-10-17.md](HIT_RATIO_REAL_TRACES_2026-10-17.md).
+
 The direct cache's default policy missed about 25% more reads than QuickCache
 on the bounded-cache turnover trace and fell below exact LRU on every skewed
 trace. A deterministic simulator traced this to three causes. The fixes bring
