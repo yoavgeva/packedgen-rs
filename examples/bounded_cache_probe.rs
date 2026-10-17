@@ -749,6 +749,7 @@ mod tests {
             cache: &cache,
             guard: cache.pin(),
             writes_since_maintenance: 0,
+            inline_maintenance: true,
         };
         let mut sample = Sample::default();
         session.apply(&worker_trace(&config, 0)[0], &config, &mut sample);
