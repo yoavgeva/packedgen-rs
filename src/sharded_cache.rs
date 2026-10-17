@@ -723,8 +723,10 @@ impl Shard {
         usize::try_from(scaled).expect("a bucket index fits usize")
     }
 
+    /// One multiply spreads every hash bit into the high half that picks
+    /// the home: for some seeds the fast hasher's low half alone clusters.
     fn home(&self, hash: u64) -> usize {
-        self.candidates(hash).0
+        self.reduce(hash.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 32)
     }
 
     fn next(&self, bucket: usize) -> usize {
@@ -737,13 +739,14 @@ impl Shard {
 
     /// The two buckets a key may live in: its home and an alternate, so a
     /// full region never chains into the next and displacement cannot grow.
-    /// Both come from a full avalanche of the key hash: a fast hasher's bit
-    /// halves can correlate for some seeds, and correlated choices left one
-    /// seed in forty evicting from full pairs on 2.4% of inserts.
+    /// The alternate comes from a full avalanche of the key hash: a fast
+    /// hasher's bit halves can correlate for some seeds, and correlated
+    /// choices left one seed in forty evicting from full pairs on 2.4% of
+    /// inserts. Lookups reach the alternate only after the home misses, so
+    /// the avalanche stays off the common path.
     fn candidates(&self, hash: u64) -> (usize, usize) {
-        let mixed = fmix64(hash);
-        let home = self.reduce(mixed);
-        let alternate = self.reduce(mixed >> 32);
+        let home = self.home(hash);
+        let alternate = self.reduce(fmix64(hash) >> 32);
         (
             home,
             if alternate == home {
@@ -763,7 +766,7 @@ impl Shard {
         mut matches: impl FnMut(DirectHandle) -> bool,
     ) -> Option<(usize, DirectHandle)> {
         let tag = tag(hash);
-        let (home, alternate) = self.candidates(hash);
+        let home = self.home(hash);
         let control = self.buckets[home].control.load(Ordering::Acquire);
         if let Some(found) = self.find_in(home, control, tag, &mut matches) {
             return Some(found);
@@ -771,6 +774,7 @@ impl Shard {
         if control >> OVERFLOW_SHIFT & OVERFLOW_MAX == 0 {
             return None;
         }
+        let (_, alternate) = self.candidates(hash);
         let control = self.buckets[alternate].control.load(Ordering::Acquire);
         self.find_in(alternate, control, tag, &mut matches)
     }
