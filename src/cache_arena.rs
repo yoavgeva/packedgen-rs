@@ -744,7 +744,8 @@ impl<V> DirectValueArena<V> {
         Arc::strong_count(&self.owner)
     }
 
-        pub(crate) fn pin(&self) -> DirectArenaPin<'_, V> {
+    #[inline]
+    pub(crate) fn pin(&self) -> DirectArenaPin<'_, V> {
         let thread_id = direct_arena_thread();
         let reader_shard = thread_id & (DIRECT_READER_SHARDS - 1);
         let reader_epoch = self.owner.enter(reader_shard);
@@ -1110,7 +1111,8 @@ impl<V> Drop for DirectArenaValue<'_, V> {
 }
 
 impl<V> Drop for DirectArenaPin<'_, V> {
-        fn drop(&mut self) {
+    #[inline]
+    fn drop(&mut self) {
         if self.active {
             self.arena.owner.leave(self.reader_epoch, self.reader_shard);
         }
@@ -2296,7 +2298,8 @@ impl<V> DirectArenaOwner<V> {
         }
     }
 
-        fn enter(&self, reader_shard: usize) -> usize {
+    #[inline]
+    fn enter(&self, reader_shard: usize) -> usize {
         enter_epoch(
             || self.current_epoch.load(Ordering::SeqCst),
             |epoch| {
@@ -2339,7 +2342,8 @@ impl<V> DirectArenaOwner<V> {
         DirectMutationReservation::Overflow
     }
 
-        fn leave(&self, reader_epoch: usize, reader_shard: usize) {
+    #[inline]
+    fn leave(&self, reader_epoch: usize, reader_shard: usize) {
         leave_epoch(reader_epoch, |epoch| {
             self.readers[epoch * DIRECT_READER_SHARDS + reader_shard]
                 .0
@@ -3010,6 +3014,7 @@ impl<V> DirectArenaState<V> {
     }
 }
 
+#[inline]
 pub(crate) fn direct_arena_thread() -> usize {
     DIRECT_ARENA_THREAD.with(|thread| {
         let current = thread.get();

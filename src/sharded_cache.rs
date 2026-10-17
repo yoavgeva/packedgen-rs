@@ -1394,12 +1394,14 @@ impl Shard {
         }
     }
 
+    #[inline]
     fn bucket(&self, slot: usize) -> &Bucket {
         &self.buckets[slot / SLOTS]
     }
 
     /// Multiply-shift range reduction of 32 bits: the table need not be a
     /// power of two.
+    #[inline]
     fn reduce(&self, bits: u64) -> usize {
         let scaled = ((bits & 0xffff_ffff) * self.buckets.len() as u64) >> 32;
         usize::try_from(scaled).expect("a bucket index fits usize")
@@ -1407,10 +1409,12 @@ impl Shard {
 
     /// One multiply spreads every hash bit into the high half that picks
     /// the home: for some seeds the fast hasher's low half alone clusters.
+    #[inline]
     fn home(&self, hash: u64) -> usize {
         self.reduce(hash.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 32)
     }
 
+    #[inline]
     fn next(&self, bucket: usize) -> usize {
         if bucket + 1 == self.buckets.len() {
             0
@@ -1426,6 +1430,7 @@ impl Shard {
     /// choices left one seed in forty evicting from full pairs on 2.4% of
     /// inserts. Lookups reach the alternate only after the home misses, so
     /// the avalanche stays off the common path.
+    #[inline]
     fn candidates(&self, hash: u64) -> (usize, usize) {
         let home = self.home(hash);
         let alternate = self.reduce(fmix64(hash) >> 32);
@@ -1442,6 +1447,7 @@ impl Shard {
     /// Finds the slot whose handle `matches` in the key's home bucket, then
     /// in its alternate if any key from that home lives in its alternate.
     /// Lock-free.
+    #[inline]
     fn find(
         &self,
         hash: u64,
@@ -1461,6 +1467,7 @@ impl Shard {
         self.find_in(alternate, control, tag, &mut matches)
     }
 
+    #[inline]
     fn find_in(
         &self,
         bucket: usize,
@@ -1489,6 +1496,7 @@ impl Shard {
     /// Publishes `handle` in a free slot of the key's home bucket, or else of
     /// its alternate, counting it in the home's overflow first. Returns
     /// `None` when both are full. Requires the shard lock.
+    #[inline]
     fn place(&self, hash: u64, handle: DirectHandle) -> Option<usize> {
         let (home, alternate) = self.candidates(hash);
         if let Some(slot) = self.place_in(home, hash, handle) {
@@ -1511,6 +1519,7 @@ impl Shard {
     }
 
     /// A main-queue record of `slot`'s current key.
+    #[inline]
     fn record(&self, slot: usize) -> u32 {
         let generation =
             (self.bucket(slot).generations.load(Ordering::Relaxed) >> ((slot % SLOTS) * 8)) & 0xff;
@@ -1520,6 +1529,7 @@ impl Shard {
 
     /// The slot a main-queue record names, if it still holds the key the
     /// record was made for.
+    #[inline]
     fn live_record(&self, record: u32) -> Option<usize> {
         let slot = usize::try_from(record >> 8).expect("a slot fits usize");
         (slot < self.buckets.len() * SLOTS
@@ -1531,6 +1541,7 @@ impl Shard {
     /// Publishes `handle` in `bucket`, one of the key's candidates, counting
     /// it in its home's overflow when `bucket` is the alternate. Returns the
     /// slot, or `None` when `bucket` is full. Requires the shard lock.
+    #[inline]
     fn place_at(
         &self,
         bucket: usize,
@@ -1553,6 +1564,7 @@ impl Shard {
         self.place_in(bucket, hash, handle)
     }
 
+    #[inline]
     fn place_in(&self, bucket: usize, hash: u64, handle: DirectHandle) -> Option<usize> {
         let current = &self.buckets[bucket];
         let control = current.control.load(Ordering::Relaxed);
@@ -1579,6 +1591,7 @@ impl Shard {
     /// Unpublishes `slot`, whose key's home bucket is `home`, releasing the
     /// home's overflow count if the key lived in its alternate. Returns the
     /// handle swapped out. Requires the shard lock.
+    #[inline]
     fn clear(&self, slot: usize, home: usize) -> DirectHandle {
         let bucket = slot / SLOTS;
         let current = &self.buckets[bucket];
@@ -1609,6 +1622,7 @@ thread_local! {
 }
 
 /// `MurmurHash3`'s 64-bit finalizer: every output bit depends on every input bit.
+#[inline]
 const fn fmix64(mut value: u64) -> u64 {
     value ^= value >> 33;
     value = value.wrapping_mul(0xff51_afd7_ed55_8ccd);
@@ -1625,16 +1639,19 @@ const TAG_HIGH_BITS: u64 = 0x0000_8080_8080_8080;
 /// is exact; a borrow can also flag a 0x01 byte above a zero byte, which
 /// callers tolerate: a candidate tag is checked against the entry's key, and
 /// only the lowest empty slot is used.
+#[inline]
 const fn zero_tag_bytes(word: u64) -> u64 {
     word.wrapping_sub(BYTE_ONES) & !word & TAG_HIGH_BITS
 }
 
 /// A slot tag: eight hash bits other than the shard and home-bucket bits,
 /// never zero.
+#[inline]
 fn tag(hash: u64) -> u8 {
     (hash >> 32).to_le_bytes()[0].max(1)
 }
 
+#[inline]
 fn handle_from_raw(raw: u64) -> DirectHandle {
     #[allow(
         unsafe_code,
