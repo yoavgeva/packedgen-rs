@@ -1802,9 +1802,11 @@ fn guarded_expiration_path_does_not_return_stale_value() {
     assert_eq!(&*cache.get(b"ttl").unwrap(), &vec![2]);
 }
 
+// Held values borrow the cache, so outliving it is a compile error; see the
+// `compile_fail` example on `DirectCacheValue`.
 #[test]
-fn protected_value_survives_replacement_and_cache_drop() {
-    let cache = Arc::new(cache(1_024, 16));
+fn protected_value_survives_replacement() {
+    let cache = cache(1_024, 16);
     cache
         .insert_discard_with_options(b"key", vec![1, 2, 3], 3, None)
         .unwrap();
@@ -1812,14 +1814,14 @@ fn protected_value_survives_replacement_and_cache_drop() {
     cache
         .insert_discard_with_options(b"key", vec![4, 5, 6], 3, None)
         .unwrap();
+    cache.maintain().unwrap();
     assert_eq!(held.as_slice(), [1, 2, 3]);
-    drop(cache);
-    assert_eq!(held.as_slice(), [1, 2, 3]);
+    assert_eq!(cache.get(b"key").unwrap().as_slice(), [4, 5, 6]);
 }
 
 #[test]
 fn protected_value_survives_discard_removal_and_forced_reclamation() {
-    let cache = Arc::new(cache(1_024, 16));
+    let cache = cache(1_024, 16);
     cache
         .insert_discard_with_options(b"key", vec![1, 2, 3], 3, None)
         .unwrap();
@@ -1828,9 +1830,6 @@ fn protected_value_survives_discard_removal_and_forced_reclamation() {
     assert!(cache.remove_discard(b"key"));
     assert!(cache.get(b"key").is_none());
     cache.maintain().unwrap();
-    assert_eq!(held.as_slice(), [1, 2, 3]);
-
-    drop(cache);
     assert_eq!(held.as_slice(), [1, 2, 3]);
 }
 
@@ -3102,8 +3101,10 @@ fn miri_conditional_block_and_boxed_reclaimers_coexist() {
         assert!(guard.remove_discard(&[key]));
     }
     drop(guard);
-    drop(cache);
     assert_eq!(held.as_slice(), [99; 16]);
+    // Values borrow the cache, so teardown follows the last held value.
+    drop(held);
+    drop(cache);
 }
 
 #[cfg(miri)]

@@ -231,14 +231,17 @@ fn pinned_value_survives_replacement_until_refresh() {
     assert_eq!(*guard.get(b"key").unwrap(), 2);
 }
 
+// Values borrow the cache, so outliving it is a compile error; see the
+// `compile_fail` example on `CacheValue`.
 #[test]
-fn owned_value_keeps_reclamation_state_alive_after_cache_drop() {
-    let held = {
-        let cache = cache(1_024);
-        cache.insert_with_options(b"key", 41_u64, 1, None).unwrap();
-        cache.get(b"key").unwrap()
-    };
+fn owned_value_survives_replacement_and_maintenance() {
+    let cache = cache(1_024);
+    cache.insert_with_options(b"key", 41_u64, 1, None).unwrap();
+    let held = cache.get(b"key").unwrap();
+    cache.insert_with_options(b"key", 42_u64, 1, None).unwrap();
+    cache.maintain().unwrap();
     assert_eq!(*held, 41);
+    assert_eq!(*cache.get(b"key").unwrap(), 42);
 }
 
 #[test]
