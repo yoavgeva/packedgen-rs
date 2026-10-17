@@ -2,7 +2,10 @@
 //!
 //! Usage: `bounded_cache_probe BACKEND WORKLOAD ENTRIES OPS WORKERS VALUE_BYTES
 //! SEED [LATENCY_STRIDE]`. BACKEND is `direct-owned`, `direct-borrowed`,
-//! `direct-guarded-owned`, `direct-guarded-borrowed`, or `quickcache`.
+//! `direct-guarded-owned`, `direct-guarded-borrowed`, `direct-background`, or
+//! `quickcache`. The direct backends run full maintenance on each worker every
+//! 4096 writes, inside the timing; `direct-background` instead starts the
+//! cache's maintenance thread (a 10 ms interval) and reads owned values.
 //! The guarded insertion variants require `cold-fill` (unique new keys).
 //! WORKLOAD is `resident-hit`, `read-miss`, `cold-fill`,
 //! `turnover`, `replace`, or `delete-reinsert`. `LATENCY_STRIDE` defaults to zero
@@ -251,6 +254,7 @@ struct DirectSession<'a, const OWNED: bool, const GUARDED: bool> {
     cache: &'a DirectPackedCache<Value>,
     guard: DirectCacheGuard<'a, Value>,
     writes_since_maintenance: usize,
+    inline_maintenance: bool,
 }
 
 impl<const OWNED: bool, const GUARDED: bool> DirectSession<'_, OWNED, GUARDED> {
@@ -285,7 +289,7 @@ impl<const OWNED: bool, const GUARDED: bool> DirectSession<'_, OWNED, GUARDED> {
             }
         }
         self.writes_since_maintenance += 1;
-        if self.writes_since_maintenance == 4096 {
+        if self.inline_maintenance && self.writes_since_maintenance == 4096 {
             self.guard.quiesce();
             self.cache
                 .maintain()
@@ -439,7 +443,11 @@ fn seed_count(config: &Config) -> usize {
 }
 
 fn direct_run<const OWNED: bool>(config: &Config) -> (Sample, Duration, usize, u64, Duration) {
-    direct_run_with_admission::<OWNED, false>(config)
+    direct_run_with_admission::<OWNED, false>(config, false)
+}
+
+fn direct_background_run(config: &Config) -> (Sample, Duration, usize, u64, Duration) {
+    direct_run_with_admission::<true, false>(config, true)
 }
 
 fn direct_guarded_run<const OWNED: bool>(
@@ -450,18 +458,21 @@ fn direct_guarded_run<const OWNED: bool>(
         Workload::ColdFill,
         "guarded insertion experiment requires cold-fill"
     );
-    direct_run_with_admission::<OWNED, true>(config)
+    direct_run_with_admission::<OWNED, true>(config, false)
 }
 
 fn direct_run_with_admission<const OWNED: bool, const GUARDED: bool>(
     config: &Config,
+    background: bool,
 ) -> (Sample, Duration, usize, u64, Duration) {
-    let cache = DirectPackedCache::try_new(
-        CacheConfig::new(config.weight_limit())
-            .with_max_entries(config.capacity_entries())
-            .with_overlay_capacity(config.capacity_entries().max(64)),
-    )
-    .expect("cache constructs");
+    let cache = Arc::new(
+        DirectPackedCache::try_new(
+            CacheConfig::new(config.weight_limit())
+                .with_max_entries(config.capacity_entries())
+                .with_overlay_capacity(config.capacity_entries().max(64)),
+        )
+        .expect("cache constructs"),
+    );
     for id in 0..seed_count(config) {
         let key = key(id as u64);
         cache
@@ -474,11 +485,14 @@ fn direct_run_with_admission<const OWNED: bool, const GUARDED: bool>(
             .expect("seed inserted");
     }
     cache.maintain().expect("seed maintenance succeeds");
+    let maintenance = background.then(|| cache.spawn_maintenance(Duration::from_millis(10)));
     let (sample, elapsed) = parallel_run(config, || DirectSession::<OWNED, GUARDED> {
         cache: &cache,
         guard: cache.pin(),
         writes_since_maintenance: 0,
+        inline_maintenance: !background,
     });
+    drop(maintenance);
     validate_result(config, &sample, cache.len(), cache.weight());
     let maintenance_started = Instant::now();
     cache.maintain().expect("final maintenance succeeds");
@@ -602,6 +616,7 @@ fn main() {
         "direct-borrowed" => direct_run::<false>(&config),
         "direct-guarded-owned" => direct_guarded_run::<true>(&config),
         "direct-guarded-borrowed" => direct_guarded_run::<false>(&config),
+        "direct-background" => direct_background_run(&config),
         "quickcache" => quick_run(&config),
         _ => panic!("unknown backend: {backend}"),
     };

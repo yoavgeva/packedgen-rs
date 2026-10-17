@@ -2299,19 +2299,33 @@ const DIRECT_GHOST_GENERATION_DIVISOR: usize = 8;
 /// stale records. The FIFO is capped near its share of the population; past
 /// the cap the oldest record is dropped, leaving that key to the ordinary
 /// sweep, so the cache never retains a second copy of every key.
+///
+/// Each shard is one FIFO with its own share of the target and cap, so writers
+/// enrolling and evicting on different shards share no counter or cache line.
 struct DirectProbation {
-    shards: Box<[Mutex<DirectProbationShard>]>,
-    len: AtomicUsize,
-    next_shard: AtomicUsize,
+    shards: Box<[DirectProbationLane]>,
     share_bps: u16,
-    record_limit: AtomicUsize,
+    /// Per-shard FIFO length above which eviction takes probationary keys.
+    shard_target: AtomicUsize,
+    /// Per-shard record cap.
+    shard_record_limit: AtomicUsize,
     ghost: DirectGhostFilter,
 }
+
+/// One shard on its own cache lines.
+#[repr(align(128))]
+struct DirectProbationLane(Mutex<DirectProbationShard>);
 
 #[derive(Default)]
 struct DirectProbationShard {
     records: VecDeque<(DirectHandle, usize)>,
     key_bytes: VecDeque<u8>,
+}
+
+thread_local! {
+    /// Where this thread's next probation pop starts. Threads start at
+    /// different shards, so concurrent evictors rarely meet on one lock.
+    static DIRECT_PROBATION_CURSOR: Cell<usize> = const { Cell::new(usize::MAX) };
 }
 
 impl DirectProbation {
@@ -2336,17 +2350,16 @@ impl DirectProbation {
         let shard_records = Self::record_limit(expected_target, shards).div_ceil(shards);
         let probation = Self {
             shards: std::iter::repeat_with(|| {
-                Mutex::new(DirectProbationShard {
+                DirectProbationLane(Mutex::new(DirectProbationShard {
                     records: VecDeque::with_capacity(shard_records),
                     key_bytes: VecDeque::new(),
-                })
+                }))
             })
             .take(shards)
             .collect(),
-            len: AtomicUsize::new(0),
-            next_shard: AtomicUsize::new(0),
             share_bps,
-            record_limit: AtomicUsize::new(0),
+            shard_target: AtomicUsize::new(0),
+            shard_record_limit: AtomicUsize::new(0),
             ghost: DirectGhostFilter::new(
                 expected_entries.div_ceil(DIRECT_GHOST_GENERATION_DIVISOR),
             ),
@@ -2367,12 +2380,27 @@ impl DirectProbation {
     }
 
     fn note_population(&self, population: usize) {
-        let limit = Self::record_limit(self.target(population), self.shards.len());
-        self.record_limit.store(limit, Ordering::Relaxed);
+        let target = self.target(population);
+        let shards = self.shards.len();
+        let shard_target = target.div_ceil(shards);
+        let shard_limit = Self::record_limit(target, shards).div_ceil(shards);
+        // Stores are rare: skipping unchanged values keeps these read-mostly
+        // lines shared between the writers that enroll and evict.
+        if self.shard_target.load(Ordering::Relaxed) != shard_target {
+            self.shard_target.store(shard_target, Ordering::Relaxed);
+        }
+        if self.shard_record_limit.load(Ordering::Relaxed) != shard_limit {
+            self.shard_record_limit
+                .store(shard_limit, Ordering::Relaxed);
+        }
     }
 
+    #[cfg(test)]
     fn len(&self) -> usize {
-        self.len.load(Ordering::Relaxed)
+        self.shards
+            .iter()
+            .map(|shard| shard.0.lock().records.len())
+            .sum()
     }
 
     fn enroll(&self, route: u64, key: &[u8], handle: DirectHandle) {
@@ -2380,37 +2408,52 @@ impl DirectProbation {
             return;
         }
         let shard_index = usize::try_from(route >> 60).expect("four bits fit usize");
-        let mut shard = self.shards[shard_index % self.shards.len()].lock();
+        let limit = self.shard_record_limit.load(Ordering::Relaxed);
+        let mut shard = self.shards[shard_index % self.shards.len()].0.lock();
         shard.records.push_back((handle, key.len()));
         shard.key_bytes.extend(key);
-        if self.len.fetch_add(1, Ordering::Relaxed) >= self.record_limit.load(Ordering::Relaxed) {
+        if shard.records.len() > limit {
             let (_, dropped_len) = shard
                 .records
                 .pop_front()
                 .expect("the shard holds the record just enrolled");
             shard.key_bytes.drain(..dropped_len);
-            self.len.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
-    /// Pops an approximately oldest record, copying its key into `key`.
+    /// Pops the oldest record of a shard holding more than its share of the
+    /// target, copying its key into `key`. Each thread starts at its own
+    /// shard and moves on by one per pop.
     fn pop(&self, key: &mut Vec<u8>) -> Option<DirectHandle> {
-        let start = self.next_shard.fetch_add(1, Ordering::Relaxed);
-        for offset in 0..self.shards.len() {
-            let mut shard = self.shards[start.wrapping_add(offset) % self.shards.len()].lock();
-            if let Some((handle, key_len)) = shard.records.pop_front() {
-                // Copy whole slices: extending from the drain iterator copies
-                // one byte at a time while the shard lock is held.
-                key.clear();
-                let (front, back) = shard.key_bytes.as_slices();
-                let from_front = key_len.min(front.len());
-                key.extend_from_slice(&front[..from_front]);
-                key.extend_from_slice(&back[..key_len - from_front]);
-                shard.key_bytes.drain(..key_len);
-                drop(shard);
-                self.len.fetch_sub(1, Ordering::Relaxed);
-                return Some(handle);
+        let start = DIRECT_PROBATION_CURSOR.with(|cursor| {
+            let mut start = cursor.get();
+            if start == usize::MAX {
+                start = doorkeeper_mix64(std::ptr::from_ref(cursor) as u64) as usize;
             }
+            cursor.set(start.wrapping_add(1));
+            start
+        });
+        let target = self.shard_target.load(Ordering::Relaxed);
+        for offset in 0..self.shards.len() {
+            let mut shard = self.shards[start.wrapping_add(offset) % self.shards.len()]
+                .0
+                .lock();
+            if shard.records.len() <= target {
+                continue;
+            }
+            let (handle, key_len) = shard
+                .records
+                .pop_front()
+                .expect("a shard above its target holds a record");
+            // Copy whole slices: extending from the drain iterator copies
+            // one byte at a time while the shard lock is held.
+            key.clear();
+            let (front, back) = shard.key_bytes.as_slices();
+            let from_front = key_len.min(front.len());
+            key.extend_from_slice(&front[..from_front]);
+            key.extend_from_slice(&back[..key_len - from_front]);
+            shard.key_bytes.drain(..key_len);
+            return Some(handle);
         }
         None
     }
@@ -2426,9 +2469,14 @@ impl DirectProbation {
 struct DirectGhostFilter {
     generations: [Box<[AtomicU64]>; DIRECT_GHOST_GENERATIONS],
     current: AtomicUsize,
-    remembered: AtomicUsize,
     rotate_every: usize,
+    /// Written by every probation eviction, so kept off the line holding the
+    /// read-mostly fields above.
+    remembered: DirectGhostCount,
 }
+
+#[repr(align(128))]
+struct DirectGhostCount(AtomicUsize);
 
 impl DirectGhostFilter {
     fn new(keys_per_generation: usize) -> Self {
@@ -2445,8 +2493,8 @@ impl DirectGhostFilter {
                     .collect::<Box<[_]>>()
             }),
             current: AtomicUsize::new(0),
-            remembered: AtomicUsize::new(0),
             rotate_every,
+            remembered: DirectGhostCount(AtomicUsize::new(0)),
         }
     }
 
@@ -2475,7 +2523,7 @@ impl DirectGhostFilter {
         let (word, mask) = self.location(route);
         let current = self.current.load(Ordering::Relaxed);
         self.generations[current][word].fetch_or(mask, Ordering::Relaxed);
-        if self.remembered.fetch_add(1, Ordering::Relaxed) + 1 == self.rotate_every {
+        if self.remembered.0.fetch_add(1, Ordering::Relaxed) + 1 == self.rotate_every {
             // Exactly one caller observes the boundary. Racing callers may
             // land in either generation, which only shifts how long they are
             // remembered.
@@ -2484,7 +2532,7 @@ impl DirectGhostFilter {
                 word.store(0, Ordering::Relaxed);
             }
             self.current.store(oldest, Ordering::Relaxed);
-            self.remembered.store(0, Ordering::Relaxed);
+            self.remembered.0.store(0, Ordering::Relaxed);
         }
     }
 }
@@ -8624,14 +8672,12 @@ impl<V> DirectPackedCache<V> {
         protected: Option<DirectHandle>,
         removal_target: usize,
     ) -> usize {
-        let population = self.len();
-        probation.note_population(population);
-        let target = probation.target(population);
+        probation.note_population(self.len());
         let mut removed = 0;
         #[cfg(feature = "cache-production-diagnostics")]
         let mut examined = 0;
         let mut key = Vec::new();
-        while removed < removal_target && probation.len() > target {
+        while removed < removal_target {
             let Some(handle) = probation.pop(&mut key) else {
                 break;
             };
@@ -9477,6 +9523,8 @@ mod tests {
     fn direct_probation_pops_whole_keys_in_order_across_ring_wraparound() {
         let probation = DirectProbation::new(10_000, 64);
         assert_eq!(probation.shards.len(), 1);
+        // Pop every record, keeping the 84-record cap.
+        probation.shard_target.store(0, Ordering::Relaxed);
         // Handles are only stored and compared here, never dereferenced.
         let handle = |id: u64| published_direct_handle_from_index(NonMaxU64::new(id).unwrap());
         let key =
@@ -9493,6 +9541,7 @@ mod tests {
             }
             if id % 3 != 0 {
                 wrapped |= !probation.shards[0]
+                    .0
                     .lock()
                     .key_bytes
                     .as_slices()
@@ -9509,6 +9558,32 @@ mod tests {
             assert_eq!(popped, key(id));
         }
         assert_eq!(probation.pop(&mut popped), None);
+    }
+
+    #[test]
+    fn direct_probation_pops_only_shards_above_their_share() {
+        // 16 shards, each with a target of four records.
+        let probation = DirectProbation::new(10_000, 1_024);
+        assert_eq!(probation.shards.len(), 16);
+        probation.note_population(64);
+        assert_eq!(probation.shard_target.load(Ordering::Relaxed), 4);
+        let handle = |id: u64| published_direct_handle_from_index(NonMaxU64::new(id).unwrap());
+        let route = |shard: u64| shard << 60;
+        // Shard 3 holds six records; shard 9 holds its full share of four.
+        for id in 0..6_u64 {
+            probation.enroll(route(3), &id.to_le_bytes(), handle(id));
+        }
+        for id in 100..104_u64 {
+            probation.enroll(route(9), &id.to_le_bytes(), handle(id));
+        }
+        let mut key = Vec::new();
+        // Whatever shard this thread starts at, only shard 3's two oldest
+        // records are above a share.
+        assert_eq!(probation.pop(&mut key), Some(handle(0)));
+        assert_eq!(probation.pop(&mut key), Some(handle(1)));
+        assert_eq!(key, 1_u64.to_le_bytes());
+        assert_eq!(probation.pop(&mut key), None);
+        assert_eq!(probation.len(), 8);
     }
 
     #[test]
