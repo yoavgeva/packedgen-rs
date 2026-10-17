@@ -170,7 +170,8 @@ rejected-experiment, and live-compaction results are in
 arbitrary-value caches on that adaptive index. They add epoch-protected values, caller-accounted weight,
 optional entry limits, per-item TTL (never before the TTL; up to ~100-200 ms
 after), compact sampled CLOCK
-eviction, statistics, and background maintenance. A reusable pinned guard is
+eviction (the direct variant marks every hit and adds a small probationary
+FIFO), statistics, and background maintenance. A reusable pinned guard is
 the fast read API; an owned thread-local guard keeps values stable after
 replacement or removal. The arena activates allocation partitions as the
 population grows, so callers do not need to predict a maximum item count.
@@ -614,6 +615,30 @@ the 200K soft target in both tests. A shorter final verified-source run put
 async at 47.304 Mops/s versus 40.510 strict and 44.165 Papaya, demonstrating
 that async can lead in short pressure bursts but not yet in sustained churn.
 
+By default DirectPackedCache keeps newly published keys in a probationary FIFO
+of about 2% of the population, in the style of S3-FIFO. Eviction takes the
+oldest probationary key first: if it was read since publication it stays
+resident under the CLOCK sweep, otherwise it is evicted and remembered in a
+two-generation ghost filter (about two bytes per expected entry), and a
+remembered key that returns skips probation. One-hit keys therefore leave
+within a short window instead of displacing reused keys for a full sweep.
+Every direct-cache hit sets the entry's CLOCK mark (only the optional frequency
+sketch is sampled), and each sweep samples at least four candidates per
+removal so that marks still protect entries in caches above 65,536 entries,
+where the sweep previously evicted every candidate it sampled. In the
+deterministic `hit_ratio_sim` example at 50,000 entries, these changes raised
+the default read hit rate from 87.47% to 89.92% on the `bounded_cache_probe`
+turnover trace (QuickCache 0.7: 89.89%) and from 59.78% to 66.53% on Zipf 0.9
+reads (QuickCache: 67.53%; exact LRU: 62.34%); at 262,144 entries they match
+QuickCache within 0.1 point on both. A cyclic scan slightly larger than the
+cache regressed from 58.00% to 54.75% (QuickCache: 63.84%; LRU: 0%). Real
+workloads are harder: on six ARC-paper traces the default improves on the old
+policy everywhere, but it trails QuickCache by 1 to 4 points in most
+configurations and by 9.7 points on DS1 at 4,000,000 entries. Probation adds
+about 3.5 to 4.5 requested bytes per entry. See
+[`docs/HIT_RATIO_SIMULATION_2026-10-16.md`](docs/HIT_RATIO_SIMULATION_2026-10-16.md).
+`CacheConfig::with_probation(0)` disables probation.
+
 DirectPackedCache also has an opt-in, scan-resistant admission doorkeeper. It
 uses compact rotating membership generations and rejects a new key once after
 the cache reaches its expected population; a repeated miss is admitted.
@@ -635,7 +660,7 @@ let maintenance = cache.spawn_maintenance(Duration::from_millis(1));
 
 This is the opt-in R-0005 tuning candidate, not the library default. Plain
 `CacheConfig::new` continues to use strict synchronous capacity enforcement,
-CLOCK admission, and no doorkeeper or frequency sketch. Do not promote the
+probationary CLOCK admission, and no doorkeeper or frequency sketch. Do not promote the
 tuned profile to the default until R-0005 validates the immutable candidate.
 
 The async setting permits temporary growth to 110% of the soft limits and

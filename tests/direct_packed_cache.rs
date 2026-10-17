@@ -21,6 +21,20 @@ fn cache(max_weight: u64, max_entries: usize) -> DirectPackedCache<Vec<u8>> {
     .unwrap()
 }
 
+/// A cache whose every eviction uses the sampled sweep and victim reservoir.
+///
+/// Probation would evict the unread keys these turnover tests insert before
+/// the sweep ever reaches the original population.
+fn sweep_cache(max_weight: u64, max_entries: usize) -> DirectPackedCache<Vec<u8>> {
+    DirectPackedCache::try_new(
+        CacheConfig::new(max_weight)
+            .with_max_entries(max_entries)
+            .with_overlay_capacity(max_entries.max(1))
+            .with_probation(0),
+    )
+    .unwrap()
+}
+
 #[test]
 fn exact_binary_crud_and_accounting() {
     let cache = cache(1_024, 16);
@@ -1950,7 +1964,7 @@ fn weighted_eviction_creates_bounded_headroom_for_uniform_turnover() {
 #[test]
 fn victim_reservoir_tolerates_stale_keys_under_repeated_pressure() {
     const CAPACITY: usize = 64;
-    let cache = cache(u64::MAX, CAPACITY);
+    let cache = sweep_cache(u64::MAX, CAPACITY);
     for key in 0_u64..CAPACITY as u64 {
         cache
             .insert_discard_with_options(&key.to_le_bytes(), vec![0; 8], 1, None)
@@ -2061,7 +2075,7 @@ fn concurrent_replacement_and_eviction_preserve_exact_capacity_accounting() {
 #[test]
 fn long_key_fallback_turns_over_without_exceeding_capacity() {
     const CAPACITY: usize = 256;
-    let cache = cache(u64::MAX, CAPACITY);
+    let cache = sweep_cache(u64::MAX, CAPACITY);
     for key in 0..CAPACITY {
         cache
             .insert_discard_with_options(&long_key(key), vec![0; 8], 1, None)
@@ -2086,7 +2100,7 @@ fn long_key_fallback_turns_over_without_exceeding_capacity() {
 #[test]
 fn mixed_long_key_reservoir_preserves_variable_key_boundaries() {
     const CAPACITY: usize = 256;
-    let cache = cache(u64::MAX, CAPACITY);
+    let cache = sweep_cache(u64::MAX, CAPACITY);
     for key in 0..CAPACITY {
         cache
             .insert_discard_with_options(&mixed_long_key(key), vec![0; 8], 1, None)
@@ -2112,7 +2126,7 @@ fn mixed_long_key_reservoir_preserves_variable_key_boundaries() {
 #[test]
 fn frozen_base_sampling_turns_over_the_packed_generation() {
     const CAPACITY: usize = 1_024;
-    let cache = cache(u64::MAX, CAPACITY);
+    let cache = sweep_cache(u64::MAX, CAPACITY);
     for key in 0_u64..CAPACITY as u64 {
         cache
             .insert_discard_with_options(&key.to_le_bytes(), vec![0; 8], 1, None)
@@ -2163,11 +2177,13 @@ fn async_eviction_allows_bounded_overshoot_and_enforces_the_hard_limit() {
 #[test]
 fn diagnostics_attribute_foreground_hard_limit_eviction() {
     const CAPACITY: usize = 128;
+    // Probation would evict these unread keys without a sampled collection.
     let cache = DirectPackedCache::try_new(
         CacheConfig::new(u64::MAX)
             .with_max_entries(CAPACITY)
             .with_overlay_capacity(512)
-            .with_async_eviction(11_000),
+            .with_async_eviction(11_000)
+            .with_probation(0),
     )
     .unwrap();
 
