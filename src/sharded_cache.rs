@@ -103,6 +103,10 @@ impl<K: Hash + Eq, V, S: BuildHasher> ShardedCache<K, V, S> {
 
     /// Creates a cache whose probationary FIFO targets `probation_bps`
     /// basis points of each shard.
+    ///
+    /// # Panics
+    ///
+    /// Panics if one shard would need 2^32 or more table slots.
     #[must_use]
     pub fn with_probation_and_hasher(
         max_entries: usize,
@@ -154,27 +158,49 @@ impl<K: Hash + Eq, V, S: BuildHasher> ShardedCache<K, V, S> {
     }
 
     /// Returns a clone of the value cached for `key`.
-    #[allow(
-        unsafe_code,
-        reason = "dereferences handles the table publishes under this read's pin"
-    )]
     pub fn get<Q>(&self, key: &Q) -> Option<V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
         V: Clone,
     {
-        let hash = self.hash_builder.hash_one(key);
         let pin = self.arena.pin();
+        self.lookup(&pin, key).cloned()
+    }
+
+    /// Pins the cache for a run of borrowed reads.
+    ///
+    /// Values a guard returns stay valid until it is refreshed or dropped,
+    /// even if they are replaced or evicted meanwhile. Entries retired while
+    /// a guard is held are not reclaimed until it refreshes, so long-lived
+    /// guards should call [`ShardedCacheGuard::refresh`] periodically.
+    #[must_use]
+    pub fn pin(&self) -> ShardedCacheGuard<'_, K, V, S> {
+        ShardedCacheGuard {
+            cache: self,
+            pin: self.arena.pin(),
+        }
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "dereferences handles the table publishes under the caller's pin"
+    )]
+    fn lookup<'pin, Q>(&self, pin: &'pin DirectArenaPin<'_, (K, V)>, key: &Q) -> Option<&'pin V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let hash = self.hash_builder.hash_one(key);
         let (_, handle) = self.shard(hash).find(hash, |handle| {
             // SAFETY: `find` passes handles published in this cache's table
             // while `pin` was held.
-            unsafe { entry(&pin, handle) }.value().0.borrow() == key
+            unsafe { entry(pin, handle) }.value().0.borrow() == key
         })?;
         // SAFETY: as above.
-        let entry = unsafe { entry(&pin, handle) };
+        let entry = unsafe { entry(pin, handle) };
         entry.mark_accessed();
-        Some(entry.value().1.clone())
+        Some(&entry.value().1)
     }
 
     /// Inserts or replaces the value for `key`, evicting from the key's shard
@@ -217,8 +243,9 @@ impl<K: Hash + Eq, V, S: BuildHasher> ShardedCache<K, V, S> {
                     }
                     writer.probation.push_back((
                         handle.index_value().get(),
-                        u32::try_from(slot).expect("shard slots fit u32"),
-                        hash as u32,
+                        // `Shard::new` bounds every shard below 2^32 slots.
+                        u32::try_from(slot).unwrap_or(u32::MAX),
+                        low_hash_bits(hash),
                     ));
                 }
             }
@@ -262,7 +289,8 @@ impl<K: Hash + Eq, V, S: BuildHasher> ShardedCache<K, V, S> {
 
     fn shard(&self, hash: u64) -> &Shard {
         // `checked_shr` keeps the single-shard shift of 64 in range.
-        &self.shards[hash.checked_shr(self.shard_shift).unwrap_or(0) as usize]
+        let shard = hash.checked_shr(self.shard_shift).unwrap_or(0);
+        &self.shards[usize::try_from(shard).expect("a shard index fits usize")]
     }
 
     /// Removes one entry from a full shard: an unread probationary key
@@ -325,6 +353,28 @@ impl<K: Hash + Eq, V, S: BuildHasher> ShardedCache<K, V, S> {
     }
 }
 
+/// A pinned read session over a [`ShardedCache`]; see [`ShardedCache::pin`].
+pub struct ShardedCacheGuard<'cache, K, V, S = DefaultHashBuilder> {
+    cache: &'cache ShardedCache<K, V, S>,
+    pin: DirectArenaPin<'cache, (K, V)>,
+}
+
+impl<K: Hash + Eq, V, S: BuildHasher> ShardedCacheGuard<'_, K, V, S> {
+    /// Borrows the value cached for `key` until this guard refreshes.
+    pub fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.cache.lookup(&self.pin, key)
+    }
+
+    /// Lets entries retired since the guard pinned be reclaimed.
+    pub fn refresh(&mut self) {
+        self.pin.refresh();
+    }
+}
+
 impl<K, V, S> Drop for ShardedCache<K, V, S> {
     #[allow(
         unsafe_code,
@@ -358,6 +408,10 @@ impl Shard {
             .div_ceil(SLOTS_PER_ENTRY_DENOMINATOR)
             .max(SLOTS * 2);
         let buckets = slots.div_ceil(SLOTS);
+        assert!(
+            u32::try_from(buckets * SLOTS).is_ok(),
+            "a shard holds fewer than 2^32 slots"
+        );
         Self {
             buckets: (0..buckets)
                 .map(|_| Bucket {
@@ -385,7 +439,8 @@ impl Shard {
     fn home(&self, hash: u64) -> usize {
         // Multiply-shift range reduction on the low 32 bits: the table need
         // not be a power of two, and probation records keep these bits.
-        ((hash & 0xffff_ffff) * self.buckets.len() as u64 >> 32) as usize
+        let scaled = ((hash & 0xffff_ffff) * self.buckets.len() as u64) >> 32;
+        usize::try_from(scaled).expect("a bucket index fits usize")
     }
 
     fn next(&self, bucket: usize) -> usize {
@@ -408,7 +463,7 @@ impl Shard {
         for _ in 0..self.buckets.len() {
             let current = &self.buckets[bucket];
             let control = current.control.load(Ordering::Acquire);
-            let mut candidates = zero_tag_bytes(control ^ BYTE_ONES * u64::from(tag));
+            let mut candidates = zero_tag_bytes(control ^ (BYTE_ONES * u64::from(tag)));
             while candidates != 0 {
                 let slot = candidates.trailing_zeros() as usize / 8;
                 candidates &= candidates - 1;
@@ -509,7 +564,13 @@ const fn zero_tag_bytes(word: u64) -> u64 {
 /// A slot tag: eight hash bits other than the shard and home-bucket bits,
 /// never zero.
 fn tag(hash: u64) -> u8 {
-    ((hash >> 32) as u8).max(1)
+    (hash >> 32).to_le_bytes()[0].max(1)
+}
+
+/// The low 32 hash bits, which choose the home bucket and ghost position.
+fn low_hash_bits(hash: u64) -> u32 {
+    let bytes = hash.to_le_bytes();
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
 fn handle_from_raw(raw: u64) -> DirectHandle {
@@ -607,7 +668,7 @@ impl Ghost {
         let low = hash & 0xffff_ffff;
         let mixed = low.wrapping_mul(0x9e37_79b9_7f4a_7c15);
         let words = (self.words.len() / GHOST_GENERATIONS) as u64;
-        let word = ((mixed >> 32) * words >> 32) as usize;
+        let word = usize::try_from(((mixed >> 32) * words) >> 32).expect("a ghost word fits usize");
         let mask =
             (0..GHOST_KEY_BITS).fold(0_u64, |mask, lane| mask | 1 << ((mixed >> (lane * 6)) & 63));
         (word * GHOST_GENERATIONS, mask)
@@ -667,6 +728,21 @@ mod tests {
     }
 
     #[test]
+    fn a_guard_keeps_borrowed_values_alive_across_replacement_and_eviction() {
+        let cache = ShardedCache::new(8);
+        cache.insert(1_u64, "first".to_owned());
+        let mut guard = cache.pin();
+        let first = guard.get(&1).expect("resident");
+        cache.insert(1, "second".to_owned());
+        for key in 100..1_000_u64 {
+            cache.insert(key, key.to_string());
+        }
+        assert_eq!(first, "first", "the guard keeps a replaced value alive");
+        guard.refresh();
+        assert_ne!(guard.get(&1).map(String::as_str), Some("first"));
+    }
+
+    #[test]
     fn borrowed_keys_find_owned_keys() {
         let cache: ShardedCache<String, u32> = ShardedCache::new(16);
         cache.insert("alpha".to_owned(), 1);
@@ -703,7 +779,7 @@ mod tests {
     impl Hasher for CollidingHasher {
         fn finish(&self) -> u64 {
             // Same shard, home bucket and tag for every key.
-            self.0 & 0
+            0
         }
         fn write(&mut self, bytes: &[u8]) {
             for byte in bytes {

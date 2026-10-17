@@ -100,7 +100,7 @@ pub use segment_cache::{
     SegmentExpiry,
 };
 pub use segmented_map::{KeyCompactionStats, SegmentedLoad, SegmentedMapStats, SegmentedSwissMap};
-pub use sharded_cache::ShardedCache;
+pub use sharded_cache::{ShardedCache, ShardedCacheGuard};
 pub use swiss_map::{PackedSwissMap, SwissMapStats};
 
 /// Primary packed-generation map for arbitrary cloneable values.

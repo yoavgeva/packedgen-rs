@@ -1804,6 +1804,9 @@ impl DirectRetiredQueue {
 /// Owns retirements removed from one epoch queue until reclamation consumes
 /// them. Its exceptional `Drop` path returns any unprocessed tokens to an
 /// owner queue without invoking user code.
+/// Retirement queues taken from one quiescent epoch, by retired shard.
+type DirectTakenRetirements = Vec<(usize, Vec<RemovedDirectHandle>)>;
+
 struct DirectRetiredBatch<'a> {
     handles: Vec<RemovedDirectHandle>,
     requeue: &'a DirectRetiredQueue,
@@ -2346,10 +2349,7 @@ impl<V> DirectArenaOwner<V> {
         }
     }
 
-    fn advance_taking_quiescent(
-        &self,
-        force: bool,
-    ) -> Option<(usize, Vec<(usize, Vec<RemovedDirectHandle>)>)> {
+    fn advance_taking_quiescent(&self, force: bool) -> Option<(usize, DirectTakenRetirements)> {
         let observed = direct_epoch_slot(self.current_epoch.load(Ordering::SeqCst));
         if !force && self.retired_count[observed].load(Ordering::Relaxed) < DIRECT_RECLAIM_BATCH {
             return None;
@@ -2402,7 +2402,7 @@ impl<V> DirectArenaOwner<V> {
     }
 
     /// Empties one quiescent epoch's retirement queues.
-    fn take_retired_epoch(&self, epoch: usize) -> Vec<(usize, Vec<RemovedDirectHandle>)> {
+    fn take_retired_epoch(&self, epoch: usize) -> DirectTakenRetirements {
         let begin = epoch * DIRECT_RETIRED_SHARDS;
         self.retired[begin..begin + DIRECT_RETIRED_SHARDS]
             .iter()
@@ -2427,7 +2427,7 @@ impl<V> DirectArenaOwner<V> {
         unsafe_code,
         reason = "reclaims only one quiescent owner-controlled retirement epoch"
     )]
-    fn reclaim_taken(&self, epoch: usize, taken: Vec<(usize, Vec<RemovedDirectHandle>)>) {
+    fn reclaim_taken(&self, epoch: usize, taken: DirectTakenRetirements) {
         let begin = epoch * DIRECT_RETIRED_SHARDS;
         let fallback_queue = &self.retired[begin];
         let retired_count = &self.retired_count[epoch];
