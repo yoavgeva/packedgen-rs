@@ -3764,7 +3764,7 @@ mod tests {
         impl Drop for DropThread {
             fn drop(&mut self) {
                 let on = DROPPING_WORKER.with(Cell::get);
-                let slot = if on == self.retired_by { 0 } else { 1 };
+                let slot = usize::from(on != self.retired_by);
                 self.drops[self.retired_by * 2 + slot].fetch_add(1, Ordering::Relaxed);
             }
         }
