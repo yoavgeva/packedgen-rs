@@ -21,6 +21,7 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
 use std::ptr::{self, NonNull};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -483,70 +484,157 @@ struct Bucket {
     generations: AtomicU64,
 }
 
-/// Readers load only `buckets`; the writer lock and its counters change on
-/// every write, so they sit on cache lines of their own.
+/// Readers load only `buckets`, and the limits never change, so this line
+/// stays in every core's cache. The writer lock and the state it guards
+/// change on every write, so they sit on cache lines of their own.
 struct Shard<T> {
     buckets: Box<[Bucket]>,
-    weight_limit: u64,
+    limits: ShardLimits,
     writer: ShardLock,
     /// Tables publish handles to `Slot<T>`s; the cache's `RetiredSlots` and
     /// `SlotStore` carry the ownership bounds.
     _entries: PhantomData<fn() -> T>,
 }
 
-/// Counters writers publish for lock-free `len`, `weight`, and `stats`.
-struct ShardCounters {
-    len: AtomicUsize,
-    weight: AtomicU64,
-    evictions: AtomicU64,
-    expirations: AtomicU64,
-}
-
-/// The writer lock, after the counters published under it. They share the
-/// lock word's cache line, which a writer owns while it holds the lock, so
-/// publishing them moves no other line between writers' cores.
-#[repr(C, align(128))]
-struct ShardLock {
-    counters: ShardCounters,
-    writer: Mutex<ShardWriter>,
-}
-
-impl ShardLock {
-    fn lock(&self) -> MutexGuard<'_, ShardWriter> {
-        self.writer.lock()
-    }
-}
-
-struct ShardWriter {
-    len: usize,
+struct ShardLimits {
     capacity: usize,
     weight: u64,
-    weight_limit: u64,
-    evictions: u64,
-    expirations: u64,
-    /// The CLOCK hand: the next slot the main-area sweep examines.
-    hand: usize,
-    /// Probationary keys in insertion order, as (slot record, key hash).
-    /// A key moved to its other bucket leaves probation for the main area.
-    probation: VecDeque<(u32, u64)>,
     probation_target: usize,
     /// Past this many records the oldest is dropped, leaving its key to the
     /// main sweep, so records never copy more than a share of the keys.
     probation_limit: usize,
+}
+
+impl ShardLimits {
+    fn main_limit(&self) -> usize {
+        self.capacity + self.capacity / 4 + 16
+    }
+}
+
+/// The writer lock, between the counts writers keep under it. The counts are
+/// atomics so that `len`, `weight`, and `stats` read them without the lock.
+///
+/// Writers' cores take turns with a shard, and each line of its state a write
+/// touches moves to the writer's core while it holds the lock. So the counts
+/// every write changes share the lock word's line with the probation queue,
+/// and the ghost and the main queue fill the next line.
+#[repr(C, align(128))]
+struct ShardLock {
+    len: AtomicUsize,
+    weight: AtomicU64,
+    evictions: AtomicU64,
+    writer: Mutex<ShardWriter>,
+    expirations: AtomicU64,
+}
+
+impl ShardLock {
+    fn lock<'shard>(&'shard self, limits: &'shard ShardLimits) -> LockedShard<'shard> {
+        LockedShard {
+            counts: self,
+            limits,
+            writer: self.writer.lock(),
+        }
+    }
+}
+
+#[repr(C)]
+struct ShardWriter {
+    /// Probationary keys in insertion order, as (slot record, key hash).
+    /// A key moved to its other bucket leaves probation for the main area.
+    probation: VecDeque<(u32, u64)>,
+    ghost: Ghost,
     /// Main-area keys in the order they entered it, as `slot << 8 |
     /// generation`. Stale records (removed, replaced by another key, or
     /// moved) are skipped when popped.
     main: VecDeque<u32>,
-    ghost: Ghost,
+    /// The CLOCK hand: the next slot the main-area sweep examines.
+    hand: usize,
 }
 
-impl ShardWriter {
+/// A shard's writer state under its lock, with the counts kept beside it.
+struct LockedShard<'shard> {
+    counts: &'shard ShardLock,
+    limits: &'shard ShardLimits,
+    writer: MutexGuard<'shard, ShardWriter>,
+}
+
+impl Deref for LockedShard<'_> {
+    type Target = ShardWriter;
+
+    fn deref(&self) -> &ShardWriter {
+        &self.writer
+    }
+}
+
+impl DerefMut for LockedShard<'_> {
+    fn deref_mut(&mut self) -> &mut ShardWriter {
+        &mut self.writer
+    }
+}
+
+/// Adds one to a count. Counts change only under the shard lock, so a load
+/// and a store suffice.
+fn increment(count: &AtomicU64) {
+    count.store(count.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+}
+
+impl LockedShard<'_> {
+    fn len(&self) -> usize {
+        self.counts.len.load(Ordering::Relaxed)
+    }
+
+    fn weight(&self) -> u64 {
+        self.counts.weight.load(Ordering::Relaxed)
+    }
+
+    fn over_limit(&self, incoming_weight: u64) -> bool {
+        self.len() >= self.limits.capacity
+            || self.weight().saturating_add(incoming_weight) > self.limits.weight
+    }
+
+    fn set_len(&mut self, len: usize) {
+        self.counts.len.store(len, Ordering::Relaxed);
+    }
+
+    fn set_weight(&mut self, weight: u64) {
+        self.counts.weight.store(weight, Ordering::Relaxed);
+    }
+
+    /// Accounts for an entry published in the table.
+    fn entered(&mut self, weight: u64) {
+        self.set_len(self.len() + 1);
+        self.set_weight(self.weight() + weight);
+    }
+
+    /// Accounts for an entry cleared from the table.
+    fn left(&mut self, weight: u64) {
+        self.set_len(self.len() - 1);
+        self.set_weight(self.weight() - weight);
+    }
+
+    fn count_expiration(&mut self) {
+        increment(&self.counts.expirations);
+    }
+
+    /// Accounts for an entry that eviction cleared from the table, and says
+    /// why it left.
+    fn evicted(&mut self, weight: u64, expired: bool) -> RemovalCause {
+        self.left(weight);
+        if expired {
+            self.count_expiration();
+            RemovalCause::Expired
+        } else {
+            increment(&self.counts.evictions);
+            RemovalCause::Size
+        }
+    }
+
     /// Appends a slot record to the main area's queue. Past its quarter of
     /// slack, stale records are dropped from the front in order-preserving
     /// chunks, so no write holds the shard lock for a whole-queue pass; only
     /// a chunk with nothing stale falls back to compacting the whole queue.
     fn enter_main<T>(&mut self, shard: &Shard<T>, record: u32) {
-        if self.main.len() >= self.main_limit() {
+        if self.main.len() >= self.limits.main_limit() {
             let mut kept = [0_u32; MAIN_CLEANUP_CHUNK];
             let mut live = 0;
             let mut examined = 0;
@@ -569,47 +657,6 @@ impl ShardWriter {
             }
         }
         self.main.push_back(record);
-    }
-
-    fn main_limit(&self) -> usize {
-        self.capacity + self.capacity / 4 + 16
-    }
-
-    fn over_limit(&self, incoming_weight: u64) -> bool {
-        self.len >= self.capacity || self.weight.saturating_add(incoming_weight) > self.weight_limit
-    }
-
-    fn publish<T>(&self, shard: &Shard<T>) {
-        shard.writer.counters.len.store(self.len, Ordering::Relaxed);
-        shard
-            .writer
-            .counters
-            .weight
-            .store(self.weight, Ordering::Relaxed);
-        shard
-            .writer
-            .counters
-            .evictions
-            .store(self.evictions, Ordering::Relaxed);
-        shard
-            .writer
-            .counters
-            .expirations
-            .store(self.expirations, Ordering::Relaxed);
-    }
-
-    /// Accounts for an entry that eviction cleared from the table, and says
-    /// why it left.
-    fn evicted(&mut self, weight: u64, expired: bool) -> RemovalCause {
-        self.len -= 1;
-        self.weight -= weight;
-        if expired {
-            self.expirations += 1;
-            RemovalCause::Expired
-        } else {
-            self.evictions += 1;
-            RemovalCause::Size
-        }
     }
 }
 
@@ -646,7 +693,7 @@ where
     pub fn len(&self) -> usize {
         self.shards
             .iter()
-            .map(|shard| shard.writer.counters.len.load(Ordering::Relaxed))
+            .map(|shard| shard.writer.len.load(Ordering::Relaxed))
             .sum()
     }
 
@@ -655,7 +702,7 @@ where
     pub fn weight(&self) -> u64 {
         self.shards
             .iter()
-            .map(|shard| shard.writer.counters.weight.load(Ordering::Relaxed))
+            .map(|shard| shard.writer.weight.load(Ordering::Relaxed))
             .sum()
     }
 
@@ -674,8 +721,8 @@ where
             stats.misses += stripe.misses.load(Ordering::Relaxed);
         }
         for shard in &self.shards {
-            stats.evictions += shard.writer.counters.evictions.load(Ordering::Relaxed);
-            stats.expirations += shard.writer.counters.expirations.load(Ordering::Relaxed);
+            stats.evictions += shard.writer.evictions.load(Ordering::Relaxed);
+            stats.expirations += shard.writer.expirations.load(Ordering::Relaxed);
         }
         stats
     }
@@ -954,7 +1001,7 @@ where
         let weight = self.weighter.weight(&key, &value);
         let Some(compact_weight) = u32::try_from(weight)
             .ok()
-            .filter(|weight| *weight <= MAX_WEIGHT && u64::from(*weight) <= shard.weight_limit)
+            .filter(|weight| *weight <= MAX_WEIGHT && u64::from(*weight) <= shard.limits.weight)
         else {
             self.remove(&key);
             return false;
@@ -971,7 +1018,7 @@ where
         let key = &unsafe { entry(&pin, handle) }.value().0;
         let mut removed = Removed::new();
         {
-            let mut writer = shard.writer.lock();
+            let mut writer = shard.lock();
             let found = shard.find(hash, |current| {
                 // SAFETY: published in this table while `pin` is held.
                 unsafe { entry(&pin, current) }.value().0 == *key
@@ -982,15 +1029,16 @@ where
                 );
                 // SAFETY: the swap unpublished `previous` while `pin` is held.
                 let previous_entry = unsafe { entry(&pin, previous) };
-                writer.weight = writer.weight - previous_entry.weight() + weight;
+                let reweighed = writer.weight() - previous_entry.weight() + weight;
+                writer.set_weight(reweighed);
                 let cause = if self.expired(previous_entry, &mut now) {
-                    writer.expirations += 1;
+                    writer.count_expiration();
                     RemovalCause::Expired
                 } else {
                     RemovalCause::Replaced
                 };
                 removed.push(previous, cause);
-                while writer.weight > writer.weight_limit {
+                while writer.weight() > shard.limits.weight {
                     let Some((victim, cause)) =
                         self.evict(shard, &mut writer, &pin, Some(handle), &mut now)
                     else {
@@ -1026,14 +1074,13 @@ where
                     );
                     placed.unwrap_or_default()
                 };
-                writer.len += 1;
-                writer.weight += weight;
+                writer.entered(weight);
                 let record = shard.record(index);
                 if writer.ghost.contains(hash) {
                     // Remembered from a recent eviction: straight to main.
                     writer.enter_main(shard, record);
                 } else {
-                    if writer.probation.len() >= writer.probation_limit {
+                    if writer.probation.len() >= shard.limits.probation_limit {
                         // An overflowing record's key joins the main area.
                         let (overflow, _) = writer
                             .probation
@@ -1044,7 +1091,6 @@ where
                     writer.probation.push_back((record, hash));
                 }
             }
-            writer.publish(shard);
         }
         self.after_write(&removed, pin);
         true
@@ -1092,7 +1138,7 @@ where
         let mut removed = Removed::new();
         let mut live = false;
         {
-            let mut writer = shard.writer.lock();
+            let mut writer = shard.lock();
             let found = shard.find(hash, |handle| {
                 // SAFETY: published in this table while `pin` is held.
                 unsafe { entry(&pin, handle) }.value().0.borrow() == key
@@ -1101,18 +1147,16 @@ where
                 let handle = shard.clear(index, shard.home(hash));
                 // SAFETY: the clear unpublished `handle` while `pin` is held.
                 let removed_entry = unsafe { entry(&pin, handle) };
-                writer.len -= 1;
-                writer.weight -= removed_entry.weight();
+                writer.left(removed_entry.weight());
                 live = !self.expired(removed_entry, &mut None);
                 let cause = if live {
                     RemovalCause::Explicit
                 } else {
-                    writer.expirations += 1;
+                    writer.count_expiration();
                     RemovalCause::Expired
                 };
                 removed.push(handle, cause);
             }
-            writer.publish(shard);
         }
         self.after_write(&removed, pin);
         live
@@ -1124,7 +1168,7 @@ where
             let pin = self.epochs.pin();
             let mut removed = Removed::new();
             {
-                let mut writer = shard.writer.lock();
+                let mut writer = shard.lock();
                 for bucket in &shard.buckets {
                     if bucket.control.load(Ordering::Relaxed) == 0 {
                         continue;
@@ -1138,13 +1182,12 @@ where
                         }
                     }
                 }
-                writer.len = 0;
-                writer.weight = 0;
+                writer.set_len(0);
+                writer.set_weight(0);
                 writer.hand = 0;
                 writer.probation.clear();
                 writer.main.clear();
                 writer.ghost.clear();
-                writer.publish(shard);
             }
             self.after_write(&removed, pin);
         }
@@ -1193,12 +1236,12 @@ where
     fn evict(
         &self,
         shard: &Shard<(K, V)>,
-        writer: &mut ShardWriter,
+        writer: &mut LockedShard<'_>,
         pin: &EpochPin<'_>,
         protected: Option<Handle<(K, V)>>,
         now: &mut Option<u64>,
     ) -> Option<(Handle<(K, V)>, RemovalCause)> {
-        while writer.probation.len() > writer.probation_target {
+        while writer.probation.len() > shard.limits.probation_target {
             let (record, hash) = writer
                 .probation
                 .pop_front()
@@ -1286,7 +1329,7 @@ where
     fn relocate_candidate(
         &self,
         shard: &Shard<(K, V)>,
-        writer: &mut ShardWriter,
+        writer: &mut LockedShard<'_>,
         pin: &EpochPin<'_>,
         hash: u64,
     ) -> bool {
@@ -1332,7 +1375,7 @@ where
     fn evict_candidate(
         &self,
         shard: &Shard<(K, V)>,
-        writer: &mut ShardWriter,
+        writer: &mut LockedShard<'_>,
         pin: &EpochPin<'_>,
         hash: u64,
         now: &mut Option<u64>,
@@ -1443,31 +1486,30 @@ impl<T> Shard<T> {
                     generations: AtomicU64::new(0),
                 })
                 .collect(),
-            weight_limit,
+            limits: ShardLimits {
+                capacity,
+                weight: weight_limit,
+                probation_target,
+                probation_limit: probation_target + probation_target / 4 + 4,
+            },
             writer: ShardLock {
-                counters: ShardCounters {
-                    len: AtomicUsize::new(0),
-                    weight: AtomicU64::new(0),
-                    evictions: AtomicU64::new(0),
-                    expirations: AtomicU64::new(0),
-                },
+                len: AtomicUsize::new(0),
+                weight: AtomicU64::new(0),
+                evictions: AtomicU64::new(0),
                 writer: Mutex::new(ShardWriter {
-                    len: 0,
-                    capacity,
-                    weight: 0,
-                    weight_limit,
-                    evictions: 0,
-                    expirations: 0,
-                    hand: 0,
                     probation: VecDeque::new(),
-                    probation_target,
-                    probation_limit: probation_target + probation_target / 4 + 4,
-                    main: VecDeque::with_capacity(capacity + capacity / 4 + 17),
                     ghost: Ghost::new(capacity.div_ceil(GHOST_GENERATION_DIVISOR)),
+                    main: VecDeque::with_capacity(capacity + capacity / 4 + 17),
+                    hand: 0,
                 }),
+                expirations: AtomicU64::new(0),
             },
             _entries: PhantomData,
         }
+    }
+
+    fn lock(&self) -> LockedShard<'_> {
+        self.writer.lock(&self.limits)
     }
 
     #[inline]
@@ -1869,8 +1911,10 @@ struct Ghost {
     /// `words[word * GHOST_GENERATIONS + generation]`.
     words: Box<[u64]>,
     current: usize,
-    remembered: usize,
-    rotate_every: usize,
+    /// Counts fit 32 bits, as shards hold fewer than 2^24 slots; the ghost
+    /// then shares one cache line with the main queue.
+    remembered: u32,
+    rotate_every: u32,
 }
 
 impl Ghost {
@@ -1881,7 +1925,7 @@ impl Ghost {
             words: vec![0; words * GHOST_GENERATIONS].into_boxed_slice(),
             current: 0,
             remembered: 0,
-            rotate_every,
+            rotate_every: u32::try_from(rotate_every).expect("a shard's ghost generation fits u32"),
         }
     }
 
@@ -2083,7 +2127,6 @@ mod tests {
         // and evictions fall through to the main area.
         for key in 0..256_u64 {
             if cache.shards[0]
-                .writer
                 .lock()
                 .probation
                 .iter()
@@ -2779,18 +2822,66 @@ mod tests {
     }
 
     #[test]
-    fn published_counters_share_the_writer_locks_cache_line() {
-        // Every write publishes them, so a line of their own would move
-        // between writers' cores on every write.
-        let shard = Shard::<(u64, u64)>::new(64, u64::MAX, DEFAULT_PROBATION_BPS);
-        let line = |address: usize| address / 64;
-        let counters = std::ptr::addr_of!(shard.writer.counters) as usize;
-        let lock = std::ptr::addr_of!(shard.writer.writer) as usize;
-        assert_eq!(line(counters), line(lock));
-        assert_eq!(
-            line(counters + std::mem::size_of::<ShardCounters>() - 1),
-            line(lock)
+    fn keys_evicted_from_probation_return_to_the_main_area() {
+        let cache = ShardedCacheBuilder::new(256).shards(1).build::<u64, u64>();
+        let in_probation = |key: u64| {
+            let hash = cache.hash_builder.hash_one(key);
+            cache.shards[0]
+                .lock()
+                .probation
+                .iter()
+                .any(|(_, probationary)| *probationary == hash)
+        };
+        for key in 0..1_000 {
+            cache.insert(key, key);
+        }
+        // Unread, the late keys left probation as later keys arrived, and
+        // the ghost remembers them.
+        let evicted = (900..990)
+            .filter(|key| !cache.contains_key(key))
+            .collect::<Vec<_>>();
+        assert!(
+            evicted.len() > 80,
+            "{} of 90 late keys were evicted",
+            evicted.len()
         );
+        for &key in &evicted {
+            cache.insert(key, key);
+            assert!(!in_probation(key), "remembered key {key} entered probation");
+        }
+        // A key the ghost never saw starts in probation.
+        cache.insert(5_000, 5_000);
+        assert!(in_probation(5_000));
+    }
+
+    #[test]
+    fn a_writes_shard_state_spans_two_cache_lines() {
+        // Writers' cores take turns holding a shard's lock, and each line of
+        // shard state a write touches moves to its core while it holds the
+        // lock. Replacing needs the lock word and the counts; an insert that
+        // evicts from probation needs the probation queue, then the ghost.
+        let shard = Shard::<(u64, u64)>::new(64, u64::MAX, DEFAULT_PROBATION_BPS);
+        let base = std::ptr::addr_of!(shard.writer) as usize;
+        let line = |field: usize, size: usize| {
+            let first = (field - base) / 64;
+            assert_eq!(first, (field + size - 1 - base) / 64, "a field spans lines");
+            first
+        };
+        let lock = &shard.writer;
+        assert_eq!(line(std::ptr::addr_of!(lock.len) as usize, 8), 0);
+        assert_eq!(line(std::ptr::addr_of!(lock.weight) as usize, 8), 0);
+        assert_eq!(line(std::ptr::addr_of!(lock.evictions) as usize, 8), 0);
+        let mutex = std::ptr::addr_of!(lock.writer) as usize;
+        let data = lock.writer.data_ptr() as usize;
+        assert!(mutex < data, "the lock word precedes the state it guards");
+        assert_eq!(line(mutex, data - mutex), 0);
+        let writer = lock.writer.lock();
+        let probation = std::ptr::addr_of!(writer.probation) as usize;
+        assert_eq!(line(probation, std::mem::size_of_val(&writer.probation)), 0);
+        let ghost = std::ptr::addr_of!(writer.ghost) as usize;
+        assert_eq!(line(ghost, std::mem::size_of_val(&writer.ghost)), 1);
+        let main = std::ptr::addr_of!(writer.main) as usize;
+        assert_eq!(line(main, std::mem::size_of_val(&writer.main)), 1);
     }
 
     #[test]
