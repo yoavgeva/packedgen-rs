@@ -55,6 +55,15 @@ pub trait Weighter<K, V> {
     fn weight(&self, key: &K, value: &V) -> u64;
 }
 
+impl<K, V, F> Weighter<K, V> for F
+where
+    F: Fn(&K, &V) -> u64,
+{
+    fn weight(&self, key: &K, value: &V) -> u64 {
+        self(key, value)
+    }
+}
+
 /// Weighs every entry as one.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UnitWeighter;
@@ -66,6 +75,23 @@ impl<K, V> Weighter<K, V> for UnitWeighter {
 }
 
 /// Configures a [`ShardedCache`].
+///
+/// ```
+/// use packedgen::{ShardedCache, ShardedCacheBuilder};
+///
+/// let cache: ShardedCache<u64, String> = ShardedCache::new(10_000);
+/// cache.insert(1, "one".to_owned());
+/// assert_eq!(cache.get(&1).as_deref(), Some("one"));
+///
+/// // Weighted limits, and borrowed reads that pin once for many lookups.
+/// let weighted = ShardedCacheBuilder::new(10_000)
+///     .max_weight(1 << 20)
+///     .weighter(|_key: &u64, value: &String| value.len() as u64)
+///     .build();
+/// weighted.insert(2, "two".to_owned());
+/// let guard = weighted.pin();
+/// assert_eq!(guard.get(&2).map(String::as_str), Some("two"));
+/// ```
 #[derive(Clone, Debug)]
 pub struct ShardedCacheBuilder<W = UnitWeighter, S = DefaultHashBuilder> {
     max_entries: usize,
