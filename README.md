@@ -21,16 +21,16 @@ or shift failures.
 `ShardedCache<K, V>` is a bounded concurrent cache for any `K: Hash + Eq`.
 Reads are lock-free and its fixed per-shard tables never rebuild. Writers use
 sharded locks and evict S3-FIFO style. Its overhead beyond the key and value is
-25.5 to 28 requested bytes per entry, against 78 to 210 for quick_cache 0.7.
+29 to 31 requested bytes per entry, against 78 to 210 for quick_cache 0.7.
 
 Against quick_cache, ShardedCache leads concurrent reads. With eight threads
-on a 16-core machine it ran 2.7 to 3.4 times quick_cache's resident-hit
-throughput and 5.8 to 7.2 times its miss throughput, and it was slightly ahead
-on a 95%-read turnover mix. It trails on writes at one or two threads, and on
+on a 16-core machine it ran 2.6 to 3.4 times quick_cache's resident-hit
+throughput and 6 to 7.3 times its miss throughput, and it was 6 to 9% ahead on
+a 95%-read turnover mix. It trails on writes at one or two threads, and on
 cold fills and replacements at every thread count measured.
 
-On the ARC paper traces, ShardedCache's hit rate was within one point of
-quick_cache in 15 of 18 cells.
+On the ARC paper traces, its summed hit rate over 18 cells was within 0.06
+points of quick_cache.
 
 Design, correctness evidence, tables, and rejected alternatives are in
 [`docs/SHARDED_CACHE_2026-10-17.md`](docs/SHARDED_CACHE_2026-10-17.md).

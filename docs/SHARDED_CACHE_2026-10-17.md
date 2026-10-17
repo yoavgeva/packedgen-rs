@@ -55,8 +55,17 @@ entry. Tables are sized once and never rebuilt.
     ghost has four generations and remembers three eighths to half of the
     shard.
   - A key the ghost remembers is admitted straight to the main area.
-  - The main area is swept by a CLOCK hand over the table's own slots. Each
-    entry holds two access marks.
+  - The main area is a CLOCK queue in the order keys entered it: on leaving
+    probation after being read, on overflowing probation's record cap, or on
+    a ghost hit. A read key loses one of its two access marks and goes to the
+    back.
+  - Probation and main-queue records are slot records: a 24-bit slot plus that
+    slot's placement generation, kept in each bucket's spare word. A record
+    of a removed, moved, or reused slot is skipped when popped. Main records
+    take 4 bytes each.
+  - Past 1.25 times the shard's capacity, the main queue drops stale records
+    from its front in chunks of 64. A table sweep remains the fallback when
+    the queue is exhausted.
 - **Reclamation.** Entries are boxes in the direct arena's epoch scheme.
   - Retirements are drained on the threads that retired them.
   - Emptied boxes go into a lock-free thread-local stash of up to 256 boxes,
@@ -80,6 +89,7 @@ entry. Tables are sized once and never rebuilt.
   - drop releasing every value;
   - guard reads surviving replacement;
   - two-bucket placement under a million-key churn;
+  - unread main-area keys leaving in insertion order;
   - forced pair evictions staying under 0.1%;
   - an 8-thread race of replacements, removals, and evictions that counts live
     values to prove each one is dropped exactly once.
@@ -96,23 +106,25 @@ rounding of the boxed entries is not included.
 
 | Entries | Key | Value | ShardedCache | DirectPackedCache | quick_cache |
 | ---: | --- | --- | ---: | ---: | ---: |
-| 100,000 | 8 B | `u64` | 43.1 | 46.6 | 118.0 |
-| 100,000 | 32 B | `[u8; 64]` | 124.1 | 128.1 | 306.7 |
-| 1,000,000 | 8 B | `u64` | 41.5 | 44.2 | 94.4 |
-| 1,000,000 | 32 B | `u64` | 65.6 | 69.0 | 144.7 |
-| 1,000,000 | 32 B | `[u8; 64]` | 121.6 | 125.1 | 245.4 |
+| 100,000 | 8 B | `u64` | 46.7 | 46.8 | 118.0 |
+| 100,000 | 32 B | `[u8; 64]` | 127.4 | 128.2 | 306.7 |
+| 1,000,000 | 8 B | `u64` | 45.0 | 44.2 | 94.4 |
+| 1,000,000 | 32 B | `u64` | 69.0 | 69.0 | 144.7 |
+| 1,000,000 | 32 B | `[u8; 64]` | 125.1 | 125.1 | 245.4 |
 
-Overhead beyond the key and value is 25.5 to 28 bytes per entry:
+Overhead beyond the key and value is 29 to 31.4 bytes per entry:
 
 | Component | Bytes per entry |
 | --- | ---: |
 | Table at 80% load | 13.3 |
 | Entry metadata | 8 |
+| Main queue, with its slack | about 4 to 5 |
 | Ghost filter | about 2 |
 | Probation records | about 2 |
 
 For comparison, the overhead is 28 to 32 for `DirectPackedCache` and 78 to 210
-for quick_cache.
+for quick_cache. The main queue added about 3.5 bytes per entry and bought
+about 3.4 points of trace hit rate.
 
 ## Throughput against quick_cache 0.7
 
@@ -127,14 +139,14 @@ Hosts:
 
 | Workload | macOS 1T | macOS 2T | macOS 8T | Linux 1T | Linux 2T | Linux 8T |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Resident hit | −26% | +16% | +240% | +9% | +38% | +169% |
-| Read miss | +60% | +131% | +616% | +57% | +147% | +485% |
-| Turnover (95% reads) | −24% | −14% | +9% | −14% | −15% | +10% |
-| Cold fill | −25% | −20% | −32% | −34% | −43% | −50% |
-| Replace | −14% | +22% | −18% | −17% | −27% | −28% |
-| Delete and reinsert | −7% | +7% | +1% | −24% | −15% | +8% |
+| Resident hit | −32% | +2% | +241% | +4% | +46% | +161% |
+| Read miss | +66% | +137% | +626% | +53% | +152% | +500% |
+| Turnover (95% reads) | −22% | −4% | +9% | −18% | −19% | +6% |
+| Cold fill | −18% | −6% | −35% | −28% | −37% | −52% |
+| Replace | −5% | +27% | −30% | −18% | −28% | −37% |
+| Delete and reinsert | −10% | −3% | −3% | −25% | −32% | −18% |
 
-Eight-thread resident hits reached 365 Mops/s against quick_cache's 109.
+Eight-thread resident hits reached 362 Mops/s against quick_cache's 109.
 
 Writes trail at low thread counts. Lock-free reads require deferred
 reclamation, so an insert cannot reuse the evicted entry's hot memory the way
@@ -150,29 +162,33 @@ configuration.
 
 | Cell | ShardedCache | quick_cache | quick_cache sharded | DirectPackedCache |
 | --- | ---: | ---: | ---: | ---: |
-| OLTP 1,000 | 36.51 | 35.15 | 36.12 | 35.30 |
-| OLTP 5,000 | 53.18 | 54.29 | 53.25 | 52.83 |
-| OLTP 15,000 | 64.30 | 64.83 | 64.57 | 63.80 |
-| P3 8,192 | 3.90 | 3.64 | 3.74 | 3.87 |
-| P3 32,768 | 12.83 | 12.94 | 13.11 | 12.66 |
-| P3 131,072 | 46.80 | 48.61 | 48.73 | 45.33 |
-| S1 65,536 | 5.95 | 6.17 | 6.23 | 5.86 |
-| S1 262,144 | 23.31 | 23.77 | 23.95 | 23.11 |
-| S1 524,288 | 42.10 | 41.99 | 42.76 | 41.60 |
-| P8 8,192 | 10.42 | 10.40 | 10.39 | 9.40 |
-| P8 32,768 | 32.40 | 32.41 | 32.30 | 30.92 |
-| P8 131,072 | 70.71 | 70.01 | 70.11 | 69.40 |
-| S3 100,000 | 11.94 | 12.67 | 12.83 | 11.57 |
-| S3 400,000 | 41.08 | 41.75 | 42.33 | 40.00 |
-| S3 800,000 | 68.96 | 66.99 | 68.35 | 66.79 |
-| DS1 1,000,000 | 14.57 | 14.86 | 14.86 | 14.36 |
-| DS1 4,000,000 | 43.99 | 44.80 | 44.76 | 43.88 |
-| DS1 8,000,000 | 68.11 | 69.22 | 69.31 | 68.20 |
+| OLTP 1,000 | 36.21 | 35.15 | 36.12 | 35.30 |
+| OLTP 5,000 | 53.11 | 54.29 | 53.25 | 52.83 |
+| OLTP 15,000 | 64.34 | 64.83 | 64.57 | 63.80 |
+| P3 8,192 | 4.30 | 3.64 | 3.74 | 3.87 |
+| P3 32,768 | 13.20 | 12.94 | 13.11 | 12.66 |
+| P3 131,072 | 48.50 | 48.61 | 48.73 | 45.33 |
+| S1 65,536 | 6.07 | 6.17 | 6.23 | 5.86 |
+| S1 262,144 | 23.69 | 23.77 | 23.95 | 23.11 |
+| S1 524,288 | 42.54 | 41.99 | 42.76 | 41.60 |
+| P8 8,192 | 10.09 | 10.40 | 10.39 | 9.40 |
+| P8 32,768 | 31.75 | 32.41 | 32.30 | 30.92 |
+| P8 131,072 | 70.20 | 70.01 | 70.11 | 69.40 |
+| S3 100,000 | 12.23 | 12.67 | 12.83 | 11.57 |
+| S3 400,000 | 41.77 | 41.75 | 42.33 | 40.00 |
+| S3 800,000 | 68.70 | 66.99 | 68.35 | 66.79 |
+| DS1 1,000,000 | 14.94 | 14.86 | 14.86 | 14.36 |
+| DS1 4,000,000 | 44.74 | 44.80 | 44.76 | 43.88 |
+| DS1 8,000,000 | 68.07 | 69.22 | 69.31 | 68.20 |
 
-Summed over the 18 cells, ShardedCache is 3.44 points behind single-shard
-quick_cache, and DirectPackedCache is 15.43 behind. ShardedCache is within one
-point in 15 cells and ahead in 6. The largest gaps are P3 at 131,072 entries
-(−1.81), OLTP at 5,000 (−1.11), and DS1 at 8,000,000 (−1.11).
+Summed over the 18 cells, ShardedCache is 0.06 points behind single-shard
+quick_cache, and DirectPackedCache is 15.43 behind. ShardedCache is within
+about one point in every cell and ahead in 9. The largest gaps are OLTP at
+5,000 entries (−1.19) and DS1 at 8,000,000 (−1.14).
+
+The insertion-order main queue closed most of the gap. A CLOCK over the
+table's own slots sweeps in hash order and loses recency: before the queue,
+the sum was −3.44 and P3 at 131,072 entries read 46.80%.
 
 ## Rejected and reverted
 
@@ -196,6 +212,11 @@ point in 15 cells and ahead in 6. The largest gaps are P3 at 131,072 entries
   fills, no gain on replace.
 - **Prefetching the next probation victim's bucket.** +4–7% on single-writer
   fills, −5% elsewhere.
+- **A CLOCK over the table's slots as the main policy.** Hash order cost 3.4
+  points of trace hit rate against the insertion-order queue.
+- **Compacting the whole main queue in one pass.** Without evictions, as
+  under delete and reinsert, a pass scanned thousands of stale records under
+  the shard lock while other writers parked.
 - **The direct arena's slab partitions for entries.** Under churn its partition
   locks and block lookups cost more than boxed entries: eight-thread turnover
   went from 20 to 46 Mops/s after switching to boxes.
