@@ -716,11 +716,15 @@ impl Shard {
         &self.buckets[slot / SLOTS]
     }
 
-    fn home(&self, hash: u64) -> usize {
-        // Multiply-shift range reduction on the low 32 bits: the table need
-        // not be a power of two, and probation records keep these bits.
-        let scaled = ((hash & 0xffff_ffff) * self.buckets.len() as u64) >> 32;
+    /// Multiply-shift range reduction of 32 bits: the table need not be a
+    /// power of two.
+    fn reduce(&self, bits: u64) -> usize {
+        let scaled = ((bits & 0xffff_ffff) * self.buckets.len() as u64) >> 32;
         usize::try_from(scaled).expect("a bucket index fits usize")
+    }
+
+    fn home(&self, hash: u64) -> usize {
+        self.candidates(hash).0
     }
 
     fn next(&self, bucket: usize) -> usize {
@@ -731,13 +735,15 @@ impl Shard {
         }
     }
 
-    /// The two buckets a key may live in: its home and an alternate chosen
-    /// from independent hash bits, so a full region never chains into the
-    /// next and displacement cannot grow.
+    /// The two buckets a key may live in: its home and an alternate, so a
+    /// full region never chains into the next and displacement cannot grow.
+    /// Both come from a full avalanche of the key hash: a fast hasher's bit
+    /// halves can correlate for some seeds, and correlated choices left one
+    /// seed in forty evicting from full pairs on 2.4% of inserts.
     fn candidates(&self, hash: u64) -> (usize, usize) {
-        let home = self.home(hash);
-        let mixed = (hash ^ (hash >> 29)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let alternate = self.home(mixed >> 32);
+        let mixed = fmix64(hash);
+        let home = self.reduce(mixed);
+        let alternate = self.reduce(mixed >> 32);
         (
             home,
             if alternate == home {
@@ -896,6 +902,15 @@ impl Shard {
 #[cfg(test)]
 thread_local! {
     static WINDOW_EVICTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// `MurmurHash3`'s 64-bit finalizer: every output bit depends on every input bit.
+const fn fmix64(mut value: u64) -> u64 {
+    value ^= value >> 33;
+    value = value.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    value ^= value >> 33;
+    value = value.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    value ^ (value >> 33)
 }
 
 const BYTE_ONES: u64 = 0x0101_0101_0101_0101;
