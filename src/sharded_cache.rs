@@ -25,7 +25,8 @@ use parking_lot::Mutex;
 
 use crate::NonMaxU64;
 use crate::cache_arena::{
-    DirectArenaEntry, DirectArenaPin, DirectHandle, DirectValueArena, RemovedDirectHandle,
+    DIRECT_MAX_WEIGHT, DirectArenaEntry, DirectArenaPin, DirectHandle, DirectValueArena,
+    RemovedDirectHandle,
 };
 
 const SLOTS: usize = 6;
@@ -47,15 +48,164 @@ const GHOST_GENERATION_DIVISOR: usize = 8;
 const GHOST_BITS_PER_KEY: usize = 32;
 const GHOST_KEY_BITS: u32 = 5;
 
+/// Charges each entry against a cache's weight limit.
+pub trait Weighter<K, V> {
+    /// The weight of one entry. Weights above `u32::MAX >> 1` are never
+    /// admitted.
+    fn weight(&self, key: &K, value: &V) -> u64;
+}
+
+/// Weighs every entry as one.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UnitWeighter;
+
+impl<K, V> Weighter<K, V> for UnitWeighter {
+    fn weight(&self, _key: &K, _value: &V) -> u64 {
+        1
+    }
+}
+
+/// Configures a [`ShardedCache`].
+#[derive(Clone, Debug)]
+pub struct ShardedCacheBuilder<W = UnitWeighter, S = DefaultHashBuilder> {
+    max_entries: usize,
+    max_weight: Option<u64>,
+    probation_bps: u16,
+    shards: Option<usize>,
+    weighter: W,
+    hash_builder: S,
+}
+
+impl ShardedCacheBuilder {
+    /// Starts a cache holding at most `max_entries` entries.
+    #[must_use]
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            max_weight: None,
+            probation_bps: DEFAULT_PROBATION_BPS,
+            shards: None,
+            weighter: UnitWeighter,
+            hash_builder: DefaultHashBuilder::default(),
+        }
+    }
+}
+
+impl<W, S> ShardedCacheBuilder<W, S> {
+    /// Also limits the summed weight of the entries; see [`Self::weighter`].
+    #[must_use]
+    pub fn max_weight(mut self, max_weight: u64) -> Self {
+        self.max_weight = Some(max_weight);
+        self
+    }
+
+    /// Sets the probationary FIFO's share of each shard in basis points
+    /// (default 200).
+    #[must_use]
+    pub fn probation_bps(mut self, probation_bps: u16) -> Self {
+        self.probation_bps = probation_bps;
+        self
+    }
+
+    /// Sets the shard count, rounded up to a power of two. By default it is
+    /// four per available thread, and fewer for small caches.
+    #[must_use]
+    pub fn shards(mut self, shards: usize) -> Self {
+        self.shards = Some(shards.max(1).next_power_of_two());
+        self
+    }
+
+    /// Weighs entries with `weighter`.
+    #[must_use]
+    pub fn weighter<W2>(self, weighter: W2) -> ShardedCacheBuilder<W2, S> {
+        ShardedCacheBuilder {
+            max_entries: self.max_entries,
+            max_weight: self.max_weight,
+            probation_bps: self.probation_bps,
+            shards: self.shards,
+            weighter,
+            hash_builder: self.hash_builder,
+        }
+    }
+
+    /// Hashes keys with `hash_builder`.
+    #[must_use]
+    pub fn hasher<S2>(self, hash_builder: S2) -> ShardedCacheBuilder<W, S2> {
+        ShardedCacheBuilder {
+            max_entries: self.max_entries,
+            max_weight: self.max_weight,
+            probation_bps: self.probation_bps,
+            shards: self.shards,
+            weighter: self.weighter,
+            hash_builder,
+        }
+    }
+
+    /// Builds the cache.
+    ///
+    /// # Panics
+    ///
+    /// Panics if one shard would need 2^32 or more table slots.
+    #[must_use]
+    pub fn build<K, V>(self) -> ShardedCache<K, V, W, S>
+    where
+        K: Hash + Eq,
+        W: Weighter<K, V>,
+        S: BuildHasher,
+    {
+        let max_entries = self.max_entries.max(1);
+        let shards = self.shards.unwrap_or_else(|| {
+            let parallelism = std::thread::available_parallelism().map_or(1, usize::from);
+            (parallelism * 4).next_power_of_two().min(
+                (max_entries / MIN_SHARD_CAPACITY)
+                    .max(1)
+                    .next_power_of_two(),
+            )
+        });
+        let max_weight = self.max_weight.unwrap_or(u64::MAX);
+        let shard_count = u64::try_from(shards).expect("the shard count fits u64");
+        let base = max_entries / shards;
+        let extra = max_entries % shards;
+        ShardedCache {
+            shards: (0..shards)
+                .map(|shard| {
+                    let index = u64::try_from(shard).expect("a shard index fits u64");
+                    let weight_limit = if max_weight == u64::MAX {
+                        u64::MAX
+                    } else {
+                        max_weight / shard_count + u64::from(index < max_weight % shard_count)
+                    };
+                    Shard::new(
+                        base + usize::from(shard < extra),
+                        weight_limit,
+                        self.probation_bps,
+                    )
+                })
+                .collect(),
+            shard_shift: u64::BITS - shards.trailing_zeros(),
+            arena: DirectValueArena::new(64),
+            weighter: self.weighter,
+            hash_builder: self.hash_builder,
+            capacity: max_entries,
+            max_weight,
+        }
+    }
+}
+
 /// A bounded concurrent cache with lock-free reads and sharded writers.
 ///
-/// `get` clones the value, so `V` is typically small or an `Arc`.
-pub struct ShardedCache<K, V, S = DefaultHashBuilder> {
+/// `get` clones the value, so `V` is typically small or an `Arc`; [`Self::pin`]
+/// borrows values instead. Limits apply per shard: each holds its share of
+/// the entry and weight limits, as in other sharded caches, so a cache can
+/// evict a little before it is full overall.
+pub struct ShardedCache<K, V, W = UnitWeighter, S = DefaultHashBuilder> {
     shards: Box<[Shard]>,
     shard_shift: u32,
     arena: DirectValueArena<(K, V)>,
+    weighter: W,
     hash_builder: S,
     capacity: usize,
+    max_weight: u64,
 }
 
 #[repr(C, align(64))]
@@ -66,15 +216,29 @@ struct Bucket {
     handles: [AtomicU64; SLOTS],
 }
 
+/// Readers load only `buckets`; the counters and the writer lock change on
+/// every write, so each sits on its own cache line.
 struct Shard {
     buckets: Box<[Bucket]>,
-    len: AtomicUsize,
-    writer: Mutex<ShardWriter>,
+    weight_limit: u64,
+    counters: ShardCounters,
+    writer: ShardLock,
 }
+
+#[repr(align(128))]
+struct ShardCounters {
+    len: AtomicUsize,
+    weight: AtomicU64,
+}
+
+#[repr(align(128))]
+struct ShardLock(Mutex<ShardWriter>);
 
 struct ShardWriter {
     len: usize,
     capacity: usize,
+    weight: u64,
+    weight_limit: u64,
     /// The CLOCK hand: the next slot the main-area sweep examines.
     hand: usize,
     /// Probationary keys in insertion order: (handle, slot, hash low bits).
@@ -86,60 +250,36 @@ struct ShardWriter {
     ghost: Ghost,
 }
 
+impl ShardWriter {
+    fn over_limit(&self, incoming_weight: u64) -> bool {
+        self.len >= self.capacity || self.weight.saturating_add(incoming_weight) > self.weight_limit
+    }
+
+    fn publish(&self, shard: &Shard) {
+        shard.counters.len.store(self.len, Ordering::Relaxed);
+        shard.counters.weight.store(self.weight, Ordering::Relaxed);
+    }
+}
+
 impl<K: Hash + Eq, V> ShardedCache<K, V> {
     /// Creates a cache holding at most `max_entries` entries.
     #[must_use]
     pub fn new(max_entries: usize) -> Self {
-        Self::with_hasher(max_entries, DefaultHashBuilder::default())
+        ShardedCacheBuilder::new(max_entries).build()
     }
 }
 
-impl<K: Hash + Eq, V, S: BuildHasher> ShardedCache<K, V, S> {
-    /// Creates a cache with an explicit hasher.
-    #[must_use]
-    pub fn with_hasher(max_entries: usize, hash_builder: S) -> Self {
-        Self::with_probation_and_hasher(max_entries, DEFAULT_PROBATION_BPS, hash_builder)
-    }
-
-    /// Creates a cache whose probationary FIFO targets `probation_bps`
-    /// basis points of each shard.
-    ///
-    /// # Panics
-    ///
-    /// Panics if one shard would need 2^32 or more table slots.
-    #[must_use]
-    pub fn with_probation_and_hasher(
-        max_entries: usize,
-        probation_bps: u16,
-        hash_builder: S,
-    ) -> Self {
-        let max_entries = max_entries.max(1);
-        let parallelism = std::thread::available_parallelism().map_or(1, usize::from);
-        let shards = (parallelism * 4)
-            .next_power_of_two()
-            .min(
-                (max_entries / MIN_SHARD_CAPACITY)
-                    .max(1)
-                    .next_power_of_two(),
-            )
-            .max(1);
-        let base = max_entries / shards;
-        let extra = max_entries % shards;
-        Self {
-            shards: (0..shards)
-                .map(|shard| Shard::new(base + usize::from(shard < extra), probation_bps))
-                .collect(),
-            shard_shift: u64::BITS - shards.trailing_zeros(),
-            arena: DirectValueArena::new(64),
-            hash_builder,
-            capacity: max_entries,
-        }
-    }
-
+impl<K: Hash + Eq, V, W: Weighter<K, V>, S: BuildHasher> ShardedCache<K, V, W, S> {
     /// The configured entry limit.
     #[must_use]
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// The configured weight limit; `u64::MAX` when weight is unlimited.
+    #[must_use]
+    pub fn max_weight(&self) -> u64 {
+        self.max_weight
     }
 
     /// The number of resident entries; a weak snapshot under concurrency.
@@ -147,7 +287,16 @@ impl<K: Hash + Eq, V, S: BuildHasher> ShardedCache<K, V, S> {
     pub fn len(&self) -> usize {
         self.shards
             .iter()
-            .map(|shard| shard.len.load(Ordering::Relaxed))
+            .map(|shard| shard.counters.len.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// The summed weight of resident entries; a weak snapshot.
+    #[must_use]
+    pub fn weight(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(|shard| shard.counters.weight.load(Ordering::Relaxed))
             .sum()
     }
 
@@ -175,7 +324,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> ShardedCache<K, V, S> {
     /// a guard is held are not reclaimed until it refreshes, so long-lived
     /// guards should call [`ShardedCacheGuard::refresh`] periodically.
     #[must_use]
-    pub fn pin(&self) -> ShardedCacheGuard<'_, K, V, S> {
+    pub fn pin(&self) -> ShardedCacheGuard<'_, K, V, W, S> {
         ShardedCacheGuard {
             cache: self,
             pin: self.arena.pin(),
@@ -204,16 +353,30 @@ impl<K: Hash + Eq, V, S: BuildHasher> ShardedCache<K, V, S> {
     }
 
     /// Inserts or replaces the value for `key`, evicting from the key's shard
-    /// when it is full.
+    /// while it is over its limits.
+    ///
+    /// A value heavier than its shard's share of the weight limit, or than
+    /// `u32::MAX >> 1`, is not cached; any previous value for `key` is then
+    /// removed, so a reader never sees a value the caller replaced. Returns
+    /// whether the value was cached.
     #[allow(
         unsafe_code,
         reason = "publishes, replaces, and retires arena handles under the shard lock"
     )]
-    pub fn insert(&self, key: K, value: V) {
+    pub fn insert(&self, key: K, value: V) -> bool {
         let hash = self.hash_builder.hash_one(&key);
         let shard = self.shard(hash);
+        let weight = self.weighter.weight(&key, &value);
+        let Some(compact_weight) = u32::try_from(weight).ok().filter(|weight| {
+            *weight <= DIRECT_MAX_WEIGHT && u64::from(*weight) <= shard.weight_limit
+        }) else {
+            self.remove(&key);
+            return false;
+        };
         let pin = self.arena.pin();
-        let handle = self.arena.allocate_boxed((key, value), 1, NEVER_EXPIRES);
+        let handle = self
+            .arena
+            .allocate_boxed((key, value), compact_weight, NEVER_EXPIRES);
         // SAFETY: the handle is this arena's own unpublished allocation.
         let key = &unsafe { entry(&pin, handle) }.value().0;
         let same_key = |current| {
@@ -222,21 +385,31 @@ impl<K: Hash + Eq, V, S: BuildHasher> ShardedCache<K, V, S> {
         };
         let mut retired = Retired::new();
         {
-            let mut writer = shard.writer.lock();
+            let mut writer = shard.writer.0.lock();
             if let Some((slot, _)) = shard.find(hash, same_key) {
-                let previous = shard.bucket(slot).handles[slot % SLOTS]
-                    .swap(handle.index_value().get(), Ordering::AcqRel);
-                retired.push(handle_from_raw(previous));
+                let previous = handle_from_raw(
+                    shard.bucket(slot).handles[slot % SLOTS]
+                        .swap(handle.index_value().get(), Ordering::AcqRel),
+                );
+                // SAFETY: the swap unpublished `previous` while `pin` is held.
+                writer.weight = writer.weight - unsafe { entry(&pin, previous) }.weight() + weight;
+                retired.push(previous);
+                while writer.weight > writer.weight_limit {
+                    let Some(victim) = self.evict(shard, &mut writer, &pin, Some(handle)) else {
+                        break;
+                    };
+                    retired.push(victim);
+                }
             } else {
-                while writer.len >= writer.capacity {
-                    let Some(victim) = self.evict(shard, &mut writer, &pin) else {
+                while writer.over_limit(weight) {
+                    let Some(victim) = self.evict(shard, &mut writer, &pin, None) else {
                         break;
                     };
                     retired.push(victim);
                 }
                 let slot = shard.place(hash, handle);
                 writer.len += 1;
-                shard.len.store(writer.len, Ordering::Relaxed);
+                writer.weight += weight;
                 if !writer.ghost.contains(hash) {
                     if writer.probation.len() >= writer.probation_limit {
                         writer.probation.pop_front();
@@ -249,8 +422,10 @@ impl<K: Hash + Eq, V, S: BuildHasher> ShardedCache<K, V, S> {
                     ));
                 }
             }
+            writer.publish(shard);
         }
         retired.retire(&pin);
+        true
     }
 
     /// Removes `key`, returning whether it was present.
@@ -267,7 +442,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> ShardedCache<K, V, S> {
         let shard = self.shard(hash);
         let pin = self.arena.pin();
         let removed = {
-            let mut writer = shard.writer.lock();
+            let mut writer = shard.writer.0.lock();
             let found = shard.find(hash, |handle| {
                 // SAFETY: published in this table while `pin` is held.
                 unsafe { entry(&pin, handle) }.value().0.borrow() == key
@@ -275,7 +450,9 @@ impl<K: Hash + Eq, V, S: BuildHasher> ShardedCache<K, V, S> {
             found.map(|(slot, _)| {
                 let removed = shard.clear(slot, shard.home(hash));
                 writer.len -= 1;
-                shard.len.store(writer.len, Ordering::Relaxed);
+                // SAFETY: the clear unpublished `removed` while `pin` is held.
+                writer.weight -= unsafe { entry(&pin, removed) }.weight();
+                writer.publish(shard);
                 removed
             })
         };
@@ -293,8 +470,9 @@ impl<K: Hash + Eq, V, S: BuildHasher> ShardedCache<K, V, S> {
         &self.shards[usize::try_from(shard).expect("a shard index fits usize")]
     }
 
-    /// Removes one entry from a full shard: an unread probationary key
-    /// first, otherwise the next unread key under the CLOCK hand.
+    /// Removes one entry from a shard over its limits: an unread
+    /// probationary key first, otherwise the next unread key under the CLOCK
+    /// hand. Never removes `protected`.
     #[allow(
         unsafe_code,
         reason = "dereferences handles published in this shard while `pin` is held"
@@ -304,6 +482,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> ShardedCache<K, V, S> {
         shard: &Shard,
         writer: &mut ShardWriter,
         pin: &DirectArenaPin<'_, (K, V)>,
+        protected: Option<DirectHandle>,
     ) -> Option<DirectHandle> {
         while writer.probation.len() > writer.probation_target {
             let (raw, slot, low_hash) = writer
@@ -311,7 +490,9 @@ impl<K: Hash + Eq, V, S: BuildHasher> ShardedCache<K, V, S> {
                 .pop_front()
                 .expect("probation is above its target");
             let slot = slot as usize;
-            if shard.bucket(slot).handles[slot % SLOTS].load(Ordering::Relaxed) != raw {
+            if shard.bucket(slot).handles[slot % SLOTS].load(Ordering::Relaxed) != raw
+                || protected.is_some_and(|protected| protected.index_value().get() == raw)
+            {
                 // Removed or replaced since it was enrolled.
                 continue;
             }
@@ -324,7 +505,8 @@ impl<K: Hash + Eq, V, S: BuildHasher> ShardedCache<K, V, S> {
             let removed = shard.clear(slot, shard.home(u64::from(low_hash)));
             writer.ghost.remember(u64::from(low_hash));
             writer.len -= 1;
-            shard.len.store(writer.len, Ordering::Relaxed);
+            // SAFETY: the clear unpublished `removed` while `pin` is held.
+            writer.weight -= unsafe { entry(pin, removed) }.weight();
             return Some(removed);
         }
         let slots = shard.buckets.len() * SLOTS;
@@ -334,7 +516,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> ShardedCache<K, V, S> {
             let slot = writer.hand;
             writer.hand = if slot + 1 == slots { 0 } else { slot + 1 };
             let raw = shard.bucket(slot).handles[slot % SLOTS].load(Ordering::Relaxed);
-            if raw == 0 {
+            if raw == 0 || protected.is_some_and(|protected| protected.index_value().get() == raw) {
                 continue;
             }
             let handle = handle_from_raw(raw);
@@ -346,7 +528,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> ShardedCache<K, V, S> {
             let hash = self.hash_builder.hash_one(&entry.value().0);
             let removed = shard.clear(slot, shard.home(hash));
             writer.len -= 1;
-            shard.len.store(writer.len, Ordering::Relaxed);
+            writer.weight -= entry.weight();
             return Some(removed);
         }
         None
@@ -354,12 +536,12 @@ impl<K: Hash + Eq, V, S: BuildHasher> ShardedCache<K, V, S> {
 }
 
 /// A pinned read session over a [`ShardedCache`]; see [`ShardedCache::pin`].
-pub struct ShardedCacheGuard<'cache, K, V, S = DefaultHashBuilder> {
-    cache: &'cache ShardedCache<K, V, S>,
+pub struct ShardedCacheGuard<'cache, K, V, W = UnitWeighter, S = DefaultHashBuilder> {
+    cache: &'cache ShardedCache<K, V, W, S>,
     pin: DirectArenaPin<'cache, (K, V)>,
 }
 
-impl<K: Hash + Eq, V, S: BuildHasher> ShardedCacheGuard<'_, K, V, S> {
+impl<K: Hash + Eq, V, W: Weighter<K, V>, S: BuildHasher> ShardedCacheGuard<'_, K, V, W, S> {
     /// Borrows the value cached for `key` until this guard refreshes.
     pub fn get<Q>(&self, key: &Q) -> Option<&V>
     where
@@ -375,7 +557,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> ShardedCacheGuard<'_, K, V, S> {
     }
 }
 
-impl<K, V, S> Drop for ShardedCache<K, V, S> {
+impl<K, V, W, S> Drop for ShardedCache<K, V, W, S> {
     #[allow(
         unsafe_code,
         reason = "exclusive drop retires every handle still published in the tables"
@@ -402,7 +584,7 @@ impl<K, V, S> Drop for ShardedCache<K, V, S> {
 }
 
 impl Shard {
-    fn new(capacity: usize, probation_bps: u16) -> Self {
+    fn new(capacity: usize, weight_limit: u64, probation_bps: u16) -> Self {
         let probation_target = capacity * usize::from(probation_bps) / 10_000;
         let slots = (capacity.max(1) * SLOTS_PER_ENTRY_NUMERATOR)
             .div_ceil(SLOTS_PER_ENTRY_DENOMINATOR)
@@ -419,16 +601,22 @@ impl Shard {
                     handles: std::array::from_fn(|_| AtomicU64::new(0)),
                 })
                 .collect(),
-            len: AtomicUsize::new(0),
-            writer: Mutex::new(ShardWriter {
+            counters: ShardCounters {
+                len: AtomicUsize::new(0),
+                weight: AtomicU64::new(0),
+            },
+            weight_limit,
+            writer: ShardLock(Mutex::new(ShardWriter {
                 len: 0,
                 capacity,
+                weight: 0,
+                weight_limit,
                 hand: 0,
                 probation: VecDeque::new(),
                 probation_target,
                 probation_limit: probation_target + probation_target / 4 + 4,
                 ghost: Ghost::new(capacity.div_ceil(GHOST_GENERATION_DIVISOR)),
-            }),
+            })),
         }
     }
 
@@ -743,6 +931,41 @@ mod tests {
     }
 
     #[test]
+    fn weights_bound_each_shard_and_oversized_values_replace_nothing() {
+        struct Length;
+        impl Weighter<u64, String> for Length {
+            fn weight(&self, _key: &u64, value: &String) -> u64 {
+                value.len() as u64
+            }
+        }
+        let cache = ShardedCacheBuilder::new(1_000)
+            .max_weight(400)
+            .shards(4)
+            .weighter(Length)
+            .build();
+        for key in 0..1_000_u64 {
+            assert!(cache.insert(key, "x".repeat(10)));
+            assert!(cache.weight() <= 400);
+        }
+        assert!(cache.len() <= 40);
+        // Growing a resident value evicts others in its shard.
+        let resident = (0..1_000_u64).find(|key| cache.get(key).is_some()).unwrap();
+        assert!(cache.insert(resident, "y".repeat(90)));
+        assert_eq!(cache.get(&resident).map(|value| value.len()), Some(90));
+        assert!(cache.weight() <= 400);
+        // A value heavier than a shard's share is refused and drops the old one.
+        assert!(!cache.insert(resident, "z".repeat(101)));
+        assert_eq!(cache.get(&resident), None);
+        assert_eq!(
+            cache.weight(),
+            (0..1_000_u64)
+                .filter_map(|key| cache.get(&key))
+                .map(|value| value.len() as u64)
+                .sum::<u64>()
+        );
+    }
+
+    #[test]
     fn borrowed_keys_find_owned_keys() {
         let cache: ShardedCache<String, u32> = ShardedCache::new(16);
         cache.insert("alpha".to_owned(), 1);
@@ -797,7 +1020,7 @@ mod tests {
 
     #[test]
     fn colliding_keys_chain_through_overflow_and_unlink_cleanly() {
-        let cache = ShardedCache::with_hasher(40, Colliding);
+        let cache = ShardedCacheBuilder::new(40).hasher(Colliding).build();
         for key in 0..40_u64 {
             cache.insert(key, key);
         }
@@ -930,7 +1153,9 @@ mod tests {
                                         assert_eq!(value.0, key);
                                     }
                                 }
-                                _ => cache.insert(key, Tracked::new(key)),
+                                _ => {
+                                    cache.insert(key, Tracked::new(key));
+                                }
                             }
                         }
                     })
@@ -962,7 +1187,9 @@ mod tests {
                         state ^= state << 17;
                         let key = state % 5_000;
                         match round % 4 {
-                            0 => cache.insert(key, (key, round)),
+                            0 => {
+                                cache.insert(key, (key, round));
+                            }
                             1 => {
                                 cache.remove(&key);
                             }

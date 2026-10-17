@@ -30,7 +30,9 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasherDefault, DefaultHasher};
 use std::ops::Range;
 
-use packedgen::{CacheConfig, DirectCacheGuard, DirectPackedCache, ShardedCache};
+use packedgen::{
+    CacheConfig, DirectCacheGuard, DirectPackedCache, ShardedCache, ShardedCacheBuilder,
+};
 use quick_cache::Weighter;
 use quick_cache::unsync::{Cache as QuickCache, DefaultLifecycle};
 
@@ -1263,11 +1265,11 @@ fn run_policy(policy: &str, trace: &Trace, entries: usize) -> Outcome {
                 });
             replay(
                 trace,
-                &mut ShardedSession(ShardedCache::with_probation_and_hasher(
-                    entries,
-                    probation,
-                    hashbrown::DefaultHashBuilder::default(),
-                )),
+                &mut ShardedSession(
+                    ShardedCacheBuilder::new(entries)
+                        .probation_bps(probation)
+                        .build(),
+                ),
             )
         }
         "lru" => replay(trace, &mut Lru::new(entries)),
