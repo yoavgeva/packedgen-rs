@@ -2312,9 +2312,13 @@ struct DirectProbation {
     ghost: DirectGhostFilter,
 }
 
-/// One shard on its own cache lines.
+/// One shard on its own cache lines. `len` mirrors the FIFO length, written
+/// under the lock, so evictors skip shards with nothing to pop without locking.
 #[repr(align(128))]
-struct DirectProbationLane(Mutex<DirectProbationShard>);
+struct DirectProbationLane {
+    shard: Mutex<DirectProbationShard>,
+    len: AtomicUsize,
+}
 
 #[derive(Default)]
 struct DirectProbationShard {
@@ -2349,11 +2353,12 @@ impl DirectProbation {
         // doubling slack of growing to it one record at a time.
         let shard_records = Self::record_limit(expected_target, shards).div_ceil(shards);
         let probation = Self {
-            shards: std::iter::repeat_with(|| {
-                DirectProbationLane(Mutex::new(DirectProbationShard {
+            shards: std::iter::repeat_with(|| DirectProbationLane {
+                shard: Mutex::new(DirectProbationShard {
                     records: VecDeque::with_capacity(shard_records),
                     key_bytes: VecDeque::new(),
-                }))
+                }),
+                len: AtomicUsize::new(0),
             })
             .take(shards)
             .collect(),
@@ -2399,7 +2404,7 @@ impl DirectProbation {
     fn len(&self) -> usize {
         self.shards
             .iter()
-            .map(|shard| shard.0.lock().records.len())
+            .map(|lane| lane.shard.lock().records.len())
             .sum()
     }
 
@@ -2409,7 +2414,8 @@ impl DirectProbation {
         }
         let shard_index = usize::try_from(route >> 60).expect("four bits fit usize");
         let limit = self.shard_record_limit.load(Ordering::Relaxed);
-        let mut shard = self.shards[shard_index % self.shards.len()].0.lock();
+        let lane = &self.shards[shard_index & (self.shards.len() - 1)];
+        let mut shard = lane.shard.lock();
         shard.records.push_back((handle, key.len()));
         shard.key_bytes.extend(key);
         if shard.records.len() > limit {
@@ -2419,6 +2425,7 @@ impl DirectProbation {
                 .expect("the shard holds the record just enrolled");
             shard.key_bytes.drain(..dropped_len);
         }
+        lane.len.store(shard.records.len(), Ordering::Relaxed);
     }
 
     /// Pops the oldest record of a shard holding more than its share of the
@@ -2434,10 +2441,13 @@ impl DirectProbation {
             start
         });
         let target = self.shard_target.load(Ordering::Relaxed);
+        let mask = self.shards.len() - 1;
         for offset in 0..self.shards.len() {
-            let mut shard = self.shards[start.wrapping_add(offset) % self.shards.len()]
-                .0
-                .lock();
+            let lane = &self.shards[start.wrapping_add(offset) & mask];
+            if lane.len.load(Ordering::Relaxed) <= target {
+                continue;
+            }
+            let mut shard = lane.shard.lock();
             if shard.records.len() <= target {
                 continue;
             }
@@ -2453,6 +2463,7 @@ impl DirectProbation {
             key.extend_from_slice(&front[..from_front]);
             key.extend_from_slice(&back[..key_len - from_front]);
             shard.key_bytes.drain(..key_len);
+            lane.len.store(shard.records.len(), Ordering::Relaxed);
             return Some(handle);
         }
         None
@@ -9541,7 +9552,7 @@ mod tests {
             }
             if id % 3 != 0 {
                 wrapped |= !probation.shards[0]
-                    .0
+                    .shard
                     .lock()
                     .key_bytes
                     .as_slices()
