@@ -1,13 +1,17 @@
-//! Packed, lock-free generational hash maps.
+//! A memory-dense concurrent cache, and research hash maps.
 //!
+//! [`ShardedCache`] is a bounded concurrent cache for any `K: Hash + Eq`:
+//! lock-free reads, per-shard writer locks, S3-FIFO eviction, times to live,
+//! loading a missing key once, and about 30 bytes of overhead per entry.
+//! Configure it with [`ShardedCacheBuilder`].
+//!
+//! The other components are research code, not recommended for production.
 //! [`PackedGenMap`] combines immutable packed generations with a lock-free
 //! mutable overlay and exact online rebuild publication. [`AtomicPackedGenMap`]
 //! specializes the value domain to [`NonMaxU64`], enabling allocation-free
-//! updates, replacements, reinsertion, and deletion in frozen slots.
-//!
-//! The crate also retains paper-derived Elastic Hashing and SwissTable-based
-//! comparison backends. They are explicit alternatives, not the placement
-//! algorithm behind the primary `PackedGen` maps.
+//! updates, replacements, reinsertion, and deletion in frozen slots. The crate
+//! also retains paper-derived Elastic Hashing and SwissTable-based comparison
+//! backends; they are not the placement algorithm behind the `PackedGen` maps.
 
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("packedgen currently supports only 64-bit targets");

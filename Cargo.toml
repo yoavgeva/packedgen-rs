@@ -3,11 +3,12 @@ name = "packedgen"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Packed lock-free generational hash maps for memory-dense concurrent workloads"
+description = "A memory-dense concurrent cache with lock-free reads, plus research packed generational hash maps"
 license = "MIT"
 repository = "https://github.com/yoavgeva/packedgen-rs"
-keywords = ["hashmap", "concurrent", "lock-free", "database", "cache"]
-categories = ["data-structures", "database-implementations"]
+readme = "README.md"
+keywords = ["cache", "concurrent", "lock-free", "s3-fifo", "hashmap"]
+categories = ["caching", "concurrency", "data-structures"]
 
 [workspace]
 members = [".", "crates/elastic-core"]
