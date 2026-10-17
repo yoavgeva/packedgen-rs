@@ -78,6 +78,43 @@ entry. Tables are sized once and never rebuilt.
   share of the weight limit is refused, and any previous value for its key is
   removed, so readers never see a value the caller replaced.
 
+## API beyond get and insert
+
+- **Loading once.** `get_or_insert_with` and `get_or_try_insert_with` take a
+  borrowed key and a loader.
+  - A caller that misses registers a flight, keyed by hash and key, in its
+    shard's lane and runs the loader outside every lock.
+  - Callers that miss the same key while it loads wait on the flight and
+    share its value.
+  - The leader inserts the value before unlisting the flight. A caller that
+    finds no flight looks the key up again under the lane lock, so it either
+    joins the flight or sees the inserted value.
+  - If the loader fails or panics, the flight is abandoned and one waiter
+    loads again with its own loader.
+- **Expiry.** `insert_with_ttl` and the builder's `time_to_live` store a
+  deadline in the entry's 31-bit expiry field, in 100 ms ticks since the
+  cache was built.
+  - An entry stays readable for its time to live and at most one tick more.
+  - Reads of entries without a deadline never read the clock.
+  - Eviction removes an expired entry wherever it meets one, ignoring its
+    access marks. When a full bucket pair forces an eviction, an expired
+    entry in the pair goes first.
+  - Expired entries the policy has not reached still count in `len`.
+- **Statistics.** `stats()` reports evictions and expirations, which shard
+  writers count under their locks. With `record_stats()`, it also reports hits
+  and misses. Those are counted on 32 cache-line-padded stripes chosen by
+  thread, so the read path adds one uncontended atomic increment.
+  `peek` and `contains_key` neither count nor mark entries as read.
+- **Removal listener.** A `RemovalListener` hears each entry that leaves, with
+  a cause: `Size`, `Expired`, `Replaced`, or `Explicit`. The cache calls it
+  after releasing the shard lock and before retiring the entry. It may use the
+  cache, but must not load the removed key through `get_or_insert_with`: the
+  removal can come from that key's own load on the same thread. A listener
+  that panics still leaves every removed entry retired.
+- **Clearing.** `clear` sweeps each shard under its lock. It retires every
+  entry, resets the probation, main, and ghost state, and leaves the eviction
+  and expiration counts in place.
+
 ## Correctness evidence
 
 - **Unit tests.** They cover:
@@ -91,8 +128,12 @@ entry. Tables are sized once and never rebuilt.
   - two-bucket placement under a million-key churn;
   - unread main-area keys leaving in insertion order;
   - forced pair evictions staying under 0.1%;
-  - an 8-thread race of replacements, removals, and evictions that counts live
-    values to prove each one is dropped exactly once.
+  - an 8-thread race of replacements, removals, loads, clears, and evictions
+    that counts live values to prove each one is dropped exactly once;
+  - eight racing callers loading a missing key once;
+  - failing and panicking loads handing the key to a waiter;
+  - expired entries reading as missing, and leaving before read live keys;
+  - statistics, every removal cause, `clear`, and `peek`.
 - **Arena tests.** They prove that retired values are destroyed outside the
   reclaim gate and on the thread that retired them.
 - **CI tools.** `scripts/cache_proof.sh` runs the module under Miri, ASan, and

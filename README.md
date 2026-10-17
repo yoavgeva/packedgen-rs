@@ -35,8 +35,20 @@ points of quick_cache.
 Design, correctness evidence, tables, and rejected alternatives are in
 [`docs/SHARDED_CACHE_2026-10-17.md`](docs/SHARDED_CACHE_2026-10-17.md).
 
+It offers:
+
+- `get_or_insert_with` and `get_or_try_insert_with`, which load a missing key
+  once however many callers miss it together;
+- per-entry and default times to live;
+- hit, miss, eviction, and expiration counts;
+- a removal listener told why each entry left;
+- `peek`, `contains_key`, and `clear`;
+- weighted limits and borrowed reads through `pin()`.
+
 ```rust
-use packedgen::{ShardedCache, ShardedCacheBuilder};
+use std::time::Duration;
+
+use packedgen::{RemovalCause, ShardedCache, ShardedCacheBuilder};
 
 let cache: ShardedCache<u64, String> = ShardedCache::new(10_000);
 cache.insert(1, "one".to_owned());
@@ -50,6 +62,20 @@ let weighted = ShardedCacheBuilder::new(10_000)
 weighted.insert(2, "two".to_owned());
 let guard = weighted.pin();
 assert_eq!(guard.get(&2).map(String::as_str), Some("two"));
+
+// Expiring entries loaded once per miss, with counts and a removal listener.
+let sessions: ShardedCache<u64, String, _, _, _> = ShardedCacheBuilder::new(10_000)
+    .time_to_live(Duration::from_secs(60))
+    .record_stats()
+    .removal_listener(|key: &u64, _value: &String, cause: RemovalCause| {
+        if cause == RemovalCause::Size {
+            println!("evicted session {key}");
+        }
+    })
+    .build();
+let name = sessions.get_or_insert_with(&3, || "three".to_owned());
+assert_eq!(name, "three");
+assert_eq!(sessions.stats().misses, 1);
 ```
 
 ## Status

@@ -524,6 +524,25 @@ impl<V> DirectArenaEntry<V> {
         }
     }
 
+    /// Marks the entry read unless its deadline has passed, deciding both
+    /// from one load of its metadata; `now` runs only for entries with a
+    /// deadline. Returns whether the entry is live.
+    pub(crate) fn mark_accessed_if_live(&self, now: impl FnOnce() -> u64) -> bool {
+        let metadata = self.metadata.load(Ordering::Relaxed);
+        // A field of all ones is the never-expiring encoding.
+        let expiry = metadata & DIRECT_EXPIRY_MASK;
+        if expiry != DIRECT_EXPIRY_MASK && expiry >> DIRECT_EXPIRY_SHIFT <= now() {
+            return false;
+        }
+        if metadata & DIRECT_ACCESS_BIT == 0 {
+            self.metadata.fetch_or(DIRECT_ACCESS_BIT, Ordering::Relaxed);
+        } else if metadata & DIRECT_SECOND_ACCESS_BIT == 0 {
+            self.metadata
+                .fetch_or(DIRECT_SECOND_ACCESS_BIT, Ordering::Relaxed);
+        }
+        true
+    }
+
     /// Reports whether the entry holds an access mark, without clearing it.
     pub(crate) fn accessed(&self) -> bool {
         self.metadata.load(Ordering::Relaxed) & (DIRECT_ACCESS_BIT | DIRECT_SECOND_ACCESS_BIT) != 0
@@ -725,7 +744,7 @@ impl<V> DirectValueArena<V> {
         Arc::strong_count(&self.owner)
     }
 
-    pub(crate) fn pin(&self) -> DirectArenaPin<'_, V> {
+        pub(crate) fn pin(&self) -> DirectArenaPin<'_, V> {
         let thread_id = direct_arena_thread();
         let reader_shard = thread_id & (DIRECT_READER_SHARDS - 1);
         let reader_epoch = self.owner.enter(reader_shard);
@@ -1091,7 +1110,7 @@ impl<V> Drop for DirectArenaValue<'_, V> {
 }
 
 impl<V> Drop for DirectArenaPin<'_, V> {
-    fn drop(&mut self) {
+        fn drop(&mut self) {
         if self.active {
             self.arena.owner.leave(self.reader_epoch, self.reader_shard);
         }
@@ -2277,7 +2296,7 @@ impl<V> DirectArenaOwner<V> {
         }
     }
 
-    fn enter(&self, reader_shard: usize) -> usize {
+        fn enter(&self, reader_shard: usize) -> usize {
         enter_epoch(
             || self.current_epoch.load(Ordering::SeqCst),
             |epoch| {
@@ -2320,7 +2339,7 @@ impl<V> DirectArenaOwner<V> {
         DirectMutationReservation::Overflow
     }
 
-    fn leave(&self, reader_epoch: usize, reader_shard: usize) {
+        fn leave(&self, reader_epoch: usize, reader_shard: usize) {
         leave_epoch(reader_epoch, |epoch| {
             self.readers[epoch * DIRECT_READER_SHARDS + reader_shard]
                 .0
