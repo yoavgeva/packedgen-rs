@@ -2442,31 +2442,49 @@ impl DirectProbation {
         });
         let target = self.shard_target.load(Ordering::Relaxed);
         let mask = self.shards.len() - 1;
+        // A shard another evictor holds is passed over; only when every
+        // eligible shard was busy does the pop wait, on the first of them.
+        let mut busy = None;
         for offset in 0..self.shards.len() {
             let lane = &self.shards[start.wrapping_add(offset) & mask];
             if lane.len.load(Ordering::Relaxed) <= target {
                 continue;
             }
-            let mut shard = lane.shard.lock();
-            if shard.records.len() <= target {
+            let Some(mut shard) = lane.shard.try_lock() else {
+                busy.get_or_insert(lane);
                 continue;
+            };
+            if let Some(handle) = Self::pop_above(lane, &mut shard, target, key) {
+                return Some(handle);
             }
-            let (handle, key_len) = shard
-                .records
-                .pop_front()
-                .expect("a shard above its target holds a record");
-            // Copy whole slices: extending from the drain iterator copies
-            // one byte at a time while the shard lock is held.
-            key.clear();
-            let (front, back) = shard.key_bytes.as_slices();
-            let from_front = key_len.min(front.len());
-            key.extend_from_slice(&front[..from_front]);
-            key.extend_from_slice(&back[..key_len - from_front]);
-            shard.key_bytes.drain(..key_len);
-            lane.len.store(shard.records.len(), Ordering::Relaxed);
-            return Some(handle);
         }
-        None
+        let lane = busy?;
+        Self::pop_above(lane, &mut lane.shard.lock(), target, key)
+    }
+
+    fn pop_above(
+        lane: &DirectProbationLane,
+        shard: &mut DirectProbationShard,
+        target: usize,
+        key: &mut Vec<u8>,
+    ) -> Option<DirectHandle> {
+        if shard.records.len() <= target {
+            return None;
+        }
+        let (handle, key_len) = shard
+            .records
+            .pop_front()
+            .expect("a shard above its target holds a record");
+        // Copy whole slices: extending from the drain iterator copies one byte
+        // at a time while the shard lock is held.
+        key.clear();
+        let (front, back) = shard.key_bytes.as_slices();
+        let from_front = key_len.min(front.len());
+        key.extend_from_slice(&front[..from_front]);
+        key.extend_from_slice(&back[..key_len - from_front]);
+        shard.key_bytes.drain(..key_len);
+        lane.len.store(shard.records.len(), Ordering::Relaxed);
+        Some(handle)
     }
 }
 
