@@ -2435,7 +2435,9 @@ impl DirectProbation {
         let start = DIRECT_PROBATION_CURSOR.with(|cursor| {
             let mut start = cursor.get();
             if start == usize::MAX {
-                start = doorkeeper_mix64(std::ptr::from_ref(cursor) as u64) as usize;
+                // Any bits will do: the address only spreads threads apart.
+                start = std::ptr::from_ref(cursor).addr();
+                start ^= start >> 7;
             }
             cursor.set(start.wrapping_add(1));
             start
@@ -9556,8 +9558,11 @@ mod tests {
         probation.shard_target.store(0, Ordering::Relaxed);
         // Handles are only stored and compared here, never dereferenced.
         let handle = |id: u64| published_direct_handle_from_index(NonMaxU64::new(id).unwrap());
-        let key =
-            |id: u64| -> Vec<u8> { (0..=id % 37).map(|byte| byte as u8 ^ id as u8).collect() };
+        let key = |id: u64| -> Vec<u8> {
+            (0..=id % 37)
+                .map(|byte| (byte ^ id).to_le_bytes()[0])
+                .collect()
+        };
         let mut expected = VecDeque::new();
         let mut popped = Vec::new();
         let mut wrapped = false;
@@ -9630,9 +9635,9 @@ mod tests {
                     .insert_discard_with_options(&id.to_le_bytes(), id, 1, None)
                     .expect("seed admission succeeds");
             }
-            let probes =
+            let probe_count =
                 || DIRECT_VICTIM_INDEX_PROBES.with(|probes| probes.load(Ordering::Relaxed));
-            let probes_before = probes();
+            let probes_before = probe_count();
             let evictions_before = cache.stats().evictions;
             for id in 1_024..4_096_u64 {
                 cache
@@ -9640,7 +9645,7 @@ mod tests {
                     .expect("admission succeeds");
             }
             let evicted = cache.stats().evictions - evictions_before;
-            let probed = probes() - probes_before;
+            let probed = probe_count() - probes_before;
             assert!(evicted >= 3_000, "{name}: only {evicted} evictions");
             // Validation and removal share one conditional index operation.
             assert!(
