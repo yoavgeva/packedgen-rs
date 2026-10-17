@@ -45,6 +45,9 @@ const SLOTS_PER_ENTRY_NUMERATOR: usize = 5;
 const SLOTS_PER_ENTRY_DENOMINATOR: usize = 4;
 /// Shards hold at least this many entries, so small caches use fewer shards.
 const MIN_SHARD_CAPACITY: usize = 64;
+/// Shards past four per thread hold at least this many entries, enough that
+/// splitting the cache further leaves hit ratios unchanged.
+const WIDE_SHARD_CAPACITY: usize = 256;
 /// Main-queue records encode a slot in 24 bits.
 const MAX_SHARD_SLOTS: usize = 1 << 24;
 /// Stale main-queue records examined per cleanup step.
@@ -228,7 +231,8 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
 
     /// Sets the shard count, rounded up to a power of two and capped so each
     /// shard holds at least one entry. By default it is four per available
-    /// thread, and fewer for small caches.
+    /// thread, fewer for small caches, and up to sixteen per thread for
+    /// caches large enough to give each shard at least 256 entries.
     #[must_use]
     pub fn shards(mut self, shards: usize) -> Self {
         self.shards = Some(shards.max(1).next_power_of_two());
@@ -318,11 +322,9 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
     {
         let max_entries = self.max_entries.max(1);
         let shards = self.shards.unwrap_or_else(|| {
-            let parallelism = std::thread::available_parallelism().map_or(1, usize::from);
-            (parallelism * 4).next_power_of_two().min(
-                (max_entries / MIN_SHARD_CAPACITY)
-                    .max(1)
-                    .next_power_of_two(),
+            default_shards(
+                max_entries,
+                std::thread::available_parallelism().map_or(1, usize::from),
             )
         });
         // Every shard holds an entry: a shard with none would admit one.
@@ -339,6 +341,15 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
         let shard_count = u64::try_from(shards).expect("the shard count fits u64");
         let base = max_entries / shards;
         let extra = max_entries % shards;
+        // Shards share one bucket count, sized for the largest share.
+        let shard_slots = ((base + usize::from(extra != 0)) * SLOTS_PER_ENTRY_NUMERATOR)
+            .div_ceil(SLOTS_PER_ENTRY_DENOMINATOR)
+            .max(SLOTS * 2);
+        let shard_buckets = shard_slots.div_ceil(SLOTS);
+        assert!(
+            u32::try_from(shard_buckets * SLOTS).is_ok(),
+            "a shard holds fewer than 2^32 slots"
+        );
         ShardedCache {
             shards: (0..shards)
                 .map(|shard| {
@@ -355,6 +366,14 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
                     )
                 })
                 .collect(),
+            table: (0..shards * shard_buckets)
+                .map(|_| Bucket {
+                    control: AtomicU64::new(0),
+                    handles: std::array::from_fn(|_| AtomicU64::new(0)),
+                    generations: AtomicU64::new(0),
+                })
+                .collect(),
+            shard_buckets,
             shard_shift: u64::BITS - shards.trailing_zeros(),
             epochs: Epochs::new(),
             retired: RetiredSlots::new(),
@@ -378,6 +397,26 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
     }
 }
 
+/// The default shard count for `max_entries` on `parallelism` threads: four
+/// shards per thread, fewer for small caches, and up to sixteen per thread
+/// for caches large enough to give each at least `WIDE_SHARD_CAPACITY`
+/// entries. Writers of different keys then rarely wait on one shard's lock.
+fn default_shards(max_entries: usize, parallelism: usize) -> usize {
+    let narrow = (parallelism * 4).next_power_of_two().min(
+        (max_entries / MIN_SHARD_CAPACITY)
+            .max(1)
+            .next_power_of_two(),
+    );
+    let wide_limit = max_entries / WIDE_SHARD_CAPACITY;
+    if wide_limit == 0 {
+        return narrow;
+    }
+    let wide = (parallelism * 16)
+        .next_power_of_two()
+        .min(1 << wide_limit.ilog2());
+    narrow.max(wide)
+}
+
 /// A bounded concurrent cache with lock-free reads and sharded writers.
 ///
 /// `get` clones the value, so `V` is typically small or an `Arc`; [`Self::pin`]
@@ -386,6 +425,9 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
 /// evict a little before it is full overall.
 pub struct ShardedCache<K, V, W = UnitWeighter, S = DefaultHashBuilder, L = NoListener> {
     shards: Box<[Shard<(K, V)>]>,
+    /// Every shard's buckets, `shard_buckets` per shard in shard order.
+    table: Box<[Bucket]>,
+    shard_buckets: usize,
     shard_shift: u32,
     epochs: Epochs,
     /// Unpublished entries awaiting reclamation. Declared before `slots`:
@@ -404,6 +446,29 @@ pub struct ShardedCache<K, V, W = UnitWeighter, S = DefaultHashBuilder, L = NoLi
     max_weight: u64,
     #[cfg(test)]
     clock_skew_nanos: AtomicU64,
+}
+
+/// A shard with its buckets: everything a write to it touches.
+struct ShardView<'cache, T> {
+    state: &'cache Shard<T>,
+    buckets: &'cache [Bucket],
+}
+
+impl<T> Clone for ShardView<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for ShardView<'_, T> {}
+
+impl<T> Deref for ShardView<'_, T> {
+    type Target = Shard<T>;
+
+    #[inline]
+    fn deref(&self) -> &Shard<T> {
+        self.state
+    }
 }
 
 /// One shard's loads in progress.
@@ -487,11 +552,12 @@ struct Bucket {
     generations: AtomicU64,
 }
 
-/// Readers load only `buckets`, and the limits never change, so this line
-/// stays in every core's cache. The writer lock and the state it guards
-/// change on every write, so they sit on cache lines of their own.
+/// A shard's writer state. Its buckets are its stretch of the cache's table,
+/// which readers find from the hash without loading the shard. The limits
+/// never change, so their line stays in every core's cache; the writer lock
+/// and the state it guards change on every write, so they sit on cache lines
+/// of their own.
 struct Shard<T> {
-    buckets: Box<[Bucket]>,
     limits: ShardLimits,
     writer: ShardLock,
     /// Tables publish handles to `Slot<T>`s; the cache's `RetiredSlots` and
@@ -682,7 +748,7 @@ impl LockedShard<'_> {
     /// slack, stale records are dropped from the front in order-preserving
     /// chunks, so no write holds the shard lock for a whole-queue pass; only
     /// a chunk with nothing stale falls back to compacting the whole queue.
-    fn enter_main<T>(&mut self, shard: &Shard<T>, record: u32) {
+    fn enter_main<T>(&mut self, shard: ShardView<'_, T>, record: u32) {
         if self.main.len() >= self.limits.main_limit() {
             let mut kept = [0_u32; MAIN_CLEANUP_CHUNK];
             let mut live = 0;
@@ -1218,12 +1284,13 @@ where
 
     /// Removes every entry. Inserts racing the sweep may survive it.
     pub fn clear(&self) {
-        for shard in &self.shards {
+        for index in 0..self.shards.len() {
+            let shard = self.view(index);
             let pin = self.epochs.pin();
             let mut removed = Removed::new();
             {
                 let mut writer = shard.lock();
-                for bucket in &shard.buckets {
+                for bucket in shard.buckets {
                     if bucket.control.load(Ordering::Relaxed) == 0 {
                         continue;
                     }
@@ -1269,8 +1336,19 @@ where
         usize::try_from(shard).expect("a shard index fits usize")
     }
 
-    fn shard(&self, hash: u64) -> &Shard<(K, V)> {
-        &self.shards[self.shard_index(hash)]
+    /// The key's shard, found from the hash without loading the shard.
+    #[inline]
+    fn shard(&self, hash: u64) -> ShardView<'_, (K, V)> {
+        self.view(self.shard_index(hash))
+    }
+
+    #[inline]
+    fn view(&self, index: usize) -> ShardView<'_, (K, V)> {
+        let first = index * self.shard_buckets;
+        ShardView {
+            state: &self.shards[index],
+            buckets: &self.table[first..first + self.shard_buckets],
+        }
     }
 
     /// Removes one entry from a shard over its limits: an unread or expired
@@ -1282,7 +1360,7 @@ where
     )]
     fn evict(
         &self,
-        shard: &Shard<(K, V)>,
+        shard: ShardView<'_, (K, V)>,
         writer: &mut LockedShard<'_>,
         pin: &EpochPin<'_>,
         protected: Option<Handle<(K, V)>>,
@@ -1375,7 +1453,7 @@ where
     )]
     fn relocate_candidate(
         &self,
-        shard: &Shard<(K, V)>,
+        shard: ShardView<'_, (K, V)>,
         writer: &mut LockedShard<'_>,
         pin: &EpochPin<'_>,
         hash: u64,
@@ -1421,7 +1499,7 @@ where
     )]
     fn evict_candidate(
         &self,
-        shard: &Shard<(K, V)>,
+        shard: ShardView<'_, (K, V)>,
         writer: &mut LockedShard<'_>,
         pin: &EpochPin<'_>,
         hash: u64,
@@ -1496,18 +1574,16 @@ impl<K, V, W, S, L> Drop for ShardedCache<K, V, W, S, L> {
     )]
     fn drop(&mut self) {
         // Exclusive access: no pin exists, so every published value can be
-        // dropped now; each slab drops its retired values and frees its
-        // chunks when the shards drop.
-        for shard in &self.shards {
-            for bucket in &shard.buckets {
-                for handle in &bucket.handles {
-                    let raw = handle.load(Ordering::Relaxed);
-                    if raw != 0 {
-                        // SAFETY: a published slot holds an initialized value,
-                        // each slot is published once, and nothing reaches it
-                        // after this exclusive drop.
-                        unsafe { drop_value(Handle::<(K, V)>::from_raw(raw).0) };
-                    }
+        // dropped now; the retired queues drop theirs, and the slot store
+        // frees the chunks, when their fields drop.
+        for bucket in &self.table {
+            for handle in &bucket.handles {
+                let raw = handle.load(Ordering::Relaxed);
+                if raw != 0 {
+                    // SAFETY: a published slot holds an initialized value,
+                    // each slot is published once, and nothing reaches it
+                    // after this exclusive drop.
+                    unsafe { drop_value(Handle::<(K, V)>::from_raw(raw).0) };
                 }
             }
         }
@@ -1517,22 +1593,7 @@ impl<K, V, W, S, L> Drop for ShardedCache<K, V, W, S, L> {
 impl<T> Shard<T> {
     fn new(capacity: usize, weight_limit: u64, probation_bps: u16) -> Self {
         let probation_target = capacity * usize::from(probation_bps) / 10_000;
-        let slots = (capacity.max(1) * SLOTS_PER_ENTRY_NUMERATOR)
-            .div_ceil(SLOTS_PER_ENTRY_DENOMINATOR)
-            .max(SLOTS * 2);
-        let buckets = slots.div_ceil(SLOTS);
-        assert!(
-            u32::try_from(buckets * SLOTS).is_ok(),
-            "a shard holds fewer than 2^32 slots"
-        );
         Self {
-            buckets: (0..buckets)
-                .map(|_| Bucket {
-                    control: AtomicU64::new(0),
-                    handles: std::array::from_fn(|_| AtomicU64::new(0)),
-                    generations: AtomicU64::new(0),
-                })
-                .collect(),
             limits: ShardLimits {
                 capacity,
                 weight: weight_limit,
@@ -1555,6 +1616,13 @@ impl<T> Shard<T> {
         }
     }
 
+    #[inline]
+    fn lock(&self) -> LockedShard<'_> {
+        self.writer.lock(&self.limits)
+    }
+}
+
+impl<T> ShardView<'_, T> {
     /// Starts loading the next probationary victim's bucket and entry, so an
     /// eviction finds both while the key is looked up, rather than loading
     /// the entry only once its bucket names it.
@@ -1566,11 +1634,6 @@ impl<T> Shard<T> {
             let handle = usize::try_from(next.handle).expect("a handle fits usize");
             prefetch(ptr::without_provenance::<u8>(handle));
         }
-    }
-
-    #[inline]
-    fn lock(&self) -> LockedShard<'_> {
-        self.writer.lock(&self.limits)
     }
 
     #[inline]
@@ -2132,7 +2195,7 @@ mod tests {
         // lived hundreds of buckets from home and every probe scanned the
         // table.
         let cache: ShardedCache<u64, u64> = ShardedCacheBuilder::new(800).shards(1).build();
-        let shard = &cache.shards[0];
+        let shard = cache.view(0);
         for key in 0..1_000_000_u64 {
             cache.insert(key, key);
             if key % 5 == 0 {
@@ -2287,7 +2350,7 @@ mod tests {
         for key in 0..12_u64 {
             assert_eq!(cache.get(&key), Some(key));
         }
-        let shard = &cache.shards[0];
+        let shard = cache.view(0);
         let overflow = |bucket: usize| {
             shard.buckets[bucket].control.load(Ordering::Relaxed) >> OVERFLOW_SHIFT & OVERFLOW_MAX
         };
@@ -2775,20 +2838,18 @@ mod tests {
         assert!(cache.len() as u64 <= capacity);
         let pin = cache.epochs.pin();
         let mut resident = 0;
-        for shard in &cache.shards {
-            for current in &shard.buckets {
-                for handle in &current.handles {
-                    let raw = handle.load(Ordering::Relaxed);
-                    if raw != 0 {
-                        // SAFETY: the table publishes this handle while
-                        // `pin` is held.
-                        let key = unsafe { entry(&pin, Handle::<(u64, Arc<()>)>::from_raw(raw)) }
-                            .value()
-                            .0;
-                        assert!(key >= refill, "cleared key {key} is still published");
-                        assert!(cache.contains_key(&key), "key {key} is not findable");
-                        resident += 1;
-                    }
+        for current in &cache.table {
+            for handle in &current.handles {
+                let raw = handle.load(Ordering::Relaxed);
+                if raw != 0 {
+                    // SAFETY: the table publishes this handle while
+                    // `pin` is held.
+                    let key = unsafe { entry(&pin, Handle::<(u64, Arc<()>)>::from_raw(raw)) }
+                        .value()
+                        .0;
+                    assert!(key >= refill, "cleared key {key} is still published");
+                    assert!(cache.contains_key(&key), "key {key} is not findable");
+                    resident += 1;
                 }
             }
         }
@@ -2886,12 +2947,59 @@ mod tests {
     }
 
     #[test]
+    fn large_caches_split_into_more_shards_of_at_least_256_entries() {
+        // Small caches keep four shards per thread, fewer when small.
+        assert_eq!(default_shards(1_000, 16), 16);
+        assert_eq!(default_shards(15_000, 16), 64);
+        // Larger ones split further, so writers rarely meet on a shard lock.
+        assert_eq!(default_shards(50_000, 16), 128);
+        assert_eq!(default_shards(200_000, 16), 256);
+        assert_eq!(default_shards(1_000_000, 16), 256);
+        assert_eq!(default_shards(1_000_000, 64), 1_024);
+        for entries in [32_768, 50_000, 65_536, 200_000, 1 << 20] {
+            for parallelism in [1, 4, 16, 64] {
+                let shards = default_shards(entries, parallelism);
+                assert!(shards.is_power_of_two());
+                assert!(
+                    shards <= (parallelism * 4).next_power_of_two() || entries / shards >= 256,
+                    "{shards} shards for {entries} entries on {parallelism} threads"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shards_share_one_bucket_table() {
+        // A read finds its shard's buckets from the hash alone, without
+        // loading the shard.
+        let cache = ShardedCacheBuilder::new(10_000)
+            .shards(8)
+            .build::<u64, u64>();
+        let per_shard = cache.shard_buckets;
+        assert_eq!(cache.table.len(), 8 * per_shard);
+        for index in 0..8 {
+            let view = cache.view(index);
+            assert_eq!(
+                view.buckets.as_ptr(),
+                cache.table[index * per_shard..].as_ptr()
+            );
+            assert_eq!(view.buckets.len(), per_shard);
+        }
+    }
+
+    #[test]
     fn more_shards_than_entries_still_bound_the_cache() {
-        let cache = ShardedCacheBuilder::new(100).shards(1024).build::<u64, u64>();
+        let cache = ShardedCacheBuilder::new(100)
+            .shards(1024)
+            .build::<u64, u64>();
         for key in 0..10_000 {
             cache.insert(key, key);
         }
-        assert!(cache.len() <= 100, "{} entries in a cache of 100", cache.len());
+        assert!(
+            cache.len() <= 100,
+            "{} entries in a cache of 100",
+            cache.len()
+        );
     }
 
     #[test]
@@ -2900,7 +3008,7 @@ mod tests {
         for key in 0..1_000 {
             cache.insert(key, key);
         }
-        let shard = &cache.shards[0];
+        let shard = cache.view(0);
         let writer = shard.lock();
         assert!(!writer.probation.is_empty());
         for probationary in &writer.probation {
