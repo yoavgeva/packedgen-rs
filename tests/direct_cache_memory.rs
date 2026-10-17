@@ -1,10 +1,8 @@
 //! Requested live bytes of a direct cache, measured via `stats_alloc` over the
 //! system allocator (not RSS). Probation adds a FIFO of recently published keys
-//! (with key copies) and a two-generation ghost filter. The filter and the
-//! reserved record buffers cost about 2.4 B/entry before any insert; a full
-//! FIFO's key copies bring a filled cache to about 3 to 5.5 B/entry. After
-//! churn the cache is smaller with probation, because it evicts recently
-//! inserted keys first.
+//! (with key copies) and a two-generation ghost filter. Together they cost
+//! about 3.5 to 4.5 B/entry, both when the cache is first filled and after its
+//! capacity has turned over.
 
 #![allow(missing_docs, clippy::cast_precision_loss)]
 
@@ -24,7 +22,9 @@ const SIZES: [usize; 3] = [65_536, 200_000, 524_288];
 // Allocation counters are process-wide: keep every measurement in one test.
 #[test]
 fn probation_adds_at_most_six_requested_bytes_per_entry() {
-    live_bytes_after_inserts(1_024, 1, true);
+    // The first index rebuild starts rayon's global pool for PtrHash builds;
+    // that one-time process state must not be charged to a measurement.
+    drop(filled_cache(SIZES[0], 2, true));
 
     let mut table = String::from(
         "| Entries | Inserted | Without probation B/entry | With probation B/entry | Probation B/entry |\n\
@@ -55,9 +55,23 @@ fn probation_adds_at_most_six_requested_bytes_per_entry() {
 }
 
 /// Live bytes held after inserting `capacities` times the capacity in
-/// distinct 32-byte keys.
+/// distinct 32-byte keys. Dropping the cache must release them again, which
+/// also checks the measurement itself.
 fn live_bytes_after_inserts(entries: usize, capacities: u64, probation: bool) -> usize {
     let region = Region::new(GLOBAL);
+    let cache = filled_cache(entries, capacities, probation);
+    let bytes = live_bytes(&region);
+    black_box(&cache);
+    drop(cache);
+    let leftover = live_bytes(&region);
+    assert!(
+        leftover <= bytes / 100,
+        "dropping the cache must release what it measured: {leftover} of {bytes} bytes remain"
+    );
+    bytes
+}
+
+fn filled_cache(entries: usize, capacities: u64, probation: bool) -> DirectPackedCache<u64> {
     let config = CacheConfig::new(u64::MAX).with_max_entries(entries);
     let cache = DirectPackedCache::try_new(if probation {
         config
@@ -74,14 +88,15 @@ fn live_bytes_after_inserts(entries: usize, capacities: u64, probation: bool) ->
         }
     }
     cache.maintain().unwrap();
+    cache
+}
+
+// `stats_alloc` already adds each reallocation's size change to
+// `bytes_allocated` or `bytes_deallocated`; adding `bytes_reallocated` again
+// would count it twice.
+fn live_bytes(region: &Region<'_, System>) -> usize {
     let stats = region.change();
-    let bytes = stats
-        .bytes_allocated
-        .saturating_sub(stats.bytes_deallocated)
-        .saturating_add_signed(stats.bytes_reallocated);
-    black_box(&cache);
-    drop(cache);
-    bytes
+    stats.bytes_allocated.saturating_sub(stats.bytes_deallocated)
 }
 
 fn key32(value: u64) -> [u8; 32] {

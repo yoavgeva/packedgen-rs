@@ -635,7 +635,7 @@ cache regressed from 58.00% to 54.75% (QuickCache: 63.84%; LRU: 0%). Real
 workloads are harder: on six ARC-paper traces the default improves on the old
 policy everywhere, but it trails QuickCache by 1 to 4 points in most
 configurations and by 9.7 points on DS1 at 4,000,000 entries. Probation adds
-about 3 to 5.5 requested bytes per entry to a filled cache. See
+about 3.5 to 4.5 requested bytes per entry. See
 [`docs/HIT_RATIO_SIMULATION_2026-10-16.md`](docs/HIT_RATIO_SIMULATION_2026-10-16.md).
 `CacheConfig::with_probation(0)` disables probation.
 

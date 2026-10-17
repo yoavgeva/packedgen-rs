@@ -184,25 +184,28 @@ capacity:
 
 | Entries | Filled, off | Filled, on | Probation, filled | After churn, off | After churn, on | Probation, churned |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 65,536 | 117.5 | 120.4 | +2.9 | 188.4 | 184.6 | -3.8 |
-| 200,000 | 120.1 | 125.5 | +5.4 | 233.5 | 225.6 | -8.0 |
-| 524,288 | 150.8 | 155.6 | +4.8 | 373.0 | 370.0 | -3.0 |
+| 65,536 | 103.6 | 107.3 | +3.7 | 115.4 | 119.9 | +4.5 |
+| 200,000 | 80.8 | 84.7 | +3.9 | 81.6 | 85.6 | +4.1 |
+| 524,288 | 68.2 | 71.8 | +3.6 | 71.2 | 75.0 | +3.8 |
 
 All values are bytes per entry. The ghost filter and the reserved record
-buffers cost 2.4 B/entry before any insert. A full FIFO's key copies add the
-rest of the filled overhead; about 1 B/entry of that is not accounted for by
-the structure sizes and is probably growth slack. After churn the cache is
-smaller with probation. A likely reason is that FIFO eviction removes recently
-inserted keys, which still sit in the index's mutable overlay. The test bounds
-the overhead at 6 B/entry.
+buffers cost 2.4 B/entry before any insert, and a full FIFO's key copies add
+about 0.8 B/entry. The remaining 0.4 to 1.3 B/entry is not accounted for by
+the structure sizes and is probably growth slack in the key-byte buffers. The
+cache's own footprint barely changes between filling and churning. The test
+bounds the probation overhead at 6 B/entry.
 
-The first implementation cost 6.1 to 8.3 B/entry filled. Its record cap was
-twice the target, its buffers grew by doubling, and its ghost filter was
-rounded up to a power of two. All three were fixed.
+Live bytes are `bytes_allocated - bytes_deallocated`. `stats_alloc` already
+folds each reallocation's size change into those two counters. An earlier
+version of this section also added `bytes_reallocated`, which counted every
+reallocation twice. That error showed the cache growing from 117-151 to
+184-373 B/entry under churn and probation saving memory after churn; neither
+is real. The test now also checks that dropping the cache releases what it
+measured.
 
-Separately from probation, inserting twice the capacity grows the cache's
-requested footprint from 117 to 151 B/entry to 184 to 373 B/entry. That
-churn growth is unexplained and worth its own investigation.
+The first implementation reserved a FIFO record cap of twice the target, grew
+its buffers by doubling, and rounded the ghost filter up to a power of two.
+All three were tightened.
 
 ## Throughput screen
 
@@ -240,8 +243,6 @@ and -0.6%, with its hit rate rising from 89.49% to 89.92%.
 - On real ARC traces, the default trails QuickCache by 1 to 4 points in most
   configurations and by 9.7 points on DS1 at 4,000,000 entries. Adaptive
   frequency admission is the next design step.
-- Churn grows the cache's requested footprint by up to 2.5x, independently of
-  probation.
 - Larger traces, such as Twitter or Meta cache traces in a one-key-per-line
   format via `file:PATH`, and a quiet-host throughput qualification are still
   to do.
