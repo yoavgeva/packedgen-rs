@@ -39,6 +39,7 @@ mod packed_map;
 mod route_cache;
 mod segment_cache;
 mod segmented_map;
+mod sharded_cache;
 mod swiss_map;
 
 pub use arena::{ArenaError, PackedKeyArena, PackedKeyRef};
@@ -99,6 +100,7 @@ pub use segment_cache::{
     SegmentExpiry,
 };
 pub use segmented_map::{KeyCompactionStats, SegmentedLoad, SegmentedMapStats, SegmentedSwissMap};
+pub use sharded_cache::ShardedCache;
 pub use swiss_map::{PackedSwissMap, SwissMapStats};
 
 /// Primary packed-generation map for arbitrary cloneable values.

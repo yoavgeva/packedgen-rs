@@ -3,7 +3,7 @@
 //! Usage: `bounded_cache_probe BACKEND WORKLOAD ENTRIES OPS WORKERS VALUE_BYTES
 //! SEED [LATENCY_STRIDE]`. BACKEND is `direct-owned`, `direct-borrowed`,
 //! `direct-guarded-owned`, `direct-guarded-borrowed`, `direct-background`, or
-//! `quickcache`. The direct backends run full maintenance on each worker every
+//! `sharded`, or `quickcache`. The direct backends run full maintenance on each worker every
 //! 4096 writes, inside the timing; `direct-background` instead starts the
 //! cache's maintenance thread (a 10 ms interval) and reads owned values.
 //! The guarded insertion variants require `cold-fill` (unique new keys).
@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use packedgen::{
     CacheAdmissionOutcome, CacheConfig, CacheWriteOutcome, DirectCacheGuard, DirectPackedCache,
+    ShardedCache,
 };
 use quick_cache::{Weighter, sync::Cache};
 
@@ -330,6 +331,60 @@ impl<const OWNED: bool, const GUARDED: bool> Session for DirectSession<'_, OWNED
     }
 }
 
+struct ShardedSession<'a>(&'a ShardedCache<Key, Value>);
+
+impl Session for ShardedSession<'_> {
+    fn apply(&mut self, operation: &Operation, config: &Config, sample: &mut Sample) {
+        match operation.action {
+            Action::Read => {
+                let value = self.0.get(&operation.key);
+                sample.observe(value.as_ref(), &operation.key);
+                if value.is_none() && config.workload == Workload::Turnover {
+                    self.0.insert(
+                        operation.key,
+                        payload(&operation.key, config.value_bytes, operation.version),
+                    );
+                    sample.writes += 1;
+                }
+            }
+            Action::Insert | Action::Replace | Action::DeleteReinsert => {
+                if matches!(operation.action, Action::DeleteReinsert) {
+                    sample.removed += u64::from(self.0.remove(&operation.key));
+                }
+                let value = payload(&operation.key, config.value_bytes, operation.version);
+                sample.writes += 1;
+                self.0.insert(operation.key, value);
+                if matches!(operation.action, Action::Replace) {
+                    sample.replacements += 1;
+                } else {
+                    sample.inserts += 1;
+                }
+            }
+        }
+    }
+}
+
+fn sharded_run(config: &Config) -> (Sample, Duration, usize, u64, Duration) {
+    let cache = ShardedCache::new(config.capacity_entries());
+    for id in 0..seed_count(config) {
+        let key = key(id as u64);
+        cache.insert(key, payload(&key, config.value_bytes, 0));
+    }
+    if config.workload.is_resident() {
+        assert_eq!(
+            cache.len(),
+            config.entries,
+            "resident control requires every seed to remain resident"
+        );
+    }
+    let (sample, elapsed) = parallel_run(config, || ShardedSession(&cache));
+    let entries = cache.len();
+    let weight = entries as u64 * config.charge();
+    validate_result(config, &sample, entries, weight);
+    validate_resident_values(config, |key| cache.get(key));
+    (sample, elapsed, entries, weight, Duration::ZERO)
+}
+
 struct QuickSession<'a>(&'a QuickCache);
 
 impl Session for QuickSession<'_> {
@@ -618,6 +673,7 @@ fn main() {
         "direct-guarded-borrowed" => direct_guarded_run::<false>(&config),
         "direct-background" => direct_background_run(&config),
         "quickcache" => quick_run(&config),
+        "sharded" => sharded_run(&config),
         _ => panic!("unknown backend: {backend}"),
     };
     sample.latencies.sort_unstable();
