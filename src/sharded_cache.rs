@@ -241,8 +241,9 @@ struct ShardWriter {
     weight_limit: u64,
     /// The CLOCK hand: the next slot the main-area sweep examines.
     hand: usize,
-    /// Probationary keys in insertion order: (handle, slot, hash low bits).
-    probation: VecDeque<(u64, u32, u32)>,
+    /// Probationary keys in insertion order, as (handle, key hash). A pop
+    /// finds the handle in the key's two buckets, wherever it was moved.
+    probation: VecDeque<(u64, u64)>,
     probation_target: usize,
     /// Past this many records the oldest is dropped, leaving its key to the
     /// main sweep, so records never copy more than a share of the keys.
@@ -359,6 +360,11 @@ impl<K: Hash + Eq, V, W: Weighter<K, V>, S: BuildHasher> ShardedCache<K, V, W, S
     /// `u32::MAX >> 1`, is not cached; any previous value for `key` is then
     /// removed, so a reader never sees a value the caller replaced. Returns
     /// whether the value was cached.
+    ///
+    /// # Panics
+    ///
+    /// Only on a bug: a placement that fails after freeing one of the key's
+    /// two buckets.
     #[allow(
         unsafe_code,
         reason = "publishes, replaces, and retires arena handles under the shard lock"
@@ -407,27 +413,29 @@ impl<K: Hash + Eq, V, W: Weighter<K, V>, S: BuildHasher> ShardedCache<K, V, W, S
                     };
                     retired.push(victim);
                 }
-                let slot = if let Some(slot) = shard.place(hash, handle) {
-                    slot
-                } else {
-                    // Both candidate buckets are full: make room in them.
-                    retired.push(self.evict_candidate(shard, &mut writer, &pin, hash));
-                    shard
-                        .place(hash, handle)
-                        .expect("evicting from a candidate bucket frees a slot")
-                };
+                if shard.place(hash, handle).is_none() {
+                    // Both candidate buckets are full: move a resident key to
+                    // its other bucket, or else evict one of them.
+                    if !self.relocate_candidate(shard, &pin, hash) {
+                        #[cfg(test)]
+                        WINDOW_EVICTIONS.with(|count| count.set(count.get() + 1));
+                        retired.push(self.evict_candidate(shard, &mut writer, &pin, hash));
+                    }
+                    let placed = shard.place(hash, handle);
+                    assert!(
+                        placed.is_some(),
+                        "relocation or eviction frees a candidate slot"
+                    );
+                }
                 writer.len += 1;
                 writer.weight += weight;
                 if !writer.ghost.contains(hash) {
                     if writer.probation.len() >= writer.probation_limit {
                         writer.probation.pop_front();
                     }
-                    writer.probation.push_back((
-                        handle.index_value().get(),
-                        // `Shard::new` bounds every shard below 2^32 slots.
-                        u32::try_from(slot).unwrap_or(u32::MAX),
-                        low_hash_bits(hash),
-                    ));
+                    writer
+                        .probation
+                        .push_back((handle.index_value().get(), hash));
                 }
             }
             writer.publish(shard);
@@ -493,15 +501,15 @@ impl<K: Hash + Eq, V, W: Weighter<K, V>, S: BuildHasher> ShardedCache<K, V, W, S
         protected: Option<DirectHandle>,
     ) -> Option<DirectHandle> {
         while writer.probation.len() > writer.probation_target {
-            let (raw, slot, low_hash) = writer
+            let (raw, hash) = writer
                 .probation
                 .pop_front()
                 .expect("probation is above its target");
-            let slot = slot as usize;
-            if shard.bucket(slot).handles[slot % SLOTS].load(Ordering::Relaxed) != raw
-                || protected.is_some_and(|protected| protected.index_value().get() == raw)
-            {
+            let Some(slot) = shard.slot_of(hash, raw) else {
                 // Removed or replaced since it was enrolled.
+                continue;
+            };
+            if protected.is_some_and(|protected| protected.index_value().get() == raw) {
                 continue;
             }
             let handle = handle_from_raw(raw);
@@ -510,8 +518,8 @@ impl<K: Hash + Eq, V, W: Weighter<K, V>, S: BuildHasher> ShardedCache<K, V, W, S
                 // Read during probation: it stays, under the main sweep.
                 continue;
             }
-            let removed = shard.clear(slot, shard.home(u64::from(low_hash)));
-            writer.ghost.remember(u64::from(low_hash));
+            let removed = shard.clear(slot, shard.home(hash));
+            writer.ghost.remember(hash);
             writer.len -= 1;
             // SAFETY: the clear unpublished `removed` while `pin` is held.
             writer.weight -= unsafe { entry(pin, removed) }.weight();
@@ -541,6 +549,46 @@ impl<K: Hash + Eq, V, W: Weighter<K, V>, S: BuildHasher> ShardedCache<K, V, W, S
             return Some(removed);
         }
         None
+    }
+
+    /// Frees a slot in the two full buckets `hash` may occupy by moving one
+    /// resident key to its own other bucket. The key is published at its new
+    /// slot before its old slot is cleared, so readers always find it.
+    #[allow(
+        unsafe_code,
+        reason = "dereferences handles published in this shard while `pin` is held"
+    )]
+    fn relocate_candidate(
+        &self,
+        shard: &Shard,
+        pin: &DirectArenaPin<'_, (K, V)>,
+        hash: u64,
+    ) -> bool {
+        let (home, alternate) = shard.candidates(hash);
+        for bucket in [home, alternate] {
+            for slot in bucket * SLOTS..(bucket + 1) * SLOTS {
+                let raw = shard.bucket(slot).handles[slot % SLOTS].load(Ordering::Relaxed);
+                let handle = handle_from_raw(raw);
+                // SAFETY: the shard lock keeps this published handle in the table.
+                let resident = unsafe { entry(pin, handle) };
+                let resident_hash = self.hash_builder.hash_one(&resident.value().0);
+                let (resident_home, resident_alternate) = shard.candidates(resident_hash);
+                let other = if bucket == resident_home {
+                    resident_alternate
+                } else {
+                    resident_home
+                };
+                if other == home || other == alternate {
+                    continue;
+                }
+                if shard.place_at(other, resident_home, resident_hash, handle) {
+                    let moved = shard.clear(slot, resident_home);
+                    debug_assert_eq!(moved.index_value(), handle.index_value());
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Removes the first unread entry, sweeping access marks, from the two
@@ -770,6 +818,37 @@ impl Shard {
         self.place_in(alternate, hash, handle)
     }
 
+    /// The slot in the key's two buckets that holds `raw`, if any.
+    fn slot_of(&self, hash: u64, raw: u64) -> Option<usize> {
+        let (home, alternate) = self.candidates(hash);
+        [home, alternate].into_iter().find_map(|bucket| {
+            self.buckets[bucket]
+                .handles
+                .iter()
+                .position(|handle| handle.load(Ordering::Relaxed) == raw)
+                .map(|slot| bucket * SLOTS + slot)
+        })
+    }
+
+    /// Publishes `handle` in `bucket`, one of the key's candidates, counting
+    /// it in its home's overflow when `bucket` is the alternate. Returns
+    /// whether `bucket` had a free slot. Requires the shard lock.
+    fn place_at(&self, bucket: usize, home: usize, hash: u64, handle: DirectHandle) -> bool {
+        if zero_tag_bytes(self.buckets[bucket].control.load(Ordering::Relaxed)) == 0 {
+            return false;
+        }
+        if bucket != home {
+            let home_bucket = &self.buckets[home];
+            let control = home_bucket.control.load(Ordering::Relaxed);
+            if control >> OVERFLOW_SHIFT & OVERFLOW_MAX < OVERFLOW_MAX {
+                home_bucket
+                    .control
+                    .store(control + (1 << OVERFLOW_SHIFT), Ordering::Release);
+            }
+        }
+        self.place_in(bucket, hash, handle).is_some()
+    }
+
     fn place_in(&self, bucket: usize, hash: u64, handle: DirectHandle) -> Option<usize> {
         let current = &self.buckets[bucket];
         let control = current.control.load(Ordering::Relaxed);
@@ -814,6 +893,11 @@ impl Shard {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static WINDOW_EVICTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 const BYTE_ONES: u64 = 0x0101_0101_0101_0101;
 /// High bits of the six tag bytes.
 const TAG_HIGH_BITS: u64 = 0x0000_8080_8080_8080;
@@ -830,12 +914,6 @@ const fn zero_tag_bytes(word: u64) -> u64 {
 /// never zero.
 fn tag(hash: u64) -> u8 {
     (hash >> 32).to_le_bytes()[0].max(1)
-}
-
-/// The low 32 hash bits, which choose the home bucket and ghost position.
-fn low_hash_bits(hash: u64) -> u32 {
-    let bytes = hash.to_le_bytes();
-    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
 fn handle_from_raw(raw: u64) -> DirectHandle {
@@ -1075,6 +1153,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn full_candidate_buckets_rarely_force_an_eviction() {
+        // Evicting from a key's two buckets overrides the cache's policy, so
+        // relocation must make room in nearly every case.
+        let cache = ShardedCacheBuilder::new(10_000).shards(1).build();
+        let before = WINDOW_EVICTIONS.with(std::cell::Cell::get);
+        for key in 0..200_000_u64 {
+            cache.insert(key, key);
+            if key % 4 == 0 {
+                let _ = cache.get(&(key / 2));
+            }
+        }
+        let forced = WINDOW_EVICTIONS.with(std::cell::Cell::get) - before;
+        assert!(
+            forced * 1_000 <= 200_000,
+            "{forced} of 200000 inserts evicted from a full pair"
+        );
     }
 
     #[test]
