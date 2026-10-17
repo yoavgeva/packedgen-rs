@@ -50,6 +50,11 @@ const DIRECT_RECYCLED_BOXED_TAG: usize = 2;
 const DIRECT_POINTER_TAGS: usize = DIRECT_BOXED_TAG | DIRECT_RECYCLED_BOXED_TAG;
 #[cfg(feature = "prepared-keys")]
 const DIRECT_RECYCLED_BOX_CAPACITY_PER_SHARD: usize = DIRECT_RECLAIM_BATCH * 2;
+/// The largest weight one direct entry can account. The weight word's top bit
+/// is the second access mark.
+pub(crate) const DIRECT_MAX_WEIGHT: u32 = u32::MAX >> 1;
+const DIRECT_WEIGHT_MASK: u64 = DIRECT_MAX_WEIGHT as u64;
+const DIRECT_SECOND_ACCESS_BIT: u64 = 1_u64 << 31;
 const DIRECT_EXPIRY_SHIFT: u32 = 32;
 const DIRECT_EXPIRY_MASK: u64 = 0x7fff_ffff_u64 << DIRECT_EXPIRY_SHIFT;
 const DIRECT_NEVER_EXPIRES: u32 = 0x7fff_ffff;
@@ -463,6 +468,7 @@ pub(crate) struct DirectArenaEntry<V> {
 
 impl<V> DirectArenaEntry<V> {
     fn new(value: V, weight: u32, expires_at: u64) -> Self {
+        debug_assert!(weight <= DIRECT_MAX_WEIGHT);
         Self {
             metadata: AtomicU64::new(
                 u64::from(weight) | (u64::from(encode_direct_expiry(expires_at)) << 32),
@@ -476,7 +482,7 @@ impl<V> DirectArenaEntry<V> {
     }
 
     pub(crate) fn weight(&self) -> u64 {
-        self.metadata.load(Ordering::Relaxed) & u64::from(u32::MAX)
+        self.metadata.load(Ordering::Relaxed) & DIRECT_WEIGHT_MASK
     }
 
     pub(crate) fn expires_at(&self) -> u64 {
@@ -508,17 +514,40 @@ impl<V> DirectArenaEntry<V> {
         }
     }
 
+    /// Records a read: the first raises one access mark, later ones a second.
+    /// A key whose marks are both set is only loaded, so hot keys stay shared.
     pub(crate) fn mark_accessed(&self) {
-        if self.metadata.load(Ordering::Relaxed) & DIRECT_ACCESS_BIT == 0 {
+        let metadata = self.metadata.load(Ordering::Relaxed);
+        if metadata & DIRECT_ACCESS_BIT == 0 {
             self.metadata.fetch_or(DIRECT_ACCESS_BIT, Ordering::Relaxed);
+        } else if metadata & DIRECT_SECOND_ACCESS_BIT == 0 {
+            self.metadata
+                .fetch_or(DIRECT_SECOND_ACCESS_BIT, Ordering::Relaxed);
         }
     }
 
+    /// Clears one access mark and reports whether there was one, so a key read
+    /// twice survives two eviction sweeps.
     pub(crate) fn take_accessed(&self) -> bool {
-        self.metadata
-            .fetch_and(!DIRECT_ACCESS_BIT, Ordering::Relaxed)
-            & DIRECT_ACCESS_BIT
-            != 0
+        let mut current = self.metadata.load(Ordering::Relaxed);
+        loop {
+            let mark = if current & DIRECT_SECOND_ACCESS_BIT != 0 {
+                DIRECT_SECOND_ACCESS_BIT
+            } else if current & DIRECT_ACCESS_BIT != 0 {
+                DIRECT_ACCESS_BIT
+            } else {
+                return false;
+            };
+            match self.metadata.compare_exchange_weak(
+                current,
+                current & !mark,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
     }
 }
 
@@ -3340,13 +3369,21 @@ mod tests {
     }
 
     #[test]
-    fn direct_entry_access_bit_round_trips() {
-        let entry = DirectArenaEntry::new(7_u64, 8, u64::MAX);
+    fn direct_entry_access_marks_count_two_reads() {
+        // A key read twice survives two eviction sweeps, one read only one.
+        let entry = DirectArenaEntry::new(7_u64, DIRECT_MAX_WEIGHT, u64::MAX);
         assert!(!entry.take_accessed());
-        entry.mark_accessed();
         entry.mark_accessed();
         assert!(entry.take_accessed());
         assert!(!entry.take_accessed());
+        for _ in 0..3 {
+            entry.mark_accessed();
+        }
+        assert_eq!(entry.weight(), u64::from(DIRECT_MAX_WEIGHT));
+        assert!(entry.take_accessed());
+        assert!(entry.take_accessed());
+        assert!(!entry.take_accessed());
+        assert_eq!(entry.weight(), u64::from(DIRECT_MAX_WEIGHT));
     }
 
     #[test]

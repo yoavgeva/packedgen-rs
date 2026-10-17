@@ -16,9 +16,9 @@ use parking_lot::Mutex;
 use crate::AtomicPreparedKey;
 use crate::cache_arena::{
     ArenaAllocationError, ArenaEntry, ArenaHandle, ArenaPin, ArenaValue, DIRECT_MAX_EXPIRY_TICK,
-    DirectArenaEntry, DirectArenaMutationPin, DirectArenaPin, DirectArenaReservation,
-    DirectArenaValue, DirectHandle, DirectValueArena, MAX_EXPIRY_TICK, RemovedDirectHandle,
-    ValueArena, direct_arena_thread,
+    DIRECT_MAX_WEIGHT, DirectArenaEntry, DirectArenaMutationPin, DirectArenaPin,
+    DirectArenaReservation, DirectArenaValue, DirectHandle, DirectValueArena, MAX_EXPIRY_TICK,
+    RemovedDirectHandle, ValueArena, direct_arena_thread,
 };
 use crate::generation_hash::GenerationKeyHash;
 use crate::{
@@ -29,6 +29,8 @@ use crate::{
 
 const NEVER_EXPIRES: u64 = u64::MAX;
 const DEFAULT_OVERLAY_CAPACITY: usize = 65_536;
+/// The smallest default overlay of an entry-limited direct cache.
+const MIN_DIRECT_DEFAULT_OVERLAY_CAPACITY: usize = 64;
 const DEFAULT_ARENA_PARTITIONS: usize = 64;
 const DEFAULT_EVICTION_BATCH: usize = 64;
 const DEFAULT_PROBATION_BPS: u16 = 200;
@@ -121,6 +123,11 @@ const DIRECT_ASYNC_VICTIM_SAMPLE_MAX: usize = 1_024;
 /// access marks only protects read entries while it holds several candidates
 /// per removal; an equal-sized window evicts every candidate it samples.
 const DIRECT_VICTIM_CANDIDATES_PER_REMOVAL: usize = 4;
+/// Sampling rounds one eviction batch may take to find unread entries. On the
+/// ARC paper's traces a CLOCK model limited to four candidates per removal
+/// lost up to 2.4 points of hit rate against an unbounded hand, and at most
+/// 0.2 with sixty-four, which sixteen rounds of four allow.
+const DIRECT_VICTIM_SWEEP_ROUNDS: usize = 16;
 const DIRECT_DOORKEEPER_GROUP_LOCK: u64 = 1_u64 << 63;
 const DIRECT_DOORKEEPER_EPOCH_MASK: u64 = DIRECT_DOORKEEPER_GROUP_LOCK - 1;
 const DIRECT_DOORKEEPER_INVALID_EPOCH: u64 = DIRECT_DOORKEEPER_EPOCH_MASK;
@@ -138,7 +145,8 @@ fn doorkeeper_hashes_from_route(route: u64) -> [u64; 2] {
 pub struct CacheConfig {
     max_weight: u64,
     max_entries: Option<usize>,
-    overlay_capacity: usize,
+    /// `None` uses the cache type's default; see [`Self::with_overlay_capacity`].
+    overlay_capacity: Option<usize>,
     arena_partitions: usize,
     eviction_batch: usize,
     admission_doorkeeper_entries: Option<usize>,
@@ -162,7 +170,7 @@ impl CacheConfig {
         Self {
             max_weight,
             max_entries: None,
-            overlay_capacity: DEFAULT_OVERLAY_CAPACITY,
+            overlay_capacity: None,
             arena_partitions: DEFAULT_ARENA_PARTITIONS,
             eviction_batch: DEFAULT_EVICTION_BATCH,
             admission_doorkeeper_entries: None,
@@ -189,10 +197,33 @@ impl CacheConfig {
     }
 
     /// Sets the initial adaptive index overlay budget.
+    ///
+    /// The default is 65,536. A [`DirectPackedCache`] with an entry limit
+    /// defaults to that limit instead, between 64 and 65,536: an overlay much
+    /// larger than the cache fills with evicted keys' slots between rebuilds,
+    /// which leaves sampled eviction too few live candidates.
     #[must_use]
     pub const fn with_overlay_capacity(mut self, overlay_capacity: usize) -> Self {
-        self.overlay_capacity = overlay_capacity;
+        self.overlay_capacity = Some(overlay_capacity);
         self
+    }
+
+    const fn packed_overlay_capacity(&self) -> usize {
+        match self.overlay_capacity {
+            Some(capacity) => capacity,
+            None => DEFAULT_OVERLAY_CAPACITY,
+        }
+    }
+
+    fn direct_overlay_capacity(&self) -> usize {
+        match (self.overlay_capacity, self.max_entries) {
+            (Some(capacity), _) => capacity,
+            (None, Some(entries)) => entries.clamp(
+                MIN_DIRECT_DEFAULT_OVERLAY_CAPACITY,
+                DEFAULT_OVERLAY_CAPACITY,
+            ),
+            (None, None) => DEFAULT_OVERLAY_CAPACITY,
+        }
     }
 
     /// Sets the number of independently allocated value-arena partitions.
@@ -467,7 +498,9 @@ pub enum CacheInsertError {
         /// Configured cache budget.
         maximum: u64,
     },
-    /// One entry cannot account more than four GiB in the compact arena.
+    /// One entry cannot account four GiB or more in `PackedCache`, or two GiB
+    /// or more in `DirectPackedCache`, whose weight word also holds an access
+    /// mark.
     WeightNotCompact {
         /// Supplied item charge.
         weight: u64,
@@ -2130,6 +2163,26 @@ impl DirectVictimBatch {
         });
     }
 
+    /// Candidates this batch may evict without taking a second chance.
+    fn eligible(&self) -> usize {
+        self.victims
+            .iter()
+            .filter(|victim| victim.expired || !victim.accessed)
+            .count()
+    }
+
+    /// Adds a later sampling round, merging entries sampled in both.
+    fn absorb(&mut self, round: Self) {
+        let key_offset = self.key_bytes.len();
+        self.key_bytes.extend_from_slice(&round.key_bytes);
+        self.victims
+            .extend(round.victims.into_iter().map(|mut victim| {
+                victim.key.key_start += key_offset;
+                victim
+            }));
+        self.merge_repeated_samples();
+    }
+
     fn key(&self, victim: &DirectVictim) -> &[u8] {
         self.key_slice(victim.key)
     }
@@ -2212,8 +2265,19 @@ const DIRECT_PROBATION_MAX_SHARDS: usize = 16;
 /// Round-robin pops across shards approximate one FIFO only when each shard
 /// holds many records, so small caches use fewer shards.
 const DIRECT_PROBATION_MIN_SHARD_RECORDS: usize = 64;
-/// Ghost filter bits per remembered key in each of its two generations.
-const DIRECT_GHOST_BITS_PER_KEY: usize = 16;
+/// Ghost filter bits per remembered key in each generation. A false positive
+/// lets a one-hit key skip probation; at 16 bits and three set bits about 2%
+/// of new keys did, costing up to a point of hit rate on scan-heavy traces.
+const DIRECT_GHOST_BITS_PER_KEY: usize = 32;
+/// Bits set per remembered key, all within one 64-bit word.
+const DIRECT_GHOST_KEY_BITS: u32 = 5;
+/// The ghost remembers between three and four generations of evicted keys.
+const DIRECT_GHOST_GENERATIONS: usize = 4;
+/// Each generation holds an eighth of the capacity, so evicted keys are
+/// remembered for three eighths to half of it. A ghost of a full capacity
+/// readmitted loop-like keys straight to the main area and lost ten points of
+/// hit rate on the ARC paper's DS1 trace at 4,000,000 entries.
+const DIRECT_GHOST_GENERATION_DIVISOR: usize = 8;
 
 /// Probationary FIFO and ghost history for newly published direct-cache keys.
 ///
@@ -2242,7 +2306,9 @@ impl DirectProbation {
         (config.probation_bps != 0).then(|| {
             Self::new(
                 config.probation_bps,
-                config.max_entries.unwrap_or(config.overlay_capacity),
+                config
+                    .max_entries
+                    .unwrap_or_else(|| config.direct_overlay_capacity()),
             )
         })
     }
@@ -2268,7 +2334,9 @@ impl DirectProbation {
             next_shard: AtomicUsize::new(0),
             share_bps,
             record_limit: AtomicUsize::new(0),
-            ghost: DirectGhostFilter::new(expected_entries.div_ceil(2)),
+            ghost: DirectGhostFilter::new(
+                expected_entries.div_ceil(DIRECT_GHOST_GENERATION_DIVISOR),
+            ),
         };
         probation.note_population(expected_entries);
         probation
@@ -2329,14 +2397,15 @@ impl DirectProbation {
     }
 }
 
-/// Two-generation approximate set of keys recently evicted from probation.
+/// Approximate set of keys recently evicted from probation, in a ring of
+/// generations.
 ///
-/// Each generation holds up to `rotate_every` keys before the older one is
-/// cleared, so a key is remembered for between one and two generations. A
+/// Each generation holds up to `rotate_every` keys before the oldest one is
+/// cleared, so a key is remembered for between three and four generations. A
 /// false positive lets a new key skip probation, which is the cache's
 /// behavior without probation; it never affects key/value correctness.
 struct DirectGhostFilter {
-    generations: [Box<[AtomicU64]>; 2],
+    generations: [Box<[AtomicU64]>; DIRECT_GHOST_GENERATIONS],
     current: AtomicUsize,
     remembered: AtomicUsize,
     rotate_every: usize,
@@ -2350,27 +2419,27 @@ impl DirectGhostFilter {
         let words = rotate_every
             .saturating_mul(DIRECT_GHOST_BITS_PER_KEY)
             .div_ceil(64);
-        let make_generation = || {
-            std::iter::repeat_with(|| AtomicU64::new(0))
-                .take(words)
-                .collect::<Box<[_]>>()
-        };
         Self {
-            generations: [make_generation(), make_generation()],
+            generations: std::array::from_fn(|_| {
+                std::iter::repeat_with(|| AtomicU64::new(0))
+                    .take(words)
+                    .collect::<Box<[_]>>()
+            }),
             current: AtomicUsize::new(0),
             remembered: AtomicUsize::new(0),
             rotate_every,
         }
     }
 
-    /// One word from the route and three bits from an independent mix, which
-    /// keeps false positives near 0.5% per full generation at 16 bits a key.
+    /// One word from the route and five bits from an independent mix, which
+    /// keeps false positives near 0.05% per full generation at 32 bits a key,
+    /// about 0.2% across all generations.
     fn location(&self, route: u64) -> (usize, u64) {
         let words = u128::try_from(self.generations[0].len()).expect("usize fits u128");
         let word = usize::try_from((u128::from(route) * words) >> 64)
             .expect("the scaled word index is below the word count");
         let bits = doorkeeper_mix64(route ^ 0x9e37_79b9_7f4a_7c15);
-        let mask = (0..3).fold(0_u64, |mask, lane| {
+        let mask = (0..DIRECT_GHOST_KEY_BITS).fold(0_u64, |mask, lane| {
             mask | 1_u64 << ((bits >> (lane * 6)) & 63)
         });
         (word, mask)
@@ -2391,11 +2460,11 @@ impl DirectGhostFilter {
             // Exactly one caller observes the boundary. Racing callers may
             // land in either generation, which only shifts how long they are
             // remembered.
-            let older = 1 - current;
-            for word in &self.generations[older] {
+            let oldest = (current + 1) % DIRECT_GHOST_GENERATIONS;
+            for word in &self.generations[oldest] {
                 word.store(0, Ordering::Relaxed);
             }
-            self.current.store(older, Ordering::Relaxed);
+            self.current.store(oldest, Ordering::Relaxed);
             self.remembered.store(0, Ordering::Relaxed);
         }
     }
@@ -2584,7 +2653,7 @@ impl<V> PackedCache<V> {
         if config.max_entries == Some(0) {
             return Err(CacheBuildError::Config(CacheConfigError::ZeroEntries));
         }
-        if config.overlay_capacity == 0 {
+        if config.packed_overlay_capacity() == 0 {
             return Err(CacheBuildError::Config(
                 CacheConfigError::ZeroOverlayCapacity,
             ));
@@ -2626,7 +2695,7 @@ impl<V> PackedCache<V> {
         }
         let index = LockFreeAtomicU64GenerationMap::try_from_entries_with_options(
             std::iter::empty::<(Box<[u8]>, NonMaxU64)>(),
-            config.overlay_capacity,
+            config.packed_overlay_capacity(),
             AtomicGenerationOverlay::AtomicAdaptive,
             AtomicGenerationBaseFilter::EmbeddedFingerprint,
         )?;
@@ -5328,7 +5397,7 @@ impl<V> DirectPackedCache<V> {
         let index =
             LockFreeAtomicU64GenerationMap::try_from_entries_with_options_and_writer_hash_and_index(
             std::iter::empty::<(Box<[u8]>, NonMaxU64)>(),
-            config.overlay_capacity,
+            config.direct_overlay_capacity(),
             AtomicGenerationOverlay::AtomicAdaptive,
             AtomicGenerationBaseFilter::EmbeddedFingerprint,
             hash_builder,
@@ -5462,7 +5531,7 @@ impl<V> DirectPackedCache<V> {
         let index_result =
             LockFreeAtomicU64GenerationMap::try_from_entries_with_options_and_writer_hash_and_index(
                 indexed_entries,
-                config.overlay_capacity,
+                config.direct_overlay_capacity(),
                 AtomicGenerationOverlay::AtomicAdaptive,
                 AtomicGenerationBaseFilter::EmbeddedFingerprint,
                 hash_builder,
@@ -7460,7 +7529,7 @@ impl<V> DirectPackedCache<V> {
                 maximum: self.config.max_weight,
             });
         }
-        u32::try_from(weight).map_err(|_| {
+        direct_compact_weight(weight).ok_or_else(|| {
             #[cfg(feature = "cache-production-diagnostics")]
             self.diagnostics
                 .rejected_weight_not_compact
@@ -8032,6 +8101,28 @@ impl<V> DirectPackedCache<V> {
             protected,
             victim_sample_window,
         );
+        if !expired_only {
+            // Like a CLOCK hand, keep sweeping past read entries instead of
+            // evicting them. Each round takes one access mark from every
+            // sampled entry, so even a fully read cache converges; the cap
+            // bounds one batch's latency.
+            for _ in 1..DIRECT_VICTIM_SWEEP_ROUNDS {
+                if batch.eligible() >= removal_target {
+                    break;
+                }
+                let round = self.collect_victim_candidates(
+                    &pin,
+                    now,
+                    expired_only,
+                    protected,
+                    victim_sample_window,
+                );
+                if round.is_empty() {
+                    break;
+                }
+                batch.absorb(round);
+            }
+        }
         #[cfg(feature = "cache-pressure-timing")]
         self.diagnostics
             .record_victim_collection(collection_started);
@@ -8759,7 +8850,7 @@ fn validate_direct_config(config: &CacheConfig) -> Result<(), CacheConfigError> 
     if config.max_entries == Some(0) {
         return Err(CacheConfigError::ZeroEntries);
     }
-    if config.overlay_capacity == 0 {
+    if config.direct_overlay_capacity() == 0 {
         return Err(CacheConfigError::ZeroOverlayCapacity);
     }
     if config.arena_partitions == 0 {
@@ -8836,6 +8927,13 @@ fn initialized_direct_capacity(
     (capacity, entry_pressure, weight_pressure)
 }
 
+/// A direct entry's weight shares its word with an access mark.
+fn direct_compact_weight(weight: u64) -> Option<u32> {
+    u32::try_from(weight)
+        .ok()
+        .filter(|weight| *weight <= DIRECT_MAX_WEIGHT)
+}
+
 fn compact_initial_weight(
     config: &CacheConfig,
     weight: u64,
@@ -8850,7 +8948,7 @@ fn compact_initial_weight(
             }),
         );
     }
-    if let Ok(weight) = u32::try_from(weight) {
+    if let Some(weight) = direct_compact_weight(weight) {
         weight
     } else {
         record_initial_error(
@@ -9388,6 +9486,79 @@ mod tests {
     }
 
     #[test]
+    fn direct_default_overlay_follows_the_entry_limit() {
+        // An overlay far larger than the cache fills with evicted keys' slots
+        // between rebuilds, so sampled eviction finds few live candidates:
+        // on the ARC paper's OLTP trace at 1,000 entries the hit rate fell
+        // from 35.3% to 26.1%, below exact LRU's 32.8%.
+        let overlay_capacity = |config: CacheConfig| {
+            DirectPackedCache::<u64>::try_new(config)
+                .unwrap()
+                .index
+                .adaptive_overlay_stats()
+                .expect("the direct index is adaptive")
+                .capacity
+        };
+        let limited = CacheConfig::new(u64::MAX).with_max_entries(1_000);
+        assert_eq!(overlay_capacity(limited.clone()), 1_000);
+        assert_eq!(
+            overlay_capacity(limited.with_overlay_capacity(4_096)),
+            4_096
+        );
+        assert_eq!(
+            overlay_capacity(CacheConfig::new(u64::MAX).with_max_entries(8)),
+            64
+        );
+        assert_eq!(
+            overlay_capacity(CacheConfig::new(u64::MAX).with_max_entries(1 << 20)),
+            DEFAULT_OVERLAY_CAPACITY
+        );
+        assert_eq!(
+            overlay_capacity(CacheConfig::new(u64::MAX)),
+            DEFAULT_OVERLAY_CAPACITY
+        );
+    }
+
+    #[test]
+    fn direct_sweep_keeps_sampling_past_read_entries() {
+        // Nine in ten entries are read, so a fixed window of four candidates
+        // per removal finds too few unread ones and evicts read entries. A
+        // CLOCK hand instead keeps sweeping until it finds unread entries.
+        const CAPACITY: u64 = 131_072;
+        let cache = DirectPackedCache::<u64>::try_new(
+            CacheConfig::new(u64::MAX)
+                .with_max_entries(usize::try_from(CAPACITY).unwrap())
+                .with_probation(0),
+        )
+        .unwrap();
+        for id in 0..CAPACITY {
+            cache
+                .insert_discard_with_options(&id.to_le_bytes(), id, 16, None)
+                .unwrap();
+        }
+        cache.maintain().unwrap();
+        {
+            let guard = cache.pin();
+            for id in (0..CAPACITY).filter(|id| id % 10 != 0) {
+                assert_eq!(guard.get(&id.to_le_bytes()), Some(&id));
+            }
+        }
+        for id in CAPACITY..CAPACITY + CAPACITY / 20 {
+            cache
+                .insert_discard_with_options(&id.to_le_bytes(), id, 16, None)
+                .unwrap();
+        }
+
+        let read_lost = (0..CAPACITY)
+            .filter(|id| id % 10 != 0 && cache.peek(&id.to_le_bytes()).is_none())
+            .count();
+        assert!(
+            read_lost * 1_000 <= usize::try_from(CAPACITY).unwrap(),
+            "the sweep evicted {read_lost} read entries while unread ones remained"
+        );
+    }
+
+    #[test]
     fn direct_single_read_during_probation_keeps_a_key_resident() {
         let cache = probation_test_cache();
         for id in 0..1_024_u64 {
@@ -9415,6 +9586,40 @@ mod tests {
             cache.peek(&read_once).is_some(),
             "a key read during probation must stay resident"
         );
+    }
+
+    #[test]
+    fn direct_ghost_remembers_between_three_eighths_and_half_the_capacity() {
+        // Remembering a full capacity of evictions sends loop-like keys
+        // straight back to the main area: on DS1 at 4,000,000 entries that
+        // cost about ten points of hit rate against a half-capacity ghost.
+        let capacity = 8_192_u64;
+        let probation = DirectProbation::new(DEFAULT_PROBATION_BPS, 8_192);
+        let ghost = &probation.ghost;
+        let route = |id: u64| doorkeeper_mix64(id ^ 0x2545_f491_4f6c_dd1d);
+        for remembered in 1..=2 * capacity {
+            ghost.remember(route(remembered - 1));
+            if remembered % 512 != 0 || remembered < capacity / 2 {
+                continue;
+            }
+            let recent = (remembered - capacity * 3 / 8..remembered)
+                .filter(|id| ghost.contains(route(*id)))
+                .count();
+            assert_eq!(
+                recent,
+                usize::try_from(capacity * 3 / 8).unwrap(),
+                "the newest three eighths are always remembered (after {remembered})"
+            );
+            let stale = (0..remembered - capacity / 2)
+                .filter(|id| ghost.contains(route(*id)))
+                .count();
+            // False positives across the four generations add up to about 0.2%.
+            assert!(
+                stale * 200 <= usize::try_from(remembered - capacity / 2).unwrap(),
+                "{stale} keys evicted more than half a capacity ago are still \
+                 remembered after {remembered}"
+            );
+        }
     }
 
     #[test]

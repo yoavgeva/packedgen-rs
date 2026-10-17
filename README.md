@@ -619,24 +619,31 @@ By default DirectPackedCache keeps newly published keys in a probationary FIFO
 of about 2% of the population, in the style of S3-FIFO. Eviction takes the
 oldest probationary key first: if it was read since publication it stays
 resident under the CLOCK sweep, otherwise it is evicted and remembered in a
-two-generation ghost filter (about two bytes per expected entry), and a
-remembered key that returns skips probation. One-hit keys therefore leave
-within a short window instead of displacing reused keys for a full sweep.
-Every direct-cache hit sets the entry's CLOCK mark (only the optional frequency
-sketch is sampled), and each sweep samples at least four candidates per
-removal so that marks still protect entries in caches above 65,536 entries,
-where the sweep previously evicted every candidate it sampled. In the
-deterministic `hit_ratio_sim` example at 50,000 entries, these changes raised
-the default read hit rate from 87.47% to 89.92% on the `bounded_cache_probe`
-turnover trace (QuickCache 0.7: 89.89%) and from 59.78% to 66.53% on Zipf 0.9
-reads (QuickCache: 67.53%; exact LRU: 62.34%); at 262,144 entries they match
-QuickCache within 0.1 point on both. A cyclic scan slightly larger than the
-cache regressed from 58.00% to 54.75% (QuickCache: 63.84%; LRU: 0%). Real
-workloads are harder: on six ARC-paper traces the default improves on the old
-policy everywhere, but it trails QuickCache by 1 to 4 points in most
-configurations and by 9.7 points on DS1 at 4,000,000 entries. Probation adds
-about 3.5 to 4.5 requested bytes per entry. See
-[`docs/HIT_RATIO_SIMULATION_2026-10-16.md`](docs/HIT_RATIO_SIMULATION_2026-10-16.md).
+ghost filter, and a remembered key that returns skips probation. The ghost
+remembers evictions for three eighths to half of the capacity in a ring of
+four filter generations (about two bytes per expected entry and 0.2% false
+positives); remembering a full capacity cost about ten points of hit rate on
+the ARC paper's DS1 trace. Every hit sets one of two CLOCK marks per entry, so
+a key read twice survives two sweeps; the second mark is the top bit of the
+entry's weight word, which limits one direct entry's weight to 2 GiB - 1. Each
+sweep samples at least four candidates per removal and samples again, up to 16
+rounds, while too few of them are unread, as a CLOCK hand keeps moving past
+marked entries. A direct cache with an entry limit sizes its index overlay to
+that limit (64 to 65,536 slots) unless `with_overlay_capacity` says otherwise.
+
+In the deterministic `hit_ratio_sim` example with the default configuration,
+on six ARC-paper traces at three sizes each, the summed gap to QuickCache 0.7
+fell from 49.5 points to 15.4 (0.86 points per cell), with DS1 at 4,000,000
+entries rising from 38.05% to 43.87% (QuickCache: 44.80%) and OLTP at 1,000
+entries from 26.20% to 35.33% (QuickCache: 35.15%). The default reaches
+QuickCache in 3 of 18 cells, is within a point in 11, and trails it by 3.3
+points at worst. On synthetic traces at 50,000 entries it is within 0.1 point
+of the October 16 policy on turnover and Zipf, gains 7.1 points on a cyclic
+loop, and loses 0.6 on scan-zipf and 0.9 on a shifting popularity trace. A
+1,000-entry cache's requested memory fell from 3,334 to 250 bytes per entry.
+Probation adds about 3.5 to 4.5 requested bytes per entry. See
+[`docs/HIT_RATIO_REAL_TRACES_2026-10-17.md`](docs/HIT_RATIO_REAL_TRACES_2026-10-17.md)
+and [`docs/HIT_RATIO_SIMULATION_2026-10-16.md`](docs/HIT_RATIO_SIMULATION_2026-10-16.md).
 `CacheConfig::with_probation(0)` disables probation.
 
 DirectPackedCache also has an opt-in, scan-resistant admission doorkeeper. It

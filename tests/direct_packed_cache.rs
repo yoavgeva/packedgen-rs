@@ -5,11 +5,9 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[cfg(feature = "cache-production-diagnostics")]
-use packedgen::CacheInsertError;
 use packedgen::{
-    CacheAdmissionOutcome, CacheBuildError, CacheConfig, CacheConfigError, CacheWriteOutcome,
-    DirectPackedCache, FrozenBuildError,
+    CacheAdmissionOutcome, CacheBuildError, CacheConfig, CacheConfigError, CacheInsertError,
+    CacheWriteOutcome, DirectPackedCache, FrozenBuildError,
 };
 
 fn cache(max_weight: u64, max_entries: usize) -> DirectPackedCache<Vec<u8>> {
@@ -33,6 +31,30 @@ fn sweep_cache(max_weight: u64, max_entries: usize) -> DirectPackedCache<Vec<u8>
             .with_probation(0),
     )
     .unwrap()
+}
+
+#[test]
+fn rejects_an_entry_weight_above_two_gib() {
+    // The weight word's top bit holds the second access mark.
+    let limit = u64::from(u32::MAX >> 1);
+    let cache = cache(u64::MAX, 4);
+    assert!(matches!(
+        cache.insert_discard_with_options(b"large", vec![1], limit + 1, None),
+        Err(CacheInsertError::WeightNotCompact { weight }) if weight == limit + 1
+    ));
+    assert!(cache.is_empty());
+    cache
+        .insert_discard_with_options(b"largest", vec![2], limit, None)
+        .unwrap();
+    assert_eq!(cache.weight(), limit);
+    assert!(matches!(
+        DirectPackedCache::try_from_entries_with_options(
+            CacheConfig::new(u64::MAX).with_max_entries(4),
+            [(b"large".as_slice(), vec![1_u8], limit + 1, None)],
+        ),
+        Err(CacheBuildError::InitialItem(CacheInsertError::WeightNotCompact { weight }))
+            if weight == limit + 1
+    ));
 }
 
 #[test]

@@ -7,10 +7,11 @@
 //! whose `START COUNT ...` lines each read `COUNT` consecutive blocks). For
 //! file traces, `OPERATIONS` of zero replays the whole file. POLICY defaults to every policy: `packed`, `packed-doorkeeper`,
 //! `packed-adaptive`, `packed-tiered`, `quick`, `lru`, `opt`, and the reference
-//! models `model-clock`, `model-s3clock`, and `model-s3fifo`. One CSV row is
+//! models `model-clock`, `model-s3clock`, `model-s3fifo`, `model-quick`
+//! (`QuickCache` 0.7's policy), and `model-tinylfu` (W-TinyLFU). One CSV row is
 //! printed per policy. A packed policy accepts `/batch=N`, `/probation=BPS`,
-//! and `/maint=N` (see `packed_config`); a model accepts `/small=PCT`, `/ghost=PCT`, and `/sample=N` (see
-//! `ClockModel::parse`).
+//! `/maint=N`, and `/overlay=N` (see `packed_config`); a model accepts the
+//! options listed at `ClockModel::parse`.
 //!
 //! Reads are look-aside, as in `bounded_cache_probe`: a miss admits the key.
 //! Writes admit unconditionally. Every record has the same charge, so each
@@ -24,7 +25,7 @@
 
 #![allow(clippy::cast_precision_loss)]
 
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasherDefault, DefaultHasher};
 use std::ops::Range;
 
@@ -38,7 +39,7 @@ const CHARGE: u64 = 32 + VALUE_BYTES;
 const REFRESH_INTERVAL: usize = 512;
 const MAINTENANCE_INTERVAL: usize = 4096;
 const OCCUPANCY_STRIDE: usize = 64;
-const ALL_POLICIES: [&str; 10] = [
+const ALL_POLICIES: [&str; 12] = [
     "packed",
     "packed-doorkeeper",
     "packed-adaptive",
@@ -49,6 +50,8 @@ const ALL_POLICIES: [&str; 10] = [
     "model-clock",
     "model-s3clock",
     "model-s3fifo",
+    "model-quick",
+    "model-tinylfu",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -357,13 +360,13 @@ fn replay(trace: &Trace, session: &mut impl Session) -> Outcome {
     outcome
 }
 
-/// `POLICY[/batch=N][/probation=BPS][/maint=N]`: the eviction batch (victim
-/// window), the probationary share, and writes between `maintain()` calls
-/// (zero never maintains). Returns the config and maintenance interval.
+/// `POLICY[/batch=N][/probation=BPS][/maint=N][/overlay=N]`: the eviction
+/// batch (victim window), the probationary share, writes between `maintain()`
+/// calls (zero never maintains), and the index overlay capacity (default: the
+/// cache's own). Returns the config and maintenance interval.
 fn packed_config(policy: &str, entries: usize) -> (CacheConfig, usize) {
     let mut base = CacheConfig::new(u64::try_from(entries).expect("entries fit u64") * CHARGE)
-        .with_max_entries(entries)
-        .with_overlay_capacity(entries.max(64));
+        .with_max_entries(entries);
     let mut maintenance_interval = MAINTENANCE_INTERVAL;
     let mut parts = policy.split('/');
     let policy = parts.next().expect("split yields a policy name");
@@ -376,6 +379,7 @@ fn packed_config(policy: &str, entries: usize) -> (CacheConfig, usize) {
                 base = base.with_probation(u16::try_from(value).expect("share fits u16"));
             }
             "maint" => maintenance_interval = value,
+            "overlay" => base = base.with_overlay_capacity(value),
             _ => panic!("unknown packed option: {option}"),
         }
     }
@@ -724,34 +728,215 @@ struct ClockModel {
     small: VecDeque<u64>,
     ghost: VecDeque<u64>,
     ghost_counts: HashMap<u64, u32>,
+    /// `TinyLFU`: a small-FIFO key leaving unread duels the next main victim
+    /// and replaces it if the sketch has seen it more often.
+    sketch: Option<ModelSketch>,
+    /// Only every `sketch_sample_every`-th hit is recorded in the sketch;
+    /// misses always are.
+    sketch_sample_every: u64,
+    sketch_hits: u64,
+    climber: Option<ModelClimber>,
+    /// `QuickCache` keeps one fewer mark when a key leaves the small FIFO.
+    keep_on_promotion: bool,
+    /// Bounds how many main keys one eviction inspects.
+    victim_window: Option<usize>,
+    /// Replaces the ghost FIFO with the packed cache's two rotating
+    /// generations, which remember between one and two generations of keys.
+    ghost_generations: Option<GhostGenerations>,
+}
+
+/// A ring of generations: remembers between `generations - 1` and
+/// `generations` full generations of keys.
+struct GhostGenerations {
+    sets: Vec<HashSet<u64>>,
+    current: usize,
+    rotate_every: usize,
+}
+
+impl GhostGenerations {
+    fn contains(&self, id: u64) -> bool {
+        self.sets.iter().any(|set| set.contains(&id))
+    }
+
+    fn remember(&mut self, id: u64) {
+        if self.sets[self.current].len() >= self.rotate_every {
+            self.current = (self.current + 1) % self.sets.len();
+            self.sets[self.current].clear();
+        }
+        self.sets[self.current].insert(id);
+    }
+}
+
+/// Count-min sketch of 4-bit counters with two hashes, halved every
+/// `10 * capacity` increments as in `TinyLFU`.
+struct ModelSketch {
+    counters: Vec<u8>,
+    mask: usize,
+    increments: u64,
+    reset_every: u64,
+}
+
+impl ModelSketch {
+    fn new(capacity: usize) -> Self {
+        let counters = (capacity * 4).next_power_of_two();
+        Self {
+            counters: vec![0; counters],
+            mask: counters - 1,
+            increments: 0,
+            reset_every: u64::try_from(capacity * 10).expect("capacity fits u64"),
+        }
+    }
+
+    fn slots(&self, id: u64) -> [usize; 2] {
+        let first = mix(id ^ 0x5851_f42d_4c95_7f2d);
+        [first, mix(first)].map(|hash| usize::try_from(hash).unwrap_or(usize::MAX) & self.mask)
+    }
+
+    fn increment(&mut self, id: u64) {
+        for slot in self.slots(id) {
+            self.counters[slot] = (self.counters[slot] + 1).min(15);
+        }
+        self.increments += 1;
+        if self.increments.is_multiple_of(self.reset_every) {
+            for counter in &mut self.counters {
+                *counter /= 2;
+            }
+        }
+    }
+
+    fn estimate(&self, id: u64) -> u8 {
+        self.slots(id)
+            .into_iter()
+            .map(|slot| self.counters[slot])
+            .min()
+            .expect("two slots")
+    }
+}
+
+/// Caffeine's hill climber: every `10 * capacity` requests, move the small
+/// FIFO's size in the direction that last raised the hit rate.
+struct ModelClimber {
+    capacity: usize,
+    sample: u64,
+    hits: u64,
+    requests: u64,
+    previous_hit_rate: f64,
+    step: f64,
+}
+
+impl ModelClimber {
+    const STEP_SHARE: f64 = 0.0625;
+    const DECAY: f64 = 0.98;
+    const RESTART_THRESHOLD: f64 = 0.05;
+
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            sample: u64::try_from(capacity * 10).expect("capacity fits u64"),
+            hits: 0,
+            requests: 0,
+            previous_hit_rate: 0.0,
+            step: -Self::STEP_SHARE * capacity as f64,
+        }
+    }
+
+    /// Records one request; returns a size adjustment at the end of a sample.
+    fn record(&mut self, hit: bool) -> Option<f64> {
+        self.requests += 1;
+        self.hits += u64::from(hit);
+        if self.requests < self.sample {
+            return None;
+        }
+        let hit_rate = self.hits as f64 / self.requests as f64;
+        let change = hit_rate - self.previous_hit_rate;
+        let amount = if change >= 0.0 { self.step } else { -self.step };
+        self.step = if change.abs() >= Self::RESTART_THRESHOLD {
+            Self::STEP_SHARE * self.capacity as f64 * amount.signum()
+        } else {
+            Self::DECAY * amount
+        };
+        self.previous_hit_rate = hit_rate;
+        self.hits = 0;
+        self.requests = 0;
+        Some(amount)
+    }
 }
 
 impl ClockModel {
-    /// `NAME[/small=PCT][/ghost=PCT][/sample=N]`: small FIFO and ghost FIFO
-    /// sizes are percentages of capacity; `sample` keeps every Nth hit.
+    /// `NAME[/OPTION=N]...`. `small=PCT` or `smallbps=BPS` sizes the small
+    /// FIFO and `ghost=PCT` the ghost FIFO, as shares of capacity. `ghostgens=N`
+    /// with `ghostgenbps=BPS` (or `ghostgen=PCT`) replaces the ghost FIFO with
+    /// N rotating generations of that size each. `maxf=N` caps the marks a key
+    /// collects, `keep=1` keeps all but one when it leaves the small FIFO, and
+    /// `window=N` bounds the main keys one eviction inspects. `sample=N` keeps
+    /// every Nth hit's mark. For `model-tinylfu`, `fsample=N` records every
+    /// Nth hit in the sketch and `climb=1` enables the hill climber.
     fn parse(name: &str, capacity: usize) -> Self {
         let mut parts = name.split('/');
-        let (mut small_percent, max_frequency) = match parts.next() {
-            Some("model-clock") => (0, 1),
-            Some("model-s3fifo") => (10, 3),
-            Some("model-s3clock") => (10, 1),
+        let (mut small_bps, mut max_frequency, tinylfu) = match parts.next() {
+            Some("model-clock") => (0, 1, false),
+            Some("model-s3fifo") => (1_000, 3, false),
+            Some("model-s3clock") => (1_000, 1, false),
+            Some("model-tinylfu") => (100, 1, true),
+            // QuickCache 0.7's defaults: 3% cold, ghosts for half the capacity,
+            // and hot marks up to two.
+            Some("model-quick") => (300, 2, false),
             _ => panic!("unknown model: {name}"),
         };
-        let mut ghost_percent = 100 - small_percent;
+        let quick = name.starts_with("model-quick");
+        let mut ghost_percent = if tinylfu {
+            0
+        } else if quick {
+            50
+        } else {
+            100 - small_bps / 100
+        };
+        let mut keep = quick;
+        let mut ghost_generation_bps = None;
+        let mut ghost_generation_count = 2;
+        let mut victim_window = None;
         let mut sample_every = 1;
+        let mut sketch_sample_every = 1;
+        let mut climb = false;
         for part in parts {
             let (option, value) = part.split_once('=').expect("model options are NAME=VALUE");
             let value: usize = value.parse().expect("model option values are integers");
             match option {
-                "small" => small_percent = value,
+                "small" => small_bps = value * 100,
+                "smallbps" => small_bps = value,
                 "ghost" => ghost_percent = value,
                 "sample" => sample_every = u64::try_from(value).expect("sample fits u64"),
+                "fsample" => sketch_sample_every = u64::try_from(value).expect("fits u64"),
+                "climb" => climb = value != 0,
+                "maxf" => max_frequency = u8::try_from(value).expect("maxf fits u8"),
+                "keep" => keep = value != 0,
+                "ghostgen" => ghost_generation_bps = Some(value * 100),
+                "ghostgenbps" => ghost_generation_bps = Some(value),
+                "ghostgens" => ghost_generation_count = value,
+                "window" => victim_window = Some(value.max(1)),
                 _ => panic!("unknown model option: {option}"),
             }
         }
-        let mut model = Self::new(capacity, capacity * small_percent / 100, max_frequency);
+        let small = (capacity * small_bps / 10_000).max(usize::from(small_bps != 0));
+        let mut model = Self::new(capacity, small, max_frequency);
         model.ghost_capacity = capacity * ghost_percent / 100;
         model.sample_every = sample_every.max(1);
+        model.keep_on_promotion = keep;
+        model.victim_window = victim_window;
+        model.ghost_generations = ghost_generation_bps.map(|bps| GhostGenerations {
+            sets: (0..ghost_generation_count)
+                .map(|_| HashSet::new())
+                .collect(),
+            current: 0,
+            rotate_every: (capacity * bps / 10_000).max(1),
+        });
+        if tinylfu {
+            model.sketch = Some(ModelSketch::new(capacity));
+            model.sketch_sample_every = sketch_sample_every.max(1);
+        }
+        if climb {
+            model.climber = Some(ModelClimber::new(capacity));
+        }
         model
     }
 
@@ -771,10 +956,20 @@ impl ClockModel {
             small: VecDeque::with_capacity(small_capacity),
             ghost: VecDeque::new(),
             ghost_counts: HashMap::new(),
+            sketch: None,
+            sketch_sample_every: 1,
+            sketch_hits: 0,
+            climber: None,
+            keep_on_promotion: false,
+            victim_window: None,
+            ghost_generations: None,
         }
     }
 
     fn take_ghost(&mut self, id: u64) -> bool {
+        if let Some(generations) = &self.ghost_generations {
+            return generations.contains(id);
+        }
         let Some(count) = self.ghost_counts.get_mut(&id) else {
             return false;
         };
@@ -787,6 +982,10 @@ impl ClockModel {
     }
 
     fn remember_ghost(&mut self, id: u64) {
+        if let Some(generations) = &mut self.ghost_generations {
+            generations.remember(id);
+            return;
+        }
         *self.ghost_counts.entry(id).or_default() += 1;
         self.ghost.push_back(id);
         while self.ghost.len() > self.ghost_capacity {
@@ -801,6 +1000,7 @@ impl ClockModel {
     }
 
     fn place_in_main(&mut self, id: u64) {
+        let keep = self.keep_on_promotion;
         let slot = if let Some(slot) = self.free_slots.pop() {
             self.slots[slot] = id;
             slot
@@ -809,7 +1009,11 @@ impl ClockModel {
             self.slots.len() - 1
         };
         let entry = self.resident.get_mut(&id).expect("placed key is resident");
-        entry.frequency = 0;
+        entry.frequency = if keep {
+            entry.frequency.saturating_sub(1)
+        } else {
+            0
+        };
         entry.slot = Some(slot);
     }
 
@@ -824,8 +1028,26 @@ impl ClockModel {
                     self.place_in_main(id);
                     continue;
                 }
+                if self.sketch.is_some() && main_len != 0 {
+                    let slot = self.next_main_victim();
+                    let victim = self.slots[slot];
+                    let sketch = self.sketch.as_ref().expect("checked above");
+                    if sketch.estimate(id) > sketch.estimate(victim) {
+                        // Pass the freed slot so its new key gets a full turn.
+                        self.hand = (self.hand + 1) % self.slots.len();
+                        self.resident.remove(&victim);
+                        self.slots[slot] = EMPTY_SLOT;
+                        self.free_slots.push(slot);
+                        self.place_in_main(id);
+                        return;
+                    }
+                }
                 self.resident.remove(&id);
                 self.remember_ghost(id);
+                return;
+            }
+            if let Some(window) = self.victim_window {
+                self.evict_from_window(window);
                 return;
             }
             let id = self.slots[self.hand];
@@ -846,7 +1068,85 @@ impl ClockModel {
         }
     }
 
+    /// The packed cache's bounded sweep: the hand inspects `window` keys,
+    /// taking one mark from each, and evicts the first unmarked one, or the
+    /// least-marked one if every inspected key was marked.
+    fn evict_from_window(&mut self, window: usize) {
+        let mut chosen: Option<(u8, usize)> = None;
+        let mut inspected = 0;
+        while inspected < window {
+            let slot = self.hand;
+            let id = self.slots[slot];
+            self.hand = (self.hand + 1) % self.slots.len();
+            if id == EMPTY_SLOT {
+                continue;
+            }
+            inspected += 1;
+            let entry = self.resident.get_mut(&id).expect("slot key is resident");
+            let marks = entry.frequency;
+            entry.frequency = entry.frequency.saturating_sub(1);
+            if chosen.is_none_or(|(best, _)| marks < best) {
+                chosen = Some((marks, slot));
+            }
+            if marks == 0 {
+                break;
+            }
+        }
+        let (_, slot) = chosen.expect("main holds a key");
+        let id = self.slots[slot];
+        self.resident.remove(&id);
+        self.slots[slot] = EMPTY_SLOT;
+        self.free_slots.push(slot);
+    }
+
+    /// Advances the CLOCK hand to the next unmarked main key, clearing marks
+    /// on the way, without evicting it.
+    fn next_main_victim(&mut self) -> usize {
+        loop {
+            let id = self.slots[self.hand];
+            if id != EMPTY_SLOT {
+                let entry = self.resident.get_mut(&id).expect("slot key is resident");
+                if entry.frequency == 0 {
+                    return self.hand;
+                }
+                entry.frequency -= 1;
+            }
+            self.hand = (self.hand + 1) % self.slots.len();
+        }
+    }
+
     fn access(&mut self, id: u64) -> bool {
+        let hit = self.lookup_or_admit(id);
+        if let Some(sketch) = &mut self.sketch {
+            if hit {
+                self.sketch_hits += 1;
+                if self.sketch_hits.is_multiple_of(self.sketch_sample_every) {
+                    sketch.increment(id);
+                }
+            } else {
+                sketch.increment(id);
+            }
+        }
+        if let Some(adjustment) = self
+            .climber
+            .as_mut()
+            .and_then(|climber| climber.record(hit))
+        {
+            let limit = self.capacity * 4 / 5;
+            let step = adjustment.round().abs();
+            // A step is a few percent of the capacity, so it fits usize.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let step = step as usize;
+            self.small_capacity = if adjustment < 0.0 {
+                self.small_capacity.saturating_sub(step).max(1)
+            } else {
+                (self.small_capacity + step).min(limit)
+            };
+        }
+        hit
+    }
+
+    fn lookup_or_admit(&mut self, id: u64) -> bool {
         if let Some(entry) = self.resident.get_mut(&id) {
             self.hits += 1;
             if self.hits.is_multiple_of(self.sample_every) {
@@ -868,6 +1168,13 @@ impl ClockModel {
             self.place_in_main(id);
         } else {
             self.small.push_back(id);
+            // Before the cache first fills, the small FIFO's overflow moves to
+            // main, as QuickCache admits straight to hot while hot has room and
+            // the packed cache drops probation records beyond its limit.
+            if self.resident.len() < self.capacity && self.small.len() > self.small_capacity {
+                let oldest = self.small.pop_front().expect("small FIFO is non-empty");
+                self.place_in_main(oldest);
+            }
         }
         false
     }
@@ -1018,15 +1325,17 @@ mod tests {
         for trace_name in ["turnover", "zipf:0.9", "scan-zipf:0.9", "shift:0.9"] {
             let trace = build_trace(trace_name, 4_096, 150_000, 3);
             let packed = run_policy("packed", &trace, entries).hit_ratio();
-            let lru = run_policy("lru", &trace, entries).hit_ratio();
-            assert!(
-                packed > lru,
-                "{trace_name}: packed hit ratio {packed:.4} is not above exact LRU {lru:.4}"
-            );
-            if trace_name == "shift:0.9" {
-                continue;
+            // On `shift` recency wins: exact LRU is within 1.1 points of
+            // QuickCache there, and only a ghost of a full capacity, which
+            // costs ten points on DS1, kept the packed cache above it.
+            if trace_name != "shift:0.9" {
+                let lru = run_policy("lru", &trace, entries).hit_ratio();
+                assert!(
+                    packed > lru,
+                    "{trace_name}: packed hit ratio {packed:.4} is not above exact LRU {lru:.4}"
+                );
             }
-            // Measured at 1.003-1.030; the original sampled CLOCK was 1.25.
+            // Measured at 0.997-1.033; the original sampled CLOCK was 1.25.
             let quick = run_policy("quick", &trace, entries).hit_ratio();
             assert!(
                 1.0 - packed <= 1.06 * (1.0 - quick),
