@@ -577,20 +577,26 @@ fn doorkeeper_applies_to_guarded_admission_batches() {
     }
     let mut guard = cache.pin();
     let mut batch = guard.admission_batch();
+    // A two-entry filter gives a fresh key a false positive often enough
+    // (about 1 run in 70) to admit it at once, which its documentation
+    // allows; a run of fresh keys must still see one rejected, then admitted.
+    let rejected = (0..10_u8)
+        .map(|index| [b's', b'c', b'a', b'n', index])
+        .find(|key| {
+            batch
+                .insert_if_absent_with_options(key, vec![2], 1, None)
+                .unwrap()
+                == CacheAdmissionOutcome::Rejected
+        })
+        .expect("the doorkeeper rejects some fresh key on its first miss");
     assert_eq!(
         batch
-            .insert_if_absent_with_options(b"scan", vec![2], 1, None)
-            .unwrap(),
-        CacheAdmissionOutcome::Rejected
-    );
-    assert_eq!(
-        batch
-            .insert_if_absent_with_options(b"scan", vec![3], 1, None)
+            .insert_if_absent_with_options(&rejected, vec![3], 1, None)
             .unwrap(),
         CacheAdmissionOutcome::Inserted
     );
     drop(batch);
-    assert!(cache.peek(b"scan").is_some());
+    assert!(cache.peek(&rejected).is_some());
     assert!(cache.len() <= 2);
 }
 
