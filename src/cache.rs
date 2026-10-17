@@ -43,6 +43,7 @@ const DIRECT_RESERVOIR_KEY_CHUNK: usize = 64;
 thread_local! {
     // Keep operation counts isolated from parallel unit tests.
     static DIRECT_WEIGHT_SCANS: AtomicUsize = const { AtomicUsize::new(0) };
+    static DIRECT_VICTIM_INDEX_PROBES: AtomicUsize = const { AtomicUsize::new(0) };
 }
 
 /// Decodes an unchanged value loaded from the direct cache's authoritative
@@ -2107,6 +2108,18 @@ struct DirectVictimKey {
     key_len: usize,
 }
 
+/// Outcome of validating and removing one eviction victim.
+enum DirectVictimRemoval {
+    /// Absent, replaced, protected, or kept because it was read.
+    Kept,
+    /// Removed from the index; the caller retires it.
+    Removed {
+        handle: DirectHandle,
+        expired: bool,
+        weight: u64,
+    },
+}
+
 struct DirectVictimBatch {
     victims: Vec<DirectVictim>,
     key_bytes: Vec<u8>,
@@ -2386,8 +2399,14 @@ impl DirectProbation {
         for offset in 0..self.shards.len() {
             let mut shard = self.shards[start.wrapping_add(offset) % self.shards.len()].lock();
             if let Some((handle, key_len)) = shard.records.pop_front() {
+                // Copy whole slices: extending from the drain iterator copies
+                // one byte at a time while the shard lock is held.
                 key.clear();
-                key.extend(shard.key_bytes.drain(..key_len));
+                let (front, back) = shard.key_bytes.as_slices();
+                let from_front = key_len.min(front.len());
+                key.extend_from_slice(&front[..from_front]);
+                key.extend_from_slice(&back[..key_len - from_front]);
+                shard.key_bytes.drain(..key_len);
                 drop(shard);
                 self.len.fetch_sub(1, Ordering::Relaxed);
                 return Some(handle);
@@ -7008,7 +7027,7 @@ impl<V> DirectPackedCache<V> {
             } else {
                 0
             };
-            let evicted = self.evict_to_limits_locked(now, None, None);
+            let evicted = self.evict_to_limits(now, None, None);
             (expired, evicted)
         };
         let rebuilt = self
@@ -7894,27 +7913,30 @@ impl<V> DirectPackedCache<V> {
         }
         #[cfg(feature = "cache-pressure-timing")]
         let started = Instant::now();
-        let mut spins = 0_u32;
-        while if async_hard_limit {
-            self.over_hard_limit()
-        } else {
-            self.over_limit()
-        } {
-            let _reclaim_deferral = self.arena.defer_reclamation();
-            if let Some(_maintenance) = self.maintenance_gate.try_lock() {
-                if async_hard_limit && self.over_hard_limit() {
-                    self.evict_to_hard_limit_locked(self.now(), Some(protected));
-                } else if self.over_limit() {
-                    self.evict_to_limits_locked(self.now(), Some(protected), removal_target);
+        if async_hard_limit {
+            let mut spins = 0_u32;
+            while self.over_hard_limit() {
+                let _reclaim_deferral = self.arena.defer_reclamation();
+                if let Some(_maintenance) = self.maintenance_gate.try_lock() {
+                    if self.over_hard_limit() {
+                        self.evict_to_hard_limit_locked(self.now(), Some(protected));
+                    }
+                    break;
                 }
-                break;
+                if spins < 64 {
+                    spin_loop();
+                    spins += 1;
+                } else {
+                    thread::yield_now();
+                }
             }
-            if spins < 64 {
-                spin_loop();
-                spins += 1;
-            } else {
-                thread::yield_now();
-            }
+        } else {
+            // Writers at the limit evict concurrently rather than queueing on
+            // the capacity gate: every removal is an exact conditional index
+            // transfer under the key's mutation stripe, so racing evictors can
+            // only overshoot the limit by their in-flight batches.
+            let _reclaim_deferral = self.arena.defer_reclamation();
+            self.evict_to_limits(self.now(), Some(protected), removal_target);
         }
         #[cfg(feature = "cache-pressure-timing")]
         self.diagnostics
@@ -7957,7 +7979,7 @@ impl<V> DirectPackedCache<V> {
         let started = Instant::now();
         let _reclaim_deferral = self.arena.defer_reclamation();
         let _maintenance = self.maintenance_gate.lock();
-        let removed = self.evict_to_limits_locked(self.now(), None, None);
+        let removed = self.evict_to_limits(self.now(), None, None);
         #[cfg(feature = "cache-pressure-timing")]
         self.diagnostics.record_background_capacity_drain(started);
         #[cfg(all(
@@ -8018,7 +8040,9 @@ impl<V> DirectPackedCache<V> {
         removed
     }
 
-    fn evict_to_limits_locked(
+    /// Evicts until the cache is within its limits. Callers may run this
+    /// concurrently with each other and with maintenance.
+    fn evict_to_limits(
         &self,
         now: u64,
         protected: Option<DirectHandle>,
@@ -8157,20 +8181,16 @@ impl<V> DirectPackedCache<V> {
             }
             let _reclaim_deferral = self.arena.defer_reclamation();
             let _mutation = self.mutation_stripe(key).lock();
-            if self.index.get_protected(key) != Some(handle.index_value()) {
-                continue;
-            }
-            // SAFETY: the revalidated victim handle and pin belong to this cache.
-            let entry = unsafe { protected_direct_entry(&pin, handle) };
-            let weight = entry.weight();
-            let was_expired = Self::is_expired(entry, now);
             if self
-                .index
-                .remove_if(key, |current| *current == handle.index_value())
+                .victim_index_remove_if(key, |current| *current == handle.index_value())
                 .is_none()
             {
                 continue;
             }
+            // SAFETY: the removed victim handle stays allocated until `pin` ends.
+            let entry = unsafe { protected_direct_entry(&pin, handle) };
+            let weight = entry.weight();
+            let was_expired = Self::is_expired(entry, now);
             self.remove_capacity(key, weight);
             // SAFETY: exact conditional removal transferred this victim once.
             unsafe { pin.retire(removed_after_exact_index_transfer(handle)) };
@@ -8539,6 +8559,59 @@ impl<V> DirectPackedCache<V> {
         });
     }
 
+    /// Removes `key` if it still publishes an unprotected entry (the
+    /// `expected` one, when given) that is expired, or unread and not
+    /// protected by frequency. Validation and removal are one conditional
+    /// index operation; a read entry loses one access mark and stays.
+    #[allow(
+        unsafe_code,
+        reason = "the predicate dereferences a handle the index publishes under this cache's pin"
+    )]
+    fn remove_unread_victim(
+        &self,
+        pin: &DirectArenaPin<'_, V>,
+        key: &[u8],
+        expected: Option<NonMaxU64>,
+        protected: Option<DirectHandle>,
+        now: u64,
+        protects_resident: bool,
+    ) -> DirectVictimRemoval {
+        // The predicate may run again after a lost race; the last evaluation
+        // describes the value that was, or failed to be, removed.
+        let retained = Cell::new(None);
+        let expired = Cell::new(false);
+        let removed = self.victim_index_remove_if(key, |current| {
+            retained.set(None);
+            let handle = published_direct_handle_from_index(*current);
+            if expected.is_some_and(|expected| *current != expected) || Some(handle) == protected {
+                return false;
+            }
+            // SAFETY: the index publishes this handle while `pin` is held.
+            let entry = unsafe { protected_direct_entry(pin, handle) };
+            expired.set(Self::is_expired(entry, now));
+            if !expired.get() && (entry.accessed() || protects_resident) {
+                retained.set(Some(handle));
+                return false;
+            }
+            true
+        });
+        if let Some(raw) = removed {
+            let handle = published_direct_handle_from_index(raw);
+            // SAFETY: the removed handle stays allocated until `pin` ends.
+            let weight = unsafe { protected_direct_entry(pin, handle) }.weight();
+            return DirectVictimRemoval::Removed {
+                handle,
+                expired: expired.get(),
+                weight,
+            };
+        }
+        if let Some(handle) = retained.get() {
+            // SAFETY: the index published this handle under `pin` above.
+            unsafe { protected_direct_entry(pin, handle) }.take_accessed();
+        }
+        DirectVictimRemoval::Kept
+    }
+
     #[allow(
         unsafe_code,
         reason = "probation validation pairs this cache's exact index handles with its arena pin"
@@ -8566,33 +8639,27 @@ impl<V> DirectPackedCache<V> {
             {
                 examined += 1;
             }
-            if Some(handle) == protected
-                || self.index.get_protected(&key) != Some(handle.index_value())
-            {
-                // Removed, replaced, or being published: no longer probationary.
+            if Some(handle) == protected {
                 continue;
             }
+            let frequency = self.victim_frequency(&key, false);
             let _reclaim_deferral = self.arena.defer_reclamation();
             let _mutation = self.mutation_stripe(&key).lock();
-            if self.index.get_protected(&key) != Some(handle.index_value()) {
+            // A removed, replaced, or still-publishing key is no longer
+            // probationary; one read during probation keeps it for the sweep.
+            let DirectVictimRemoval::Removed {
+                expired, weight, ..
+            } = self.remove_unread_victim(
+                pin,
+                &key,
+                Some(handle.index_value()),
+                protected,
+                now,
+                self.frequency_protects_resident(frequency),
+            )
+            else {
                 continue;
-            }
-            // SAFETY: the revalidated probation handle and pin belong to this cache.
-            let entry = unsafe { protected_direct_entry(pin, handle) };
-            let expired = Self::is_expired(entry, now);
-            let frequency = self.victim_frequency(&key, false);
-            if !expired && (entry.take_accessed() || self.frequency_protects_resident(frequency)) {
-                // Read during probation: it stays under the ordinary sweep.
-                continue;
-            }
-            let weight = entry.weight();
-            if self
-                .index
-                .remove_if(&key, |current| *current == handle.index_value())
-                .is_none()
-            {
-                continue;
-            }
+            };
             self.remove_capacity(&key, weight);
             // SAFETY: exact conditional removal transferred this victim once.
             unsafe { pin.retire(removed_after_exact_index_transfer(handle)) };
@@ -8642,33 +8709,24 @@ impl<V> DirectPackedCache<V> {
             batch.next += 1;
             examined += 1;
             let key = batch.key(victim_index);
-            let Some(raw) = self.index.get_protected(key) else {
-                continue;
-            };
-            let handle = published_direct_handle_from_index(raw);
-            if Some(handle) == protected {
-                continue;
-            }
+            let frequency = self.victim_frequency(key, false);
             let _reclaim_deferral = self.arena.defer_reclamation();
             let _mutation = self.mutation_stripe(key).lock();
-            if self.index.get_protected(key) != Some(raw) {
+            let DirectVictimRemoval::Removed {
+                handle,
+                expired,
+                weight,
+            } = self.remove_unread_victim(
+                pin,
+                key,
+                None,
+                protected,
+                now,
+                self.frequency_protects_resident(frequency),
+            )
+            else {
                 continue;
-            }
-            // SAFETY: the revalidated reservoir handle and pin belong to this cache.
-            let entry = unsafe { protected_direct_entry(pin, handle) };
-            let expired = Self::is_expired(entry, now);
-            let frequency = self.victim_frequency(key, false);
-            if !expired && (entry.take_accessed() || self.frequency_protects_resident(frequency)) {
-                continue;
-            }
-            let weight = entry.weight();
-            if self
-                .index
-                .remove_if(key, |current| *current == raw)
-                .is_none()
-            {
-                continue;
-            }
+            };
             self.remove_capacity(key, weight);
             // SAFETY: exact conditional removal transferred this victim once.
             unsafe { pin.retire(removed_after_exact_index_transfer(handle)) };
@@ -8792,6 +8850,19 @@ impl<V> DirectPackedCache<V> {
 
     fn maintenance_counters(&self) -> &CacheCounters {
         &self.counters[0]
+    }
+
+    /// Conditional index removal of an eviction victim.
+    fn victim_index_remove_if(
+        &self,
+        key: &[u8],
+        predicate: impl Fn(&NonMaxU64) -> bool,
+    ) -> Option<NonMaxU64> {
+        #[cfg(test)]
+        DIRECT_VICTIM_INDEX_PROBES.with(|probes| {
+            probes.fetch_add(1, Ordering::Relaxed);
+        });
+        self.index.remove_if(key, predicate)
     }
 
     fn mutation_stripe(&self, key: &[u8]) -> &Mutex<()> {
@@ -9400,6 +9471,79 @@ mod tests {
         let removed = cache.remove(&2_u64.to_le_bytes()).unwrap();
         assert_eq!(cache.arena.owner_references(), baseline);
         assert_eq!((*got, *peeked, *removed), (0, 1, 2));
+    }
+
+    #[test]
+    fn direct_probation_pops_whole_keys_in_order_across_ring_wraparound() {
+        let probation = DirectProbation::new(10_000, 64);
+        assert_eq!(probation.shards.len(), 1);
+        // Handles are only stored and compared here, never dereferenced.
+        let handle = |id: u64| published_direct_handle_from_index(NonMaxU64::new(id).unwrap());
+        let key =
+            |id: u64| -> Vec<u8> { (0..=id % 37).map(|byte| byte as u8 ^ id as u8).collect() };
+        let mut expected = VecDeque::new();
+        let mut popped = Vec::new();
+        let mut wrapped = false;
+        for id in 0..2_000_u64 {
+            probation.enroll(0, &key(id), handle(id));
+            expected.push_back(id);
+            // Past the record limit the oldest record is dropped on enrollment.
+            while expected.len() > probation.len() {
+                expected.pop_front();
+            }
+            if id % 3 != 0 {
+                wrapped |= !probation.shards[0]
+                    .lock()
+                    .key_bytes
+                    .as_slices()
+                    .1
+                    .is_empty();
+                let id = expected.pop_front().unwrap();
+                assert_eq!(probation.pop(&mut popped), Some(handle(id)));
+                assert_eq!(popped, key(id));
+            }
+        }
+        assert!(wrapped, "the key ring must wrap for this test to cover it");
+        while let Some(id) = expected.pop_front() {
+            assert_eq!(probation.pop(&mut popped), Some(handle(id)));
+            assert_eq!(popped, key(id));
+        }
+        assert_eq!(probation.pop(&mut popped), None);
+    }
+
+    #[test]
+    fn direct_eviction_probes_the_index_about_once_per_victim() {
+        let probation = probation_test_cache();
+        let sweep_only = DirectPackedCache::try_new(
+            CacheConfig::new(u64::MAX)
+                .with_max_entries(1_024)
+                .with_probation(0),
+        )
+        .expect("cache constructs");
+        for (name, cache) in [("probation", probation), ("sweep", sweep_only)] {
+            for id in 0..1_024_u64 {
+                cache
+                    .insert_discard_with_options(&id.to_le_bytes(), id, 1, None)
+                    .expect("seed admission succeeds");
+            }
+            let probes =
+                || DIRECT_VICTIM_INDEX_PROBES.with(|probes| probes.load(Ordering::Relaxed));
+            let probes_before = probes();
+            let evictions_before = cache.stats().evictions;
+            for id in 1_024..4_096_u64 {
+                cache
+                    .insert_discard_with_options(&id.to_le_bytes(), id, 1, None)
+                    .expect("admission succeeds");
+            }
+            let evicted = cache.stats().evictions - evictions_before;
+            let probed = probes() - probes_before;
+            assert!(evicted >= 3_000, "{name}: only {evicted} evictions");
+            // Validation and removal share one conditional index operation.
+            assert!(
+                probed as u64 <= evicted + evicted / 8,
+                "{name}: {probed} index probes for {evicted} evictions"
+            );
+        }
     }
 
     fn probation_test_cache() -> DirectPackedCache<u64> {
@@ -10185,6 +10329,46 @@ mod tests {
         writer.join().expect("writer remains healthy");
         assert_eq!(cache.len(), 141);
         drop(maintenance);
+    }
+
+    #[test]
+    fn strict_writers_evict_without_waiting_for_another_evictor() {
+        const CAPACITY: usize = 128;
+        let cache = Arc::new(
+            DirectPackedCache::try_new(
+                CacheConfig::new(u64::MAX)
+                    .with_max_entries(CAPACITY)
+                    .with_overlay_capacity(512),
+            )
+            .expect("cache constructs"),
+        );
+        for key in 0..CAPACITY as u64 {
+            cache
+                .insert_discard_with_options(&key.to_le_bytes(), key, 1, None)
+                .expect("admission succeeds");
+        }
+
+        // Another thread holding the capacity gate (maintenance, or a writer
+        // already evicting) must not stall every other writer at the limit.
+        let maintenance = cache.maintenance_gate.lock();
+        let writer_cache = Arc::clone(&cache);
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let writer = thread::spawn(move || {
+            for key in CAPACITY as u64..CAPACITY as u64 + 8 {
+                writer_cache
+                    .insert_discard_with_options(&key.to_le_bytes(), key, 1, None)
+                    .expect("admission succeeds");
+            }
+            finished_tx.send(()).expect("receiver remains live");
+        });
+        let finished = finished_rx.recv_timeout(Duration::from_secs(5));
+        drop(maintenance);
+        writer.join().expect("writer remains healthy");
+        assert!(
+            finished.is_ok(),
+            "a writer at the entry limit waited for the capacity gate"
+        );
+        assert!(cache.len() <= CAPACITY);
     }
 
     #[test]

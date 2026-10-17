@@ -526,6 +526,11 @@ impl<V> DirectArenaEntry<V> {
         }
     }
 
+    /// Reports whether the entry holds an access mark, without clearing it.
+    pub(crate) fn accessed(&self) -> bool {
+        self.metadata.load(Ordering::Relaxed) & (DIRECT_ACCESS_BIT | DIRECT_SECOND_ACCESS_BIT) != 0
+    }
+
     /// Clears one access mark and reports whether there was one, so a key read
     /// twice survives two eviction sweeps.
     pub(crate) fn take_accessed(&self) -> bool {
