@@ -80,6 +80,9 @@ struct ShardWriter {
     /// Probationary keys in insertion order: (handle, slot, hash low bits).
     probation: VecDeque<(u64, u32, u32)>,
     probation_target: usize,
+    /// Past this many records the oldest is dropped, leaving its key to the
+    /// main sweep, so records never copy more than a share of the keys.
+    probation_limit: usize,
     ghost: Ghost,
 }
 
@@ -198,6 +201,9 @@ impl<K: Hash + Eq, V, S: BuildHasher> ShardedCache<K, V, S> {
                 writer.len += 1;
                 shard.len.store(writer.len, Ordering::Relaxed);
                 if !writer.ghost.contains(hash) {
+                    if writer.probation.len() >= writer.probation_limit {
+                        writer.probation.pop_front();
+                    }
                     writer.probation.push_back((
                         handle.index_value().get(),
                         u32::try_from(slot).expect("shard slots fit u32"),
@@ -354,6 +360,7 @@ impl Shard {
                 hand: 0,
                 probation: VecDeque::new(),
                 probation_target: capacity * PROBATION_BPS / 10_000,
+                probation_limit: capacity * PROBATION_BPS / 8_000 + 4,
                 ghost: Ghost::new(capacity.div_ceil(GHOST_GENERATION_DIVISOR)),
             }),
         }
@@ -544,9 +551,11 @@ impl Retired {
 }
 
 /// Approximate set of recently evicted probationary keys, in a ring of
-/// generations; guarded by the shard lock.
+/// generations; guarded by the shard lock. A key's word in every generation
+/// sits on one cache line, so a lookup costs one miss.
 struct Ghost {
-    generations: [Box<[u64]>; GHOST_GENERATIONS],
+    /// `words[word * GHOST_GENERATIONS + generation]`.
+    words: Box<[u64]>,
     current: usize,
     remembered: usize,
     rotate_every: usize,
@@ -557,7 +566,7 @@ impl Ghost {
         let rotate_every = keys_per_generation.max(8);
         let words = (rotate_every * GHOST_BITS_PER_KEY).div_ceil(64);
         Self {
-            generations: std::array::from_fn(|_| vec![0; words].into_boxed_slice()),
+            words: vec![0; words * GHOST_GENERATIONS].into_boxed_slice(),
             current: 0,
             remembered: 0,
             rotate_every,
@@ -567,26 +576,34 @@ impl Ghost {
     fn location(&self, hash: u64) -> (usize, u64) {
         let low = hash & 0xffff_ffff;
         let mixed = low.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let word = ((mixed >> 32) * self.generations[0].len() as u64 >> 32) as usize;
+        let words = (self.words.len() / GHOST_GENERATIONS) as u64;
+        let word = ((mixed >> 32) * words >> 32) as usize;
         let mask =
             (0..GHOST_KEY_BITS).fold(0_u64, |mask, lane| mask | 1 << ((mixed >> (lane * 6)) & 63));
-        (word, mask)
+        (word * GHOST_GENERATIONS, mask)
     }
 
     fn contains(&self, hash: u64) -> bool {
-        let (word, mask) = self.location(hash);
-        self.generations
+        let (base, mask) = self.location(hash);
+        self.words[base..base + GHOST_GENERATIONS]
             .iter()
-            .any(|generation| generation[word] & mask == mask)
+            .any(|word| word & mask == mask)
     }
 
     fn remember(&mut self, hash: u64) {
-        let (word, mask) = self.location(hash);
-        self.generations[self.current][word] |= mask;
+        let (base, mask) = self.location(hash);
+        self.words[base + self.current] |= mask;
         self.remembered += 1;
         if self.remembered == self.rotate_every {
             self.current = (self.current + 1) % GHOST_GENERATIONS;
-            self.generations[self.current].fill(0);
+            for word in self
+                .words
+                .iter_mut()
+                .skip(self.current)
+                .step_by(GHOST_GENERATIONS)
+            {
+                *word = 0;
+            }
             self.remembered = 0;
         }
     }
