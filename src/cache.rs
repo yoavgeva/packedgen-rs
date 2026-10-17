@@ -1342,11 +1342,15 @@ impl DirectFrequencySketch {
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1);
         if observation.is_multiple_of(self.reset_every) {
+            // `fetch_update` is deprecated in favor of `try_update`, which is
+            // newer than the crate's 1.88 MSRV.
+            #[allow(deprecated)]
             self.epoch
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
                     Some(epoch.wrapping_add(1) & Self::EPOCH_MASK)
                 })
                 .unwrap_or_else(|_| unreachable!("epoch update always succeeds"));
+            #[allow(deprecated)]
             let _ = self
                 .victim_gate
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
