@@ -38,8 +38,8 @@ const SLOTS_PER_ENTRY_DENOMINATOR: usize = 4;
 /// Shards hold at least this many entries, so small caches use fewer shards.
 const MIN_SHARD_CAPACITY: usize = 64;
 const NEVER_EXPIRES: u64 = u64::MAX;
-/// Probation's share of each shard, in basis points.
-const PROBATION_BPS: usize = 1_000;
+/// Probation's default share of each shard, in basis points.
+const DEFAULT_PROBATION_BPS: u16 = 200;
 /// The ghost holds this many generations of evicted probationary keys.
 const GHOST_GENERATIONS: usize = 4;
 /// Each ghost generation holds this fraction of the shard's capacity.
@@ -98,6 +98,17 @@ impl<K: Hash + Eq, V, S: BuildHasher> ShardedCache<K, V, S> {
     /// Creates a cache with an explicit hasher.
     #[must_use]
     pub fn with_hasher(max_entries: usize, hash_builder: S) -> Self {
+        Self::with_probation_and_hasher(max_entries, DEFAULT_PROBATION_BPS, hash_builder)
+    }
+
+    /// Creates a cache whose probationary FIFO targets `probation_bps`
+    /// basis points of each shard.
+    #[must_use]
+    pub fn with_probation_and_hasher(
+        max_entries: usize,
+        probation_bps: u16,
+        hash_builder: S,
+    ) -> Self {
         let max_entries = max_entries.max(1);
         let parallelism = std::thread::available_parallelism().map_or(1, usize::from);
         let shards = (parallelism * 4)
@@ -112,7 +123,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> ShardedCache<K, V, S> {
         let extra = max_entries % shards;
         Self {
             shards: (0..shards)
-                .map(|shard| Shard::new(base + usize::from(shard < extra)))
+                .map(|shard| Shard::new(base + usize::from(shard < extra), probation_bps))
                 .collect(),
             shard_shift: u64::BITS - shards.trailing_zeros(),
             arena: DirectValueArena::new(64),
@@ -179,17 +190,17 @@ impl<K: Hash + Eq, V, S: BuildHasher> ShardedCache<K, V, S> {
         let handle = self.arena.allocate_boxed((key, value), 1, NEVER_EXPIRES);
         // SAFETY: the handle is this arena's own unpublished allocation.
         let key = &unsafe { entry(&pin, handle) }.value().0;
+        let same_key = |current| {
+            // SAFETY: published in this table while `pin` is held.
+            unsafe { entry(&pin, current) }.value().0 == *key
+        };
         let mut retired = Retired::new();
         {
             let mut writer = shard.writer.lock();
-            let found = shard.find(hash, |current| {
-                // SAFETY: published in this table while `pin` is held.
-                unsafe { entry(&pin, current) }.value().0 == *key
-            });
-            if let Some((slot, previous)) = found {
-                shard.bucket(slot).handles[slot % SLOTS]
-                    .store(handle.index_value().get(), Ordering::Release);
-                retired.push(previous);
+            if let Some((slot, _)) = shard.find(hash, same_key) {
+                let previous = shard.bucket(slot).handles[slot % SLOTS]
+                    .swap(handle.index_value().get(), Ordering::AcqRel);
+                retired.push(handle_from_raw(previous));
             } else {
                 while writer.len >= writer.capacity {
                     let Some(victim) = self.evict(shard, &mut writer, &pin) else {
@@ -234,11 +245,11 @@ impl<K: Hash + Eq, V, S: BuildHasher> ShardedCache<K, V, S> {
                 // SAFETY: published in this table while `pin` is held.
                 unsafe { entry(&pin, handle) }.value().0.borrow() == key
             });
-            found.map(|(slot, handle)| {
-                shard.clear(slot, shard.home(hash));
+            found.map(|(slot, _)| {
+                let removed = shard.clear(slot, shard.home(hash));
                 writer.len -= 1;
                 shard.len.store(writer.len, Ordering::Relaxed);
-                handle
+                removed
             })
         };
         let mut retired = Retired::new();
@@ -282,11 +293,11 @@ impl<K: Hash + Eq, V, S: BuildHasher> ShardedCache<K, V, S> {
                 // Read during probation: it stays, under the main sweep.
                 continue;
             }
-            shard.clear(slot, shard.home(u64::from(low_hash)));
+            let removed = shard.clear(slot, shard.home(u64::from(low_hash)));
             writer.ghost.remember(u64::from(low_hash));
             writer.len -= 1;
             shard.len.store(writer.len, Ordering::Relaxed);
-            return Some(handle);
+            return Some(removed);
         }
         let slots = shard.buckets.len() * SLOTS;
         // Each pass takes one access mark from every entry, and entries hold
@@ -305,10 +316,10 @@ impl<K: Hash + Eq, V, S: BuildHasher> ShardedCache<K, V, S> {
                 continue;
             }
             let hash = self.hash_builder.hash_one(&entry.value().0);
-            shard.clear(slot, shard.home(hash));
+            let removed = shard.clear(slot, shard.home(hash));
             writer.len -= 1;
             shard.len.store(writer.len, Ordering::Relaxed);
-            return Some(handle);
+            return Some(removed);
         }
         None
     }
@@ -341,7 +352,8 @@ impl<K, V, S> Drop for ShardedCache<K, V, S> {
 }
 
 impl Shard {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, probation_bps: u16) -> Self {
+        let probation_target = capacity * usize::from(probation_bps) / 10_000;
         let slots = (capacity.max(1) * SLOTS_PER_ENTRY_NUMERATOR)
             .div_ceil(SLOTS_PER_ENTRY_DENOMINATOR)
             .max(SLOTS * 2);
@@ -359,8 +371,8 @@ impl Shard {
                 capacity,
                 hand: 0,
                 probation: VecDeque::new(),
-                probation_target: capacity * PROBATION_BPS / 10_000,
-                probation_limit: capacity * PROBATION_BPS / 8_000 + 4,
+                probation_target,
+                probation_limit: probation_target + probation_target / 4 + 4,
                 ghost: Ghost::new(capacity.div_ceil(GHOST_GENERATION_DIVISOR)),
             }),
         }
@@ -450,8 +462,10 @@ impl Shard {
     }
 
     /// Unpublishes `slot`, whose key's home bucket is `home`, and releases
-    /// the overflow counts its placement added. Requires the shard lock.
-    fn clear(&self, slot: usize, home: usize) {
+    /// the overflow counts its placement added. Returns the handle swapped
+    /// out, which a lock-free replacement may have changed since the caller
+    /// read it. Requires the shard lock.
+    fn clear(&self, slot: usize, home: usize) -> DirectHandle {
         let bucket = slot / SLOTS;
         let current = &self.buckets[bucket];
         let control = current.control.load(Ordering::Relaxed);
@@ -459,7 +473,7 @@ impl Shard {
             control & !(TAG_MASK << ((slot % SLOTS) * 8)),
             Ordering::Release,
         );
-        current.handles[slot % SLOTS].store(0, Ordering::Release);
+        let removed = handle_from_raw(current.handles[slot % SLOTS].swap(0, Ordering::AcqRel));
         let mut passed = home;
         while passed != bucket {
             let passed_bucket = &self.buckets[passed];
@@ -476,6 +490,7 @@ impl Shard {
             }
             passed = self.next(passed);
         }
+        removed
     }
 }
 
@@ -630,6 +645,9 @@ mod tests {
     use std::hash::Hasher;
     use std::sync::Arc;
     use std::thread;
+
+    /// Interpreted and sanitized runs keep the same races, fewer of them.
+    const STRESS_ROUNDS: u64 = if cfg!(miri) { 300 } else { 40_000 };
 
     #[test]
     fn inserts_reads_replaces_and_removes() {
@@ -788,6 +806,73 @@ mod tests {
     }
 
     #[test]
+    fn racing_replacements_removals_and_evictions_retire_every_value_once() {
+        static LIVE: AtomicUsize = AtomicUsize::new(0);
+
+        struct Tracked(u64);
+
+        impl Tracked {
+            fn new(key: u64) -> Self {
+                LIVE.fetch_add(1, Ordering::Relaxed);
+                Self(key)
+            }
+        }
+
+        impl Clone for Tracked {
+            fn clone(&self) -> Self {
+                Self::new(self.0)
+            }
+        }
+
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                let previous = LIVE.fetch_sub(1, Ordering::Relaxed);
+                assert_ne!(previous, 0, "a value was dropped twice");
+            }
+        }
+
+        {
+            // Few keys and a small capacity keep replacements, removals, and
+            // evictions colliding on the same slots.
+            let cache = Arc::new(ShardedCache::<u64, Tracked>::new(64));
+            let threads: Vec<_> = (0..8_u64)
+                .map(|thread| {
+                    let cache = Arc::clone(&cache);
+                    thread::spawn(move || {
+                        let mut state = thread * 7 + 1;
+                        for round in 0..STRESS_ROUNDS {
+                            state ^= state << 13;
+                            state ^= state >> 7;
+                            state ^= state << 17;
+                            let key = state % 96;
+                            match round % 3 {
+                                0 => {
+                                    cache.remove(&key);
+                                }
+                                1 => {
+                                    if let Some(value) = cache.get(&key) {
+                                        assert_eq!(value.0, key);
+                                    }
+                                }
+                                _ => cache.insert(key, Tracked::new(key)),
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for thread in threads {
+                thread.join().expect("worker completes");
+            }
+            assert!(cache.len() <= 64);
+        }
+        assert_eq!(
+            LIVE.load(Ordering::Relaxed),
+            0,
+            "every value was dropped once"
+        );
+    }
+
+    #[test]
     fn concurrent_readers_and_writers_see_only_their_own_values() {
         let cache = Arc::new(ShardedCache::new(2_000));
         let threads: Vec<_> = (0..8_u64)
@@ -795,7 +880,7 @@ mod tests {
                 let cache = Arc::clone(&cache);
                 thread::spawn(move || {
                     let mut state = thread + 1;
-                    for round in 0..50_000_u64 {
+                    for round in 0..STRESS_ROUNDS {
                         state ^= state << 13;
                         state ^= state >> 7;
                         state ^= state << 17;

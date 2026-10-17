@@ -136,6 +136,8 @@ miri() {
   MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
     cargo +nightly miri test --test direct_packed_cache \
     unbounded_admission_batch_publishes_length_immediately -- --exact
+  MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
+    cargo +nightly miri test --lib sharded_cache::tests
 }
 
 sanitizers() {
@@ -150,6 +152,12 @@ sanitizers() {
     cargo +nightly test -Zbuild-std --target "$target" --features prepared-keys \
     --test direct_packed_cache \
     concurrent_prepared_replacement_batches_recycle_without_lost_values -- --exact
+  RUSTFLAGS="-Zsanitizer=address" RUSTDOCFLAGS="-Zsanitizer=address" \
+    cargo +nightly test --target "$target" --lib sharded_cache::tests
+  RUSTFLAGS="-Zsanitizer=thread" RUSTDOCFLAGS="-Zsanitizer=thread" \
+    cargo +nightly test -Zbuild-std --target "$target" --lib sharded_cache::tests::racing
+  RUSTFLAGS="-Zsanitizer=thread" RUSTDOCFLAGS="-Zsanitizer=thread" \
+    cargo +nightly test -Zbuild-std --target "$target" --lib sharded_cache::tests::concurrent
 }
 
 memory_soak() {

@@ -1254,7 +1254,22 @@ fn run_policy(policy: &str, trace: &Trace, entries: usize) -> Outcome {
                 ConstantWeighter,
             )),
         ),
-        "sharded" => replay(trace, &mut ShardedSession(ShardedCache::new(entries))),
+        sharded if sharded.starts_with("sharded") => {
+            let probation = sharded
+                .split('/')
+                .find_map(|option| option.strip_prefix("probation="))
+                .map_or(200, |bps| {
+                    bps.parse().expect("probation= takes basis points")
+                });
+            replay(
+                trace,
+                &mut ShardedSession(ShardedCache::with_probation_and_hasher(
+                    entries,
+                    probation,
+                    hashbrown::DefaultHashBuilder::default(),
+                )),
+            )
+        }
         "lru" => replay(trace, &mut Lru::new(entries)),
         model if model.starts_with("model-") => {
             replay(trace, &mut ClockModel::parse(model, entries))
@@ -1410,7 +1425,10 @@ mod tests {
         for policy in ALL_POLICIES {
             let first = run_policy(policy, &trace, 256);
             let second = run_policy(policy, &trace, 256);
-            if policy.starts_with("packed") || policy == "sharded" || policy == "quick-sync" {
+            if policy.starts_with("packed")
+                || policy.starts_with("sharded")
+                || policy == "quick-sync"
+            {
                 // Each cache seeds its index hasher randomly, which changes
                 // the victim scan order; the policy itself must stay stable.
                 assert!(
