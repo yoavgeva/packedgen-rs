@@ -1364,6 +1364,9 @@ mod tests {
     }
 
     #[test]
+    // A contended parking_lot mutex parks through a futex syscall whose
+    // variadic argument type current Miri rejects; ASan and TSan run these.
+    #[cfg_attr(miri, ignore = "parking_lot's futex wait fails Miri's variadic check")]
     fn racing_replacements_removals_and_evictions_retire_every_value_once() {
         static LIVE: AtomicUsize = AtomicUsize::new(0);
 
@@ -1433,6 +1436,9 @@ mod tests {
     }
 
     #[test]
+    // A contended parking_lot mutex parks through a futex syscall whose
+    // variadic argument type current Miri rejects; ASan and TSan run these.
+    #[cfg_attr(miri, ignore = "parking_lot's futex wait fails Miri's variadic check")]
     fn concurrent_readers_and_writers_see_only_their_own_values() {
         let cache = Arc::new(ShardedCache::new(2_000));
         let threads: Vec<_> = (0..8_u64)
