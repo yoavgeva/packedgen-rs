@@ -382,7 +382,7 @@ impl<K: Hash + Eq, V, W: Weighter<K, V>, S: BuildHasher> ShardedCache<K, V, W, S
         let pin = self.arena.pin();
         let handle = self
             .arena
-            .allocate_boxed((key, value), compact_weight, NEVER_EXPIRES);
+            .allocate_recycled((key, value), compact_weight, NEVER_EXPIRES);
         // SAFETY: the handle is this arena's own unpublished allocation.
         let key = &unsafe { entry(&pin, handle) }.value().0;
         let same_key = |current| {

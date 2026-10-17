@@ -6,7 +6,8 @@
 //! arena uses `seize`. Both retire values only after they become unreachable,
 //! and owned guards keep returned values alive after removal or cache drop.
 
-use std::cell::{Cell, UnsafeCell};
+use std::alloc::Layout;
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
@@ -48,7 +49,6 @@ const DIRECT_RESERVATION_SIZE: usize = 8;
 const DIRECT_BOXED_TAG: usize = 1;
 const DIRECT_RECYCLED_BOXED_TAG: usize = 2;
 const DIRECT_POINTER_TAGS: usize = DIRECT_BOXED_TAG | DIRECT_RECYCLED_BOXED_TAG;
-#[cfg(feature = "prepared-keys")]
 const DIRECT_RECYCLED_BOX_CAPACITY_PER_SHARD: usize = DIRECT_RECLAIM_BATCH * 2;
 /// The largest weight one direct entry can account. The weight word's top bit
 /// is the second access mark.
@@ -392,7 +392,6 @@ impl DirectHandle {
         Self(NonMaxU64::new(tagged).expect("allocated pointer is not the reserved marker"))
     }
 
-    #[cfg(feature = "prepared-keys")]
     fn from_recycled_boxed_pointer<V>(pointer: *mut DirectArenaEntry<V>) -> Self {
         let address = pointer.expose_provenance();
         debug_assert_eq!(address & DIRECT_POINTER_TAGS, 0);
@@ -430,7 +429,6 @@ impl DirectHandle {
         self.0.get() & DIRECT_BOXED_TAG as u64 != 0
     }
 
-    #[cfg(feature = "prepared-keys")]
     const fn is_recycled_boxed(self) -> bool {
         self.0.get() & DIRECT_RECYCLED_BOXED_TAG as u64 != 0
     }
@@ -674,6 +672,21 @@ impl<V> DirectValueArena<V> {
         DirectHandle::from_boxed_pointer(Box::into_raw(Box::new(DirectArenaEntry::new(
             value, weight, expires_at,
         ))))
+    }
+
+    /// Allocates a boxed entry, reusing a box this thread's earlier
+    /// retirements returned to the pool when one is available, so steady
+    /// churn neither allocates nor frees entry memory.
+    #[allow(unsafe_code, reason = "initializes one uniquely reserved recycled box")]
+    pub(crate) fn allocate_recycled(&self, value: V, weight: u32, expires_at: u64) -> DirectHandle {
+        let pointer = direct_stash_take(self.owner.id).map_or_else(
+            || Box::into_raw(Box::new(MaybeUninit::<DirectArenaEntry<V>>::uninit())).cast(),
+            |stashed| stashed.as_ptr().cast::<DirectArenaEntry<V>>(),
+        );
+        // SAFETY: the pointer is a unique, uninitialized box owned by this
+        // arena, and nothing can observe it before it is published.
+        unsafe { pointer.write(DirectArenaEntry::new(value, weight, expires_at)) };
+        DirectHandle::from_recycled_boxed_pointer(pointer)
     }
 
     #[cfg(feature = "prepared-keys")]
@@ -1795,18 +1808,49 @@ impl DirectMutatorSlot {
 #[repr(align(128))]
 struct DirectRetiredQueue(Mutex<Vec<RemovedDirectHandle>>);
 
+/// Boxes reclaimed for one retired shard's threads to reuse, on its own
+/// cache lines: unpadded pools shared a line between two threads, and every
+/// allocation's lock moved that line between their cores.
+#[repr(align(128))]
+struct DirectRecyclePool(Mutex<Vec<DirectHandle>>);
+
 impl DirectRetiredQueue {
     fn new() -> Self {
         Self(Mutex::new(Vec::new()))
     }
 }
 
-/// Owns retirements removed from one epoch queue until reclamation consumes
-/// them. Its exceptional `Drop` path returns any unprocessed tokens to an
-/// owner queue without invoking user code.
 /// Retirement queues taken from one quiescent epoch, by retired shard.
 type DirectTakenRetirements = Vec<(usize, Vec<RemovedDirectHandle>)>;
 
+/// Quiescent retirements of one retired shard. The threads that retired
+/// them drain the queue, so values are destroyed, and their allocations
+/// freed or recycled, on the threads that retired them.
+struct DirectReadyQueue {
+    handles: DirectRetiredQueue,
+    len: AtomicUsize,
+    /// The epoch token when the queue last went from empty to non-empty.
+    since: AtomicUsize,
+}
+
+impl DirectReadyQueue {
+    fn new() -> Self {
+        Self {
+            handles: DirectRetiredQueue::new(),
+            len: AtomicUsize::new(0),
+            since: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// Epoch tokens (about six rotations) a ready queue may wait for its own
+/// threads before any advancing thread drains it, so a thread that stopped
+/// retiring cannot strand its retirements.
+const DIRECT_READY_STALE_TOKENS: usize = 8;
+
+/// Owns retirements removed from one epoch queue until reclamation consumes
+/// them. Its exceptional `Drop` path returns any unprocessed tokens to an
+/// owner queue without invoking user code.
 struct DirectRetiredBatch<'a> {
     handles: Vec<RemovedDirectHandle>,
     requeue: &'a DirectRetiredQueue,
@@ -1859,12 +1903,80 @@ impl Drop for DirectRetiredBatch<'_> {
     }
 }
 
-#[cfg(feature = "prepared-keys")]
+static NEXT_DIRECT_ARENA_ID: AtomicU64 = AtomicU64::new(1);
+/// Boxes a thread keeps for reuse, and the largest box it keeps: together
+/// they bound what a thread can hold after its arenas are gone.
+const DIRECT_BOX_STASH_CAPACITY: usize = 256;
+const DIRECT_BOX_STASH_MAX_BYTES: usize = 512;
+
+/// Entry boxes this thread reclaimed, reused by its own allocations without
+/// any lock. Each is tagged with its arena's id and layout; a box whose arena
+/// is gone is freed when evicted or when the thread exits.
+struct DirectBoxStash(std::collections::VecDeque<(u64, NonNull<u8>, Layout)>);
+
+#[allow(
+    unsafe_code,
+    reason = "frees boxes the stash exclusively owns with their recorded layouts"
+)]
+impl Drop for DirectBoxStash {
+    fn drop(&mut self) {
+        for (_, pointer, layout) in self.0.drain(..) {
+            // SAFETY: each stashed pointer is an uninitialized box allocated
+            // with `layout` and owned only by this stash.
+            unsafe { std::alloc::dealloc(pointer.as_ptr(), layout) };
+        }
+    }
+}
+
+thread_local! {
+    static DIRECT_BOX_STASH: RefCell<DirectBoxStash> =
+        const { RefCell::new(DirectBoxStash(std::collections::VecDeque::new())) };
+}
+
+/// Takes one of `arena_id`'s boxes from this thread's stash.
+fn direct_stash_take(arena_id: u64) -> Option<NonNull<u8>> {
+    DIRECT_BOX_STASH
+        .try_with(|stash| {
+            let mut stash = stash.try_borrow_mut().ok()?;
+            let position = stash.0.iter().rposition(|(id, _, _)| *id == arena_id)?;
+            stash.0.remove(position).map(|(_, pointer, _)| pointer)
+        })
+        .ok()
+        .flatten()
+}
+
+/// Parks an uninitialized box in this thread's stash. Returns `false`, and
+/// leaves the box with the caller, when it cannot be stashed.
+#[allow(
+    unsafe_code,
+    reason = "frees the oldest stashed box with its recorded layout"
+)]
+fn direct_stash_put(arena_id: u64, pointer: NonNull<u8>, layout: Layout) -> bool {
+    if layout.size() > DIRECT_BOX_STASH_MAX_BYTES {
+        return false;
+    }
+    DIRECT_BOX_STASH
+        .try_with(|stash| {
+            let Ok(mut stash) = stash.try_borrow_mut() else {
+                return false;
+            };
+            if stash.0.len() == DIRECT_BOX_STASH_CAPACITY
+                && let Some((_, oldest, oldest_layout)) = stash.0.pop_front()
+            {
+                // SAFETY: the stash exclusively owned this uninitialized box,
+                // allocated with the layout recorded beside it.
+                unsafe { std::alloc::dealloc(oldest.as_ptr(), oldest_layout) };
+            }
+            stash.0.push_back((arena_id, pointer, layout));
+            true
+        })
+        .unwrap_or(false)
+}
+
 struct DirectRecycledBoxGuard<V> {
     pointer: *mut DirectArenaEntry<V>,
 }
 
-#[cfg(feature = "prepared-keys")]
 #[allow(
     unsafe_code,
     reason = "deallocates one uniquely owned recycled box after value destruction"
@@ -1883,6 +1995,8 @@ impl<V> Drop for DirectRecycledBoxGuard<V> {
 
 struct DirectArenaOwner<V> {
     state: DirectArenaState<V>,
+    /// Tags this arena's boxes in thread stashes; never reused.
+    id: u64,
     // Monotonic token. The low two bits select physical slot 0, 1, or 2; the
     // remaining bits prevent a stalled reader from accepting a slot after the
     // collector completes a full cycle. Encoding the slot avoids division on
@@ -1894,8 +2008,8 @@ struct DirectArenaOwner<V> {
     readers: [DirectReaderCounter; DIRECT_EPOCHS * DIRECT_READER_SHARDS],
     retired: [DirectRetiredQueue; DIRECT_EPOCHS * DIRECT_RETIRED_SHARDS],
     retired_count: [AtomicUsize; DIRECT_EPOCHS],
-    #[cfg(feature = "prepared-keys")]
-    recycled_boxes: OnceLock<Box<[Mutex<Vec<DirectHandle>>]>>,
+    ready: Box<[DirectReadyQueue]>,
+    recycled_boxes: OnceLock<Box<[DirectRecyclePool]>>,
     #[cfg(feature = "cache-production-diagnostics")]
     allocation_requests: AtomicU64,
     #[cfg(feature = "cache-production-diagnostics")]
@@ -1918,6 +2032,7 @@ impl<V> DirectArenaOwner<V> {
     fn new(partitions: usize) -> Self {
         Self {
             state: DirectArenaState::new(partitions),
+            id: NEXT_DIRECT_ARENA_ID.fetch_add(1, Ordering::Relaxed),
             current_epoch: AtomicUsize::new(0),
             mutator_overflow: AtomicUsize::new(0),
             mutator_activity: AtomicBool::new(false),
@@ -1925,7 +2040,9 @@ impl<V> DirectArenaOwner<V> {
             readers: std::array::from_fn(|_| DirectReaderCounter::new()),
             retired: std::array::from_fn(|_| DirectRetiredQueue::new()),
             retired_count: std::array::from_fn(|_| AtomicUsize::new(0)),
-            #[cfg(feature = "prepared-keys")]
+            ready: (0..DIRECT_RETIRED_SHARDS)
+                .map(|_| DirectReadyQueue::new())
+                .collect(),
             recycled_boxes: OnceLock::new(),
             #[cfg(feature = "cache-production-diagnostics")]
             allocation_requests: AtomicU64::new(0),
@@ -1987,7 +2104,11 @@ impl<V> DirectArenaOwner<V> {
         let mut retired_bytes = 0_u64;
         #[cfg(feature = "cache-production-diagnostics")]
         let mut retired_arena_values = 0_usize;
-        for queue in &self.retired {
+        for queue in self
+            .retired
+            .iter()
+            .chain(self.ready.iter().map(|ready| &ready.handles))
+        {
             let retired = queue.0.lock();
             retired_values += retired.len();
             retired_bytes = retired.iter().fold(retired_bytes, |total, handle| {
@@ -2009,7 +2130,7 @@ impl<V> DirectArenaOwner<V> {
             .sum();
         #[cfg(feature = "prepared-keys")]
         let recyclable_allocations = self.recycled_boxes.get().map_or(0, |shards| {
-            shards.iter().map(|shard| shard.lock().len()).sum()
+            shards.iter().map(|shard| shard.0.lock().len()).sum()
         });
         #[cfg(not(feature = "prepared-keys"))]
         let recyclable_allocations = 0;
@@ -2067,11 +2188,10 @@ impl<V> DirectArenaOwner<V> {
         }
     }
 
-    #[cfg(feature = "prepared-keys")]
-    fn recycled_boxes(&self) -> &[Mutex<Vec<DirectHandle>>] {
+    fn recycled_boxes(&self) -> &[DirectRecyclePool] {
         self.recycled_boxes.get_or_init(|| {
             (0..DIRECT_RETIRED_SHARDS)
-                .map(|_| Mutex::new(Vec::new()))
+                .map(|_| DirectRecyclePool(Mutex::new(Vec::new())))
                 .collect()
         })
     }
@@ -2079,7 +2199,7 @@ impl<V> DirectArenaOwner<V> {
     #[cfg(feature = "prepared-keys")]
     fn reserve_recycled_boxes(&self, thread_id: usize, pointers: &mut [*mut DirectArenaEntry<V>]) {
         let shard = thread_id & (DIRECT_RETIRED_SHARDS - 1);
-        let mut recycled = self.recycled_boxes()[shard].lock();
+        let mut recycled = self.recycled_boxes()[shard].0.lock();
         let recycled_count = recycled.len().min(pointers.len());
         #[cfg(feature = "cache-production-diagnostics")]
         {
@@ -2125,7 +2245,7 @@ impl<V> DirectArenaOwner<V> {
             return;
         }
         let shard = thread_id & (DIRECT_RETIRED_SHARDS - 1);
-        let mut recycled = self.recycled_boxes()[shard].lock();
+        let mut recycled = self.recycled_boxes()[shard].0.lock();
         let available = DIRECT_RECYCLED_BOX_CAPACITY_PER_SHARD.saturating_sub(recycled.len());
         let keep = pointers.len().min(available);
         recycled.extend(
@@ -2250,6 +2370,7 @@ impl<V> DirectArenaOwner<V> {
                 self.advance_or_defer(false);
             }
         }
+        self.drain_own_ready(shard);
     }
 
     /// Queues exactly removed allocations for epoch reclamation.
@@ -2295,6 +2416,7 @@ impl<V> DirectArenaOwner<V> {
                 self.advance_or_defer(false);
             }
         }
+        self.drain_own_ready(shard);
     }
 
     fn epoch_is_quiescent(&self, epoch: usize) -> bool {
@@ -2342,50 +2464,78 @@ impl<V> DirectArenaOwner<V> {
     }
 
     fn try_advance(&self, force: bool) {
-        // Destructors and slot releases run after the gate is released, so
-        // other threads keep advancing and reclaiming their own batches.
-        if let Some((epoch, taken)) = self.advance_taking_quiescent(force) {
-            self.reclaim_taken(epoch, taken);
+        if !self.advance_into_ready(force) {
+            return;
+        }
+        // Destructors and releases run here, after the gate is released, so
+        // other threads keep advancing and reclaiming meanwhile.
+        let own = direct_arena_thread() & (DIRECT_RETIRED_SHARDS - 1);
+        let token = self.current_epoch.load(Ordering::Relaxed);
+        for shard in 0..DIRECT_RETIRED_SHARDS {
+            let ready = &self.ready[shard];
+            if ready.len.load(Ordering::Relaxed) == 0 {
+                continue;
+            }
+            let stale = token.wrapping_sub(ready.since.load(Ordering::Relaxed))
+                >= DIRECT_READY_STALE_TOKENS;
+            if force || shard == own || stale {
+                self.drain_ready(shard);
+            }
         }
     }
 
-    fn advance_taking_quiescent(&self, force: bool) -> Option<(usize, DirectTakenRetirements)> {
+    /// Advances one epoch when the older slots are quiescent, moving each
+    /// shard's retirements from the slot two rotations old into that shard's
+    /// ready queue. Returns whether it advanced.
+    fn advance_into_ready(&self, force: bool) -> bool {
         let observed = direct_epoch_slot(self.current_epoch.load(Ordering::SeqCst));
         if !force && self.retired_count[observed].load(Ordering::Relaxed) < DIRECT_RECLAIM_BATCH {
-            return None;
+            return false;
         }
-        let _reclaim = self.reclaim_gate.try_lock()?;
+        let Some(_reclaim) = self.reclaim_gate.try_lock() else {
+            return false;
+        };
         // A successful standalone removal announces its short publication
         // window here. A racing mutation may overlap one rotation, but the
         // next scan must observe it before a second rotation can proceed.
         if self.mutator_activity.load(Ordering::SeqCst) && !self.mutators_are_quiescent() {
-            return None;
+            return false;
         }
         let current_generation = self.current_epoch.load(Ordering::SeqCst);
         let current = direct_epoch_slot(current_generation);
         if !force && self.retired_count[current].load(Ordering::Relaxed) < DIRECT_RECLAIM_BATCH {
-            return None;
+            return false;
         }
         // A rotation may leave current readers behind, but every older slot
         // must first be quiescent. Consequently a mutator pin spanning index
         // publication through retirement prevents a second rotation, while
         // continuous readers in the current slot do not block the first.
-        let advance =
-            plan_epoch_advance(current_generation, |epoch| self.epoch_is_quiescent(epoch))?;
+        let Some(advance) =
+            plan_epoch_advance(current_generation, |epoch| self.epoch_is_quiescent(epoch))
+        else {
+            return false;
+        };
         // `next_epoch` was current two rotations ago. Checking every
         // non-current slot above proves that both readers already present at
         // removal and readers admitted during one racing rotation have left.
-        let taken = self.epoch_has_retired(advance.next_epoch).then(|| {
+        if self.epoch_has_retired(advance.next_epoch) {
             self.retired_count[advance.next_epoch].swap(0, Ordering::Relaxed);
             // Destructors may nest through another arena before this arena's
             // first mutation. Publish the permanent flag before user code so
             // reentrant activation finds mutators already active.
             self.mutator_activity.store(true, Ordering::SeqCst);
-            (
-                advance.next_epoch,
-                self.take_retired_epoch(advance.next_epoch),
-            )
-        });
+            for (shard, handles) in self.take_retired_epoch(advance.next_epoch) {
+                let ready = &self.ready[shard];
+                let mut queued = ready.handles.0.lock();
+                if queued.is_empty() {
+                    ready.since.store(current_generation, Ordering::Relaxed);
+                    *queued = handles;
+                } else {
+                    queued.extend(handles);
+                }
+                ready.len.store(queued.len(), Ordering::Relaxed);
+            }
+        }
         debug_assert_eq!(
             advance.next_epoch,
             direct_epoch_slot(advance.next_generation)
@@ -2398,7 +2548,30 @@ impl<V> DirectArenaOwner<V> {
                 Ordering::SeqCst,
             )
             .unwrap_or_else(|_| std::process::abort());
-        taken
+        true
+    }
+
+    /// Drains this thread's ready queue unless reclamation is deferred here.
+    fn drain_own_ready(&self, shard: usize) {
+        if self.ready[shard].len.load(Ordering::Relaxed) != 0
+            && DIRECT_RECLAIM_DEFERRAL_DEPTH.with(|depth| depth.get() == 0)
+        {
+            self.drain_ready(shard);
+        }
+    }
+
+    /// Destroys and releases one shard's quiescent retirements. Handles left
+    /// unprocessed by a panicking destructor return to the same ready queue.
+    fn drain_ready(&self, shard: usize) {
+        let ready = &self.ready[shard];
+        let handles = {
+            let mut queued = ready.handles.0.lock();
+            ready.len.store(0, Ordering::Relaxed);
+            std::mem::take(&mut *queued)
+        };
+        if !handles.is_empty() {
+            self.reclaim_shards(vec![(shard, handles)], |_| (&ready.handles, &ready.len));
+        }
     }
 
     /// Empties one quiescent epoch's retirement queues.
@@ -2416,25 +2589,31 @@ impl<V> DirectArenaOwner<V> {
 
     fn drain_retired_epoch(&self, epoch: usize) {
         let taken = self.take_retired_epoch(epoch);
-        self.reclaim_taken(epoch, taken);
+        let begin = epoch * DIRECT_RETIRED_SHARDS;
+        let retired_count = &self.retired_count[epoch];
+        self.reclaim_shards(taken, |shard| (&self.retired[begin + shard], retired_count));
     }
 
-    /// Destroys and releases handles taken from one quiescent epoch. Handles
-    /// left unprocessed by a panicking destructor return to that epoch's
-    /// queues, which then belong to a later epoch: they age further, which
-    /// is always safe.
+    /// Destroys and releases quiescent handles, by retired shard. Handles a
+    /// panicking destructor leaves unprocessed return to the queue `requeue`
+    /// names for their shard; any queue is safe, as they only age further.
     #[allow(
         unsafe_code,
-        reason = "reclaims only one quiescent owner-controlled retirement epoch"
+        reason = "reclaims only quiescent owner-controlled retirements"
     )]
-    fn reclaim_taken(&self, epoch: usize, taken: DirectTakenRetirements) {
-        let begin = epoch * DIRECT_RETIRED_SHARDS;
-        let fallback_queue = &self.retired[begin];
-        let retired_count = &self.retired_count[epoch];
-        let mut arena_handles = DirectRetiredBatch::new(Vec::new(), fallback_queue, retired_count);
+    fn reclaim_shards<'a>(
+        &'a self,
+        taken: DirectTakenRetirements,
+        requeue: impl Fn(usize) -> (&'a DirectRetiredQueue, &'a AtomicUsize),
+    ) {
+        let Some(first_shard) = taken.first().map(|(shard, _)| *shard) else {
+            return;
+        };
+        let (fallback_queue, fallback_count) = requeue(first_shard);
+        let mut arena_handles = DirectRetiredBatch::new(Vec::new(), fallback_queue, fallback_count);
         for (shard, handles) in taken {
-            let retired = &self.retired[begin + shard];
-            let mut handles = DirectRetiredBatch::new(handles, retired, retired_count);
+            let (queue, count) = requeue(shard);
+            let mut handles = DirectRetiredBatch::new(handles, queue, count);
             self.reclaim_handles(&mut handles, shard, &mut arena_handles);
         }
         let arena_handles = arena_handles.disarm();
@@ -2449,7 +2628,7 @@ impl<V> DirectArenaOwner<V> {
         // selected epoch is quiescent, and the queue owns each retirement once.
         unsafe {
             self.state
-                .reclaim_entries(&arena_pointers, Some((fallback_queue, retired_count)));
+                .reclaim_entries(&arena_pointers, Some((fallback_queue, fallback_count)));
         };
         #[cfg(feature = "cache-production-diagnostics")]
         self.note_reclaimed(arena_pointers.len(), arena_retired_bytes);
@@ -2506,7 +2685,6 @@ impl<V> DirectArenaOwner<V> {
     ) {
         #[cfg(not(feature = "prepared-keys"))]
         let _ = retired_shard;
-        #[cfg(feature = "prepared-keys")]
         let mut recycled = None;
         while let Some(removed) = handles.pop() {
             let handle = removed.published();
@@ -2516,18 +2694,26 @@ impl<V> DirectArenaOwner<V> {
                 // SAFETY: this quiescent retired handle remains initialized.
                 unsafe { (*pointer).weight() }
             };
-            #[cfg(feature = "prepared-keys")]
             if handle.is_recycled_boxed() {
                 let pointer = handle.pointer::<V>();
                 let allocation = DirectRecycledBoxGuard { pointer };
                 // SAFETY: boxed handles originate from Box::into_raw and the
                 // quiescent-state proof gives this reclaimer unique access.
                 unsafe { ptr::drop_in_place(pointer) };
-                let recycled =
-                    recycled.get_or_insert_with(|| self.recycled_boxes()[retired_shard].lock());
-                if recycled.len() < DIRECT_RECYCLED_BOX_CAPACITY_PER_SHARD {
+                // The value is gone, so no user code runs while the stash is
+                // borrowed; overflow goes to the shard pool reservations use.
+                let stashed = NonNull::new(pointer.cast::<u8>()).is_some_and(|box_pointer| {
+                    direct_stash_put(self.id, box_pointer, Layout::new::<DirectArenaEntry<V>>())
+                });
+                if stashed {
                     std::mem::forget(allocation);
-                    recycled.push(handle);
+                } else {
+                    let recycled = recycled
+                        .get_or_insert_with(|| self.recycled_boxes()[retired_shard].0.lock());
+                    if recycled.len() < DIRECT_RECYCLED_BOX_CAPACITY_PER_SHARD {
+                        std::mem::forget(allocation);
+                        recycled.push(handle);
+                    }
                 }
                 #[cfg(feature = "cache-production-diagnostics")]
                 self.note_reclaimed(1, retired_bytes);
@@ -2568,10 +2754,12 @@ impl<V> Drop for DirectArenaOwner<V> {
         for epoch in 0..DIRECT_EPOCHS {
             self.drain_retired_epoch(epoch);
         }
-        #[cfg(feature = "prepared-keys")]
+        for shard in 0..DIRECT_RETIRED_SHARDS {
+            self.drain_ready(shard);
+        }
         if let Some(recycled_boxes) = self.recycled_boxes.get_mut() {
             for recycled in recycled_boxes {
-                for handle in recycled.get_mut().drain(..) {
+                for handle in recycled.0.get_mut().drain(..) {
                     // SAFETY: recycled boxes contain no initialized value and
                     // are uniquely owned by this arena during final drop.
                     unsafe {
@@ -3543,6 +3731,76 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("reentrant value destruction must not deadlock the collector gate");
         worker.join().expect("reclamation worker must not panic");
+    }
+
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "retires exclusively owned unpublished test values"
+    )]
+    fn each_thread_destroys_the_values_it_retired() {
+        // A retiring thread allocated what it retires when it replaces its
+        // own values; freeing on that thread keeps allocator frees local.
+        struct DropThread {
+            retired_on: std::thread::ThreadId,
+            dropped_elsewhere: Arc<AtomicUsize>,
+        }
+
+        impl Drop for DropThread {
+            fn drop(&mut self) {
+                if std::thread::current().id() != self.retired_on {
+                    self.dropped_elsewhere.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let arena = Arc::new(DirectValueArena::new(4));
+        let dropped_elsewhere = Arc::new(AtomicUsize::new(0));
+        // Counted when the first worker finishes, while both are active.
+        let while_both_active = Arc::new(AtomicUsize::new(usize::MAX));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let arena = Arc::clone(&arena);
+                let dropped_elsewhere = Arc::clone(&dropped_elsewhere);
+                let while_both_active = Arc::clone(&while_both_active);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..20 * DIRECT_RECLAIM_BATCH {
+                        let handle = arena.allocate_boxed(
+                            DropThread {
+                                retired_on: std::thread::current().id(),
+                                dropped_elsewhere: Arc::clone(&dropped_elsewhere),
+                            },
+                            1,
+                            u64::MAX,
+                        );
+                        let pin = arena.pin();
+                        // SAFETY: the unpublished handle is exclusively
+                        // owned and protected by its arena pin.
+                        unsafe {
+                            pin.retire(RemovedDirectHandle::from_exact_removal(handle));
+                        }
+                    }
+                    let _ = while_both_active.compare_exchange(
+                        usize::MAX,
+                        dropped_elsewhere.load(Ordering::Relaxed),
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
+                    barrier.wait();
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("worker completes");
+        }
+        assert_eq!(
+            while_both_active.load(Ordering::Relaxed),
+            0,
+            "values retired by an active thread were destroyed on another"
+        );
     }
 
     #[test]
