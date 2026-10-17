@@ -4090,20 +4090,23 @@ mod tests {
             )
             .unwrap(),
         );
+        // Compaction waits for this reader of the original generation right
+        // after redirecting to its successor, so the successor stays in its
+        // prepublication state until the reader is dropped.
+        let original_reader = cache.pin();
+        let original = Arc::clone(&original_reader.generation);
         let rebuilding = Arc::clone(&cache);
         let join = thread::spawn(move || rebuilding.compact().unwrap());
 
-        loop {
-            let current = cache.current.load();
-            if matches!(
-                current.base.load().as_ref(),
-                OnlineSegmentBase::Previous { .. }
-            ) {
-                break;
-            }
+        while Arc::ptr_eq(&cache.current.load(), &original) {
             thread::yield_now();
         }
+        assert!(matches!(
+            cache.current.load().base.load().as_ref(),
+            OnlineSegmentBase::Previous { .. }
+        ));
         let old_snapshot = cache.pin();
+        assert!(old_snapshot.frozen.is_none());
         old_snapshot
             .insert(b"during-build", b"visible", None)
             .unwrap();
@@ -4111,6 +4114,7 @@ mod tests {
             old_snapshot.peek(b"during-build"),
             Some(b"visible".as_slice())
         );
+        drop(original_reader);
         while cache
             .current
             .load()
@@ -4125,6 +4129,10 @@ mod tests {
         assert_eq!(
             postpublication_snapshot.peek(b"during-build"),
             Some(b"visible".as_slice())
+        );
+        assert!(
+            !join.is_finished(),
+            "publication must wait for the prepublication read batch"
         );
         drop(old_snapshot);
         join.join().unwrap();
