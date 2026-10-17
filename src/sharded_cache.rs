@@ -1170,6 +1170,7 @@ mod tests {
         unsafe_code,
         reason = "reads entries the table publishes under the test's pin"
     )]
+    #[cfg_attr(miri, ignore = "a statistical churn of up to a million inserts")]
     fn live_keys_stay_in_their_two_candidate_buckets_under_long_churn() {
         // Linear probing with holes clustered under this churn until keys
         // lived hundreds of buckets from home and every probe scanned the
@@ -1201,6 +1202,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a statistical churn of up to a million inserts")]
     fn full_candidate_buckets_rarely_force_an_eviction() {
         // Evicting from a key's two buckets overrides the cache's policy, so
         // relocation must make room in nearly every case.
