@@ -66,12 +66,28 @@ entry. Tables are sized once and never rebuilt.
   - Past 1.25 times the shard's capacity, the main queue drops stale records
     from its front in chunks of 64. A table sweep remains the fallback when
     the queue is exhausted.
-- **Reclamation.** Entries are boxes in the direct arena's epoch scheme.
-  - Retirements are drained on the threads that retired them.
-  - Emptied boxes go into a lock-free thread-local stash of up to 256 boxes,
-    each at most 512 bytes. That thread's later allocations reuse them.
-  - An advancing thread drains ready queues that have waited for about six
-    rotations, so an idle thread cannot strand its retirements.
+- **Storage and reclamation.** Entries live in slab chunks of 8 to 256
+  slots, in `src/sharded_arena.rs`, under the direct arena's reader protocol
+  and epoch state machine.
+  - A writer pins, takes a vacant slot from its thread's stack for the
+    cache, and fills it before taking the shard lock.
+  - After the lock, still pinned, it queues the entries it unpublished in its
+    thread's retired queue. Each carries the generation token read after
+    the unpublication, aged three advances. The advance that reuses the
+    tag's epoch slot found that slot and the next one quiescent, the direct
+    arena's two-rotation aging.
+  - In the same queue lock, the writer takes up to 16 aged entries, drops
+    their values, and pushes the slots onto its own stack, so it refills
+    slots whose lines it just touched.
+  - Every 64 retirements a writer also drains one other queue, so a thread
+    that stops writing does not strand its retirements. `maintain()` drains
+    every queue.
+  - A thread's stack overflows into a shared depot, draws from it in batches
+    of 32, and returns to it when the thread exits. Chunks are freed when the
+    cache drops; a stack left for a dropped cache is forgotten without
+    touching its slots.
+  - The generation advances once 512 retirements are pending across the
+    cache. A failed try waits for 256 more.
 - **Reads.** `get` pins per call and clones the value. `pin()` returns a guard
   for borrowed reads that pins once.
 - **Weights.** Weights come from a `Weighter`. A value heavier than its shard's
@@ -134,8 +150,21 @@ entry. Tables are sized once and never rebuilt.
   - failing and panicking loads handing the key to a waiter;
   - expired entries reading as missing, and leaving before read live keys;
   - statistics, every removal cause, `clear`, and `peek`.
-- **Arena tests.** They prove that retired values are destroyed outside the
-  reclaim gate and on the thread that retired them.
+- **Arena tests.** They cover:
+  - aging of exactly three advances;
+  - a pin blocking the second advance past its epoch;
+  - `maintain()` dropping every removed value;
+  - an exiting thread returning its vacant slots;
+  - a dropped cache leaving other threads' stacks harmless;
+  - other writers dropping an idle thread's retired values (verified to fail
+    without the foreign drains).
+- **Allocation contract.** `tests/sharded_cache_allocations.rs` counts
+  allocations: 100,000 inserts into a warm, full cache must allocate fewer
+  than 1,000 times. Boxed entries allocated about 50,000 times.
+- **Loom models.** `tests/cache_concurrency_model.rs` model-checks the token
+  rule. It covers a reader racing a pinned writer and a reclaimer, and a
+  reader admitted at the epoch after the writer's pin. A negative control
+  shows the model catches aging of one advance.
 - **CI tools.** `scripts/cache_proof.sh` runs the module under Miri, ASan, and
   TSan.
 
@@ -167,12 +196,58 @@ For comparison, the overhead is 28 to 32 for `DirectPackedCache` and 78 to 210
 for quick_cache. The main queue added about 3.5 bytes per entry and bought
 about 3.4 points of trace hit rate.
 
+## Slab storage against boxed entries
+
+Entries first lived in individually allocated boxes in the direct arena.
+They now live in slab chunks (see "Storage and reclamation").
+
+Process RSS per resident entry with 1,000,000 entries after 3,000,000
+inserts. Unlike the requested-bytes table above, this includes allocator
+headers and rounding:
+
+| Host | Key, value | Boxed entries | Slab | quick_cache |
+| --- | --- | ---: | ---: | ---: |
+| Linux, glibc | `u64`, `u64` | 53.4 | 45.4 | 84.0 |
+| Linux, glibc | `[u8; 32]`, `[u8; 64]` | 133.5 | 125.6 | 191.0 |
+| macOS | `u64`, `u64` | 54.8 | 47.1 | 120.5 |
+| macOS | `[u8; 32]`, `[u8; 64]` | 135.5 | 135.3 | 332.2 |
+
+Throughput of slab storage against boxed entries, paired medians of three
+runs with 50,000 entries and 64-byte `Arc<[u8]>` values; positive means the
+slab is faster:
+
+| Workload | Linux 1T | Linux 8T | macOS 1T | macOS 8T |
+| --- | ---: | ---: | ---: | ---: |
+| Cold fill | +3.8% | +3.0% | +9.4% | +1.4% |
+| Replace | +10.2% | −5.8% | +13.1% | +5.6% |
+| Delete and reinsert | +8.9% | −4.5% | +11.2% | −2.6% |
+| Turnover (95% reads) | −2.1% | +2.5% | −7.7% | +0.2% |
+| Resident hit | +23.8% | +11.2% | −17.9% | −23.6% |
+
+With jemalloc on Linux, single-thread cells moved by 0 to +16% and
+eight-thread cells by −5 to −10%.
+
+The macOS resident-hit loss is a layout effect of the benchmark's
+allocation order. It builds each value just before inserting it. A boxed
+entry, allocated next, often reused the 64-byte block the value's `Vec` had
+just freed. It then sat beside its value, and one prefetch covered both.
+Slab slots sit apart from values.
+
+A read microbenchmark separates the effects:
+
+- Guard reads cost 11 ns and a pin 3.7 ns in both designs.
+- A `get` cost 34 ns with boxes and 41 ns with slabs.
+- With values allocated in a pass of their own, `get` costs matched within
+  the noise.
+- A `get` pays memory latency in full: its pin's `SeqCst` RMW keeps one
+  call's misses from overlapping the next call's.
+
 ## Throughput against quick_cache 0.7
 
-Measured with `bounded_cache_probe`: 32-byte keys, 64-byte `Arc<[u8]>` values,
-and 50,000 entries. Reads ran 16 million requests and writes 8 million (4
-million on Linux). Each figure is the paired median of three runs; positive
-means `ShardedCache` is faster.
+Measured with `bounded_cache_probe` on the slab storage: 32-byte keys,
+64-byte `Arc<[u8]>` values, and 50,000 entries. Reads ran 16 million
+requests and writes 8 million on macOS, and half that on Linux. Each figure is
+the paired median of three runs; positive means `ShardedCache` is faster.
 
 Hosts:
 - macOS: a shared 16-core Apple Silicon machine.
@@ -180,20 +255,27 @@ Hosts:
 
 | Workload | macOS 1T | macOS 2T | macOS 8T | Linux 1T | Linux 2T | Linux 8T |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Resident hit | −32% | +2% | +241% | +4% | +46% | +161% |
-| Read miss | +66% | +137% | +626% | +53% | +152% | +500% |
-| Turnover (95% reads) | −22% | −4% | +9% | −18% | −19% | +6% |
-| Cold fill | −18% | −6% | −35% | −28% | −37% | −52% |
-| Replace | −5% | +27% | −30% | −18% | −28% | −37% |
-| Delete and reinsert | −10% | −3% | −3% | −25% | −32% | −18% |
+| Resident hit | −39% | −3% | +153% | +16% | +36% | +155% |
+| Read miss | +84% | +174% | +638% | +72% | +155% | +530% |
+| Turnover (95% reads) | −27% | −8% | +7% | −18% | −10% | +9% |
+| Cold fill | −10% | −14% | −34% | −25% | −41% | −53% |
+| Replace | −3% | −4% | −25% | −9% | −27% | −42% |
+| Delete and reinsert | −14% | −11% | −10% | −27% | −31% | −23% |
 
-Eight-thread resident hits reached 362 Mops/s against quick_cache's 109.
+Eight-thread resident hits reached 275 Mops/s on macOS against quick_cache's
+109, and 233 against 94 on Linux.
 
-Writes trail at low thread counts. Lock-free reads require deferred
-reclamation, so an insert cannot reuse the evicted entry's hot memory the way
-quick_cache's slab does, and every operation pays an epoch pin, which is a
-full barrier. A guard read through `pin()` took 22 ns at 50,000 entries,
-against 34 ns for `get`.
+Writes still trail. Lock-free reads require deferred reclamation: an insert
+cannot reuse the evicted entry's memory until three epoch advances later,
+where quick_cache frees under its shard lock. Every operation also pays an
+epoch pin, a full barrier, and a write takes its shard lock and its thread's
+retired-queue lock. A guard read through `pin()` took 11 ns at 50,000 entries,
+against 34 to 41 ns for `get`, whose pin keeps one call's cache misses from
+overlapping the next call's.
+
+The earlier boxed-entry storage measured macOS resident hits at −32%, +2%,
+and +241%. On macOS those boxes often sat beside their values (see "Slab
+storage against boxed entries").
 
 ## Hit ratio
 
@@ -261,6 +343,26 @@ the sum was −3.44 and P3 at 131,072 entries read 46.80%.
 - **The direct arena's slab partitions for entries.** Under churn its partition
   locks and block lookups cost more than boxed entries: eight-thread turnover
   went from 20 to 46 Mops/s after switching to boxes.
+- **Boxed entries in the direct arena.** About one insert in two allocated:
+  a thread's 256-box stash could not hold its 512-entry reclaim batches, and
+  the stash interleaved entry frees with values in glibc's heap. See
+  "Slab storage against boxed entries" for the comparison.
+- **Retired queues per shard, under the shard lock.** Retiring needed no
+  extra lock. But every thread writing a shard moved its queue's cache lines
+  between cores, and eight-thread replace fell 45%.
+- **Per-thread lanes within each shard's queue.** Each thread kept 64 lanes,
+  one per shard, too many to stay cached: a lane's first loads missed on
+  most visits.
+- **A lock-free free stack per shard.** Popping a slot another core
+  reclaimed missed under the shard lock, and the stack's head moved between
+  cores on every write.
+- **Reclaiming in batches of 32.** Freeing values together was meant to
+  overlap their cache misses; eight-thread writes fell 12 to 16% instead.
+- **64-byte slots.** Aligning slots to cache lines moved reads by −8 to +5%
+  and cost 8 bytes per 56-byte entry.
+- **Trying an advance every 32 retirements per shard.** Each try scans 128
+  reader counters; eight-thread replace fell 63%. Tries now wait for 512
+  retirements across the cache.
 
 ## Reproduce
 

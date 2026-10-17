@@ -23,10 +23,11 @@ key lives in one of two buckets. Overhead beyond the key and value is 29 to 31
 requested bytes per entry, against 78 to 210 for quick_cache 0.7.
 
 Against quick_cache, ShardedCache leads concurrent reads. With eight threads
-on a 16-core machine it ran 2.6 to 3.4 times quick_cache's resident-hit
-throughput and 6 to 7.3 times its miss throughput, and it was 6 to 9% ahead on
-a 95%-read turnover mix. It trails on writes at one or two threads, and on
-cold fills and replacements at every thread count measured.
+on a 16-core machine it ran 2.5 to 2.6 times quick_cache's resident-hit
+throughput and 6.3 to 7.4 times its miss throughput, and it was 7 to 9% ahead
+on a 95%-read turnover mix. It trails on writes: by 3 to 27% at one thread and
+10 to 53% at eight. In process memory, 1,000,000 entries took 45 to 135 bytes
+each, against 84 to 332 for quick_cache.
 
 On the ARC paper traces, its summed hit rate over 18 cells was within 0.06
 points of quick_cache.
@@ -41,7 +42,8 @@ It offers:
 - per-entry and default times to live;
 - hit, miss, eviction, and expiration counts;
 - a removal listener told why each entry left;
-- `peek`, `contains_key`, and `clear`;
+- `peek`, `contains_key`, `clear`, and `maintain`, which drops removed
+  values promptly after a burst of writes;
 - weighted limits and borrowed reads through `pin()`.
 
 ```rust
