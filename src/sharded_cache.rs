@@ -643,6 +643,8 @@ struct Probationary {
 #[inline]
 #[allow(unsafe_code, reason = "issues a prefetch hint")]
 fn prefetch<T>(address: *const T) {
+    #[cfg(test)]
+    PREFETCHED.with(|lines| lines.borrow_mut().push(address as usize));
     #[cfg(all(target_arch = "x86_64", not(miri)))]
     // SAFETY: a prefetch hint never faults and changes no program state.
     unsafe {
@@ -659,6 +661,37 @@ fn prefetch<T>(address: *const T) {
     }
     #[cfg(any(miri, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
     let _ = address;
+}
+
+/// Like [`prefetch`], for a line about to be written: fetching it for
+/// ownership saves the upgrade a write after a read would wait for.
+#[inline]
+#[allow(unsafe_code, reason = "issues a prefetch hint")]
+fn prefetch_write<T>(address: *const T) {
+    #[cfg(test)]
+    PREFETCHED.with(|lines| lines.borrow_mut().push(address as usize));
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    // SAFETY: a prefetch hint never faults and changes no program state.
+    unsafe {
+        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_ET0 }>(address.cast());
+    }
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    // SAFETY: as above.
+    unsafe {
+        core::arch::asm!(
+            "prfm pstl1keep, [{address}]",
+            address = in(reg) address,
+            options(nostack, preserves_flags, readonly)
+        );
+    }
+    #[cfg(any(miri, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
+    let _ = address;
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Addresses this thread prefetched, for tests of what writers fetch.
+    static PREFETCHED: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// A shard's writer state under its lock, with the counts kept beside it.
@@ -1144,7 +1177,7 @@ where
         {
             let mut writer = shard.lock();
             if writer.over_limit(weight) {
-                shard.prefetch_next_victim(&writer);
+                shard.prefetch_eviction(&writer, hash);
             }
             let found = shard.find(hash, |current| {
                 // SAFETY: published in this table while `pin` is held.
@@ -1643,18 +1676,25 @@ impl<T> Shard<T> {
 }
 
 impl<T> ShardView<'_, T> {
-    /// Starts loading the next probationary victim's bucket and entry, so an
-    /// eviction finds both while the key is looked up, rather than loading
-    /// the entry only once its bucket names it. Writers call it only for a
-    /// full shard, so writes that evict nothing fetch nothing extra.
+    /// Starts loading the lines an insert of `hash` that evicts the next
+    /// probationary victim touches: the victim's bucket, entry, and ghost and
+    /// shadow words, and the new key's home bucket and ghost word. Each was
+    /// most likely last written on another core, and fetched together their
+    /// misses overlap instead of following one another under the lock.
+    /// Lines the insert writes are fetched for writing. Writers call it only
+    /// for a full shard, so writes that evict nothing fetch nothing extra.
     #[inline]
-    fn prefetch_next_victim(&self, writer: &ShardWriter) {
+    fn prefetch_eviction(&self, writer: &ShardWriter, hash: u64) {
         if let Some(next) = writer.probation.front() {
             let slot = usize::try_from(next.record >> 8).expect("a slot fits usize");
-            prefetch(self.buckets.as_ptr().wrapping_add(slot / SLOTS));
+            prefetch_write(self.buckets.as_ptr().wrapping_add(slot / SLOTS));
             let handle = usize::try_from(next.handle).expect("a handle fits usize");
             prefetch(ptr::without_provenance::<u8>(handle));
+            writer.filters.prefetch_write(GHOST, next.hash);
+            writer.filters.prefetch_write(PROBATION_SHADOW, next.hash);
         }
+        prefetch_write(self.buckets.as_ptr().wrapping_add(self.home(hash)));
+        writer.filters.prefetch(GHOST, hash);
     }
 
     #[inline]
@@ -2142,17 +2182,38 @@ impl Filters {
         }
     }
 
+    /// The bits that place `hash` in every filter.
     #[inline]
-    fn location(&self, filter: usize, hash: u64) -> (usize, u64) {
+    fn mixed(hash: u64) -> u64 {
+        (hash & 0xffff_ffff).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    }
+
+    /// The index of `hash`'s first word, generation 0, in `filter`.
+    #[inline]
+    fn word(&self, filter: usize, hash: u64) -> usize {
         let (start, words, sets) = self.region(filter);
         let set = filter.saturating_sub(PROBATION_SHADOW);
-        let low = hash & 0xffff_ffff;
-        let mixed = low.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let word =
-            usize::try_from(((mixed >> 32) * words as u64) >> 32).expect("a ghost word fits usize");
+        let word = usize::try_from(((Self::mixed(hash) >> 32) * words as u64) >> 32)
+            .expect("a ghost word fits usize");
+        start + (word * sets + set) * GHOST_GENERATIONS
+    }
+
+    #[inline]
+    fn location(&self, filter: usize, hash: u64) -> (usize, u64) {
+        let mixed = Self::mixed(hash);
         let mask =
             (0..GHOST_KEY_BITS).fold(0_u64, |mask, lane| mask | 1 << ((mixed >> (lane * 6)) & 63));
-        (start + (word * sets + set) * GHOST_GENERATIONS, mask)
+        (self.word(filter, hash), mask)
+    }
+
+    #[inline]
+    fn prefetch(&self, filter: usize, hash: u64) {
+        prefetch(self.words.as_ptr().wrapping_add(self.word(filter, hash)));
+    }
+
+    #[inline]
+    fn prefetch_write(&self, filter: usize, hash: u64) {
+        prefetch_write(self.words.as_ptr().wrapping_add(self.word(filter, hash)));
     }
 
     #[inline]
@@ -3251,6 +3312,60 @@ mod tests {
                 assert_eq!(probationary.handle, published);
             }
         }
+    }
+
+    #[test]
+    fn a_full_shards_insert_prefetches_the_lines_its_eviction_writes() {
+        // One shard at its limit with every key unread, so the next insert
+        // evicts the probation front: its bucket loses the handle, and the
+        // ghost and the probation shadow remember its hash. The new key
+        // lands in its home bucket after the ghost is checked for it.
+        let cache = ShardedCacheBuilder::new(256).shards(1).build::<u64, u64>();
+        for key in 0..1_000 {
+            cache.insert(key, key);
+        }
+        let shard = cache.view(0);
+        let fresh = cache.hash_builder.hash_one(5_000_u64);
+        let (victim, lines) = {
+            let writer = shard.lock();
+            let front = *writer.probation.front().expect("probation holds a key");
+            let slot = shard
+                .live_record(front.record)
+                .expect("the front key is live");
+            let word = |filter: usize, hash: u64| {
+                writer
+                    .filters
+                    .words
+                    .as_ptr()
+                    .wrapping_add(writer.filters.location(filter, hash).0) as usize
+            };
+            (
+                front.hash,
+                [
+                    (
+                        "the victim's bucket",
+                        std::ptr::from_ref(shard.bucket(slot)) as usize,
+                    ),
+                    ("the victim's ghost word", word(GHOST, front.hash)),
+                    (
+                        "the victim's shadow word",
+                        word(PROBATION_SHADOW, front.hash),
+                    ),
+                    ("the new key's ghost word", word(GHOST, fresh)),
+                    (
+                        "the new key's home bucket",
+                        std::ptr::from_ref(&shard.buckets[shard.home(fresh)]) as usize,
+                    ),
+                ],
+            )
+        };
+        PREFETCHED.with(|prefetched| prefetched.borrow_mut().clear());
+        cache.insert(5_000, 5_000);
+        let prefetched = PREFETCHED.with(std::cell::RefCell::take);
+        for (name, line) in lines {
+            assert!(prefetched.contains(&line), "{name} was not prefetched");
+        }
+        assert!(shard.lock().filters.remembers(GHOST, victim));
     }
 
     #[test]
