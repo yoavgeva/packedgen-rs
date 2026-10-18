@@ -3522,6 +3522,24 @@ mod tests {
             cache.insert(key, key);
         }
         let shard = cache.view(0);
+        // The next insert must evict the probation front. A missed key the
+        // ghost's current generation seems to remember (one fill in 400)
+        // grows the probation target and skips probation, so the insert
+        // would evict from the main area; a relocated front key (one in 750)
+        // leaves a stale record, which eviction skips. Later keys restore
+        // both.
+        let mut key = 1_000;
+        while {
+            let writer = shard.lock();
+            writer.probation.len() <= writer.filters.probation_target()
+                || writer
+                    .probation
+                    .front()
+                    .is_none_or(|front| shard.live_record(front.record).is_none())
+        } {
+            cache.insert(key, key);
+            key += 1;
+        }
         let fresh = cache.hash_builder.hash_one(5_000_u64);
         let (victim, lines) = {
             let writer = shard.lock();
