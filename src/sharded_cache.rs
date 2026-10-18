@@ -2795,6 +2795,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a thousand inserts counting hash calls")]
     fn relocation_moves_residents_without_rehashing_their_keys() {
         // Both candidate buckets were full on 6% of inserts into a full
         // shard. Rehashing a resident to find its other bucket read its
@@ -3638,7 +3639,7 @@ mod tests {
         let mut model = VecDeque::new();
         let mut cursor = 0;
         let mut state = 0x2545_f491_u32;
-        for step in 0..20_000_u32 {
+        for step in 0..if cfg!(miri) { 2_000 } else { 20_000_u32 } {
             state ^= state << 13;
             state ^= state >> 17;
             state ^= state << 5;
@@ -3721,6 +3722,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "thousands of remembers over 512 ghost lines")]
     fn remembering_a_key_clears_a_bounded_number_of_ghost_lines() {
         // A 16,384-entry shard: 512 ghost lines, 1,024 keys a generation.
         // Rotating cleared the next generation's word in every line at
