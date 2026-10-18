@@ -41,6 +41,9 @@ const SLOTS: usize = 6;
 const TAG_MASK: u64 = 0xff;
 const OVERFLOW_SHIFT: u32 = 48;
 const OVERFLOW_MAX: u64 = 0xff;
+/// A bucket's generations word marks a key living in its alternate bucket
+/// at this bit plus its slot.
+const DISPLACED_SHIFT: usize = 48;
 /// Table slots per entry of capacity: about 80% load when the shard is full.
 const SLOTS_PER_ENTRY_NUMERATOR: usize = 5;
 const SLOTS_PER_ENTRY_DENOMINATOR: usize = 4;
@@ -560,7 +563,8 @@ struct Bucket {
     control: AtomicU64,
     handles: [AtomicU64; SLOTS],
     /// A byte per slot counting its placements, so a main-queue record of
-    /// a slot can tell its key from a later one. Only writers use it.
+    /// a slot can tell its key from a later one, then a bit per slot set
+    /// while its key lives in its alternate bucket. Only writers use it.
     generations: AtomicU64,
 }
 
@@ -1237,7 +1241,10 @@ where
                 } else {
                     // Both candidate buckets are full: move a resident key to
                     // its other bucket, or else evict one of them.
-                    if !self.relocate_candidate(shard, &mut writer, &pin, hash) {
+                    if shard.relocate_candidate(&mut writer, hash) {
+                        #[cfg(test)]
+                        RELOCATIONS.with(|count| count.set(count.get() + 1));
+                    } else {
                         #[cfg(test)]
                         WINDOW_EVICTIONS.with(|count| count.set(count.get() + 1));
                         let (victim, cause) =
@@ -1325,7 +1332,7 @@ where
                 unsafe { entry(&pin, handle) }.value().0.borrow() == key
             });
             if let Some((index, _)) = found {
-                let handle = shard.clear(index, shard.home(hash));
+                let handle = shard.clear(index);
                 // SAFETY: the clear unpublished `handle` while `pin` is held.
                 let removed_entry = unsafe { entry(&pin, handle) };
                 writer.left(removed_entry.weight());
@@ -1448,7 +1455,7 @@ where
                 writer.enter_main(shard, record);
                 continue;
             }
-            let removed = shard.clear(slot, shard.home(hash));
+            let removed = shard.clear(slot);
             if !expired {
                 writer.filters.remember_probationary(hash);
             }
@@ -1476,7 +1483,7 @@ where
                 continue;
             }
             let hash = self.hash_builder.hash_one(&entry.value().0);
-            let removed = shard.clear(slot, shard.home(hash));
+            let removed = shard.clear(slot);
             if !expired {
                 writer.filters.remember_main(hash);
             }
@@ -1502,59 +1509,13 @@ where
                 continue;
             }
             let hash = self.hash_builder.hash_one(&entry.value().0);
-            let removed = shard.clear(slot, shard.home(hash));
+            let removed = shard.clear(slot);
             if !expired {
                 writer.filters.remember_main(hash);
             }
             return Some((removed, writer.evicted(entry.weight(), expired)));
         }
         None
-    }
-
-    /// Frees a slot in the two full buckets `hash` may occupy by moving one
-    /// resident key to its own other bucket. The key is published at its new
-    /// slot before its old slot is cleared, so readers always find it.
-    #[allow(
-        unsafe_code,
-        reason = "dereferences handles published in this shard while `pin` is held"
-    )]
-    fn relocate_candidate(
-        &self,
-        shard: ShardView<'_, (K, V)>,
-        writer: &mut LockedShard<'_>,
-        pin: &EpochPin<'_>,
-        hash: u64,
-    ) -> bool {
-        let (home, alternate) = shard.candidates(hash);
-        for bucket in [home, alternate] {
-            for slot in bucket * SLOTS..(bucket + 1) * SLOTS {
-                let raw = shard.bucket(slot).handles[slot % SLOTS].load(Ordering::Relaxed);
-                let handle = Handle::<(K, V)>::from_raw(raw);
-                // SAFETY: the shard lock keeps this published handle in the table.
-                let resident = unsafe { entry(pin, handle) };
-                let resident_hash = self.hash_builder.hash_one(&resident.value().0);
-                let (resident_home, resident_alternate) = shard.candidates(resident_hash);
-                let other = if bucket == resident_home {
-                    resident_alternate
-                } else {
-                    resident_home
-                };
-                if other == home || other == alternate {
-                    continue;
-                }
-                if let Some(moved_to) = shard.place_at(other, resident_home, resident_hash, handle)
-                {
-                    let moved = shard.clear(slot, resident_home);
-                    debug_assert_eq!(moved.raw(), handle.raw());
-                    // Its old record no longer matches; a probationary key
-                    // gains a main record it does not need, which only
-                    // gives it a second life after probation.
-                    writer.enter_main(shard, shard.record(moved_to));
-                    return true;
-                }
-            }
-        }
-        false
     }
 
     /// Removes an expired entry, or else the first unread one, sweeping
@@ -1592,9 +1553,8 @@ where
                 if keep {
                     continue;
                 }
-                let victim_home = shard.home(self.hash_builder.hash_one(&entry.value().0));
                 let cause = writer.evicted(entry.weight(), expired);
-                return (shard.clear(slot, victim_home), cause);
+                return (shard.clear(slot), cause);
             }
         }
         unreachable!("the last pass evicts its first slot")
@@ -1731,34 +1691,60 @@ impl<T> ShardView<'_, T> {
         self.reduce(hash.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 32)
     }
 
+    /// How far past its home a key with `tag` has its alternate: one to
+    /// one less than the bucket count, so the two always differ.
     #[inline]
-    fn next(&self, bucket: usize) -> usize {
-        if bucket + 1 == self.buckets.len() {
-            0
+    fn offset(&self, tag: u8) -> usize {
+        // Multiples of 2^32 / phi spread the tags evenly over the range.
+        let spread = (u64::from(tag) * 0x9e37_79b9) & 0xffff_ffff;
+        let scaled = (spread * (self.buckets.len() as u64 - 1)) >> 32;
+        1 + usize::try_from(scaled).expect("a bucket offset fits usize")
+    }
+
+    #[inline]
+    fn alternate(&self, home: usize, tag: u8) -> usize {
+        let alternate = home + self.offset(tag);
+        if alternate >= self.buckets.len() {
+            alternate - self.buckets.len()
         } else {
-            bucket + 1
+            alternate
+        }
+    }
+
+    /// The home of a key with `tag` that lives in its alternate, `bucket`.
+    #[inline]
+    fn displaced_home(&self, bucket: usize, tag: u8) -> usize {
+        let offset = self.offset(tag);
+        if bucket >= offset {
+            bucket - offset
+        } else {
+            bucket + self.buckets.len() - offset
         }
     }
 
     /// The two buckets a key may live in: its home and an alternate, so a
     /// full region never chains into the next and displacement cannot grow.
-    /// The alternate comes from a full avalanche of the key hash: a fast
-    /// hasher's bit halves can correlate for some seeds, and correlated
-    /// choices left one seed in forty evicting from full pairs on 2.4% of
-    /// inserts. Lookups reach the alternate only after the home misses, so
-    /// the avalanche stays off the common path.
+    /// The alternate lies its tag's offset past the home, so a resident's
+    /// other bucket follows from its slot without reading its key.
+    /// Lookups reach the alternate only after the home misses.
     #[inline]
     fn candidates(&self, hash: u64) -> (usize, usize) {
         let home = self.home(hash);
-        let alternate = self.reduce(fmix64(hash) >> 32);
-        (
-            home,
-            if alternate == home {
-                self.next(home)
-            } else {
-                alternate
-            },
-        )
+        (home, self.alternate(home, tag(hash)))
+    }
+
+    /// The other candidate bucket of the key in occupied `slot`, and
+    /// whether that bucket is the key's home.
+    #[inline]
+    fn other_bucket(&self, slot: usize) -> (usize, bool) {
+        let bucket = slot / SLOTS;
+        let current = &self.buckets[bucket];
+        let tag = current.control.load(Ordering::Relaxed).to_le_bytes()[slot % SLOTS];
+        if is_displaced(current, slot % SLOTS) {
+            (self.displaced_home(bucket, tag), true)
+        } else {
+            (self.alternate(bucket, tag), false)
+        }
     }
 
     /// Finds the slot whose handle `matches` in the key's home bucket, then
@@ -1779,7 +1765,7 @@ impl<T> ShardView<'_, T> {
         if control >> OVERFLOW_SHIFT & OVERFLOW_MAX == 0 {
             return None;
         }
-        let (_, alternate) = self.candidates(hash);
+        let alternate = self.alternate(home, tag);
         let control = self.buckets[alternate].control.load(Ordering::Acquire);
         self.find_in(alternate, control, tag, &mut matches)
     }
@@ -1816,7 +1802,7 @@ impl<T> ShardView<'_, T> {
     #[inline]
     fn place(&self, hash: u64, handle: Handle<T>) -> Option<usize> {
         let (home, alternate) = self.candidates(hash);
-        if let Some(slot) = self.place_in(home, hash, handle) {
+        if let Some(slot) = self.place_in(home, tag(hash), handle, false) {
             return Some(slot);
         }
         let alternate_control = self.buckets[alternate].control.load(Ordering::Relaxed);
@@ -1832,7 +1818,7 @@ impl<T> ShardView<'_, T> {
                 .control
                 .store(control + (1 << OVERFLOW_SHIFT), Ordering::Release);
         }
-        self.place_in(alternate, hash, handle)
+        self.place_in(alternate, tag(hash), handle, true)
     }
 
     /// A main-queue record of `slot`'s current key.
@@ -1855,28 +1841,65 @@ impl<T> ShardView<'_, T> {
             .then_some(slot)
     }
 
-    /// Publishes `handle` in `bucket`, one of the key's candidates, counting
-    /// it in its home's overflow when `bucket` is the alternate. Returns the
-    /// slot, or `None` when `bucket` is full. Requires the shard lock.
+    /// Moves the key in `slot` to `other`, its other candidate bucket, if
+    /// that has room, and returns its new slot. The key is published there
+    /// before its old slot is cleared. Requires the shard lock.
     #[inline]
-    fn place_at(&self, bucket: usize, home: usize, hash: u64, handle: Handle<T>) -> Option<usize> {
-        if zero_tag_bytes(self.buckets[bucket].control.load(Ordering::Relaxed)) == 0 {
+    fn relocate(&self, slot: usize, (other, to_home): (usize, bool)) -> Option<usize> {
+        if zero_tag_bytes(self.buckets[other].control.load(Ordering::Relaxed)) == 0 {
             return None;
         }
-        if bucket != home {
-            let home_bucket = &self.buckets[home];
-            let control = home_bucket.control.load(Ordering::Relaxed);
-            if control >> OVERFLOW_SHIFT & OVERFLOW_MAX < OVERFLOW_MAX {
-                home_bucket
-                    .control
-                    .store(control + (1 << OVERFLOW_SHIFT), Ordering::Release);
-            }
+        let current = self.bucket(slot);
+        let control = current.control.load(Ordering::Relaxed);
+        let raw = current.handles[slot % SLOTS].load(Ordering::Relaxed);
+        if !to_home && control >> OVERFLOW_SHIFT & OVERFLOW_MAX < OVERFLOW_MAX {
+            // Leaving its home: counted there before lookups can need it.
+            current
+                .control
+                .store(control + (1 << OVERFLOW_SHIFT), Ordering::Release);
         }
-        self.place_in(bucket, hash, handle)
+        let tag = control.to_le_bytes()[slot % SLOTS];
+        let moved_to = self.place_in(other, tag, Handle::from_raw(raw), !to_home)?;
+        let moved = self.clear(slot);
+        debug_assert_eq!(moved.raw(), raw);
+        Some(moved_to)
     }
 
+    /// Frees a slot in the two full buckets `hash` may occupy by moving one
+    /// resident key to its own other bucket, which follows from its slot:
+    /// no resident's entry is read. Requires the shard lock.
+    fn relocate_candidate(self, writer: &mut LockedShard<'_>, hash: u64) -> bool {
+        let (home, alternate) = self.candidates(hash);
+        for slot in [home, alternate]
+            .into_iter()
+            .flat_map(|bucket| bucket * SLOTS..(bucket + 1) * SLOTS)
+        {
+            let other = self.other_bucket(slot);
+            if other.0 == home || other.0 == alternate {
+                continue;
+            }
+            if let Some(moved_to) = self.relocate(slot, other) {
+                // Its old record no longer matches; a probationary key
+                // gains a main record it does not need, which only gives it
+                // a second life after probation.
+                writer.enter_main(self, self.record(moved_to));
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Publishes `handle`, of a key with `tag`, in a free slot of `bucket`,
+    /// marking whether that is the key's alternate. Returns the slot, or
+    /// `None` when `bucket` is full. Requires the shard lock.
     #[inline]
-    fn place_in(&self, bucket: usize, hash: u64, handle: Handle<T>) -> Option<usize> {
+    fn place_in(
+        &self,
+        bucket: usize,
+        tag: u8,
+        handle: Handle<T>,
+        displaced: bool,
+    ) -> Option<usize> {
         let current = &self.buckets[bucket];
         let control = current.control.load(Ordering::Relaxed);
         let empty = zero_tag_bytes(control);
@@ -1886,24 +1909,26 @@ impl<T> ShardView<'_, T> {
         // The lowest flagged byte of `zero_tag_bytes` is always exact.
         let slot = empty.trailing_zeros() as usize / 8;
         current.handles[slot].store(handle.raw(), Ordering::Release);
-        current.control.store(
-            control | (u64::from(tag(hash)) << (slot * 8)),
-            Ordering::Release,
-        );
+        current
+            .control
+            .store(control | (u64::from(tag) << (slot * 8)), Ordering::Release);
         let generations = current.generations.load(Ordering::Relaxed);
         let bumped = ((generations >> (slot * 8)) + 1) & 0xff;
+        let flag = 1 << (DISPLACED_SHIFT + slot);
         current.generations.store(
-            (generations & !(0xff << (slot * 8))) | (bumped << (slot * 8)),
+            (generations & !(0xff << (slot * 8)) & !flag)
+                | (bumped << (slot * 8))
+                | if displaced { flag } else { 0 },
             Ordering::Relaxed,
         );
         Some(bucket * SLOTS + slot)
     }
 
-    /// Unpublishes `slot`, whose key's home bucket is `home`, releasing the
-    /// home's overflow count if the key lived in its alternate. Returns the
-    /// handle it held. Requires the shard lock.
+    /// Unpublishes `slot`, releasing its key's count in its home's overflow
+    /// if the key lived in its alternate. Returns the handle it held.
+    /// Requires the shard lock.
     #[inline]
-    fn clear(&self, slot: usize, home: usize) -> Handle<T> {
+    fn clear(&self, slot: usize) -> Handle<T> {
         let bucket = slot / SLOTS;
         let current = &self.buckets[bucket];
         let control = current.control.load(Ordering::Relaxed);
@@ -1912,8 +1937,9 @@ impl<T> ShardView<'_, T> {
             Ordering::Release,
         );
         let removed = Handle::from_raw(current.exchange(slot % SLOTS, 0));
-        if bucket != home {
-            let home_bucket = &self.buckets[home];
+        if is_displaced(current, slot % SLOTS) {
+            let tag = control.to_le_bytes()[slot % SLOTS];
+            let home_bucket = &self.buckets[self.displaced_home(bucket, tag)];
             let control = home_bucket.control.load(Ordering::Relaxed);
             let overflow = control >> OVERFLOW_SHIFT & OVERFLOW_MAX;
             debug_assert_ne!(overflow, 0, "a key in its alternate is counted at home");
@@ -1930,16 +1956,7 @@ impl<T> ShardView<'_, T> {
 #[cfg(test)]
 thread_local! {
     static WINDOW_EVICTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-/// `MurmurHash3`'s 64-bit finalizer: every output bit depends on every input bit.
-#[inline]
-const fn fmix64(mut value: u64) -> u64 {
-    value ^= value >> 33;
-    value = value.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    value ^= value >> 33;
-    value = value.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-    value ^ (value >> 33)
+    static RELOCATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 const BYTE_ONES: u64 = 0x0101_0101_0101_0101;
@@ -1953,6 +1970,12 @@ const TAG_HIGH_BITS: u64 = 0x0000_8080_8080_8080;
 #[inline]
 const fn zero_tag_bytes(word: u64) -> u64 {
     word.wrapping_sub(BYTE_ONES) & !word & TAG_HIGH_BITS
+}
+
+/// Whether the key in `bucket`'s `slot` lives in its alternate bucket.
+#[inline]
+fn is_displaced(bucket: &Bucket, slot: usize) -> bool {
+    bucket.generations.load(Ordering::Relaxed) >> (DISPLACED_SHIFT + slot) & 1 != 0
 }
 
 /// A slot tag: eight hash bits other than the shard and home-bucket bits,
@@ -2481,8 +2504,9 @@ mod tests {
             }
         }
         let pin = cache.epochs.pin();
+        let mut displaced_from = vec![0_u64; shard.buckets.len()];
         for (bucket, current) in shard.buckets.iter().enumerate() {
-            for handle in &current.handles {
+            for (slot, handle) in current.handles.iter().enumerate() {
                 let raw = handle.load(Ordering::Relaxed);
                 if raw == 0 {
                     continue;
@@ -2496,7 +2520,23 @@ mod tests {
                     bucket == home || bucket == alternate,
                     "key {key} lives in bucket {bucket}, outside {home} and {alternate}"
                 );
+                // Relocation and clears find a key's other bucket from its
+                // slot alone.
+                assert_eq!(is_displaced(current, slot), bucket != home);
+                let other = if bucket == home { alternate } else { home };
+                assert_eq!(
+                    shard.other_bucket(bucket * SLOTS + slot),
+                    (other, other == home)
+                );
+                displaced_from[home] += u64::from(bucket != home);
             }
+        }
+        for (bucket, displaced) in shard.buckets.iter().zip(displaced_from) {
+            let overflow = bucket.control.load(Ordering::Relaxed) >> OVERFLOW_SHIFT & OVERFLOW_MAX;
+            assert_eq!(
+                overflow, displaced,
+                "a home counts its keys in their alternate"
+            );
         }
     }
 
@@ -2644,6 +2684,43 @@ mod tests {
         fn build_hasher(&self) -> PinWatchingHasher {
             PinWatchingHasher(DefaultHasher::new())
         }
+    }
+
+    /// A deterministic hasher that counts the keys its thread hashes.
+    #[derive(Clone, Default)]
+    struct Counting;
+
+    thread_local! {
+        static KEYS_HASHED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    impl BuildHasher for Counting {
+        type Hasher = DefaultHasher;
+        fn build_hasher(&self) -> DefaultHasher {
+            KEYS_HASHED.set(KEYS_HASHED.get() + 1);
+            DefaultHasher::new()
+        }
+    }
+
+    #[test]
+    fn relocation_moves_residents_without_rehashing_their_keys() {
+        // Both candidate buckets were full on 6% of inserts into a full
+        // shard. Rehashing a resident to find its other bucket read its
+        // entry, a cache miss apiece, before the move could start.
+        let cache = ShardedCacheBuilder::new(1_000)
+            .shards(1)
+            .hasher(Counting)
+            .build();
+        let relocations = RELOCATIONS.with(std::cell::Cell::get);
+        KEYS_HASHED.set(0);
+        for key in 0..1_000_u64 {
+            cache.insert(key, key);
+        }
+        assert!(
+            RELOCATIONS.with(std::cell::Cell::get) > relocations,
+            "filling the shard relocates keys"
+        );
+        assert_eq!(KEYS_HASHED.get(), 1_000, "each insert hashes only its key");
     }
 
     #[test]

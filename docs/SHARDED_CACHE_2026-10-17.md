@@ -45,9 +45,12 @@ entry. Tables are sized once and never rebuilt.
   zero-byte test.
 - **Placement.** A key lives in its home bucket or one alternate bucket, so
   lookups touch at most two buckets. The home is one multiply of the key hash.
-  The alternate comes from MurmurHash3's finalizer.
+  The alternate lies an offset past the home that the key's tag picks.
   - The home's overflow count is the number of its keys that live in their
     alternates. A lookup reads the alternate only when that count is nonzero.
+  - A bit per slot, in the writer-only generations word, marks a key living
+    in its alternate. With the slot's tag it names the key's other bucket, so
+    relocation and removal never read a resident's key to find it.
   - When both buckets are full, the cache first moves one resident key to its
     own other bucket. The copy is published before the old slot is cleared, so
     readers always find it.
@@ -366,6 +369,18 @@ These changes followed, each measured against the one before:
   That is one fewer read-modify-write per replace, eviction, and removal,
   an out-of-line call on Linux aarch64. Eight-thread cold fill on macOS:
   +5.0%; other cells within 4%.
+- **Relocating without reading residents.** Both candidate buckets were
+  full on 6.4% of inserts into a full shard. Relocation then read each
+  resident it tried, 1.5 on average, to hash its key and find its other
+  bucket: a cache miss apiece in a large cache, about 260 ns per relocation
+  on macOS at 1,000,000 entries. The alternate is now an offset that the
+  key's tag picks, and a bit per slot marks keys in their alternates, so a
+  slot alone names its key's other bucket. At 1,000,000 entries on macOS,
+  single-thread cold fill gained 11% and turnover 7%, and cold fill's p99
+  insert fell from 625 to 375 ns; eight threads gained 1 to 4%. At 50,000
+  entries every cell stayed within 3%. On Linux, single-thread cells at
+  1,000,000 entries moved by −4 to +2%: the VM backs memory with 2 MB
+  transparent huge pages, which likely made the old reads cheaper there.
 
 Pacing is a trade-off between allocators and workloads. Freeing up to four
 entries per write instead changed Linux throughput by:
@@ -558,7 +573,10 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
 - **Raw hash bits for the buckets.** For one seed in forty, the fast hasher's
   halves correlated. That left 2.4% of inserts evicting from full pairs, and CI
   hit such a seed. The full finalizer on the home bucket fixed it but cost
-  12–15% of single-thread reads, so only the alternate takes it.
+  12–15% of single-thread reads, so only the alternate took it, until the
+  alternate became an offset of the key's tag. Over 300 random seeds of that
+  test's churn, with `u64` and 32-byte keys, the tag offsets evicted from full
+  pairs on at most 5 of 200,000 inserts, the same as the finalizer.
 - **A fixed 10% probation share.** 2% read better on DS1, P3, and S3; for
   example, DS1 at 8,000,000 entries read 68.06% against 63.91%. Probation
   now adapts per shard instead (see "Adaptive probation").
