@@ -10,8 +10,8 @@
 //! WORKLOAD is `resident-hit`, `read-miss`, `cold-fill`,
 //! `turnover`, `replace`, or `delete-reinsert`. `LATENCY_STRIDE` defaults to zero
 //! (uninstrumented throughput); otherwise every stride-th operation is timed,
-//! and the row ends with their p99, p99.9, p99.99, and maximum latencies. Each
-//! invocation runs exactly one cache.
+//! and the row ends with their p99, p99.9, p99.99, p99.999, and maximum
+//! latencies. Each invocation runs exactly one cache.
 
 #![allow(clippy::cast_precision_loss)]
 
@@ -693,10 +693,10 @@ fn main() {
             .map_or_else(|| "na".to_owned(), |value| value.as_nanos().to_string())
     };
     println!(
-        "backend,workload,entries_limit,weight_limit,operations,workers,value_bytes,seed,latency_stride,mops,read_hits,reads,write_attempts,removed,final_entries,final_weight,latency_samples,p99_ns,final_maintenance_ns,checksum,p999_ns,p9999_ns,max_ns"
+        "backend,workload,entries_limit,weight_limit,operations,workers,value_bytes,seed,latency_stride,mops,read_hits,reads,write_attempts,removed,final_entries,final_weight,latency_samples,p99_ns,final_maintenance_ns,checksum,p999_ns,p9999_ns,p99999_ns,max_ns"
     );
     println!(
-        "{backend},{},{},{},{},{},{},{},{},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{backend},{},{},{},{},{},{},{},{},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         args[2],
         config.capacity_entries(),
         config.weight_limit(),
@@ -718,6 +718,7 @@ fn main() {
         black_box(sample.checksum),
         quantile(99_900),
         quantile(99_990),
+        quantile(99_999),
         quantile(100_000),
     );
 }
