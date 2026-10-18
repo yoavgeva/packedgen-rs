@@ -23,13 +23,14 @@ key lives in one of two buckets. Overhead beyond the key and value is 29.1 to
 33.3 requested bytes per entry, against 78 to 210 for quick_cache 0.7.
 
 Against quick_cache, ShardedCache leads concurrent reads. With eight threads
-on a 16-core machine it ran 2.3 to 3.9 times quick_cache's resident-hit
-throughput and 6.6 to 7.7 times its miss throughput, and it was 33 to 44%
-ahead on a 95%-read turnover mix. At eight threads it was also 30 to 35%
-ahead on deleting and reinserting keys, between 11% behind and 2% ahead on
-replacing them, and 19 to 20% behind on inserting new keys into a full cache.
-On one thread, resident hits ranged from 10% behind to 2% ahead, and writes
-from 7% ahead to 21% behind. In process memory, 1,000,000 entries took 46 to
+on a 16-core machine it ran 2.4 to 3.8 times quick_cache's resident-hit
+throughput and 6.5 to 7.3 times its miss throughput, and it was 42 to 46%
+ahead on a 95%-read turnover mix. At eight threads it was also 27 to 29%
+ahead on deleting and reinserting keys, between 14% behind and 22% ahead on
+replacing them, and 12 to 22% behind on inserting new keys into a full cache.
+On one thread, resident hits ranged from 12% behind to even, and writes from
+5% ahead to 21% behind; most of that write gap is the delay epoch
+reclamation needs before memory is reused. In process memory, 1,000,000 entries took 46 to
 136 bytes each, against 83 to 332 for quick_cache.
 
 Each shard sizes its probationary queue to the keys it sees return. On the

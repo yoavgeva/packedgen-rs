@@ -388,8 +388,9 @@ overhead.
 
 ## Throughput against quick_cache 0.7
 
-Measured with `bounded_cache_probe` after reads began hashing before they
-pin: 32-byte keys, 64-byte `Arc<[u8]>` values, and 50,000 entries. Reads ran
+Measured with `bounded_cache_probe` after adaptive probation and the latest
+write-path changes: 32-byte keys, 64-byte `Arc<[u8]>` values, and 50,000
+entries. Reads ran
 16 million requests and writes 8 million on macOS, and half that on Linux.
 Each figure is the paired median of three runs; positive means
 `ShardedCache` is faster.
@@ -402,25 +403,26 @@ Hosts:
 Two-thread cells varied most between runs, by up to 30% for one build, as
 threads landed on performance or efficiency cores. On Linux, rebuilding the
 same sources with a different code layout moved single-thread cells by up to
-14%.
+14%, and whole runs drifted by about 10% between sessions: quick_cache's own
+figures moved as much. Direct before-and-after comparisons, as quoted under
+"Write path" and "Adaptive probation", are the better guide to each change.
 
 | Workload | macOS 1T | macOS 2T | macOS 8T | Linux 1T | Linux 2T | Linux 8T |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Resident hit | −10% | +30% | +292% | +2% | +20% | +133% |
-| Read miss | +91% | +184% | +670% | +75% | +169% | +556% |
-| Turnover (95% reads) | −13% | −4% | +33% | −21% | −8% | +44% |
-| Cold fill | −10% | −17% | −20% | −21% | −8% | −19% |
-| Replace | +7% | −4% | +2% | −16% | −14% | −11% |
-| Delete and reinsert | +6% | 0% | +35% | −20% | −10% | +30% |
+| Resident hit | 0% | +40% | +283% | −12% | +6% | +136% |
+| Read miss | +87% | +163% | +634% | +79% | +238% | +551% |
+| Turnover (95% reads) | −13% | +7% | +42% | −18% | −16% | +46% |
+| Cold fill | −9% | −23% | −12% | −21% | −13% | −22% |
+| Replace | −3% | −12% | +22% | −15% | −16% | −14% |
+| Delete and reinsert | +5% | −2% | +29% | −14% | −9% | +27% |
 
 Before reads hashed first, macOS resident hits read −42%, −9%, and +151%,
-and macOS turnover −22%, −11%, and +27%. The write code did not change; its
-cells moved within the noise above. Before the write-path changes, the write
-rows read −10 to −53% for cold fill, −3 to −42% for replace, −10 to −31% for
-delete and reinsert, and −27 to +9% for turnover.
+and macOS turnover −22%, −11%, and +27%. Before the write-path changes, the
+write rows read −10 to −53% for cold fill, −3 to −42% for replace, −10 to
+−31% for delete and reinsert, and −27 to +9% for turnover.
 
-Eight-thread resident hits reached 418 Mops/s on macOS against quick_cache's
-107, and 212 against 94 on Linux.
+Eight-thread resident hits reached 408 Mops/s on macOS against quick_cache's
+105, and 213 against 93 on Linux.
 
 Cold fill still trails: every insert into a full shard evicts under the lock
 (see "Write path"), and single-thread writes pay what lock-free reads
@@ -429,6 +431,20 @@ advances later, where quick_cache frees under its shard lock, and every
 write pays an epoch pin and its thread's retired-queue lock. A single-thread
 `get` still waits at its unpin for the value clone's increment, the remaining
 difference from quick_cache on macOS (see "Read path").
+
+Two bounds, measured on one Linux thread and unsound with concurrent
+readers, locate the single-thread write cost:
+
+- Freeing removed entries at once instead of queuing them made cold fill
+  29 to 32% faster, delete and reinsert 25 to 27%, and replace 34 to 35%:
+  ahead of quick_cache, which led by 13 to 20%.
+- Dropping only the retired queue's lock moved the same cells by −4 to +1%.
+
+The cost is the delay, not the bookkeeping. A slot and its value's
+allocation are reused about 1,500 writes after their last use, from L2
+rather than L1. Shortening the delay means scanning the 128 reader counters
+more often, which costs more at eight threads (see "Rejected and
+reverted").
 
 The earlier boxed-entry storage measured macOS resident hits at −32%, +2%,
 and +241%. On macOS those boxes often sat beside their values (see "Slab
