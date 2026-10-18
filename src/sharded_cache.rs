@@ -564,6 +564,23 @@ struct Bucket {
     generations: AtomicU64,
 }
 
+impl Bucket {
+    /// Puts `raw` in `slot` and returns the handle it held. Requires the
+    /// shard lock, under which writers make every change to a handle: the
+    /// load sees the current handle, and the lock orders the entry it names
+    /// before this writer. Readers acquire the entry `raw` names through the
+    /// release store. Readers still holding the old handle are covered by
+    /// the writer's pin, as for any unpublication, so a swap's
+    /// read-modify-write would buy nothing.
+    #[inline]
+    fn exchange(&self, slot: usize, raw: u64) -> u64 {
+        let handle = &self.handles[slot];
+        let previous = handle.load(Ordering::Relaxed);
+        handle.store(raw, Ordering::Release);
+        previous
+    }
+}
+
 /// A shard's writer state. Its buckets are its stretch of the cache's table,
 /// which readers find from the hash without loading the shard. The limits
 /// never change, so their line stays in every core's cache; the writer lock
@@ -1184,10 +1201,10 @@ where
                 unsafe { entry(&pin, current) }.value().0 == *key
             });
             if let Some((index, _)) = found {
-                let previous = Handle::from_raw(
-                    shard.bucket(index).handles[index % SLOTS].swap(handle.raw(), Ordering::AcqRel),
-                );
-                // SAFETY: the swap unpublished `previous` while `pin` is held.
+                let previous =
+                    Handle::from_raw(shard.bucket(index).exchange(index % SLOTS, handle.raw()));
+                // SAFETY: the exchange unpublished `previous` while `pin` is
+                // held.
                 let previous_entry = unsafe { entry(&pin, previous) };
                 let reweighed = writer.weight() - previous_entry.weight() + weight;
                 writer.set_weight(reweighed);
@@ -1341,8 +1358,8 @@ where
                     }
                     // Tags first, as `Shard::clear` does, then the handles.
                     bucket.control.store(0, Ordering::Release);
-                    for handle in &bucket.handles {
-                        let raw = handle.swap(0, Ordering::AcqRel);
+                    for slot in 0..SLOTS {
+                        let raw = bucket.exchange(slot, 0);
                         if raw != 0 {
                             removed.push(Handle::from_raw(raw), RemovalCause::Explicit);
                         }
@@ -1887,7 +1904,7 @@ impl<T> ShardView<'_, T> {
 
     /// Unpublishes `slot`, whose key's home bucket is `home`, releasing the
     /// home's overflow count if the key lived in its alternate. Returns the
-    /// handle swapped out. Requires the shard lock.
+    /// handle it held. Requires the shard lock.
     #[inline]
     fn clear(&self, slot: usize, home: usize) -> Handle<T> {
         let bucket = slot / SLOTS;
@@ -1897,7 +1914,7 @@ impl<T> ShardView<'_, T> {
             control & !(TAG_MASK << ((slot % SLOTS) * 8)),
             Ordering::Release,
         );
-        let removed = Handle::from_raw(current.handles[slot % SLOTS].swap(0, Ordering::AcqRel));
+        let removed = Handle::from_raw(current.exchange(slot % SLOTS, 0));
         if bucket != home {
             let home_bucket = &self.buckets[home];
             let control = home_bucket.control.load(Ordering::Relaxed);
