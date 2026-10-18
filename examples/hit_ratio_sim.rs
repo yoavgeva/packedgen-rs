@@ -1258,13 +1258,16 @@ fn run_policy(policy: &str, trace: &Trace, entries: usize) -> Outcome {
             )),
         ),
         sharded if sharded.starts_with("sharded") => {
-            let probation = sharded
+            let builder = ShardedCacheBuilder::new(entries);
+            let builder = match sharded
                 .split('/')
                 .find_map(|option| option.strip_prefix("probation="))
-                .map_or(200, |bps| {
-                    bps.parse().expect("probation= takes basis points")
-                });
-            let builder = ShardedCacheBuilder::new(entries).probation_bps(probation);
+            {
+                Some(bps) => {
+                    builder.probation_bps(bps.parse().expect("probation= takes basis points"))
+                }
+                None => builder,
+            };
             let builder = match sharded
                 .split('/')
                 .find_map(|option| option.strip_prefix("shards="))
