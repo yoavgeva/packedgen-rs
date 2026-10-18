@@ -98,8 +98,9 @@ entry. Tables are sized once and never rebuilt.
     touching its slots.
   - The generation advances once 512 retirements are pending across the
     cache. A failed try waits for 256 more.
-- **Reads.** `get` pins per call and clones the value. `pin()` returns a guard
-  for borrowed reads that pins once.
+- **Reads.** `get` hashes the key, then pins and clones the value. Hashing
+  before pinning lets the hash run while the previous call's unpin completes
+  (see "Read path"). `pin()` returns a guard for borrowed reads that pins once.
 - **Weights.** Weights come from a `Weighter`. A value heavier than its shard's
   share of the weight limit is refused, and any previous value for its key is
   removed, so readers never see a value the caller replaced.
@@ -262,8 +263,47 @@ A read microbenchmark separates the effects:
 - A `get` cost 34 ns with boxes and 41 ns with slabs.
 - With values allocated in a pass of their own, `get` costs matched within
   the noise.
-- A `get` pays memory latency in full: its pin's `SeqCst` RMW keeps one
-  call's misses from overlapping the next call's.
+- A `get` paid memory latency in full: its pin's `SeqCst` RMW held back the
+  next call's loads until this call's had finished. "Read path" covers the
+  part of that it no longer pays.
+
+## Read path
+
+On one thread on macOS, `get` trailed quick_cache by 42% at 50,000 entries,
+yet a borrowed read under one guard took 11 ns. At 2,000 entries, a
+cycle-sampled profile placed 30% of `get`'s cycles at its unpin, waiting for
+the value clone's atomic increment. quick_cache spent 42% of its cycles in
+its key hash, which ran while its previous call's unlock completed.
+
+A pin's `SeqCst` read-modify-write holds back the loads after it, the key's
+included. `get` hashed under its pin, so a call could not start hashing until
+the previous call's clone and unpin had finished. `get`, `peek`, and
+`contains_key` now hash first. Resident hits on one thread of an M4 Max, in
+millions per second:
+
+| Entries | Hashing under the pin | Hashing first | quick_cache |
+| ---: | ---: | ---: | ---: |
+| 2,000 | 44 | 59 | 63 |
+| 50,000 | 24 | 35 | 39 |
+| 1,000,000 | 4.5 | 7.7 | 8.5 |
+
+On the Linux VM the change was neutral: one build pair read 10 to 14% slower
+on one thread, and the same sources rebuilt with one codegen unit read 3%
+faster. Builds with inline LSE atomics also measured within noise.
+
+Other variants, none kept:
+
+- A `Release` unpin instead of `SeqCst`, hashing before or after the pin:
+  within 2%, so the epoch protocol is unchanged.
+- Prefetching the home bucket before pinning: 2 to 6% slower than hashing
+  first alone.
+- Computing the bucket's address before pinning: within noise.
+- `#[inline]` on `get`: within noise in the probe.
+- Taking and filling an insert's slot before pinning: within noise on
+  writes.
+- Prefetching the home bucket, or the eviction victim's bucket, for writing:
+  the same cell moved from +12% to −6% between runs, within the machine's
+  noise.
 
 ## Write path
 
@@ -324,42 +364,47 @@ overhead.
 
 ## Throughput against quick_cache 0.7
 
-Measured with `bounded_cache_probe` after the write-path changes: 32-byte
-keys, 64-byte `Arc<[u8]>` values, and 50,000 entries. Reads ran 16 million
-requests and writes 8 million on macOS, and half that on Linux. Each figure is
-the paired median of three runs; positive means `ShardedCache` is faster.
+Measured with `bounded_cache_probe` after reads began hashing before they
+pin: 32-byte keys, 64-byte `Arc<[u8]>` values, and 50,000 entries. Reads ran
+16 million requests and writes 8 million on macOS, and half that on Linux.
+Each figure is the paired median of three runs; positive means
+`ShardedCache` is faster.
 
 Hosts:
-- macOS: a shared 16-core Apple Silicon machine, with other containers and
-  services using about four cores during the runs.
+- macOS: a shared 16-core Apple Silicon machine (an M4 Max), with other
+  containers and services using about four cores during the runs.
 - Linux: an aarch64 Docker VM on the same machine, using glibc's allocator.
 
 Two-thread cells varied most between runs, by up to 30% for one build, as
-threads landed on performance or efficiency cores.
+threads landed on performance or efficiency cores. On Linux, rebuilding the
+same sources with a different code layout moved single-thread cells by up to
+14%.
 
 | Workload | macOS 1T | macOS 2T | macOS 8T | Linux 1T | Linux 2T | Linux 8T |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Resident hit | −42% | −9% | +151% | +12% | +47% | +136% |
-| Read miss | +73% | +187% | +624% | +65% | +163% | +521% |
-| Turnover (95% reads) | −22% | −11% | +27% | −16% | −6% | +50% |
-| Cold fill | −9% | −24% | −20% | −21% | −16% | −29% |
-| Replace | +3% | +38% | +18% | −15% | −23% | −5% |
-| Delete and reinsert | +3% | −3% | +28% | −13% | −5% | +25% |
+| Resident hit | −10% | +30% | +292% | +2% | +20% | +133% |
+| Read miss | +91% | +184% | +670% | +75% | +169% | +556% |
+| Turnover (95% reads) | −13% | −4% | +33% | −21% | −8% | +44% |
+| Cold fill | −10% | −17% | −20% | −21% | −8% | −19% |
+| Replace | +7% | −4% | +2% | −16% | −14% | −11% |
+| Delete and reinsert | +6% | 0% | +35% | −20% | −10% | +30% |
 
-Before the write-path changes, the write rows read −10 to −53% for cold
-fill, −3 to −42% for replace, −10 to −31% for delete and reinsert, and −27
-to +9% for turnover.
+Before reads hashed first, macOS resident hits read −42%, −9%, and +151%,
+and macOS turnover −22%, −11%, and +27%. The write code did not change; its
+cells moved within the noise above. Before the write-path changes, the write
+rows read −10 to −53% for cold fill, −3 to −42% for replace, −10 to −31% for
+delete and reinsert, and −27 to +9% for turnover.
 
-Eight-thread resident hits reached 272 Mops/s on macOS against quick_cache's
-109, and 228 against 96 on Linux.
+Eight-thread resident hits reached 418 Mops/s on macOS against quick_cache's
+107, and 212 against 94 on Linux.
 
 Cold fill still trails: every insert into a full shard evicts under the lock
 (see "Write path"), and single-thread writes pay what lock-free reads
 require. An insert cannot reuse the evicted entry's memory until three epoch
 advances later, where quick_cache frees under its shard lock, and every
-write pays an epoch pin and its thread's retired-queue lock. A guard read
-through `pin()` took 11 ns at 50,000 entries, against 34 to 41 ns for `get`,
-whose pin keeps one call's cache misses from overlapping the next call's.
+write pays an epoch pin and its thread's retired-queue lock. A single-thread
+`get` still waits at its unpin for the value clone's increment, the remaining
+difference from quick_cache on macOS (see "Read path").
 
 The earlier boxed-entry storage measured macOS resident hits at −32%, +2%,
 and +241%. On macOS those boxes often sat beside their values (see "Slab
