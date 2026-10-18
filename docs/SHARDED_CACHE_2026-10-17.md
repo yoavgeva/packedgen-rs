@@ -62,8 +62,9 @@ entry. Tables are sized once and never rebuilt.
     probation"). It starts at 0.25% of the shard and stays between one
     entry and a quarter of the shard.
   - An unread probationary key leaves first and goes into a ghost filter. The
-    ghost has four generations and remembers three eighths to half of the
-    shard.
+    ghost has eight generations of a sixteenth of the shard and remembers
+    seven sixteenths to half of it. A key's words in every generation fill
+    one 64-byte line.
   - A key the ghost remembers is admitted straight to the main area.
   - The main area is a CLOCK queue in the order keys entered it: on leaving
     probation after being read, on overflowing probation's record cap, or on
@@ -214,7 +215,7 @@ state adds about 1.4 bytes per entry; at 1,000,000 entries it adds about 0.5:
 | Entry metadata | 8 |
 | Main queue, with its slack | about 4 to 5 |
 | Ghost filter | about 2 |
-| Shadow filters | about 0.25 |
+| Main filter | about 0.25 |
 | Probation records, 24 bytes each | about 0.1 at the starting share |
 
 Probation records grow with the probation a shard adapts to. A workload
@@ -352,6 +353,19 @@ These changes followed, each measured against the one before:
   bucket table. With one shared table, a read loads no shard state. On macOS
   at eight threads: delete-reinsert +17%, replace +14%, turnover +6%, cold
   fill +4%, and reads +4%.
+- **Prefetching every line an eviction writes.** Besides the victim's bucket
+  and entry, an evicting insert writes the victim's ghost and shadow words
+  and reads, then writes, the new key's home bucket. A writer that takes a
+  full shard's lock now prefetches all of them, those it writes for writing.
+  Eight-thread turnover: +4.6 to +5.4% on macOS and +3.6 to +4.5% on Linux;
+  cold fill +1 to +7%, with every median positive and ranges crossing zero.
+- **Stores instead of swaps.** Unpublishing a handle swapped it with an
+  AcqRel read-modify-write. Under the shard lock a relaxed load and a
+  release store do the same: writers change handles only under the lock,
+  and readers still holding the old handle are covered by the writer's pin.
+  That is one fewer read-modify-write per replace, eviction, and removal,
+  an out-of-line call on Linux aarch64. Eight-thread cold fill on macOS:
+  +5.0%; other cells within 4%.
 
 Pacing is a trade-off between allocators and workloads. Freeing up to four
 entries per write instead changed Linux throughput by:
@@ -428,29 +442,29 @@ configuration. "Fixed 2%" is ShardedCache before probation adapted.
 
 | Cell | ShardedCache | Fixed 2% | quick_cache | quick_cache sharded |
 | --- | ---: | ---: | ---: | ---: |
-| OLTP 1,000 | 39.33 | 36.20 | 35.15 | 36.13 |
-| OLTP 5,000 | 54.41 | 53.13 | 54.29 | 53.24 |
-| OLTP 15,000 | 65.33 | 64.35 | 64.83 | 64.55 |
-| P3 8,192 | 4.46 | 4.26 | 3.64 | 3.75 |
-| P3 32,768 | 12.96 | 13.09 | 12.94 | 13.11 |
-| P3 131,072 | 48.44 | 48.39 | 48.61 | 48.73 |
-| S1 65,536 | 6.13 | 6.06 | 6.17 | 6.23 |
-| S1 262,144 | 23.93 | 23.66 | 23.77 | 23.94 |
-| S1 524,288 | 43.08 | 42.53 | 41.99 | 42.73 |
-| P8 8,192 | 10.02 | 10.09 | 10.40 | 10.37 |
-| P8 32,768 | 32.05 | 31.73 | 32.41 | 32.31 |
-| P8 131,072 | 70.39 | 70.17 | 70.01 | 70.11 |
-| S3 100,000 | 12.53 | 12.28 | 12.67 | 12.83 |
-| S3 400,000 | 42.26 | 41.76 | 41.75 | 42.27 |
-| S3 800,000 | 69.61 | 68.70 | 66.99 | 68.34 |
+| OLTP 1,000 | 39.76 | 36.20 | 35.15 | 36.13 |
+| OLTP 5,000 | 54.73 | 53.13 | 54.29 | 53.24 |
+| OLTP 15,000 | 65.36 | 64.35 | 64.83 | 64.55 |
+| P3 8,192 | 4.53 | 4.26 | 3.64 | 3.75 |
+| P3 32,768 | 13.42 | 13.09 | 12.94 | 13.11 |
+| P3 131,072 | 48.69 | 48.39 | 48.61 | 48.73 |
+| S1 65,536 | 6.16 | 6.06 | 6.17 | 6.23 |
+| S1 262,144 | 24.00 | 23.66 | 23.77 | 23.94 |
+| S1 524,288 | 43.06 | 42.53 | 41.99 | 42.73 |
+| P8 8,192 | 10.11 | 10.09 | 10.40 | 10.37 |
+| P8 32,768 | 31.98 | 31.73 | 32.41 | 32.31 |
+| P8 131,072 | 70.28 | 70.17 | 70.01 | 70.11 |
+| S3 100,000 | 12.55 | 12.28 | 12.67 | 12.83 |
+| S3 400,000 | 42.35 | 41.76 | 41.75 | 42.27 |
+| S3 800,000 | 69.45 | 68.70 | 66.99 | 68.34 |
 | DS1 1,000,000 | 15.25 | 14.94 | 14.86 | 14.86 |
-| DS1 4,000,000 | 45.07 | 44.74 | 44.80 | 44.75 |
-| DS1 8,000,000 | 70.33 | 68.06 | 69.22 | 69.31 |
+| DS1 4,000,000 | 45.08 | 44.74 | 44.80 | 44.75 |
+| DS1 8,000,000 | 70.26 | 68.06 | 69.22 | 69.31 |
 
-Summed over the 18 cells, ShardedCache reads 665.59, against 654.51 for
+Summed over the 18 cells, ShardedCache reads 667.03, against 654.51 for
 single-shard quick_cache and 657.58 for its sharded cache. It is ahead of the
-sharded cache in 10 cells, by up to 3.21 points (OLTP at 1,000 entries), and
-at most 0.36 behind (P8 at 8,192). The default hasher is seeded per process,
+sharded cache in 13 cells, by up to 3.63 points (OLTP at 1,000 entries), and
+at most 0.33 behind (P8 at 32,768). The default hasher is seeded per process,
 so sums vary by about 0.1 between runs.
 
 The insertion-order main queue closed most of the earlier gap. A CLOCK over
@@ -470,21 +484,38 @@ changes per share were:
 | All 18 cells | +1.04 | +0.15 | −2.33 | −7.07 | −22.99 | −53.31 |
 
 Picking each cell's best fixed share would have reached 667.77. So each
-shard adapts its own share, ARC-style, from two shadow filters of its most
-recent evictions, one from probation and one from the main area, each about
-a 32nd of the shard. A missed key a shadow remembers would have hit had that
-queue been a little longer. A probation-shadow hit grows probation by one
-entry, and a main-shadow hit shrinks it by two. Only writers adapt, under
-the shard lock; reads are unchanged.
+shard adapts its own share, ARC-style, from the keys that return soon after
+leaving a queue:
+
+- The ghost's current generation holds up to a sixteenth of the shard's
+  most recent probation evictions. A missed key it remembers would most
+  likely have hit with a little more probation, and grows probation by one
+  entry. The line that answers is the one that admits the key, so this
+  costs no extra miss.
+- A main filter holds as many of the most recent main-area evictions, in one
+  generation cleared when it fills. A missed key it remembers shrinks
+  probation by two entries. It is read only while it remembers a key, so
+  inserts that evict only from probation, as in cold fill, never touch it.
+
+Probation stays between one entry and a quarter of the shard. Only writers
+adapt, under the shard lock; reads are unchanged.
 
 Variants measured on the way, as summed changes against the old 2%:
 
+- Dedicated shadow filters of a 32nd of the shard for both queues, beside a
+  four-generation ghost: +11.47. Each evicting insert then read and wrote
+  two more lines of filter words, and cold fill lost 3.7% on one thread and
+  9.2% on two. With the eight-generation ghost they read +12.77; the
+  current-generation pair kept here reads +12.90.
+- The ghost's current generation for probation against a dedicated main
+  shadow of a 32nd: +10.26. The ghost's window, up to a sixteenth, outweighed
+  the shadow's.
 - A main-area ghost as large as the probation ghost, compared hit for hit:
   −16.66. Probation's ghost spans far more evictions, so its hits swamped
   the main area's, and DS1 at 4,000,000 entries lost 5.95.
-- Shadows of a 32nd of the shard, starting at 2% (+9.70), at 0.5% (+11.13),
-  and at 0.25% (+11.32, kept). Large shards converge slowly, and DS1 favors a
-  small probation.
+- With dedicated shadows, starting at 2% (+9.70), at 0.5% (+11.13), and at
+  0.25% (+11.32, kept). Large shards converge slowly, and DS1 favors a small
+  probation.
 - Shrinking by one entry per main-shadow hit instead of two: the same sum,
   but P8 at 131,072 entries fell 0.48.
 - Shadows of a 16th or a 64th of the shard: within 0.1 of a 32nd.
@@ -494,9 +525,10 @@ Variants measured on the way, as summed changes against the old 2%:
 - A cap of 10% instead of 25%: −1 point, from OLTP.
 
 On synthetic traces at 10,000 and 100,000 entries, adaptation changed Zipf,
-scan-mixed Zipf, shifting-Zipf, and turnover hit rates by −0.01 to +0.11
-points. A loop of 1.25 times the capacity gained 1.4 and 2.3 points; it read
-60.7% and 60.3%, against 61.1% and 63.4% for quick_cache's sharded cache.
+scan-mixed Zipf, shifting-Zipf, and turnover hit rates by 0 to +0.44
+points. A loop of 1.25 times the capacity read 59.8% and 58.1%, +0.5 and +0.1
+over fixed probation, against 61.1% and 63.4% for quick_cache's sharded
+cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
 
 ## Rejected and reverted
 

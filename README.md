@@ -33,8 +33,8 @@ from 7% ahead to 21% behind. In process memory, 1,000,000 entries took 46 to
 136 bytes each, against 83 to 332 for quick_cache.
 
 Each shard sizes its probationary queue to the keys it sees return. On the
-ARC paper traces, its summed hit rate over 18 cells was 11.1 points above
-single-shard quick_cache and 8.0 above quick_cache's sharded cache.
+ARC paper traces, its summed hit rate over 18 cells was 12.5 points above
+single-shard quick_cache and 9.5 above quick_cache's sharded cache.
 
 Design, correctness evidence, tables, and rejected alternatives are in
 [`docs/SHARDED_CACHE_2026-10-17.md`](docs/SHARDED_CACHE_2026-10-17.md).
