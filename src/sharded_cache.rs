@@ -13,8 +13,9 @@
 //! Writers take their shard's mutex. A shard at its limit evicts in the
 //! S3-FIFO style: new keys wait in a small probationary FIFO and leave unless
 //! read; keys the ghost filter remembers go straight to the main area, a
-//! CLOCK queue in the order keys entered it. Expired entries leave first
-//! wherever eviction meets them.
+//! CLOCK queue in the order keys entered it. Each shard sizes its probation
+//! to the keys it sees return. Expired entries leave first wherever eviction
+//! meets them.
 
 use std::borrow::Borrow;
 use std::collections::VecDeque;
@@ -596,7 +597,7 @@ impl ShardLimits {
 /// Writers' cores take turns with a shard, and each line of its state a write
 /// touches moves to the writer's core while it holds the lock. So the counts
 /// every write changes share the lock word's line with the probation queue,
-/// and the ghost and the main queue fill the next line.
+/// and the filters and the main queue fill the next line.
 #[repr(C, align(128))]
 struct ShardLock {
     len: AtomicUsize,

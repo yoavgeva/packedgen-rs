@@ -19,8 +19,8 @@ shift failures.
 
 Writers take per-shard locks; readers take none. The shards share one table
 of six-slot buckets of tags and handles to epoch-reclaimed entries, and every
-key lives in one of two buckets. Overhead beyond the key and value is 29.5 to
-33.4 requested bytes per entry, against 78 to 210 for quick_cache 0.7.
+key lives in one of two buckets. Overhead beyond the key and value is 29.1 to
+33.3 requested bytes per entry, against 78 to 210 for quick_cache 0.7.
 
 Against quick_cache, ShardedCache leads concurrent reads. With eight threads
 on a 16-core machine it ran 2.3 to 3.9 times quick_cache's resident-hit
@@ -32,9 +32,9 @@ On one thread, resident hits ranged from 10% behind to 2% ahead, and writes
 from 7% ahead to 21% behind. In process memory, 1,000,000 entries took 46 to
 136 bytes each, against 83 to 332 for quick_cache.
 
-On the ARC paper traces, its summed hit rate over 18 cells was within 0.06
-points of single-shard quick_cache and 3.4 points behind quick_cache's sharded
-cache.
+Each shard sizes its probationary queue to the keys it sees return. On the
+ARC paper traces, its summed hit rate over 18 cells was 11.1 points above
+single-shard quick_cache and 8.0 above quick_cache's sharded cache.
 
 Design, correctness evidence, tables, and rejected alternatives are in
 [`docs/SHARDED_CACHE_2026-10-17.md`](docs/SHARDED_CACHE_2026-10-17.md).

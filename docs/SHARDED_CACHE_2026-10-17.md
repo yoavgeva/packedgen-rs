@@ -54,10 +54,13 @@ entry. Tables are sized once and never rebuilt.
   - If no resident key can move, the cache evicts an unread entry from the two
     buckets. This happened on fewer than 0.1% of inserts into a full shard.
 - **Eviction.** Each shard uses an S3-FIFO-style policy:
-  - New keys wait in a probationary FIFO, 2% of the shard by default. Its
-    records hold the key's slot record, its hash, and the handle it was
-    published with. A writer that takes a full shard's lock prefetches the
-    next victim's bucket and entry together.
+  - New keys wait in a probationary FIFO. Its records hold the key's slot
+    record, its hash, and the handle it was published with. A writer that
+    takes a full shard's lock prefetches the next victim's bucket and entry
+    together.
+  - Each shard sizes its probation to the keys that return (see "Adaptive
+    probation"). It starts at 0.25% of the shard and stays between one
+    entry and a quarter of the shard.
   - An unread probationary key leaves first and goes into a ghost filter. The
     ghost has four generations and remembers three eighths to half of the
     shard.
@@ -195,13 +198,13 @@ rounding of the boxed entries is not included.
 
 | Entries | Key | Value | ShardedCache | DirectPackedCache | quick_cache |
 | ---: | --- | --- | ---: | ---: | ---: |
-| 100,000 | 8 B | `u64` | 48.1 | 46.8 | 118.0 |
-| 100,000 | 32 B | `[u8; 64]` | 129.4 | 128.2 | 306.7 |
-| 1,000,000 | 8 B | `u64` | 45.5 | 44.2 | 94.4 |
-| 1,000,000 | 32 B | `u64` | 69.5 | 69.0 | 144.7 |
-| 1,000,000 | 32 B | `[u8; 64]` | 125.6 | 125.1 | 245.4 |
+| 100,000 | 8 B | `u64` | 48.0 | 46.8 | 118.0 |
+| 100,000 | 32 B | `[u8; 64]` | 129.3 | 128.2 | 306.7 |
+| 1,000,000 | 8 B | `u64` | 45.1 | 44.2 | 94.4 |
+| 1,000,000 | 32 B | `u64` | 69.1 | 69.0 | 144.7 |
+| 1,000,000 | 32 B | `[u8; 64]` | 125.2 | 125.1 | 245.4 |
 
-Overhead beyond the key and value is 29.5 to 33.4 bytes per entry. On a
+Overhead beyond the key and value is 29.1 to 33.3 bytes per entry. On a
 16-thread machine, a 100,000-entry cache now has 256 shards, and their fixed
 state adds about 1.4 bytes per entry; at 1,000,000 entries it adds about 0.5:
 
@@ -211,7 +214,12 @@ state adds about 1.4 bytes per entry; at 1,000,000 entries it adds about 0.5:
 | Entry metadata | 8 |
 | Main queue, with its slack | about 4 to 5 |
 | Ghost filter | about 2 |
-| Probation records, 24 bytes each | about 2 to 3 |
+| Shadow filters | about 0.25 |
+| Probation records, 24 bytes each | about 0.1 at the starting share |
+
+Probation records grow with the probation a shard adapts to. A workload
+that drives probation to its cap of a quarter of the shard holds up to 7.5
+bytes of records per entry, plus the queue's growth slack.
 
 For comparison, the overhead is 28 to 32 for `DirectPackedCache` and 78 to 210
 for quick_cache. The main queue added about 3.5 bytes per entry and bought
@@ -324,7 +332,9 @@ These changes followed, each measured against the one before:
   writer's state spanned four lines of the lock block. `len`, `weight`, and
   the eviction count now sit beside the lock word, followed by the probation
   queue; the ghost and the main queue fill the next line, and the limits moved
-  to the shard's read-only header. At eight threads: replace +13%,
+  to the shard's read-only header. (Adaptive probation later put its shadow
+  filters and target in the ghost's struct, and the main queue in a 24-byte
+  ring, to keep this layout.) At eight threads: replace +13%,
   delete-reinsert +11.5%, cold fill +7%. Replace's hold time fell to 95 ns.
 - **Four-slot reclamation batches.** Two 16-slot batches per write, zeroed
   and handed on by value, took most of a single-thread replace's time after
@@ -414,40 +424,79 @@ storage against boxed entries").
 
 The ARC paper traces were replayed through `hit_ratio_sim`; the traces are
 cited, not committed. Values are read hit percentages at the default
-configuration.
+configuration. "Fixed 2%" is ShardedCache before probation adapted.
 
-| Cell | ShardedCache | quick_cache | quick_cache sharded | DirectPackedCache |
+| Cell | ShardedCache | Fixed 2% | quick_cache | quick_cache sharded |
 | --- | ---: | ---: | ---: | ---: |
-| OLTP 1,000 | 36.21 | 35.15 | 36.12 | 35.30 |
-| OLTP 5,000 | 53.11 | 54.29 | 53.25 | 52.83 |
-| OLTP 15,000 | 64.34 | 64.83 | 64.57 | 63.80 |
-| P3 8,192 | 4.30 | 3.64 | 3.74 | 3.87 |
-| P3 32,768 | 13.20 | 12.94 | 13.11 | 12.66 |
-| P3 131,072 | 48.50 | 48.61 | 48.73 | 45.33 |
-| S1 65,536 | 6.07 | 6.17 | 6.23 | 5.86 |
-| S1 262,144 | 23.69 | 23.77 | 23.95 | 23.11 |
-| S1 524,288 | 42.54 | 41.99 | 42.76 | 41.60 |
-| P8 8,192 | 10.09 | 10.40 | 10.39 | 9.40 |
-| P8 32,768 | 31.75 | 32.41 | 32.30 | 30.92 |
-| P8 131,072 | 70.20 | 70.01 | 70.11 | 69.40 |
-| S3 100,000 | 12.23 | 12.67 | 12.83 | 11.57 |
-| S3 400,000 | 41.77 | 41.75 | 42.33 | 40.00 |
-| S3 800,000 | 68.70 | 66.99 | 68.35 | 66.79 |
-| DS1 1,000,000 | 14.94 | 14.86 | 14.86 | 14.36 |
-| DS1 4,000,000 | 44.74 | 44.80 | 44.76 | 43.88 |
-| DS1 8,000,000 | 68.07 | 69.22 | 69.31 | 68.20 |
+| OLTP 1,000 | 39.33 | 36.20 | 35.15 | 36.13 |
+| OLTP 5,000 | 54.41 | 53.13 | 54.29 | 53.24 |
+| OLTP 15,000 | 65.33 | 64.35 | 64.83 | 64.55 |
+| P3 8,192 | 4.46 | 4.26 | 3.64 | 3.75 |
+| P3 32,768 | 12.96 | 13.09 | 12.94 | 13.11 |
+| P3 131,072 | 48.44 | 48.39 | 48.61 | 48.73 |
+| S1 65,536 | 6.13 | 6.06 | 6.17 | 6.23 |
+| S1 262,144 | 23.93 | 23.66 | 23.77 | 23.94 |
+| S1 524,288 | 43.08 | 42.53 | 41.99 | 42.73 |
+| P8 8,192 | 10.02 | 10.09 | 10.40 | 10.37 |
+| P8 32,768 | 32.05 | 31.73 | 32.41 | 32.31 |
+| P8 131,072 | 70.39 | 70.17 | 70.01 | 70.11 |
+| S3 100,000 | 12.53 | 12.28 | 12.67 | 12.83 |
+| S3 400,000 | 42.26 | 41.76 | 41.75 | 42.27 |
+| S3 800,000 | 69.61 | 68.70 | 66.99 | 68.34 |
+| DS1 1,000,000 | 15.25 | 14.94 | 14.86 | 14.86 |
+| DS1 4,000,000 | 45.07 | 44.74 | 44.80 | 44.75 |
+| DS1 8,000,000 | 70.33 | 68.06 | 69.22 | 69.31 |
 
-Summed over the 18 cells, ShardedCache is 0.06 points behind single-shard
-quick_cache, and DirectPackedCache is 15.43 behind. ShardedCache is within
-about one point in every cell and ahead in 9. The largest gaps are OLTP at
-5,000 entries (−1.19) and DS1 at 8,000,000 (−1.14).
+Summed over the 18 cells, ShardedCache reads 665.59, against 654.51 for
+single-shard quick_cache and 657.58 for its sharded cache. It is ahead of the
+sharded cache in 10 cells, by up to 3.21 points (OLTP at 1,000 entries), and
+at most 0.36 behind (P8 at 8,192). The default hasher is seeded per process,
+so sums vary by about 0.1 between runs.
 
-The table predates the larger default shard count for big caches, which
-moved ShardedCache's sum by −0.13 points; no cell moved by more than 0.08.
+The insertion-order main queue closed most of the earlier gap. A CLOCK over
+the table's own slots sweeps in hash order and loses recency: before the
+queue, the sum was −3.44 against quick_cache and P3 at 131,072 entries read
+46.80%.
 
-The insertion-order main queue closed most of the gap. A CLOCK over the
-table's own slots sweeps in hash order and loses recency: before the queue,
-the sum was −3.44 and P3 at 131,072 entries read 46.80%.
+### Adaptive probation
+
+No fixed probation share suits every trace. Against the old 2%, summed
+changes per share were:
+
+| Probation | 0.5% | 1% | 3% | 5% | 10% | 20% |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| OLTP, three cells | −3.51 | −3.18 | +1.02 | +3.31 | +5.52 | +6.51 |
+| DS1 at 8,000,000 | +1.84 | +1.31 | −1.45 | −3.87 | −8.06 | −12.48 |
+| All 18 cells | +1.04 | +0.15 | −2.33 | −7.07 | −22.99 | −53.31 |
+
+Picking each cell's best fixed share would have reached 667.77. So each
+shard adapts its own share, ARC-style, from two shadow filters of its most
+recent evictions, one from probation and one from the main area, each about
+a 32nd of the shard. A missed key a shadow remembers would have hit had that
+queue been a little longer. A probation-shadow hit grows probation by one
+entry, and a main-shadow hit shrinks it by two. Only writers adapt, under
+the shard lock; reads are unchanged.
+
+Variants measured on the way, as summed changes against the old 2%:
+
+- A main-area ghost as large as the probation ghost, compared hit for hit:
+  −16.66. Probation's ghost spans far more evictions, so its hits swamped
+  the main area's, and DS1 at 4,000,000 entries lost 5.95.
+- Shadows of a 32nd of the shard, starting at 2% (+9.70), at 0.5% (+11.13),
+  and at 0.25% (+11.32, kept). Large shards converge slowly, and DS1 favors a
+  small probation.
+- Shrinking by one entry per main-shadow hit instead of two: the same sum,
+  but P8 at 131,072 entries fell 0.48.
+- Shadows of a 16th or a 64th of the shard: within 0.1 of a 32nd.
+- Shadows whose generations held at least eight keys, as the ghost's do: a
+  1.25×-capacity loop at 10,000 entries lost 3 points, as shards of 156
+  entries got shadows of a fifth of the shard.
+- A cap of 10% instead of 25%: −1 point, from OLTP.
+
+On synthetic traces at 10,000 and 100,000 entries, adaptation changed Zipf,
+scan-mixed Zipf, shifting-Zipf, and turnover hit rates by −0.01 to +0.11
+points. A loop of 1.25 times the capacity gained 1.4 and 2.3 points; it read
+60.7% and 60.3%, against 61.1% and 63.4% for quick_cache's sharded cache.
 
 ## Rejected and reverted
 
@@ -462,8 +511,9 @@ the sum was −3.44 and P3 at 131,072 entries read 46.80%.
   halves correlated. That left 2.4% of inserts evicting from full pairs, and CI
   hit such a seed. The full finalizer on the home bucket fixed it but cost
   12–15% of single-thread reads, so only the alternate takes it.
-- **A 10% probation share.** 2% read better on DS1, P3, and S3; for example,
-  DS1 at 8,000,000 entries read 68.06% against 63.91%.
+- **A fixed 10% probation share.** 2% read better on DS1, P3, and S3; for
+  example, DS1 at 8,000,000 entries read 68.06% against 63.91%. Probation
+  now adapts per shard instead (see "Adaptive probation").
 - **Lock-free replacement by compare-exchange.** It added a lookup to every
   new-key insert and did not move replace throughput, which was dominated by
   frees.
