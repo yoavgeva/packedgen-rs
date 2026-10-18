@@ -101,6 +101,8 @@ impl Epochs {
     #[inline]
     pub(crate) fn pin(&self) -> EpochPin<'_> {
         let shard = direct_arena_thread() & (READER_SHARDS - 1);
+        #[cfg(test)]
+        PINS_HELD.set(PINS_HELD.get() + 1);
         EpochPin {
             epochs: self,
             epoch: self.enter(shard),
@@ -197,7 +199,22 @@ impl Drop for EpochPin<'_> {
     #[inline]
     fn drop(&mut self) {
         self.epochs.leave(self.epoch, self.shard);
+        #[cfg(test)]
+        PINS_HELD.set(PINS_HELD.get() - 1);
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The epoch pins this thread holds.
+    static PINS_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many epoch pins this thread holds, for tests of work kept outside
+/// them.
+#[cfg(test)]
+pub(crate) fn pins_held() -> usize {
+    PINS_HELD.get()
 }
 
 /// One entry's storage: atomic metadata, then the value.

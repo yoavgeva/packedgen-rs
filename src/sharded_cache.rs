@@ -849,10 +849,11 @@ where
         Q: Hash + Eq + ?Sized,
         V: Clone,
     {
+        // Hashed before pinning: the pin's atomics hold back the loads after
+        // them, so hashing first overlaps it with the previous read's end.
+        let hash = self.hash_builder.hash_one(key);
         let pin = self.epochs.pin();
-        let value = self
-            .lookup(&pin, key, self.hash_builder.hash_one(key))
-            .cloned();
+        let value = self.lookup(&pin, key, hash).cloned();
         self.count(value.is_some());
         value
     }
@@ -865,8 +866,9 @@ where
         Q: Hash + Eq + ?Sized,
         V: Clone,
     {
+        let hash = self.hash_builder.hash_one(key);
         let pin = self.epochs.pin();
-        self.live_entry(&pin, key, self.hash_builder.hash_one(key))
+        self.live_entry(&pin, key, hash)
             .map(|entry| entry.value().1.clone())
     }
 
@@ -876,9 +878,9 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
+        let hash = self.hash_builder.hash_one(key);
         let pin = self.epochs.pin();
-        self.live_entry(&pin, key, self.hash_builder.hash_one(key))
-            .is_some()
+        self.live_entry(&pin, key, hash).is_some()
     }
 
     /// Returns the value cached for `key`, or loads it with `load` and
@@ -2340,6 +2342,51 @@ mod tests {
         fn build_hasher(&self) -> CollidingHasher {
             CollidingHasher(0)
         }
+    }
+
+    /// A hasher that notes when its thread hashes under an epoch pin.
+    #[derive(Clone, Default)]
+    struct PinWatching;
+
+    struct PinWatchingHasher(DefaultHasher);
+
+    thread_local! {
+        static HASHED_UNDER_PIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    impl Hasher for PinWatchingHasher {
+        fn finish(&self) -> u64 {
+            self.0.finish()
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            if crate::sharded_arena::pins_held() != 0 {
+                HASHED_UNDER_PIN.set(true);
+            }
+            self.0.write(bytes);
+        }
+    }
+
+    impl BuildHasher for PinWatching {
+        type Hasher = PinWatchingHasher;
+        fn build_hasher(&self) -> PinWatchingHasher {
+            PinWatchingHasher(DefaultHasher::new())
+        }
+    }
+
+    #[test]
+    fn reads_hash_their_keys_before_pinning() {
+        // A pin's atomics hold back the loads after them, the key's
+        // included: a read that hashed under its pin waited for the
+        // previous read to finish instead of overlapping it.
+        let cache = ShardedCacheBuilder::new(100).hasher(PinWatching).build();
+        cache.insert(1_u64, 1_u64);
+        HASHED_UNDER_PIN.set(false);
+        assert_eq!(cache.get(&1), Some(1));
+        assert_eq!(cache.get(&2), None);
+        assert_eq!(cache.peek(&1), Some(1));
+        assert!(cache.contains_key(&1));
+        assert_eq!(cache.get_or_insert_with(&1, || 0), 1);
+        assert!(!HASHED_UNDER_PIN.get());
     }
 
     #[test]
