@@ -59,17 +59,17 @@ const NEVER_EXPIRES: u64 = u64::MAX;
 const DEFAULT_PROBATION_BPS: u16 = 25;
 /// Probation never takes more than this share of its shard, in basis points.
 const MAX_PROBATION_BPS: usize = 2_500;
-/// Each shadow remembers this fraction of its shard's capacity in recent
-/// evictions from its queue.
-const SHADOW_DIVISOR: usize = 32;
-/// Entries a probation-shadow hit adds to the probation target.
+/// Entries a returning key the ghost's current generation remembers adds to
+/// the probation target.
 const PROBATION_GROWTH: usize = 1;
-/// Entries a main-shadow hit takes from the probation target.
+/// Entries a returning key the main filter remembers takes from it.
 const PROBATION_SHRINKAGE: usize = 2;
-/// The ghost holds this many generations of evicted probationary keys.
-const GHOST_GENERATIONS: usize = 4;
-/// Each ghost generation holds this fraction of the shard's capacity.
-const GHOST_GENERATION_DIVISOR: usize = 8;
+/// The ghost holds this many generations of evicted probationary keys, and
+/// a key's word in each fills one cache line.
+const GHOST_GENERATIONS: usize = 8;
+/// Each ghost generation, and the main filter, holds this fraction of the
+/// shard's capacity.
+const GHOST_GENERATION_DIVISOR: usize = 16;
 const GHOST_BITS_PER_KEY: usize = 32;
 const GHOST_KEY_BITS: u32 = 5;
 /// Deadlines are 100 ms ticks since the cache was built, kept in the entry's
@@ -1253,8 +1253,7 @@ where
                 };
                 writer.entered(weight);
                 let record = shard.record(index);
-                writer.filters.adapt(hash, shard.limits.probation_max);
-                if writer.filters.remembers(GHOST, hash) {
+                if writer.filters.admit(hash, shard.limits.probation_max) {
                     // Remembered from a recent eviction: straight to main.
                     writer.enter_main(shard, record);
                 } else {
@@ -1451,8 +1450,7 @@ where
             }
             let removed = shard.clear(slot, shard.home(hash));
             if !expired {
-                writer.filters.remember(GHOST, hash);
-                writer.filters.remember(PROBATION_SHADOW, hash);
+                writer.filters.remember_probationary(hash);
             }
             return Some((removed, writer.evicted(entry.weight(), expired)));
         }
@@ -1480,7 +1478,7 @@ where
             let hash = self.hash_builder.hash_one(&entry.value().0);
             let removed = shard.clear(slot, shard.home(hash));
             if !expired {
-                writer.filters.remember(MAIN_SHADOW, hash);
+                writer.filters.remember_main(hash);
             }
             return Some((removed, writer.evicted(entry.weight(), expired)));
         }
@@ -1506,7 +1504,7 @@ where
             let hash = self.hash_builder.hash_one(&entry.value().0);
             let removed = shard.clear(slot, shard.home(hash));
             if !expired {
-                writer.filters.remember(MAIN_SHADOW, hash);
+                writer.filters.remember_main(hash);
             }
             return Some((removed, writer.evicted(entry.weight(), expired)));
         }
@@ -1694,8 +1692,8 @@ impl<T> Shard<T> {
 
 impl<T> ShardView<'_, T> {
     /// Starts loading the lines an insert of `hash` that evicts the next
-    /// probationary victim touches: the victim's bucket, entry, and ghost and
-    /// shadow words, and the new key's home bucket and ghost word. Each was
+    /// probationary victim touches: the victim's bucket, entry, and ghost
+    /// line, and the new key's home bucket and ghost line. Each was
     /// most likely last written on another core, and fetched together their
     /// misses overlap instead of following one another under the lock.
     /// Lines the insert writes are fetched for writing. Writers call it only
@@ -1707,11 +1705,10 @@ impl<T> ShardView<'_, T> {
             prefetch_write(self.buckets.as_ptr().wrapping_add(slot / SLOTS));
             let handle = usize::try_from(next.handle).expect("a handle fits usize");
             prefetch(ptr::without_provenance::<u8>(handle));
-            writer.filters.prefetch_write(GHOST, next.hash);
-            writer.filters.prefetch_write(PROBATION_SHADOW, next.hash);
+            prefetch_write(writer.filters.ghost_line(next.hash));
         }
         prefetch_write(self.buckets.as_ptr().wrapping_add(self.home(hash)));
-        writer.filters.prefetch(GHOST, hash);
+        prefetch(writer.filters.ghost_line(hash));
     }
 
     #[inline]
@@ -2106,53 +2103,66 @@ impl<K, V> Removed<(K, V)> {
     }
 }
 
-/// A shard's filters of recently evicted keys, and the probation target its
-/// shadows size; guarded by the shard lock.
+/// A shard's filters of recently evicted keys, and the probation target
+/// they size; guarded by the shard lock.
 ///
-/// - The ghost remembers keys evicted from probation unread, three eighths
-///   to half of the shard. A missed key it remembers enters the main area
-///   directly.
-/// - Two shadows remember the shard's most recent evictions, one from
-///   probation and one from the main area, each about a 32nd of the shard.
-///   A missed key that a shadow remembers would have hit had its queue been
-///   a little longer, so each shadow hit moves the probation target toward
-///   that queue: one entry for probation, two for the main area. Probation
-///   keeps one key at least and a quarter of the shard at most.
+/// - The ghost remembers keys evicted from probation unread, in eight
+///   generations of a sixteenth of the shard: seven sixteenths to half of
+///   the shard. A missed key it remembers enters the main area directly.
+/// - The main filter remembers keys evicted from the main area, a sixteenth
+///   of the shard at most, and forgets them all once it holds that many.
 ///
-/// Each filter is a ring of `GHOST_GENERATIONS` generations of words. A
-/// key's words in every generation sit together, as do its words in both
-/// shadows, so a lookup touches one or two cache lines.
+/// The ghost's current generation and the main filter each hold up to the
+/// same number of their queue's most recent evictions. A missed key one of
+/// them remembers would most likely have hit had that queue been a little
+/// longer, so it moves the probation target toward the queue: one entry for
+/// probation, two for the main area, between one entry and a quarter of the
+/// shard.
+///
+/// A key's words in every ghost generation fill one cache line, which also
+/// tells whether its current generation remembers it. The main filter is
+/// read only while it remembers a key, so an insert that evicts only from
+/// probation touches no filter line but the ghost's.
 struct Filters {
-    /// The ghost's words, `[word * GHOST_GENERATIONS + generation]`, then
-    /// the shadows', `[(word * 2 + shadow) * GHOST_GENERATIONS + generation]`.
-    words: Box<[u64]>,
-    /// Where the shadows' words begin.
-    shadow_start: u32,
-    /// Keys remembered in each filter's current generation. Counts fit 32
-    /// bits, as shards hold fewer than 2^24 slots; the filters then share
-    /// one cache line with the main queue.
-    remembered: [u32; 3],
-    current: [u8; 3],
+    /// The ghost's lines, then the main filter's.
+    lines: Box<[FilterLine]>,
+    /// Where the main filter's lines begin.
+    main_start: u32,
+    /// The words of its lines the main filter uses.
+    main_words: u32,
+    /// Keys remembered in the ghost's current generation and in the main
+    /// filter. Counts fit 32 bits, as shards hold fewer than 2^24 slots; the
+    /// filters then share one cache line with the main queue.
+    remembered: [u32; 2],
+    /// The ghost's current generation.
+    current: u8,
     probation_target: u32,
 }
 
+/// One cache line of filter words: a key's ghost word in every generation,
+/// or eight words of the main filter.
+#[repr(C, align(64))]
+struct FilterLine([u64; GHOST_GENERATIONS]);
+
+/// Each filter word holds about this many keys.
+const KEYS_PER_FILTER_WORD: usize = 64 / GHOST_BITS_PER_KEY;
 const GHOST: usize = 0;
-const PROBATION_SHADOW: usize = 1;
-const MAIN_SHADOW: usize = 2;
-/// Each word of a generation holds about this many keys.
-const KEYS_PER_GHOST_WORD: usize = 64 / GHOST_BITS_PER_KEY;
+const MAIN: usize = 1;
 
 impl Filters {
     fn new(capacity: usize, probation_target: usize) -> Self {
-        let generation_words = |keys: usize| keys.div_ceil(KEYS_PER_GHOST_WORD).max(1);
-        let ghost = generation_words(capacity.div_ceil(GHOST_GENERATION_DIVISOR).max(8));
-        let shadow = generation_words(capacity / SHADOW_DIVISOR / GHOST_GENERATIONS);
-        let shadow_start = ghost * GHOST_GENERATIONS;
+        let generation = capacity.div_ceil(GHOST_GENERATION_DIVISOR);
+        let ghost_lines = generation.max(8).div_ceil(KEYS_PER_FILTER_WORD);
+        let main_words = generation.div_ceil(KEYS_PER_FILTER_WORD).max(1);
+        let main_lines = main_words.div_ceil(GHOST_GENERATIONS);
         Self {
-            words: vec![0; shadow_start + 2 * shadow * GHOST_GENERATIONS].into_boxed_slice(),
-            shadow_start: u32::try_from(shadow_start).expect("a shard's ghost fits u32 words"),
-            remembered: [0; 3],
-            current: [0; 3],
+            lines: (0..ghost_lines + main_lines)
+                .map(|_| FilterLine([0; GHOST_GENERATIONS]))
+                .collect(),
+            main_start: u32::try_from(ghost_lines).expect("a shard's ghost fits u32 lines"),
+            main_words: u32::try_from(main_words).expect("a shard's main filter fits u32 words"),
+            remembered: [0; 2],
+            current: 0,
             probation_target: u32::try_from(probation_target)
                 .expect("a shard's probation target fits u32"),
         }
@@ -2172,102 +2182,103 @@ impl Filters {
         target + target / 4 + 4
     }
 
-    /// Moves the probation target for a missed key the shard now inserts.
-    #[inline]
-    fn adapt(&mut self, hash: u64, max: usize) {
-        let target = self.probation_target();
-        let target = if self.remembers(PROBATION_SHADOW, hash) {
-            (target + PROBATION_GROWTH).min(max)
-        } else if self.remembers(MAIN_SHADOW, hash) {
-            target.saturating_sub(PROBATION_SHRINKAGE).max(1)
-        } else {
-            return;
-        };
-        self.probation_target = u32::try_from(target).expect("a probation target fits u32");
-    }
-
-    /// The first word of `filter`'s words, how many words each generation
-    /// holds, and how many sets share the region.
-    #[inline]
-    fn region(&self, filter: usize) -> (usize, usize, usize) {
-        let shadow_start = self.shadow_start as usize;
-        if filter == GHOST {
-            (0, shadow_start / GHOST_GENERATIONS, 1)
-        } else {
-            let words = (self.words.len() - shadow_start) / (2 * GHOST_GENERATIONS);
-            (shadow_start, words, 2)
-        }
-    }
-
     /// The bits that place `hash` in every filter.
     #[inline]
     fn mixed(hash: u64) -> u64 {
         (hash & 0xffff_ffff).wrapping_mul(0x9e37_79b9_7f4a_7c15)
     }
 
-    /// The index of `hash`'s first word, generation 0, in `filter`.
     #[inline]
-    fn word(&self, filter: usize, hash: u64) -> usize {
-        let (start, words, sets) = self.region(filter);
-        let set = filter.saturating_sub(PROBATION_SHADOW);
-        let word = usize::try_from(((Self::mixed(hash) >> 32) * words as u64) >> 32)
-            .expect("a ghost word fits usize");
-        start + (word * sets + set) * GHOST_GENERATIONS
+    fn mask(mixed: u64) -> u64 {
+        (0..GHOST_KEY_BITS).fold(0_u64, |mask, lane| mask | 1 << ((mixed >> (lane * 6)) & 63))
     }
 
+    /// `n` scaled by the fraction `mixed`'s high half picks.
     #[inline]
-    fn location(&self, filter: usize, hash: u64) -> (usize, u64) {
+    fn pick(mixed: u64, n: u32) -> usize {
+        usize::try_from(((mixed >> 32) * u64::from(n)) >> 32).expect("a filter index fits usize")
+    }
+
+    /// The line of `hash`'s ghost words.
+    #[inline]
+    fn ghost_line(&self, hash: u64) -> *const FilterLine {
+        let line = Self::pick(Self::mixed(hash), self.main_start);
+        std::ptr::from_ref(&self.lines[line])
+    }
+
+    /// The main filter's word for `mixed`: its line and its index there.
+    #[inline]
+    fn main_word(&self, mixed: u64) -> (usize, usize) {
+        let word = Self::pick(mixed, self.main_words);
+        (
+            self.main_start as usize + word / GHOST_GENERATIONS,
+            word % GHOST_GENERATIONS,
+        )
+    }
+
+    /// Whether the ghost remembers `hash`, a missed key the shard now
+    /// inserts. Moves the probation target if the ghost's current
+    /// generation or the main filter remembers it.
+    #[inline]
+    fn admit(&mut self, hash: u64, max: usize) -> bool {
         let mixed = Self::mixed(hash);
-        let mask =
-            (0..GHOST_KEY_BITS).fold(0_u64, |mask, lane| mask | 1 << ((mixed >> (lane * 6)) & 63));
-        (self.word(filter, hash), mask)
+        let mask = Self::mask(mixed);
+        let words = &self.lines[Self::pick(mixed, self.main_start)].0;
+        let remembered = words.iter().any(|word| word & mask == mask);
+        let target = self.probation_target();
+        let target = if words[usize::from(self.current)] & mask == mask {
+            (target + PROBATION_GROWTH).min(max)
+        } else if self.remembered[MAIN] != 0 && {
+            let (line, word) = self.main_word(mixed);
+            self.lines[line].0[word] & mask == mask
+        } {
+            target.saturating_sub(PROBATION_SHRINKAGE).max(1)
+        } else {
+            return remembered;
+        };
+        self.probation_target = u32::try_from(target).expect("a probation target fits u32");
+        remembered
     }
 
+    /// Remembers a key evicted from probation unread, in the ghost.
     #[inline]
-    fn prefetch(&self, filter: usize, hash: u64) {
-        prefetch(self.words.as_ptr().wrapping_add(self.word(filter, hash)));
-    }
-
-    #[inline]
-    fn prefetch_write(&self, filter: usize, hash: u64) {
-        prefetch_write(self.words.as_ptr().wrapping_add(self.word(filter, hash)));
-    }
-
-    #[inline]
-    fn remembers(&self, filter: usize, hash: u64) -> bool {
-        let (base, mask) = self.location(filter, hash);
-        self.words[base..base + GHOST_GENERATIONS]
-            .iter()
-            .any(|word| word & mask == mask)
-    }
-
-    #[inline]
-    fn remember(&mut self, filter: usize, hash: u64) {
-        let (base, mask) = self.location(filter, hash);
-        self.words[base + usize::from(self.current[filter])] |= mask;
-        self.remembered[filter] += 1;
-        let (start, words, sets) = self.region(filter);
-        if self.remembered[filter] as usize == words * KEYS_PER_GHOST_WORD {
-            let current = (usize::from(self.current[filter]) + 1) % GHOST_GENERATIONS;
-            self.current[filter] = u8::try_from(current).expect("a generation index fits u8");
-            let set = filter.saturating_sub(PROBATION_SHADOW);
-            let region = start..start + words * sets * GHOST_GENERATIONS;
-            for word in self.words[region]
-                .iter_mut()
-                .skip(set * GHOST_GENERATIONS + current)
-                .step_by(sets * GHOST_GENERATIONS)
-            {
-                *word = 0;
+    fn remember_probationary(&mut self, hash: u64) {
+        let mixed = Self::mixed(hash);
+        let line = Self::pick(mixed, self.main_start);
+        self.lines[line].0[usize::from(self.current)] |= Self::mask(mixed);
+        self.remembered[GHOST] += 1;
+        if self.remembered[GHOST] as usize == self.main_start as usize * KEYS_PER_FILTER_WORD {
+            let current = (usize::from(self.current) + 1) % GHOST_GENERATIONS;
+            self.current = u8::try_from(current).expect("a generation index fits u8");
+            for line in &mut self.lines[..self.main_start as usize] {
+                line.0[current] = 0;
             }
-            self.remembered[filter] = 0;
+            self.remembered[GHOST] = 0;
+        }
+    }
+
+    /// Remembers a key evicted from the main area, in the main filter.
+    #[inline]
+    fn remember_main(&mut self, hash: u64) {
+        let mixed = Self::mixed(hash);
+        let (line, word) = self.main_word(mixed);
+        self.lines[line].0[word] |= Self::mask(mixed);
+        self.remembered[MAIN] += 1;
+        if self.remembered[MAIN] as usize == self.main_words as usize * KEYS_PER_FILTER_WORD {
+            for line in &mut self.lines[self.main_start as usize..] {
+                line.0 = [0; GHOST_GENERATIONS];
+            }
+            self.remembered[MAIN] = 0;
         }
     }
 
     /// Forgets every key; the probation target stays.
     fn clear(&mut self) {
-        self.words.fill(0);
-        self.current = [0; 3];
-        self.remembered = [0; 3];
+        for line in &mut self.lines {
+            line.0 = [0; GHOST_GENERATIONS];
+        }
+        self.current = 0;
+        self.remembered = [0; 2];
     }
 }
 
@@ -3335,8 +3346,8 @@ mod tests {
     fn a_full_shards_insert_prefetches_the_lines_its_eviction_writes() {
         // One shard at its limit with every key unread, so the next insert
         // evicts the probation front: its bucket loses the handle, and the
-        // ghost and the probation shadow remember its hash. The new key
-        // lands in its home bucket after the ghost is checked for it.
+        // ghost remembers its hash. The new key lands in its home bucket
+        // after the ghost is checked for it.
         let cache = ShardedCacheBuilder::new(256).shards(1).build::<u64, u64>();
         for key in 0..1_000 {
             cache.insert(key, key);
@@ -3349,13 +3360,7 @@ mod tests {
             let slot = shard
                 .live_record(front.record)
                 .expect("the front key is live");
-            let word = |filter: usize, hash: u64| {
-                writer
-                    .filters
-                    .words
-                    .as_ptr()
-                    .wrapping_add(writer.filters.location(filter, hash).0) as usize
-            };
+            let ghost = |hash: u64| writer.filters.ghost_line(hash) as usize;
             (
                 front.hash,
                 [
@@ -3363,12 +3368,8 @@ mod tests {
                         "the victim's bucket",
                         std::ptr::from_ref(shard.bucket(slot)) as usize,
                     ),
-                    ("the victim's ghost word", word(GHOST, front.hash)),
-                    (
-                        "the victim's shadow word",
-                        word(PROBATION_SHADOW, front.hash),
-                    ),
-                    ("the new key's ghost word", word(GHOST, fresh)),
+                    ("the victim's ghost line", ghost(front.hash)),
+                    ("the new key's ghost line", ghost(fresh)),
                     (
                         "the new key's home bucket",
                         std::ptr::from_ref(&shard.buckets[shard.home(fresh)]) as usize,
@@ -3382,7 +3383,7 @@ mod tests {
         for (name, line) in lines {
             assert!(prefetched.contains(&line), "{name} was not prefetched");
         }
-        assert!(shard.lock().filters.remembers(GHOST, victim));
+        assert!(shard.lock().filters.admit(victim, usize::MAX));
     }
 
     #[test]
@@ -3451,29 +3452,77 @@ mod tests {
     }
 
     #[test]
-    fn filters_keep_their_keys_apart_and_forget_them_in_four_generations() {
-        let mut filters = Filters::new(1_024, 1);
+    fn filters_size_probation_from_recent_evictions_and_forget_older_ones() {
+        // A 1,024-entry shard: ghost generations, and the main filter, hold
+        // 64 keys each.
+        let mut filters = Filters::new(1_024, 8);
         let hash = |key: u64| BuildHasherDefault::<DefaultHasher>::default().hash_one(key);
-        filters.remember(GHOST, hash(1));
-        filters.remember(PROBATION_SHADOW, hash(2));
-        filters.remember(MAIN_SHADOW, hash(3));
-        for (key, filter) in [(1, GHOST), (2, PROBATION_SHADOW), (3, MAIN_SHADOW)] {
-            for other in [GHOST, PROBATION_SHADOW, MAIN_SHADOW] {
-                assert_eq!(filters.remembers(other, hash(key)), other == filter);
-            }
+        filters.remember_probationary(hash(1));
+        filters.remember_main(hash(2));
+        // Each filter answers only for its own keys.
+        assert!(filters.admit(hash(1), 100));
+        assert_eq!(filters.probation_target(), 8 + PROBATION_GROWTH);
+        assert!(!filters.admit(hash(2), 100));
+        assert_eq!(
+            filters.probation_target(),
+            8 + PROBATION_GROWTH - PROBATION_SHRINKAGE
+        );
+        assert!(!filters.admit(hash(3), 100));
+        assert_eq!(filters.probation_target(), 7);
+        // Once later evictions fill its generation, the ghost still admits
+        // the key, but no longer counts it as recent.
+        for key in 100..164 {
+            filters.remember_probationary(hash(key));
         }
-        // Each shadow generation holds 1,024 / 32 / 4 keys: four
-        // generations' worth of later keys rotate the first out.
-        for key in 100..108 {
-            filters.remember(PROBATION_SHADOW, hash(key));
+        assert!(filters.admit(hash(1), 100));
+        assert_eq!(filters.probation_target(), 7);
+        // Eight generations later it is forgotten.
+        for key in 200..200 + 7 * 64 {
+            filters.remember_probationary(hash(key));
         }
-        assert!(filters.remembers(PROBATION_SHADOW, hash(2)));
-        for key in 108..140 {
-            filters.remember(PROBATION_SHADOW, hash(key));
+        assert!(!filters.admit(hash(1), 100));
+        // The main filter forgets everything once it holds 64 keys.
+        for key in 1_000..1_062 {
+            filters.remember_main(hash(key));
         }
-        assert!(!filters.remembers(PROBATION_SHADOW, hash(2)));
-        assert!(filters.remembers(MAIN_SHADOW, hash(3)));
-        assert!(filters.remembers(GHOST, hash(1)));
+        assert!(!filters.admit(hash(2), 100));
+        assert_eq!(filters.probation_target(), 5);
+        filters.remember_main(hash(1_062));
+        assert!(!filters.admit(hash(2), 100));
+        assert_eq!(filters.probation_target(), 5);
+    }
+
+    #[test]
+    fn a_keys_ghost_words_fill_one_cache_line() {
+        assert_eq!(std::mem::size_of::<FilterLine>(), 64);
+        assert_eq!(std::mem::align_of::<FilterLine>(), 64);
+    }
+
+    #[test]
+    fn a_key_back_within_the_ghosts_current_generation_grows_probation() {
+        // One 1,024-entry shard, whose ghost generations hold 64 keys each.
+        let cache = ShardedCacheBuilder::new(1_024)
+            .shards(1)
+            .build::<u64, u64>();
+        let target = || cache.view(0).lock().filters.probation_target();
+        for key in 0..1_024 {
+            cache.insert(key, key);
+        }
+        // The next insert evicts the first key from probation, and the
+        // ghost's first generation starts with it.
+        let mut key = 1_024;
+        cache.insert(key, key);
+        let evicted = (0..key)
+            .find(|old| !cache.contains_key(old))
+            .expect("a full shard evicts");
+        // Forty more evictions keep it within that generation.
+        for _ in 0..40 {
+            key += 1;
+            cache.insert(key, key);
+        }
+        let before = target();
+        cache.insert(evicted, evicted);
+        assert_eq!(target(), before + PROBATION_GROWTH);
     }
 
     type FixedHashCache = ShardedCache<u64, u64, UnitWeighter, BuildHasherDefault<DefaultHasher>>;
