@@ -381,6 +381,23 @@ These changes followed, each measured against the one before:
   entries every cell stayed within 3%. On Linux, single-thread cells at
   1,000,000 entries moved by −4 to +2%: the VM backs memory with 2 MB
   transparent huge pages, which likely made the old reads cheaper there.
+- **Compacting the main queue a chunk at a time.** Each relocated main key
+  leaves a stale record behind and a new one at the back. A full shard
+  taking only new keys never evicts its oldest main keys, so stale records
+  gathered behind a live front. Cleanup dropped stale records from the front
+  64 at a time and, finding none, compacted the whole queue under the lock:
+  77 µs per pass for 15,600-entry shards and 1.3 ms for 250,000-entry ones,
+  timed directly. A cursor now walks the queue 64 records per append once
+  the queue is within a sixteenth of its limit. Live records slide over
+  dropped ones, and the gap behind them frees its slots when the walk
+  reaches the back. The walk prefetches the chunk's buckets first and
+  updates without branching on each record's fate, which cut a chunk from
+  700 to about 500 ns. Single-thread cold fill at 4,000,000 entries: p99.999
+  fell from 79 to 15 µs with 256 shards; p99 rose by one or two 42 ns timer
+  ticks, as 0.4% of inserts now walk a chunk; throughput stayed within
+  noise. The cursor fits the writer's second cache line because the filters
+  now derive where the main filter starts from their lines' length, and
+  keep the ghost's generation index in the low bits of its key count.
 
 Pacing is a trade-off between allocators and workloads. Freeing up to four
 entries per write instead changed Linux throughput by:

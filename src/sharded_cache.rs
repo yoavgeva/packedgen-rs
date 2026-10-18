@@ -54,7 +54,7 @@ const MIN_SHARD_CAPACITY: usize = 64;
 const WIDE_SHARD_CAPACITY: usize = 256;
 /// Main-queue records encode a slot in 24 bits.
 const MAX_SHARD_SLOTS: usize = 1 << 24;
-/// Stale main-queue records examined per cleanup step.
+/// Main-queue records compaction examines per append.
 const MAIN_CLEANUP_CHUNK: usize = 64;
 const NEVER_EXPIRES: u64 = u64::MAX;
 /// Probation's default starting share of each shard, in basis points. Each
@@ -69,7 +69,10 @@ const PROBATION_GROWTH: usize = 1;
 const PROBATION_SHRINKAGE: usize = 2;
 /// The ghost holds this many generations of evicted probationary keys, and
 /// a key's word in each fills one cache line.
-const GHOST_GENERATIONS: usize = 8;
+const GHOST_GENERATIONS: usize = GENERATION_COUNT as usize;
+/// A key remembered in the ghost adds this to its count, which keeps the
+/// current generation's index below it.
+const GENERATION_COUNT: u32 = 8;
 /// Each ghost generation, and the main filter, holds this fraction of the
 /// shard's capacity.
 const GHOST_GENERATION_DIVISOR: usize = 16;
@@ -805,32 +808,24 @@ impl LockedShard<'_> {
         }
     }
 
-    /// Appends a slot record to the main area's queue. Past its quarter of
-    /// slack, stale records are dropped from the front in order-preserving
-    /// chunks, so no write holds the shard lock for a whole-queue pass; only
-    /// a chunk with nothing stale falls back to compacting the whole queue.
+    /// Appends a slot record to the main area's queue. Within a sixteenth
+    /// of its limit, each append first compacts a chunk of the queue, so no
+    /// write holds the shard lock for a whole-queue pass. A walk over the
+    /// queue takes at most one append per chunk, and the remaining room
+    /// lasts two walks, which drop every record stale when the first began:
+    /// at least a sixth of the shard, as live records name distinct keys.
     fn enter_main<T>(&mut self, shard: ShardView<'_, T>, record: u32) {
-        if self.main.len() >= self.limits.main_limit() {
-            let mut kept = [0_u32; MAIN_CLEANUP_CHUNK];
-            let mut live = 0;
-            let mut examined = 0;
-            while examined < MAIN_CLEANUP_CHUNK {
-                let Some(front) = self.main.pop_front() else {
-                    break;
-                };
-                examined += 1;
-                if shard.live_record(front).is_some() {
-                    kept[live] = front;
-                    live += 1;
-                }
-            }
-            for front in kept[..live].iter().rev() {
-                self.main.push_front(*front);
-            }
-            if live == examined {
-                self.main
-                    .retain(|record| shard.live_record(record).is_some());
-            }
+        let limit = self.limits.main_limit();
+        if self.main.span() >= limit - limit / 16 {
+            self.main.compact(
+                MAIN_CLEANUP_CHUNK,
+                |record| shard.prefetch_record(record),
+                |record| {
+                    #[cfg(test)]
+                    MAIN_RECORDS_EXAMINED.with(|count| count.set(count.get() + 1));
+                    shard.is_live(record)
+                },
+            );
         }
         self.main.push_back(record);
     }
@@ -1835,10 +1830,29 @@ impl<T> ShardView<'_, T> {
     #[inline]
     fn live_record(&self, record: u32) -> Option<usize> {
         let slot = usize::try_from(record >> 8).expect("a slot fits usize");
-        (slot < self.buckets.len() * SLOTS
-            && self.record(slot) == record
-            && self.bucket(slot).handles[slot % SLOTS].load(Ordering::Relaxed) != 0)
-            .then_some(slot)
+        self.is_live(record).then_some(slot)
+    }
+
+    /// Whether `record`'s slot still holds the key the record was made for,
+    /// tested without branching on the answer.
+    #[inline]
+    fn is_live(&self, record: u32) -> bool {
+        let slot = usize::try_from(record >> 8).expect("a slot fits usize");
+        if slot >= self.buckets.len() * SLOTS {
+            return false;
+        }
+        let bucket = self.bucket(slot);
+        let generation =
+            (bucket.generations.load(Ordering::Relaxed) >> ((slot % SLOTS) * 8)) & 0xff;
+        (generation == u64::from(record & 0xff))
+            & (bucket.handles[slot % SLOTS].load(Ordering::Relaxed) != 0)
+    }
+
+    /// Prefetches the bucket of `record`'s slot.
+    #[inline]
+    fn prefetch_record(&self, record: u32) {
+        let slot = usize::try_from(record >> 8).expect("a slot fits usize");
+        prefetch(self.buckets.as_ptr().wrapping_add(slot / SLOTS));
     }
 
     /// Moves the key in `slot` to `other`, its other candidate bucket, if
@@ -1957,6 +1971,7 @@ impl<T> ShardView<'_, T> {
 thread_local! {
     static WINDOW_EVICTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static RELOCATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static MAIN_RECORDS_EXAMINED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 const BYTE_ONES: u64 = 0x0101_0101_0101_0101;
@@ -2149,16 +2164,15 @@ impl<K, V> Removed<(K, V)> {
 struct Filters {
     /// The ghost's lines, then the main filter's.
     lines: Box<[FilterLine]>,
-    /// Where the main filter's lines begin.
-    main_start: u32,
     /// The words of its lines the main filter uses.
     main_words: u32,
-    /// Keys remembered in the ghost's current generation and in the main
-    /// filter. Counts fit 32 bits, as shards hold fewer than 2^24 slots; the
-    /// filters then share one cache line with the main queue.
-    remembered: [u32; 2],
-    /// The ghost's current generation.
-    current: u8,
+    /// Keys remembered in the ghost's current generation, times the number
+    /// of generations, plus the current generation's index. Counts fit 32
+    /// bits, as shards hold fewer than 2^24 slots, and the filters then
+    /// share one cache line with the main queue.
+    ghost_remembered: u32,
+    /// Keys remembered in the main filter.
+    main_remembered: u32,
     probation_target: u32,
 }
 
@@ -2169,8 +2183,6 @@ struct FilterLine([u64; GHOST_GENERATIONS]);
 
 /// Each filter word holds about this many keys.
 const KEYS_PER_FILTER_WORD: usize = 64 / GHOST_BITS_PER_KEY;
-const GHOST: usize = 0;
-const MAIN: usize = 1;
 
 impl Filters {
     fn new(capacity: usize, probation_target: usize) -> Self {
@@ -2182,10 +2194,9 @@ impl Filters {
             lines: (0..ghost_lines + main_lines)
                 .map(|_| FilterLine([0; GHOST_GENERATIONS]))
                 .collect(),
-            main_start: u32::try_from(ghost_lines).expect("a shard's ghost fits u32 lines"),
             main_words: u32::try_from(main_words).expect("a shard's main filter fits u32 words"),
-            remembered: [0; 2],
-            current: 0,
+            ghost_remembered: 0,
+            main_remembered: 0,
             probation_target: u32::try_from(probation_target)
                 .expect("a shard's probation target fits u32"),
         }
@@ -2195,6 +2206,19 @@ impl Filters {
     #[inline]
     fn probation_target(&self) -> usize {
         self.probation_target as usize
+    }
+
+    /// Where the main filter's lines begin: the ghost's line count, which
+    /// the lines' length holds, so no field must.
+    #[inline]
+    fn main_start(&self) -> usize {
+        self.lines.len() - (self.main_words as usize).div_ceil(GHOST_GENERATIONS)
+    }
+
+    /// The ghost's current generation.
+    #[inline]
+    fn current(&self) -> usize {
+        self.ghost_remembered as usize % GHOST_GENERATIONS
     }
 
     /// Past this many records the oldest is dropped, leaving its key to the
@@ -2218,23 +2242,23 @@ impl Filters {
 
     /// `n` scaled by the fraction `mixed`'s high half picks.
     #[inline]
-    fn pick(mixed: u64, n: u32) -> usize {
-        usize::try_from(((mixed >> 32) * u64::from(n)) >> 32).expect("a filter index fits usize")
+    fn pick(mixed: u64, n: usize) -> usize {
+        usize::try_from(((mixed >> 32) * n as u64) >> 32).expect("a filter index fits usize")
     }
 
     /// The line of `hash`'s ghost words.
     #[inline]
     fn ghost_line(&self, hash: u64) -> *const FilterLine {
-        let line = Self::pick(Self::mixed(hash), self.main_start);
+        let line = Self::pick(Self::mixed(hash), self.main_start());
         std::ptr::from_ref(&self.lines[line])
     }
 
     /// The main filter's word for `mixed`: its line and its index there.
     #[inline]
     fn main_word(&self, mixed: u64) -> (usize, usize) {
-        let word = Self::pick(mixed, self.main_words);
+        let word = Self::pick(mixed, self.main_words as usize);
         (
-            self.main_start as usize + word / GHOST_GENERATIONS,
+            self.main_start() + word / GHOST_GENERATIONS,
             word % GHOST_GENERATIONS,
         )
     }
@@ -2246,12 +2270,12 @@ impl Filters {
     fn admit(&mut self, hash: u64, max: usize) -> bool {
         let mixed = Self::mixed(hash);
         let mask = Self::mask(mixed);
-        let words = &self.lines[Self::pick(mixed, self.main_start)].0;
+        let words = &self.lines[Self::pick(mixed, self.main_start())].0;
         let remembered = words.iter().any(|word| word & mask == mask);
         let target = self.probation_target();
-        let target = if words[usize::from(self.current)] & mask == mask {
+        let target = if words[self.current()] & mask == mask {
             (target + PROBATION_GROWTH).min(max)
-        } else if self.remembered[MAIN] != 0 && {
+        } else if self.main_remembered != 0 && {
             let (line, word) = self.main_word(mixed);
             self.lines[line].0[word] & mask == mask
         } {
@@ -2267,16 +2291,17 @@ impl Filters {
     #[inline]
     fn remember_probationary(&mut self, hash: u64) {
         let mixed = Self::mixed(hash);
-        let line = Self::pick(mixed, self.main_start);
-        self.lines[line].0[usize::from(self.current)] |= Self::mask(mixed);
-        self.remembered[GHOST] += 1;
-        if self.remembered[GHOST] as usize == self.main_start as usize * KEYS_PER_FILTER_WORD {
-            let current = (usize::from(self.current) + 1) % GHOST_GENERATIONS;
-            self.current = u8::try_from(current).expect("a generation index fits u8");
-            for line in &mut self.lines[..self.main_start as usize] {
-                line.0[current] = 0;
+        let main_start = self.main_start();
+        let line = Self::pick(mixed, main_start);
+        let current = self.current();
+        self.lines[line].0[current] |= Self::mask(mixed);
+        self.ghost_remembered += GENERATION_COUNT;
+        if self.ghost_remembered as usize / GHOST_GENERATIONS == main_start * KEYS_PER_FILTER_WORD {
+            let next = (current + 1) % GHOST_GENERATIONS;
+            for line in &mut self.lines[..main_start] {
+                line.0[next] = 0;
             }
-            self.remembered[GHOST] = 0;
+            self.ghost_remembered = u32::try_from(next).expect("a generation index fits u32");
         }
     }
 
@@ -2286,12 +2311,13 @@ impl Filters {
         let mixed = Self::mixed(hash);
         let (line, word) = self.main_word(mixed);
         self.lines[line].0[word] |= Self::mask(mixed);
-        self.remembered[MAIN] += 1;
-        if self.remembered[MAIN] as usize == self.main_words as usize * KEYS_PER_FILTER_WORD {
-            for line in &mut self.lines[self.main_start as usize..] {
+        self.main_remembered += 1;
+        if self.main_remembered as usize == self.main_words as usize * KEYS_PER_FILTER_WORD {
+            let main_start = self.main_start();
+            for line in &mut self.lines[main_start..] {
                 line.0 = [0; GHOST_GENERATIONS];
             }
-            self.remembered[MAIN] = 0;
+            self.main_remembered = 0;
         }
     }
 
@@ -2300,18 +2326,27 @@ impl Filters {
         for line in &mut self.lines {
             line.0 = [0; GHOST_GENERATIONS];
         }
-        self.current = 0;
-        self.remembered = [0; 2];
+        self.ghost_remembered = 0;
+        self.main_remembered = 0;
     }
 }
 
 /// Main-area keys in the order they entered it, as `slot << 8 |
 /// generation`, in a ring sized for the queue's limit. Stale records
 /// (removed, replaced by another key, or moved) are skipped when popped.
+///
+/// Compaction walks the queue from its front a chunk at a time and drops
+/// stale records. The live records it passes close up behind the front, so
+/// a gap of dropped records' slots trails them. The gap closes when pops
+/// reach it, or frees the ring's slots once the walk reaches the back.
 struct MainQueue {
     records: Box<[u32]>,
     head: u32,
     len: u32,
+    /// Records compaction has passed, which precede the gap.
+    cursor: u32,
+    /// Slots between the first `cursor` records and the rest.
+    gap: u32,
 }
 
 impl MainQueue {
@@ -2320,6 +2355,8 @@ impl MainQueue {
             records: vec![0; capacity.max(1)].into_boxed_slice(),
             head: 0,
             len: 0,
+            cursor: 0,
+            gap: 0,
         }
     }
 
@@ -2328,6 +2365,13 @@ impl MainQueue {
         self.len as usize
     }
 
+    /// Slots the records and the gap between them take.
+    #[inline]
+    fn span(&self) -> usize {
+        (self.len + self.gap) as usize
+    }
+
+    /// The ring slot `offset` slots past the head.
     #[inline]
     fn index(&self, offset: usize) -> usize {
         let index = self.head as usize + offset;
@@ -2339,32 +2383,16 @@ impl MainQueue {
     }
 
     /// Appends `record`. The queue never outgrows its ring: `enter_main`
-    /// compacts it below its limit first, and evictions pop before they
-    /// push. A full ring would drop its oldest record.
+    /// compacts it early enough, and evictions pop before they push. A
+    /// full ring would drop its oldest record.
     #[inline]
     fn push_back(&mut self, record: u32) {
-        debug_assert!(self.len() < self.records.len(), "the main queue is full");
-        if self.len() == self.records.len() {
+        debug_assert!(self.span() < self.records.len(), "the main queue is full");
+        if self.span() == self.records.len() {
             self.pop_front();
         }
-        let index = self.index(self.len());
+        let index = self.index(self.span());
         self.records[index] = record;
-        self.len += 1;
-    }
-
-    #[inline]
-    fn push_front(&mut self, record: u32) {
-        debug_assert!(self.len() < self.records.len(), "the main queue is full");
-        if self.len() == self.records.len() {
-            return;
-        }
-        let head = if self.head == 0 {
-            self.records.len() - 1
-        } else {
-            self.head as usize - 1
-        };
-        self.head = u32::try_from(head).expect("a main queue index fits u32");
-        self.records[head] = record;
         self.len += 1;
     }
 
@@ -2376,26 +2404,78 @@ impl MainQueue {
         let record = self.records[self.head as usize];
         self.head = u32::try_from(self.index(1)).expect("a main queue index fits u32");
         self.len -= 1;
+        self.cursor = self.cursor.saturating_sub(1);
+        self.settle();
         Some(record)
     }
 
-    /// Keeps the records `keep` accepts, in order.
-    fn retain(&mut self, mut keep: impl FnMut(u32) -> bool) {
-        let mut kept = 0;
-        for offset in 0..self.len() {
-            let record = self.records[self.index(offset)];
-            if keep(record) {
-                let index = self.index(kept);
-                self.records[index] = record;
-                kept += 1;
+    /// Examines up to `budget` records where compaction left off, dropping
+    /// those `keep` rejects, and stops early once it passes the back.
+    fn compact(
+        &mut self,
+        budget: usize,
+        mut fetch: impl FnMut(u32),
+        mut keep: impl FnMut(u32) -> bool,
+    ) {
+        // Fetching what each record names first overlaps the misses that
+        // checking them one by one would wait for in turn.
+        let next = (self.cursor + self.gap) as usize;
+        for offset in 0..budget.min((self.len - self.cursor) as usize) {
+            fetch(self.records[self.index(next + offset)]);
+        }
+        for _ in 0..budget {
+            if self.len == 0 {
+                return;
+            }
+            let record = self.records[self.index((self.cursor + self.gap) as usize)];
+            // Without branches on the outcome, a stale record mispredicts
+            // nothing: a dropped record's copy is overwritten by the next.
+            let kept = keep(record);
+            let index = self.index(self.cursor as usize);
+            self.records[index] = record;
+            self.cursor += u32::from(kept);
+            self.gap += u32::from(!kept);
+            self.len -= u32::from(!kept);
+            if self.settle() {
+                return;
             }
         }
-        self.len = u32::try_from(kept).expect("a main queue length fits u32");
+    }
+
+    /// Closes a gap that reached an end of the queue: at the front the head
+    /// skips it, and at the back its slots are free and the next walk starts
+    /// over. Returns whether the walk passed the back.
+    #[inline]
+    fn settle(&mut self) -> bool {
+        if self.cursor == 0 {
+            self.head =
+                u32::try_from(self.index(self.gap as usize)).expect("a main queue index fits u32");
+            self.gap = 0;
+        }
+        if self.cursor == self.len {
+            self.cursor = 0;
+            self.gap = 0;
+            return true;
+        }
+        false
     }
 
     fn clear(&mut self) {
         self.head = 0;
         self.len = 0;
+        self.cursor = 0;
+        self.gap = 0;
+    }
+
+    /// The records, front first.
+    #[cfg(test)]
+    fn records(&self) -> Vec<u32> {
+        (0..self.len)
+            .map(|offset| {
+                let gap = if offset < self.cursor { 0 } else { self.gap };
+                self.records[self.index((offset + gap) as usize)]
+            })
+            .collect()
     }
 }
 
@@ -3497,30 +3577,71 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a churn of a hundred thousand inserts")]
+    fn main_queue_cleanup_examines_a_bounded_chunk_per_write() {
+        // A full shard taking only new keys keeps its oldest main keys, so
+        // the queue's front stays live while relocations append records
+        // that go stale behind it. Compacting the whole queue whenever the
+        // front had nothing stale held one write for 16 µs.
+        let cache = ShardedCacheBuilder::new(1_000).shards(1).build();
+        for key in 0..100_000_u64 {
+            let before = MAIN_RECORDS_EXAMINED.with(std::cell::Cell::get);
+            cache.insert(key, key);
+            let examined = MAIN_RECORDS_EXAMINED.with(std::cell::Cell::get) - before;
+            // Unread, an insert moves at most two keys to the main area: a
+            // relocated one and probation's overflow.
+            assert!(
+                examined <= 2 * MAIN_CLEANUP_CHUNK as u64,
+                "insert {key} examined {examined} main records"
+            );
+        }
+        assert!(
+            MAIN_RECORDS_EXAMINED.with(std::cell::Cell::get) > 0,
+            "relocations' records made the queue compact"
+        );
+    }
+
+    #[test]
     fn the_main_queue_matches_a_deque_around_its_ring() {
-        let mut queue = MainQueue::with_capacity(5);
+        // The model compacts by removing records where its walk stands.
+        let mut queue = MainQueue::with_capacity(7);
         let mut model = VecDeque::new();
+        let mut cursor = 0;
         let mut state = 0x2545_f491_u32;
-        for step in 0..2_000_u32 {
+        for step in 0..20_000_u32 {
             state ^= state << 13;
             state ^= state >> 17;
             state ^= state << 5;
             match state % 4 {
-                0 | 1 if model.len() < 5 => {
+                0 | 1 if queue.span() < 7 => {
                     queue.push_back(step);
                     model.push_back(step);
                 }
-                2 if model.len() < 5 => {
-                    queue.push_front(step);
-                    model.push_front(step);
+                2 => {
+                    let budget = (state >> 8) as usize % 4;
+                    queue.compact(budget, |_| {}, |record| record % 3 != 0);
+                    for _ in 0..budget {
+                        if model.is_empty() {
+                            break;
+                        }
+                        if model[cursor] % 3 == 0 {
+                            model.remove(cursor);
+                        } else {
+                            cursor += 1;
+                        }
+                        if cursor == model.len() {
+                            cursor = 0;
+                            break;
+                        }
+                    }
                 }
-                3 if step % 7 == 0 => {
-                    queue.retain(|record| record % 3 != 0);
-                    model.retain(|record| record % 3 != 0);
+                _ => {
+                    assert_eq!(queue.pop_front(), model.pop_front());
+                    cursor = cursor.saturating_sub(1);
                 }
-                _ => assert_eq!(queue.pop_front(), model.pop_front()),
             }
-            assert_eq!(queue.len(), model.len());
+            assert_eq!(queue.records(), Vec::from(model.clone()));
+            assert_eq!(queue.cursor as usize, cursor);
         }
         while let Some(record) = model.pop_front() {
             assert_eq!(queue.pop_front(), Some(record));
