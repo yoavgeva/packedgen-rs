@@ -398,6 +398,16 @@ These changes followed, each measured against the one before:
   noise. The cursor fits the writer's second cache line because the filters
   now derive where the main filter starts from their lines' length, and
   keep the ghost's generation index in the low bits of its key count.
+- **Clearing the ghost's next generation ahead.** Starting a ghost
+  generation cleared its word in every ghost line at once, about 1.6 ns a
+  line under the lock: 0.5 µs for 15,600-entry shards, 6.5 µs for 250,000
+  entries, and 25 µs (37 µs at most) for 1,000,000, timed directly. The last
+  sixty-fourth of each generation now clears the next one's word, at most
+  32 lines per remembered key, so the oldest generation fades over that
+  sixty-fourth instead of vanishing at its end. Clearing over the whole
+  generation instead cost 0.79 points of the trace hit-ratio sum, and over
+  its last quarter 0.10; the bounded version moved the sum from 667.05 to
+  667.08, and throughput stayed within noise on macOS and Linux.
 
 Pacing is a trade-off between allocators and workloads. Freeing up to four
 entries per write instead changed Linux throughput by:

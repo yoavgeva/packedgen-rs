@@ -73,6 +73,8 @@ const GHOST_GENERATIONS: usize = GENERATION_COUNT as usize;
 /// A key remembered in the ghost adds this to its count, which keeps the
 /// current generation's index below it.
 const GENERATION_COUNT: u32 = 8;
+/// Ghost lines one remembered key clears ahead of the next generation.
+const GHOST_CLEARED_LINES: usize = 32;
 /// Each ghost generation, and the main filter, holds this fraction of the
 /// shard's capacity.
 const GHOST_GENERATION_DIVISOR: usize = 16;
@@ -2296,11 +2298,21 @@ impl Filters {
         let current = self.current();
         self.lines[line].0[current] |= Self::mask(mixed);
         self.ghost_remembered += GENERATION_COUNT;
-        if self.ghost_remembered as usize / GHOST_GENERATIONS == main_start * KEYS_PER_FILTER_WORD {
-            let next = (current + 1) % GHOST_GENERATIONS;
-            for line in &mut self.lines[..main_start] {
+        // The generation's last 64th clears the next one's word, a bounded
+        // number of lines per key, so no write clears the whole ghost at
+        // once. The oldest generation fades over that 64th instead of
+        // vanishing at its end.
+        let remembered = self.ghost_remembered as usize / GHOST_GENERATIONS;
+        let generation = main_start * KEYS_PER_FILTER_WORD;
+        let next = (current + 1) % GHOST_GENERATIONS;
+        let left = generation - remembered;
+        if left * GHOST_CLEARED_LINES < main_start {
+            let first = main_start.saturating_sub((left + 1) * GHOST_CLEARED_LINES);
+            for line in &mut self.lines[first..main_start - left * GHOST_CLEARED_LINES] {
                 line.0[next] = 0;
             }
+        }
+        if remembered == generation {
             self.ghost_remembered = u32::try_from(next).expect("a generation index fits u32");
         }
     }
@@ -3688,6 +3700,41 @@ mod tests {
         filters.remember_main(hash(1_062));
         assert!(!filters.admit(hash(2), 100));
         assert_eq!(filters.probation_target(), 5);
+    }
+
+    #[test]
+    fn remembering_a_key_clears_a_bounded_number_of_ghost_lines() {
+        // A 16,384-entry shard: 512 ghost lines, 1,024 keys a generation.
+        // Rotating cleared the next generation's word in every line at
+        // once, 25 µs under the shard lock for a 1,000,000-entry shard.
+        let mut filters = Filters::new(16_384, 8);
+        let lines = filters.main_start();
+        assert_eq!(lines, 512);
+        let hash = |key: u64| BuildHasherDefault::<DefaultHasher>::default().hash_one(key);
+        for line in &mut filters.lines[..lines] {
+            line.0 = [u64::MAX; GHOST_GENERATIONS];
+        }
+        let cleared = |filters: &Filters, generation: usize| {
+            filters.lines[..lines]
+                .iter()
+                .filter(|line| line.0[generation] == 0)
+                .count()
+        };
+        for key in 0..3 * 1_024 {
+            let next = (filters.current() + 1) % GHOST_GENERATIONS;
+            let before = cleared(&filters, next);
+            filters.remember_probationary(hash(key));
+            let after = cleared(&filters, next);
+            assert!(
+                after - before <= GHOST_CLEARED_LINES,
+                "key {key} cleared {}",
+                after - before
+            );
+            if filters.current() == next {
+                // A new generation starts empty.
+                assert_eq!(after, lines, "key {key} rotated into a remembered word");
+            }
+        }
     }
 
     #[test]
