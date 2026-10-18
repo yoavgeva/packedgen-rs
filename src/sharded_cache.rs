@@ -53,8 +53,18 @@ const MAX_SHARD_SLOTS: usize = 1 << 24;
 /// Stale main-queue records examined per cleanup step.
 const MAIN_CLEANUP_CHUNK: usize = 64;
 const NEVER_EXPIRES: u64 = u64::MAX;
-/// Probation's default share of each shard, in basis points.
-const DEFAULT_PROBATION_BPS: u16 = 200;
+/// Probation's default starting share of each shard, in basis points. Each
+/// shard then adapts it (see [`Filters`]).
+const DEFAULT_PROBATION_BPS: u16 = 25;
+/// Probation never takes more than this share of its shard, in basis points.
+const MAX_PROBATION_BPS: usize = 2_500;
+/// Each shadow remembers this fraction of its shard's capacity in recent
+/// evictions from its queue.
+const SHADOW_DIVISOR: usize = 32;
+/// Entries a probation-shadow hit adds to the probation target.
+const PROBATION_GROWTH: usize = 1;
+/// Entries a main-shadow hit takes from the probation target.
+const PROBATION_SHRINKAGE: usize = 2;
 /// The ghost holds this many generations of evicted probationary keys.
 const GHOST_GENERATIONS: usize = 4;
 /// Each ghost generation holds this fraction of the shard's capacity.
@@ -221,8 +231,9 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
         self
     }
 
-    /// Sets the probationary FIFO's share of each shard in basis points
-    /// (default 200).
+    /// Sets the probationary FIFO's starting share of each shard in basis
+    /// points (default 25). Each shard then adapts the share, between one
+    /// entry and a quarter of the shard, to the keys it sees return.
     #[must_use]
     pub fn probation_bps(mut self, probation_bps: u16) -> Self {
         self.probation_bps = probation_bps;
@@ -568,10 +579,8 @@ struct Shard<T> {
 struct ShardLimits {
     capacity: usize,
     weight: u64,
-    probation_target: usize,
-    /// Past this many records the oldest is dropped, leaving its key to the
-    /// main sweep, so records never copy more than a share of the keys.
-    probation_limit: usize,
+    /// The largest probation target the shard adapts to.
+    probation_max: usize,
 }
 
 impl ShardLimits {
@@ -613,11 +622,8 @@ struct ShardWriter {
     /// Probationary keys in insertion order. A key moved to its other bucket
     /// leaves probation for the main area.
     probation: VecDeque<Probationary>,
-    ghost: Ghost,
-    /// Main-area keys in the order they entered it, as `slot << 8 |
-    /// generation`. Stale records (removed, replaced by another key, or
-    /// moved) are skipped when popped.
-    main: VecDeque<u32>,
+    filters: Filters,
+    main: MainQueue,
     /// The CLOCK hand: the next slot the main-area sweep examines.
     hand: usize,
 }
@@ -768,7 +774,7 @@ impl LockedShard<'_> {
             }
             if live == examined {
                 self.main
-                    .retain(|record| shard.live_record(*record).is_some());
+                    .retain(|record| shard.live_record(record).is_some());
             }
         }
         self.main.push_back(record);
@@ -1196,11 +1202,12 @@ where
                 };
                 writer.entered(weight);
                 let record = shard.record(index);
-                if writer.ghost.contains(hash) {
+                writer.filters.adapt(hash, shard.limits.probation_max);
+                if writer.filters.remembers(GHOST, hash) {
                     // Remembered from a recent eviction: straight to main.
                     writer.enter_main(shard, record);
                 } else {
-                    if writer.probation.len() >= shard.limits.probation_limit {
+                    if writer.probation.len() >= writer.filters.probation_record_limit() {
                         // An overflowing record's key joins the main area.
                         let overflow = writer
                             .probation
@@ -1312,7 +1319,7 @@ where
                 writer.hand = 0;
                 writer.probation.clear();
                 writer.main.clear();
-                writer.ghost.clear();
+                writer.filters.clear();
             }
             self.after_write(&removed, pin);
         }
@@ -1370,7 +1377,7 @@ where
         protected: Option<Handle<(K, V)>>,
         now: &mut Option<u64>,
     ) -> Option<(Handle<(K, V)>, RemovalCause)> {
-        while writer.probation.len() > shard.limits.probation_target {
+        while writer.probation.len() > writer.filters.probation_target() {
             let Probationary { record, hash, .. } = writer
                 .probation
                 .pop_front()
@@ -1393,7 +1400,8 @@ where
             }
             let removed = shard.clear(slot, shard.home(hash));
             if !expired {
-                writer.ghost.remember(hash);
+                writer.filters.remember(GHOST, hash);
+                writer.filters.remember(PROBATION_SHADOW, hash);
             }
             return Some((removed, writer.evicted(entry.weight(), expired)));
         }
@@ -1420,6 +1428,9 @@ where
             }
             let hash = self.hash_builder.hash_one(&entry.value().0);
             let removed = shard.clear(slot, shard.home(hash));
+            if !expired {
+                writer.filters.remember(MAIN_SHADOW, hash);
+            }
             return Some((removed, writer.evicted(entry.weight(), expired)));
         }
         // Keys the queue does not hold, or readers re-marking every queued
@@ -1443,6 +1454,9 @@ where
             }
             let hash = self.hash_builder.hash_one(&entry.value().0);
             let removed = shard.clear(slot, shard.home(hash));
+            if !expired {
+                writer.filters.remember(MAIN_SHADOW, hash);
+            }
             return Some((removed, writer.evicted(entry.weight(), expired)));
         }
         None
@@ -1596,13 +1610,14 @@ impl<K, V, W, S, L> Drop for ShardedCache<K, V, W, S, L> {
 
 impl<T> Shard<T> {
     fn new(capacity: usize, weight_limit: u64, probation_bps: u16) -> Self {
-        let probation_target = capacity * usize::from(probation_bps) / 10_000;
+        let probation_max = (capacity * MAX_PROBATION_BPS / 10_000).max(1);
+        let probation_target =
+            (capacity * usize::from(probation_bps) / 10_000).clamp(1, probation_max);
         Self {
             limits: ShardLimits {
                 capacity,
                 weight: weight_limit,
-                probation_target,
-                probation_limit: probation_target + probation_target / 4 + 4,
+                probation_max,
             },
             writer: ShardLock {
                 len: AtomicUsize::new(0),
@@ -1610,8 +1625,8 @@ impl<T> Shard<T> {
                 evictions: AtomicU64::new(0),
                 writer: Mutex::new(ShardWriter {
                     probation: VecDeque::new(),
-                    ghost: Ghost::new(capacity.div_ceil(GHOST_GENERATION_DIVISOR)),
-                    main: VecDeque::with_capacity(capacity + capacity / 4 + 17),
+                    filters: Filters::new(capacity, probation_target),
+                    main: MainQueue::with_capacity(capacity + capacity / 4 + 17),
                     hand: 0,
                 }),
                 expirations: AtomicU64::new(0),
@@ -2033,73 +2048,241 @@ impl<K, V> Removed<(K, V)> {
     }
 }
 
-/// Approximate set of recently evicted probationary keys, in a ring of
-/// generations; guarded by the shard lock. A key's word in every generation
-/// sits on one cache line, so a lookup costs one miss.
-struct Ghost {
-    /// `words[word * GHOST_GENERATIONS + generation]`.
+/// A shard's filters of recently evicted keys, and the probation target its
+/// shadows size; guarded by the shard lock.
+///
+/// - The ghost remembers keys evicted from probation unread, three eighths
+///   to half of the shard. A missed key it remembers enters the main area
+///   directly.
+/// - Two shadows remember the shard's most recent evictions, one from
+///   probation and one from the main area, each about a 32nd of the shard.
+///   A missed key that a shadow remembers would have hit had its queue been
+///   a little longer, so each shadow hit moves the probation target toward
+///   that queue: one entry for probation, two for the main area. Probation
+///   keeps one key at least and a quarter of the shard at most.
+///
+/// Each filter is a ring of `GHOST_GENERATIONS` generations of words. A
+/// key's words in every generation sit together, as do its words in both
+/// shadows, so a lookup touches one or two cache lines.
+struct Filters {
+    /// The ghost's words, `[word * GHOST_GENERATIONS + generation]`, then
+    /// the shadows', `[(word * 2 + shadow) * GHOST_GENERATIONS + generation]`.
     words: Box<[u64]>,
-    current: usize,
-    /// Counts fit 32 bits, as shards hold fewer than 2^24 slots; the ghost
-    /// then shares one cache line with the main queue.
-    remembered: u32,
-    rotate_every: u32,
+    /// Where the shadows' words begin.
+    shadow_start: u32,
+    /// Keys remembered in each filter's current generation. Counts fit 32
+    /// bits, as shards hold fewer than 2^24 slots; the filters then share
+    /// one cache line with the main queue.
+    remembered: [u32; 3],
+    current: [u8; 3],
+    probation_target: u32,
 }
 
-impl Ghost {
-    fn new(keys_per_generation: usize) -> Self {
-        let rotate_every = keys_per_generation.max(8);
-        let words = (rotate_every * GHOST_BITS_PER_KEY).div_ceil(64);
+const GHOST: usize = 0;
+const PROBATION_SHADOW: usize = 1;
+const MAIN_SHADOW: usize = 2;
+/// Each word of a generation holds about this many keys.
+const KEYS_PER_GHOST_WORD: usize = 64 / GHOST_BITS_PER_KEY;
+
+impl Filters {
+    fn new(capacity: usize, probation_target: usize) -> Self {
+        let generation_words = |keys: usize| keys.div_ceil(KEYS_PER_GHOST_WORD).max(1);
+        let ghost = generation_words(capacity.div_ceil(GHOST_GENERATION_DIVISOR).max(8));
+        let shadow = generation_words(capacity / SHADOW_DIVISOR / GHOST_GENERATIONS);
+        let shadow_start = ghost * GHOST_GENERATIONS;
         Self {
-            words: vec![0; words * GHOST_GENERATIONS].into_boxed_slice(),
-            current: 0,
-            remembered: 0,
-            rotate_every: u32::try_from(rotate_every).expect("a shard's ghost generation fits u32"),
+            words: vec![0; shadow_start + 2 * shadow * GHOST_GENERATIONS].into_boxed_slice(),
+            shadow_start: u32::try_from(shadow_start).expect("a shard's ghost fits u32 words"),
+            remembered: [0; 3],
+            current: [0; 3],
+            probation_target: u32::try_from(probation_target)
+                .expect("a shard's probation target fits u32"),
+        }
+    }
+
+    /// Keys probation holds before it evicts.
+    #[inline]
+    fn probation_target(&self) -> usize {
+        self.probation_target as usize
+    }
+
+    /// Past this many records the oldest is dropped, leaving its key to the
+    /// main sweep, so records never copy more than a share of the keys.
+    #[inline]
+    fn probation_record_limit(&self) -> usize {
+        let target = self.probation_target();
+        target + target / 4 + 4
+    }
+
+    /// Moves the probation target for a missed key the shard now inserts.
+    #[inline]
+    fn adapt(&mut self, hash: u64, max: usize) {
+        let target = self.probation_target();
+        let target = if self.remembers(PROBATION_SHADOW, hash) {
+            (target + PROBATION_GROWTH).min(max)
+        } else if self.remembers(MAIN_SHADOW, hash) {
+            target.saturating_sub(PROBATION_SHRINKAGE).max(1)
+        } else {
+            return;
+        };
+        self.probation_target = u32::try_from(target).expect("a probation target fits u32");
+    }
+
+    /// The first word of `filter`'s words, how many words each generation
+    /// holds, and how many sets share the region.
+    #[inline]
+    fn region(&self, filter: usize) -> (usize, usize, usize) {
+        let shadow_start = self.shadow_start as usize;
+        if filter == GHOST {
+            (0, shadow_start / GHOST_GENERATIONS, 1)
+        } else {
+            let words = (self.words.len() - shadow_start) / (2 * GHOST_GENERATIONS);
+            (shadow_start, words, 2)
         }
     }
 
     #[inline]
-    fn location(&self, hash: u64) -> (usize, u64) {
+    fn location(&self, filter: usize, hash: u64) -> (usize, u64) {
+        let (start, words, sets) = self.region(filter);
+        let set = filter.saturating_sub(PROBATION_SHADOW);
         let low = hash & 0xffff_ffff;
         let mixed = low.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let words = (self.words.len() / GHOST_GENERATIONS) as u64;
-        let word = usize::try_from(((mixed >> 32) * words) >> 32).expect("a ghost word fits usize");
+        let word =
+            usize::try_from(((mixed >> 32) * words as u64) >> 32).expect("a ghost word fits usize");
         let mask =
             (0..GHOST_KEY_BITS).fold(0_u64, |mask, lane| mask | 1 << ((mixed >> (lane * 6)) & 63));
-        (word * GHOST_GENERATIONS, mask)
+        (start + (word * sets + set) * GHOST_GENERATIONS, mask)
     }
 
     #[inline]
-    fn contains(&self, hash: u64) -> bool {
-        let (base, mask) = self.location(hash);
+    fn remembers(&self, filter: usize, hash: u64) -> bool {
+        let (base, mask) = self.location(filter, hash);
         self.words[base..base + GHOST_GENERATIONS]
             .iter()
             .any(|word| word & mask == mask)
     }
 
     #[inline]
-    fn remember(&mut self, hash: u64) {
-        let (base, mask) = self.location(hash);
-        self.words[base + self.current] |= mask;
-        self.remembered += 1;
-        if self.remembered == self.rotate_every {
-            self.current = (self.current + 1) % GHOST_GENERATIONS;
-            for word in self
-                .words
+    fn remember(&mut self, filter: usize, hash: u64) {
+        let (base, mask) = self.location(filter, hash);
+        self.words[base + usize::from(self.current[filter])] |= mask;
+        self.remembered[filter] += 1;
+        let (start, words, sets) = self.region(filter);
+        if self.remembered[filter] as usize == words * KEYS_PER_GHOST_WORD {
+            let current = (usize::from(self.current[filter]) + 1) % GHOST_GENERATIONS;
+            self.current[filter] = u8::try_from(current).expect("a generation index fits u8");
+            let set = filter.saturating_sub(PROBATION_SHADOW);
+            let region = start..start + words * sets * GHOST_GENERATIONS;
+            for word in self.words[region]
                 .iter_mut()
-                .skip(self.current)
-                .step_by(GHOST_GENERATIONS)
+                .skip(set * GHOST_GENERATIONS + current)
+                .step_by(sets * GHOST_GENERATIONS)
             {
                 *word = 0;
             }
-            self.remembered = 0;
+            self.remembered[filter] = 0;
         }
     }
 
+    /// Forgets every key; the probation target stays.
     fn clear(&mut self) {
         self.words.fill(0);
-        self.current = 0;
-        self.remembered = 0;
+        self.current = [0; 3];
+        self.remembered = [0; 3];
+    }
+}
+
+/// Main-area keys in the order they entered it, as `slot << 8 |
+/// generation`, in a ring sized for the queue's limit. Stale records
+/// (removed, replaced by another key, or moved) are skipped when popped.
+struct MainQueue {
+    records: Box<[u32]>,
+    head: u32,
+    len: u32,
+}
+
+impl MainQueue {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            records: vec![0; capacity.max(1)].into_boxed_slice(),
+            head: 0,
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    #[inline]
+    fn index(&self, offset: usize) -> usize {
+        let index = self.head as usize + offset;
+        if index >= self.records.len() {
+            index - self.records.len()
+        } else {
+            index
+        }
+    }
+
+    /// Appends `record`. The queue never outgrows its ring: `enter_main`
+    /// compacts it below its limit first, and evictions pop before they
+    /// push. A full ring would drop its oldest record.
+    #[inline]
+    fn push_back(&mut self, record: u32) {
+        debug_assert!(self.len() < self.records.len(), "the main queue is full");
+        if self.len() == self.records.len() {
+            self.pop_front();
+        }
+        let index = self.index(self.len());
+        self.records[index] = record;
+        self.len += 1;
+    }
+
+    #[inline]
+    fn push_front(&mut self, record: u32) {
+        debug_assert!(self.len() < self.records.len(), "the main queue is full");
+        if self.len() == self.records.len() {
+            return;
+        }
+        let head = if self.head == 0 {
+            self.records.len() - 1
+        } else {
+            self.head as usize - 1
+        };
+        self.head = u32::try_from(head).expect("a main queue index fits u32");
+        self.records[head] = record;
+        self.len += 1;
+    }
+
+    #[inline]
+    fn pop_front(&mut self) -> Option<u32> {
+        if self.len == 0 {
+            return None;
+        }
+        let record = self.records[self.head as usize];
+        self.head = u32::try_from(self.index(1)).expect("a main queue index fits u32");
+        self.len -= 1;
+        Some(record)
+    }
+
+    /// Keeps the records `keep` accepts, in order.
+    fn retain(&mut self, mut keep: impl FnMut(u32) -> bool) {
+        let mut kept = 0;
+        for offset in 0..self.len() {
+            let record = self.records[self.index(offset)];
+            if keep(record) {
+                let index = self.index(kept);
+                self.records[index] = record;
+                kept += 1;
+            }
+        }
+        self.len = u32::try_from(kept).expect("a main queue length fits u32");
+    }
+
+    fn clear(&mut self) {
+        self.head = 0;
+        self.len = 0;
     }
 }
 
@@ -3103,11 +3286,141 @@ mod tests {
     }
 
     #[test]
+    fn the_main_queue_matches_a_deque_around_its_ring() {
+        let mut queue = MainQueue::with_capacity(5);
+        let mut model = VecDeque::new();
+        let mut state = 0x2545_f491_u32;
+        for step in 0..2_000_u32 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            match state % 4 {
+                0 | 1 if model.len() < 5 => {
+                    queue.push_back(step);
+                    model.push_back(step);
+                }
+                2 if model.len() < 5 => {
+                    queue.push_front(step);
+                    model.push_front(step);
+                }
+                3 if step % 7 == 0 => {
+                    queue.retain(|record| record % 3 != 0);
+                    model.retain(|record| record % 3 != 0);
+                }
+                _ => assert_eq!(queue.pop_front(), model.pop_front()),
+            }
+            assert_eq!(queue.len(), model.len());
+        }
+        while let Some(record) = model.pop_front() {
+            assert_eq!(queue.pop_front(), Some(record));
+        }
+        assert_eq!(queue.pop_front(), None);
+    }
+
+    #[test]
+    fn filters_keep_their_keys_apart_and_forget_them_in_four_generations() {
+        let mut filters = Filters::new(1_024, 1);
+        let hash = |key: u64| BuildHasherDefault::<DefaultHasher>::default().hash_one(key);
+        filters.remember(GHOST, hash(1));
+        filters.remember(PROBATION_SHADOW, hash(2));
+        filters.remember(MAIN_SHADOW, hash(3));
+        for (key, filter) in [(1, GHOST), (2, PROBATION_SHADOW), (3, MAIN_SHADOW)] {
+            for other in [GHOST, PROBATION_SHADOW, MAIN_SHADOW] {
+                assert_eq!(filters.remembers(other, hash(key)), other == filter);
+            }
+        }
+        // Each shadow generation holds 1,024 / 32 / 4 keys: four
+        // generations' worth of later keys rotate the first out.
+        for key in 100..108 {
+            filters.remember(PROBATION_SHADOW, hash(key));
+        }
+        assert!(filters.remembers(PROBATION_SHADOW, hash(2)));
+        for key in 108..140 {
+            filters.remember(PROBATION_SHADOW, hash(key));
+        }
+        assert!(!filters.remembers(PROBATION_SHADOW, hash(2)));
+        assert!(filters.remembers(MAIN_SHADOW, hash(3)));
+        assert!(filters.remembers(GHOST, hash(1)));
+    }
+
+    type FixedHashCache = ShardedCache<u64, u64, UnitWeighter, BuildHasherDefault<DefaultHasher>>;
+
+    /// A one-shard cache whose hashes, and so whose evictions, repeat from
+    /// run to run.
+    fn fixed_hash_cache(probation_bps: u16) -> FixedHashCache {
+        ShardedCacheBuilder::new(1_000)
+            .shards(1)
+            .probation_bps(probation_bps)
+            .hasher(BuildHasherDefault::<DefaultHasher>::default())
+            .build()
+    }
+
+    /// A look-aside read: a miss inserts the key. Returns whether it hit.
+    fn read_through(cache: &FixedHashCache, key: u64) -> bool {
+        let hit = cache.get(&key).is_some();
+        if !hit {
+            cache.insert(key, key);
+        }
+        hit
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "a hit-ratio run of tens of thousands of requests")]
+    fn probation_grows_to_hold_keys_read_again_soon_after_arriving() {
+        // Every key is read twice, 40 new keys apart. A probation of 20 keys
+        // evicts each before its second read, and the ghost then admits it to
+        // the main area, where nothing reads it again.
+        const GAP: u64 = 40;
+        let cache = fixed_hash_cache(200);
+        let steps = 20_000;
+        let mut late_hits = 0;
+        for step in 0..steps {
+            read_through(&cache, step);
+            if step >= GAP && read_through(&cache, step - GAP) && step >= steps / 2 {
+                late_hits += 1;
+            }
+        }
+        let late_reads = steps / 2;
+        assert!(
+            late_hits * 10 > late_reads * 9,
+            "{late_hits} of {late_reads} second reads hit"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "a hit-ratio run of tens of thousands of requests")]
+    fn probation_shrinks_until_a_hot_loop_fits_the_main_area() {
+        // 960 keys read in a loop fit a 1,000-entry shard, but not beside a
+        // 10% probation; one-time keys arrive between them.
+        const HOT: u64 = 960;
+        let cache = fixed_hash_cache(1_000);
+        let rounds = 40;
+        let mut late_hits = 0;
+        let mut fresh = HOT;
+        for round in 0..rounds {
+            for key in 0..HOT {
+                if read_through(&cache, key) && round >= rounds / 2 {
+                    late_hits += 1;
+                }
+                if key % 10 == 0 {
+                    read_through(&cache, fresh);
+                    fresh += 1;
+                }
+            }
+        }
+        let late_reads = HOT * rounds / 2;
+        assert!(
+            late_hits * 10 > late_reads * 9,
+            "{late_hits} of {late_reads} hot reads hit"
+        );
+    }
+
+    #[test]
     fn a_writes_shard_state_spans_two_cache_lines() {
         // Writers' cores take turns holding a shard's lock, and each line of
         // shard state a write touches moves to its core while it holds the
         // lock. Replacing needs the lock word and the counts; an insert that
-        // evicts from probation needs the probation queue, then the ghost.
+        // evicts from probation needs the probation queue, then the filters.
         let shard = Shard::<(u64, u64)>::new(64, u64::MAX, DEFAULT_PROBATION_BPS);
         let base = std::ptr::addr_of!(shard.writer) as usize;
         let line = |field: usize, size: usize| {
@@ -3126,8 +3439,8 @@ mod tests {
         let writer = lock.writer.lock();
         let probation = std::ptr::addr_of!(writer.probation) as usize;
         assert_eq!(line(probation, std::mem::size_of_val(&writer.probation)), 0);
-        let ghost = std::ptr::addr_of!(writer.ghost) as usize;
-        assert_eq!(line(ghost, std::mem::size_of_val(&writer.ghost)), 1);
+        let filters = std::ptr::addr_of!(writer.filters) as usize;
+        assert_eq!(line(filters, std::mem::size_of_val(&writer.filters)), 1);
         let main = std::ptr::addr_of!(writer.main) as usize;
         assert_eq!(line(main, std::mem::size_of_val(&writer.main)), 1);
     }
