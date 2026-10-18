@@ -492,6 +492,48 @@ The earlier boxed-entry storage measured macOS resident hits at −32%, +2%,
 and +241%. On macOS those boxes often sat beside their values (see "Slab
 storage against boxed entries").
 
+## Tail latency against quick_cache 0.7
+
+Every operation was timed (`LATENCY_STRIDE` 1) at 1,000,000 entries,
+8,000,000 operations, and 64-byte values. Each cell is the median of three
+runs, in nanoseconds, as ShardedCache / quick_cache; both hosts' timers tick
+every 42 ns. Cold fill includes filling the empty cache.
+
+macOS:
+
+| Cell | p99 | p99.9 | p99.99 | p99.999 |
+| --- | ---: | ---: | ---: | ---: |
+| Cold fill, 1 thread | 375 / 292 | 1,959 / 1,167 | 5,000 / 5,375 | 8,583 / 191,625 |
+| Cold fill, 8 threads | 875 / 792 | 4,750 / 10,750 | 12,792 / 99,291 | 27,500 / 385,791 |
+| Turnover, 1 thread | 458 / 375 | 2,334 / 1,833 | 5,083 / 5,000 | 9,000 / 10,917 |
+| Turnover, 8 threads | 709 / 750 | 1,166 / 10,583 | 5,333 / 28,666 | 14,042 / 78,125 |
+
+Linux:
+
+| Cell | p99 | p99.9 | p99.99 | p99.999 |
+| --- | ---: | ---: | ---: | ---: |
+| Cold fill, 1 thread | 583 / 500 | 5,083 / 4,708 | 7,583 / 9,042 | 14,625 / 255,250 |
+| Cold fill, 8 threads | 1,292 / 1,209 | 6,583 / 29,166 | 43,459 / 140,750 | 122,292 / 496,916 |
+| Turnover, 1 thread | 709 / 708 | 4,834 / 5,250 | 7,333 / 7,709 | 14,166 / 15,292 |
+| Turnover, 8 threads | 833 / 958 | 2,292 / 13,625 | 11,750 / 54,292 | 25,750 / 90,000 |
+
+From p99.99 on, ShardedCache's tail is the shorter one in every cell but
+macOS single-thread turnover, which was level: up to 22 times shorter at
+p99.999 for single-thread cold fill, where quick_cache stalled for 190 to
+255 µs. At eight threads it is 2.3 to 14 times shorter from p99.9, as
+readers never wait on a shard lock. On one thread its p99 trails by up to two
+timer ticks (83 ns), and on macOS its p99.9 by 0.5 to 0.8 µs: the bounded
+steps below run on a fraction of a percent of inserts there.
+
+Two steps of a write used to take time proportional to the shard under its
+lock: compacting the whole main queue and clearing the ghost's next
+generation. Each now does a bounded share, and relocation no longer reads the
+residents it tries (see "Write path"). What remains is the CLOCK sweep past
+read keys, as in quick_cache's hot ring, and a scan of 128 reader counters
+every 512 retirements. On turnover with 1,000,000 entries per shard, the
+sweep averaged 3.3 records per main-area eviction; 13 of 908,149 sweeps
+passed 1,000 records, and the longest took 1,504.
+
 ## Hit ratio
 
 The ARC paper traces were replayed through `hit_ratio_sim`; the traces are
@@ -664,6 +706,7 @@ cargo build --release --example bounded_cache_probe --example hit_ratio_sim
 PROBE=target/release/examples/bounded_cache_probe
 $PROBE sharded turnover 50000 8000000 8 64 1
 $PROBE quickcache turnover 50000 8000000 8 64 1
+$PROBE sharded cold-fill 1000000 8000000 1 64 1 1
 target/release/examples/hit_ratio_sim file:PATH/DS1.keys 8000000 0 1 sharded quick
 target/release/examples/hit_ratio_sim arc:PATH/P3.lis 131072 0 1 sharded/shards=64 sharded
 cargo test --release --lib sharded_cache

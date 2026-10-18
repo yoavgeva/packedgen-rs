@@ -31,7 +31,10 @@ replacing them, and 12 to 22% behind on inserting new keys into a full cache.
 On one thread, resident hits ranged from 12% behind to even, and writes from
 5% ahead to 21% behind; most of that write gap is the delay epoch
 reclamation needs before memory is reused. In process memory, 1,000,000 entries took 46 to
-136 bytes each, against 83 to 332 for quick_cache.
+136 bytes each, against 83 to 332 for quick_cache. Timing every operation at
+1,000,000 entries, its p99.999 latency was 1.1 to 22 times shorter than
+quick_cache's, and 2.3 to 14 times shorter from p99.9 at eight threads; on
+one thread its p99 trailed by up to two 42 ns timer ticks.
 
 Each shard sizes its probationary queue to the keys it sees return. On the
 ARC paper traces, its summed hit rate over 18 cells was 12.5 points above
