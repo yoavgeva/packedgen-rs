@@ -3392,6 +3392,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "twenty thousand inserts past the slab region")]
     fn memory_a_guard_held_is_freed_after_it_drops() {
         let cache = ShardedCacheBuilder::new(256).shards(1).build::<u64, u64>();
         let guard = cache.pin();
