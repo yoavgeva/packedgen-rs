@@ -398,7 +398,11 @@ the model then holds.
 Throughput moved little: on macOS every cell moved by −5 to +11% in both
 codegen settings, within run-to-run ranges; on the Linux VM, at 50,000
 entries, writes gained 1 to 4% in the default build and moved by −7 to
-+3% with one codegen unit. An earlier form, which marked the shard on
++3% with one codegen unit. On an x86_64 runner (an AMD EPYC 7763), at
+50,000 entries, single-thread cold fill gained 12% in the default build
+and 7% with one codegen unit, both within tight ranges; the other cells
+moved by −10 to +23% on a runner whose own baseline varied by up to 60%
+between pairs. An earlier form, which marked the shard on
 every pin, gained 2 to 12% on single-thread writes before later
 write-path changes took most of that, and cost misses 1.2 to 3.4% (see
 "Rejected and reverted").
