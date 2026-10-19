@@ -40,9 +40,12 @@ entry. Tables are sized once and never rebuilt.
 - **One bucket table.** All shards' 64-byte buckets form one table, in
   stretches of equal length. A read computes its bucket from the hash and two
   fields of the cache, without loading the shard.
-- **Buckets.** A control word carries six tag bytes and an overflow count, and
-  the bucket holds six atomic handles. Tags are matched with one word-wide
-  zero-byte test.
+- **Buckets.** A bucket fills one 64-byte line with ten slots: a tag word
+  with the tag bytes of slots 0 to 7, a meta word with slots 8 and 9's tags
+  and the overflow count, and ten atomic four-byte handles. Tags are
+  matched with word-wide zero-byte tests, and a lookup reads the meta word
+  only after slots 0 to 7 miss. A handle is its slot's offset in the slab
+  region (see "Four-byte handles").
 - **Placement.** A key lives in its home bucket or one alternate bucket, so
   lookups touch at most two buckets. The home is one multiply of the key hash.
   The alternate lies an offset past the home that the key's tag picks.
@@ -74,9 +77,9 @@ entry. Tables are sized once and never rebuilt.
     a ghost hit. A read key loses one of its two access marks and goes to the
     back.
   - Probation and main-queue records are slot records: a 24-bit slot plus that
-    slot's placement generation, kept in each bucket's spare word. A record
-    of a removed, moved, or reused slot is skipped when popped. Main records
-    take 4 bytes each.
+    slot's placement generation, kept in each bucket's generations word, or
+    for slots 8 and 9 its meta word. A record of a removed, moved, or reused
+    slot is skipped when popped. Main records take 4 bytes each.
   - Past 1.25 times the shard's capacity, the main queue drops stale records
     from its front in chunks of 64. A table sweep remains the fallback when
     the queue is exhausted.
@@ -203,27 +206,31 @@ rounding of the boxed entries is not included.
 
 | Entries | Key | Value | ShardedCache | DirectPackedCache | quick_cache |
 | ---: | --- | --- | ---: | ---: | ---: |
-| 100,000 | 8 B | `u64` | 48.0 | 46.8 | 118.0 |
-| 100,000 | 32 B | `[u8; 64]` | 129.3 | 128.2 | 306.7 |
-| 1,000,000 | 8 B | `u64` | 45.1 | 44.2 | 94.4 |
-| 1,000,000 | 32 B | `u64` | 69.1 | 69.0 | 144.7 |
-| 1,000,000 | 32 B | `[u8; 64]` | 125.2 | 125.1 | 245.4 |
+| 100,000 | 8 B | `u64` | 43.9 | 47.4 | 118.0 |
+| 100,000 | 32 B | `[u8; 64]` | 130.5 | 128.2 | 306.7 |
+| 1,000,000 | 8 B | `u64` | 39.8 | 44.2 | 94.4 |
+| 1,000,000 | 32 B | `u64` | 64.0 | 69.0 | 144.7 |
+| 1,000,000 | 32 B | `[u8; 64]` | 120.4 | 125.1 | 245.4 |
 
-Overhead beyond the key and value is 29.1 to 33.3 bytes per entry. On a
-16-thread machine, a 100,000-entry cache now has 256 shards, and their fixed
-state adds about 1.4 bytes per entry; at 1,000,000 entries it adds about 0.5:
+Overhead beyond the key and value is 23.8 to 24.4 bytes per entry at
+1,000,000 entries, and 27.9 to 34.5 at 100,000, where the slab region's
+spare slots, which a single-threaded fill never touches, add 2 to 8.5 (see
+"The slab region"). Before four-byte handles it was 29.1 to 33.3 at both
+sizes. On a 16-thread machine, a 100,000-entry cache has 256 shards, and
+their fixed state adds about 1.4 bytes per entry; at 1,000,000 entries it
+adds about 0.5:
 
 | Component | Bytes per entry |
 | --- | ---: |
-| Table at 80% load | 13.3 |
+| Table at 80% load | 8.0 |
 | Entry metadata | 8 |
 | Main queue, with its slack | about 4 to 5 |
 | Ghost filter | about 2 |
 | Main filter | about 0.25 |
-| Probation records, 24 bytes each | about 0.1 at the starting share |
+| Probation records, 16 bytes each | about 0.05 at the starting share |
 
 Probation records grow with the probation a shard adapts to. A workload
-that drives probation to its cap of a quarter of the shard holds up to 7.5
+that drives probation to its cap of a quarter of the shard holds up to 5
 bytes of records per entry, plus the queue's growth slack.
 
 For comparison, the overhead is 28 to 32 for `DirectPackedCache` and 78 to 210
@@ -274,6 +281,79 @@ inline `BuildHasher::hash_one` (see "Hashing without `hash_one`"). Built
 with one codegen unit, and again with the hashing change in both, resident
 hits moved by −2 to +14% at 50,000 entries and by 0 to +1% at 1,000,000,
 and writes by −3 to +4%.
+
+## Four-byte handles
+
+A bucket held six eight-byte entry addresses beside a control word and a
+generations word: 13.3 bytes of table per entry at 80% load, the largest
+share of the overhead. It now holds ten four-byte handles, so the table
+takes 8.0 bytes per entry. A region slot's handle is its offset in words
+from one word below the region's first slot, so readers decode it with one
+add from a base they load before pinning. An overflow slot's handle has the
+top bit set and names its chunk's id and its index there; the chunk's
+address comes from a directory of lazily allocated blocks, found through
+the region's header word, the word just below the first slot.
+
+Bigger buckets also displace fewer keys into their alternates, so misses
+probe fewer lines. Over the ARC traces' 18 cells the summed hit rate moved
+from 667.01 to 667.70, within the hasher's seed noise.
+
+Readers never decode an overflow handle inside their lookup. When a lookup
+meets one with its key's tag, it gives up, and a cold, out-of-line function
+searches again with the decoding path. Decoding inline, though no overflow
+handle existed in the benchmark, made resident hits at 1,000,000 entries
+20 to 25% slower on Apple Silicon in both codegen settings: whether as an
+out-of-line call, inlined, or reading the directory through the region's
+header to keep no extra state live. An overflow branch that only panicked,
+or one that gave up the lookup, cost nothing, so the cost is the shape of
+the code a returning path gives the lookup loop, not the instructions the
+hit runs. Writers, under the shard lock, decode inline.
+
+Before codegen was controlled, several decodings looked costly and were
+not. Built with default codegen units against a lucky baseline, a chunk
+directory, a multiply by the slot size, and three ALU steps each lost 17 to
+25% of resident hits. Built with one codegen unit on both sides, the
+directory and the ALU steps were level, as were one or two added ALU steps
+on eight-byte handles, byte offsets instead of words, and four-byte handles
+held in eight-byte atomics.
+
+Against the slab region alone, the median of three pairs on macOS, each
+build compared with the same build of the previous commit:
+
+| Workload | Entries | Default, 1T | Default, 8T | One unit, 1T | One unit, 8T |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Resident hit | 50,000 | +3% | +2% | +22% | 0% |
+| Resident hit | 1,000,000 | +2% | +3% | +1% | +3% |
+| Read miss | 50,000 | +1% | −10% | −1% | −8% |
+| Read miss | 1,000,000 | +10% | +9% | +12% | +27% |
+| Turnover | 1,000,000 | +10% | +6% | +4% | +1% |
+| Cold fill | 1,000,000 | +17% | +4% | +14% | +3% |
+
+The other write cells moved by −8 to +10%. The 50,000-entry miss and
+one-thread hit cells varied by 10 to 25% between runs.
+
+On the Linux VM, the region and the handles together against the hashing
+change, at 1,000,000 entries: resident hits +12 to +21%, misses +15 to
++27%, turnover +8 to +30%, and cold fill +5 to +22%, in both codegen
+settings. At 50,000 entries cells moved by −9 to +17%, 17 of 20 within
+±10%.
+
+On x86_64 runners, against the hashing change at 50,000 entries on an AMD
+EPYC 9V45 over five pairs, every cell moved by −7 to +6% in both codegen
+settings. At 1,000,000 entries, two runs on EPYC 7763 runners, each
+against quick_cache in the same run, bracket the change: before it, one
+thread trailed quick_cache by 17% on resident hits and 52% on misses, and
+four threads by 16% on misses; with the region and handles, but before
+readers deferred overflow decoding, one thread led by 4% on hits and
+trailed by 31% on misses, and four threads led by 23% on misses.
+Single-thread turnover went from +5% to +20%.
+
+Against quick_cache at 1,000,000 entries on macOS, the default build's
+single thread was level on resident hits (+2%, from −14%) and 9% ahead on
+turnover, and trailed by 51% on misses (from −59%). quick_cache's control
+bytes, a byte per slot, stay in the core's L2; ShardedCache's tag words share
+their lines with the handles, so a miss loads a bucket line from memory.
+Eight threads led by 29% on hits, 65% on turnover, and 2.4 times on misses.
 
 ## Slab storage against boxed entries
 
@@ -915,6 +995,9 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
   cores on every write.
 - **Reclaiming in batches of 32.** Freeing values together was meant to
   overlap their cache misses; eight-thread writes fell 12 to 16% instead.
+- **Decoding overflow handles inside readers' lookups.** Resident hits at
+  1,000,000 entries lost 20 to 25% on Apple Silicon, though no overflow
+  handle existed; see "Four-byte handles".
 - **64-byte slots.** Aligning slots to cache lines moved reads by −8 to +5%
   and cost 8 bytes per 56-byte entry.
 - **Trying an advance every 32 retirements per shard.** Each try scans 128

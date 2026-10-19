@@ -3,7 +3,7 @@
 PackedGen's main component is `ShardedCache`, a bounded concurrent cache for
 any `K: Hash + Eq`. Reads are lock-free, per-shard tables are sized once and
 never rebuilt, and eviction follows S3-FIFO. Its overhead beyond the key and
-value is about 30 requested bytes per entry.
+value is about 24 requested bytes per entry at 1,000,000 entries.
 
 The repository also holds research data structures: packed generational
 maps, lock-free and lock-based concurrent maps, the byte-keyed
@@ -19,8 +19,10 @@ shift failures.
 
 Writers take per-shard locks; readers take none. The shards share one table
 of six-slot buckets of tags and handles to epoch-reclaimed entries, and every
-key lives in one of two buckets. Overhead beyond the key and value is 29.1 to
-33.3 requested bytes per entry, against 78 to 210 for quick_cache 0.7.
+key lives in one of two buckets, and buckets hold ten four-byte handles to
+entries in one slab region per cache. Overhead beyond the key and value is
+23.8 to 24.4 requested bytes per entry at 1,000,000 entries and 27.9 to 34.5
+at 100,000, against 78 to 210 for quick_cache 0.7.
 
 Against quick_cache, ShardedCache leads concurrent reads. With eight threads
 on a 16-core machine it ran 2.6 to 3.9 times quick_cache's resident-hit
@@ -31,8 +33,10 @@ replacing them, and 13 to 14% behind on inserting new keys into a full cache.
 On one thread, resident hits were 8 to 11% behind, and writes 1 to 18%
 behind; much of that write gap is epoch reclamation's
 bookkeeping, queuing, tagging, and later freeing each removed entry. With
-1,000,000 entries, one thread trailed by about 14% on hits and 59% on
-misses, as its bucket table outgrew the caches. Those figures are from
+1,000,000 entries, one thread was level with quick_cache on hits (+2%) and
+9% ahead on turnover, but 51% behind on misses, whose tag words share cache
+lines with the handles; eight threads led by 29% on hits and ran 2.4 times
+quick_cache's miss throughput. Those figures are from
 Apple Silicon; on a 4-vCPU x86_64 runner at 50,000 entries, four threads
 led by 30 to 58% on reads and turnover, and one thread trailed by 20 to 23%
 on writes. In
