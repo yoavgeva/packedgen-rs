@@ -532,3 +532,138 @@ fn one_advance_of_aging_reclaims_beneath_a_later_epoch_reader() {
     // reader admitted during a racing rotation.
     model_reader_admitted_after_the_writers_pin(one_advance);
 }
+
+/// Reader shards per masked model: the writer's and the reader's.
+const MODEL_SHARDS: usize = 2;
+
+/// `ShardedCache`'s advances scan only the reader shards some thread has
+/// claimed: a thread sets its shard's bit, sequentially consistently, before
+/// its first pin, and an advance reads the mask after the generation with a
+/// zero-delta read-modify-write.
+struct MaskedTokenModel {
+    generation: AtomicUsize,
+    readers: [[AtomicUsize; MODEL_SHARDS]; EPOCHS],
+    shards: AtomicUsize,
+    index: AtomicUsize,
+    old_alive: AtomicBool,
+    due: AtomicUsize,
+}
+
+impl MaskedTokenModel {
+    fn new() -> Self {
+        Self {
+            generation: AtomicUsize::new(0),
+            readers: std::array::from_fn(|_| std::array::from_fn(|_| AtomicUsize::new(0))),
+            shards: AtomicUsize::new(0),
+            index: AtomicUsize::new(OLD),
+            old_alive: AtomicBool::new(true),
+            due: AtomicUsize::new(NO_RETIRED_EPOCH),
+        }
+    }
+
+    fn claim(&self, shard: usize) {
+        self.shards.fetch_or(1 << shard, Ordering::SeqCst);
+    }
+
+    /// The claimed shards, read as production reads them for an advance:
+    /// with a zero-delta read-modify-write, which observes the latest claim
+    /// where a load may not.
+    fn claimed(&self) -> usize {
+        self.shards.fetch_or(0, Ordering::SeqCst)
+    }
+
+    fn enter(&self, shard: usize) -> usize {
+        enter_epoch(
+            || self.generation.load(Ordering::SeqCst),
+            |epoch| {
+                self.readers[epoch][shard].fetch_add(1, Ordering::SeqCst);
+            },
+            |epoch| self.readers[epoch][shard].fetch_sub(1, Ordering::SeqCst),
+        )
+    }
+
+    fn leave(&self, epoch: usize, shard: usize) {
+        leave_epoch(epoch, |epoch| {
+            self.readers[epoch][shard].fetch_sub(1, Ordering::SeqCst)
+        });
+    }
+
+    /// Advances from `generation` if the claimed shards in `mask` are
+    /// quiescent in the epochs the advance retires.
+    fn advance(&self, generation: usize, mask: usize) {
+        let Some(advance) = plan_epoch_advance(generation, |epoch| {
+            (0..MODEL_SHARDS)
+                .filter(|shard| mask & 1 << shard != 0)
+                .all(|shard| self.readers[epoch][shard].fetch_add(0, Ordering::SeqCst) == 0)
+        }) else {
+            return;
+        };
+        let _ = self.generation.compare_exchange(
+            generation,
+            advance.next_generation,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+
+    fn reclaim_if_due(&self) {
+        let due = self.due.load(Ordering::Acquire);
+        if due != NO_RETIRED_EPOCH && self.generation.load(Ordering::SeqCst) >= due {
+            self.old_alive.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+/// A writer retires the old slot while a reader on another shard claims
+/// that shard and pins; the main thread advances, reading the claimed shards
+/// with `claimed`, and reclaims when due.
+fn model_masked_reclamation(claimed: fn(&MaskedTokenModel) -> usize) {
+    model_bounded(move || {
+        let state = Arc::new(MaskedTokenModel::new());
+        state.claim(0);
+        let reader = {
+            let state = Arc::clone(&state);
+            thread::spawn(move || {
+                state.claim(1);
+                let epoch = state.enter(1);
+                if state.index.load(Ordering::Acquire) == OLD {
+                    assert!(
+                        state.old_alive.load(Ordering::SeqCst),
+                        "a pinned reader observed a reclaimed slot"
+                    );
+                }
+                state.leave(epoch, 1);
+            })
+        };
+        let writer = {
+            let state = Arc::clone(&state);
+            thread::spawn(move || {
+                let epoch = state.enter(0);
+                state.index.swap(ABSENT, Ordering::AcqRel);
+                let tag = state.generation.load(Ordering::SeqCst);
+                state.due.store(reclaim_at(tag), Ordering::Release);
+                state.leave(epoch, 0);
+            })
+        };
+        for _ in 0..EPOCHS {
+            let generation = state.generation.load(Ordering::SeqCst);
+            state.advance(generation, claimed(&state));
+            state.reclaim_if_due();
+        }
+        reader.join().unwrap();
+        writer.join().unwrap();
+    });
+}
+
+#[test]
+fn masked_advances_never_reclaim_under_a_reader_claiming_its_shard() {
+    model_masked_reclamation(MaskedTokenModel::claimed);
+}
+
+#[test]
+#[should_panic(expected = "a pinned reader observed a reclaimed slot")]
+fn masked_advances_that_load_the_mask_can_skip_a_new_reader() {
+    // Negative control: a plain load of the mask can miss a claim that a
+    // read-modify-write observes.
+    model_masked_reclamation(|state| state.shards.load(Ordering::SeqCst));
+}

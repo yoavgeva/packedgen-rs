@@ -107,8 +107,10 @@ entry. Tables are sized once and never rebuilt.
     of 32, and returns to it when the thread exits. The region is freed when
     the cache drops; a stack left for a dropped cache is forgotten without
     touching its slots.
-  - The generation advances once 512 retirements are pending across the
-    cache. A failed try waits for 256 more.
+  - The generation advances once retirements pending across the cache reach
+    32 per reader shard any thread has claimed, at most 512, and a try
+    scans only the claimed shards' counters (see "Reader shards in use"). A
+    failed try waits for half as many more.
 - **Reads.** `get` hashes the key, then pins and clones the value. Hashing
   before pinning lets the hash run while the previous call's unpin completes
   (see "Read path"). `pin()` returns a guard for borrowed reads that pins once.
@@ -194,7 +196,11 @@ entry. Tables are sized once and never rebuilt.
 - **Loom models.** `tests/cache_concurrency_model.rs` model-checks the token
   rule. It covers a reader racing a pinned writer and a reclaimer, and a
   reader admitted at the epoch after the writer's pin. A negative control
-  shows the model catches aging of one advance.
+  shows the model catches aging of one advance. A second model gives each
+  reader its own shard and scans only the claimed ones, with a reader
+  claiming its shard while the writer retires and the main thread
+  advances; its negative control reads the mask with a load instead of a
+  read-modify-write, and the model finds a reclamation beneath the reader.
 - **CI tools.** `scripts/cache_proof.sh` runs the module under Miri, ASan, and
   TSan.
 
@@ -354,6 +360,40 @@ turnover, and trailed by 51% on misses (from −59%). quick_cache's control
 bytes, a byte per slot, stay in the core's L2; ShardedCache's tag words share
 their lines with the handles, so a miss loads a bucket line from memory.
 Eight threads led by 29% on hits, 65% on turnover, and 2.4 times on misses.
+
+## Reader shards in use
+
+Each thread's index, assigned on its first pin of any cache, sets a bit in
+a process-wide mask before the index is first used. An advance reads the
+mask after the generation, with a zero-delta read-modify-write, and scans
+only the claimed shards' reader counters; advances come due after 32
+retirements per claimed shard, at most the 512 they waited for before. A
+pin costs nothing more: the index assignment it already makes sets the
+bit once per thread. Indices are never reused, so once 64 threads have
+claimed shards, every shard is scanned and advances wait for 512
+retirements, as before.
+
+A lone writer's removed values used to wait for three advances of 512
+retirements: 1,536 of them were still held after 100,000 inserts into a
+1,000-entry cache. They now wait for three of 32, and
+`tests/sharded_cache_reclamation.rs` checks that at most 256 are held. At
+50,000 entries, a single writer's slab high-water mark fell from 51,600 to
+50,200 slots; with more threads, preemption decided it either way.
+
+Reading the mask with a load was enough under the C++ sequentially
+consistent order, by the argument above, but not under the Loom model's,
+which found a reader that pinned a retired epoch after an advance's load
+had missed its claim. The read-modify-write observes every earlier claim
+in the mask's modification order, as the zero-delta counter reads do, and
+the model then holds.
+
+Throughput moved little: on macOS every cell moved by −5 to +11% in both
+codegen settings, within run-to-run ranges; on the Linux VM, at 50,000
+entries, writes gained 1 to 4% in the default build and moved by −7 to
++3% with one codegen unit. An earlier form, which marked the shard on
+every pin, gained 2 to 12% on single-thread writes before later
+write-path changes took most of that, and cost misses 1.2 to 3.4% (see
+"Rejected and reverted").
 
 ## Slab storage against boxed entries
 
@@ -1064,17 +1104,17 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
   On x86, single-thread writes moved by 0 to +1%, delete and reinsert by
   +14% within −2 to +34%; on macOS, by −2 to +7% within wider ranges. Not
   enough to replace the mutex with unsafe code of our own.
-- **Scanning only the reader shards in use.** Each pin marked its reader
-  shard in a per-cache mask; tries scanned only marked shards' counters and
-  came due after 32 retirements per marked shard. A lone writer's backlog
-  fell from 1,536 removed entries to under 256, and requested memory at
-  100,000 entries by 0.7 to 1.6 bytes per entry. Single-thread writes on
-  Linux gained 2 to 12%, and eight-thread replace 2 to 6%. But the mark
-  check on every pin cost reads: misses lost 1.2 to 1.6% on macOS and 1.8 to
-  3.4% on Linux, and eight-thread resident hits 3.2 to 3.6% on Linux. On
-  x86, single-thread cold fill gained 6% and reads lost 2 to 3%. A
-  process-wide mask set once per thread would cost reads nothing, but fills
-  once 64 threads have used any cache, as under thread churn.
+- **Scanning only the reader shards in use, marked on every pin.** Each
+  pin marked its reader shard in a per-cache mask; tries scanned only
+  marked shards' counters and came due after 32 retirements per marked
+  shard. A lone writer's backlog fell from 1,536 removed entries to under
+  256, and requested memory at 100,000 entries by 0.7 to 1.6 bytes per
+  entry. Single-thread writes on Linux gained 2 to 12%, and eight-thread
+  replace 2 to 6%. But the mark check on every pin cost reads: misses lost
+  1.2 to 1.6% on macOS and 1.8 to 3.4% on Linux, and eight-thread resident
+  hits 3.2 to 3.6% on Linux. On x86, single-thread cold fill gained 6% and
+  reads lost 2 to 3%. The process-wide mask set once per thread replaced it
+  (see "Reader shards in use").
 
 ## Reproduce
 
