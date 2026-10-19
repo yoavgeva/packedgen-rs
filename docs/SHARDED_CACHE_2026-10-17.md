@@ -500,7 +500,11 @@ puts a write at 1.4 to 1.6 times quick_cache's cycles. Evicting costs less
 than quick_cache's eviction; queuing, tagging, and later freeing each
 removed entry take about 80 cycles, spread over the retired queue, the
 reclamation batches, and the slot stacks, with no single step
-dominating.
+dominating. In single-thread cold fill, freeing the evicted values also
+took about 60 cycles per insert against quick_cache's 36, most of the
+difference in the macOS allocator's chunk-list pushes: probation evicts
+each shard's newest key, so the freed values belong to chunks the
+allocator filled shortly before.
 
 The earlier boxed-entry storage measured macOS resident hits at −32%, +2%,
 and +241%. On macOS those boxes often sat beside their values (see "Slab
@@ -732,6 +736,13 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
   covers eight buckets, so each write invalidates it for readers of all
   eight. The split would also have fit seven handles in a line, about 0.5
   bytes per entry less.
+- **Writers without a pin.** A writer holds its shard's lock while it
+  reads entries, so its pin serves only the retirement tag. As an upper
+  bound, writes that skipped the pin altogether, unsoundly, moved
+  single-thread writes by −1 to +4% on macOS and −5 to +2% on Linux, and
+  eight-thread writes by +1 to +7%. A sound replacement still needs a
+  release that the next advance acquires, so it would save one of the two
+  read-modify-writes at most.
 - **Scanning only the reader shards in use.** Each pin marked its reader
   shard in a per-cache mask; tries scanned only marked shards' counters and
   came due after 32 retirements per marked shard. A lone writer's backlog
