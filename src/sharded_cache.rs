@@ -3586,8 +3586,8 @@ mod tests {
         // removed entries to about a hundred, so the spare past the entry
         // limit is 1,024 slots and 256 per available thread.
         let threads = std::thread::available_parallelism().map_or(1, usize::from);
-        let cache = ShardedCacheBuilder::new(100_000).build::<u64, u64>();
-        assert_eq!(cache.slots.region_slots(), 100_000 + 1_024 + 256 * threads);
+        let cache = ShardedCacheBuilder::new(1_000).build::<u64, u64>();
+        assert_eq!(cache.slots.region_slots(), 1_000 + 1_024 + 256 * threads);
     }
 
     #[test]
