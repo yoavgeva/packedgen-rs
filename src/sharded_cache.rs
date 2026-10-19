@@ -1,8 +1,8 @@
 //! A sharded concurrent cache with lock-free reads.
 //!
-//! Each shard is a fixed table of 64-byte buckets. A bucket holds six slots:
-//! one control word with a tag byte per slot and an overflow count, and six
-//! atomic handles to entries in the shard's epoch-reclaimed slab (see
+//! Each shard is a fixed table of 64-byte buckets. A bucket holds ten slots:
+//! a tag byte per slot and an overflow count in two words, and ten atomic
+//! four-byte handles to entries in the cache's epoch-reclaimed slab (see
 //! `sharded_arena`). Keys live in the entries, not in the table, and an entry
 //! never changes after publication, so a reader compares keys only in memory
 //! that its epoch pin keeps alive. Writers can therefore reuse a freed table
@@ -23,9 +23,9 @@ use std::convert::Infallible;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
-use std::ptr::{self, NonNull};
+use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use hashbrown::DefaultHashBuilder;
@@ -35,17 +35,25 @@ use crate::cache_arena::direct_arena_thread;
 #[cfg(test)]
 use crate::sharded_arena::PREFETCHED;
 use crate::sharded_arena::{
-    EpochPin, Epochs, MAX_EXPIRY_TICK, MAX_WEIGHT, Reclaimed, RetiredSlots, Slot, SlotStore,
-    drop_value, fill, prefetch, prefetch_write,
+    EpochPin, Epochs, MAX_EXPIRY_TICK, MAX_WEIGHT, OVERFLOW_HANDLE, Reclaimed, RetiredSlots, Slot,
+    SlotDecoder, SlotStore, drop_value, fill, prefetch, prefetch_write,
 };
 
-const SLOTS: usize = 6;
+const SLOTS: usize = 10;
+/// Slots whose tags fill a bucket's tag word; the rest are in its meta word.
+const WORD_SLOTS: usize = 8;
 const TAG_MASK: u64 = 0xff;
-const OVERFLOW_SHIFT: u32 = 48;
+/// The meta word's count of keys that probed past the bucket.
+const OVERFLOW_SHIFT: u32 = 16;
 const OVERFLOW_MAX: u64 = 0xff;
-/// A bucket's generations word marks a key living in its alternate bucket
-/// at this bit plus its slot.
-const DISPLACED_SHIFT: usize = 48;
+/// The meta word marks a key living in its alternate bucket at this bit
+/// plus its slot.
+const DISPLACED_SHIFT: usize = 24;
+/// The meta word holds the placement counts of the slots past `WORD_SLOTS`
+/// from this bit.
+const META_GENERATION_SHIFT: usize = 40;
+/// Meta bits a clear keeps: placement counts.
+const META_GENERATIONS: u64 = 0xffff << META_GENERATION_SHIFT;
 /// Table slots per entry of capacity: about 80% load when the shard is full.
 const SLOTS_PER_ENTRY_NUMERATOR: usize = 5;
 const SLOTS_PER_ENTRY_DENOMINATOR: usize = 4;
@@ -56,6 +64,12 @@ const MIN_SHARD_CAPACITY: usize = 64;
 const WIDE_SHARD_CAPACITY: usize = 256;
 /// Main-queue records encode a slot in 24 bits.
 const MAX_SHARD_SLOTS: usize = 1 << 24;
+/// Slab region slots beyond the entry limit, for entries removed but not
+/// yet reclaimed: about what reclamation trails by on one thread.
+const REGION_SPARE: usize = 4_096;
+/// More region slots per available thread, for each thread's stack of
+/// vacant slots and its share of the reclamation backlog.
+const REGION_SPARE_PER_THREAD: usize = 256;
 /// Main-queue records compaction examines per append.
 const MAIN_CLEANUP_CHUNK: usize = 64;
 const NEVER_EXPIRES: u64 = u64::MAX;
@@ -343,12 +357,10 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
         L: RemovalListener<K, V>,
     {
         let max_entries = self.max_entries.max(1);
-        let shards = self.shards.unwrap_or_else(|| {
-            default_shards(
-                max_entries,
-                std::thread::available_parallelism().map_or(1, usize::from),
-            )
-        });
+        let parallelism = std::thread::available_parallelism().map_or(1, usize::from);
+        let shards = self
+            .shards
+            .unwrap_or_else(|| default_shards(max_entries, parallelism));
         // Every shard holds an entry: a shard with none would admit one.
         let most = 1 << max_entries.ilog2();
         // Main-queue records hold a slot in 24 bits.
@@ -390,8 +402,9 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
                 .collect(),
             table: (0..shards * shard_buckets)
                 .map(|_| Bucket {
-                    control: AtomicU64::new(0),
-                    handles: std::array::from_fn(|_| AtomicU64::new(0)),
+                    tags: AtomicU64::new(0),
+                    meta: AtomicU64::new(0),
+                    handles: std::array::from_fn(|_| AtomicU32::new(0)),
                     generations: AtomicU64::new(0),
                 })
                 .collect(),
@@ -399,7 +412,11 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
             shard_shift: u64::BITS - shards.trailing_zeros(),
             epochs: Epochs::new(),
             retired: RetiredSlots::new(),
-            slots: SlotStore::new(),
+            slots: SlotStore::new(
+                max_entries
+                    .saturating_add(REGION_SPARE)
+                    .saturating_add(REGION_SPARE_PER_THREAD.saturating_mul(parallelism)),
+            ),
             weighter: self.weighter,
             hash_builder: self.hash_builder,
             listener: self.listener,
@@ -474,6 +491,7 @@ pub struct ShardedCache<K, V, W = UnitWeighter, S = DefaultHashBuilder, L = NoLi
 struct ShardView<'cache, T> {
     state: &'cache Shard<T>,
     buckets: &'cache [Bucket],
+    slots: SlotDecoder<'cache, T>,
 }
 
 impl<T> Clone for ShardView<'_, T> {
@@ -563,32 +581,103 @@ fn count_read(stripes: &[StatStripe], hit: bool) {
     }
 }
 
+/// Ten slots in one cache line. Writers store to the tag and meta words
+/// with release, as readers acquire both, and only under the shard lock.
 #[repr(C, align(64))]
 struct Bucket {
-    /// Tag bytes for the six slots (zero marks an empty slot), then the
-    /// count of keys that probed past this bucket.
-    control: AtomicU64,
-    handles: [AtomicU64; SLOTS],
-    /// A byte per slot counting its placements, so a main-queue record of
-    /// a slot can tell its key from a later one, then a bit per slot set
-    /// while its key lives in its alternate bucket. Only writers use it.
+    /// Tag bytes for slots 0 to 7; zero marks an empty slot.
+    tags: AtomicU64,
+    /// Tag bytes for slots 8 and 9, then the count of keys that probed past
+    /// this bucket. Writers also keep here a bit per slot set while its key
+    /// lives in its alternate bucket, and slots 8 and 9's placement counts.
+    meta: AtomicU64,
+    handles: [AtomicU32; SLOTS],
+    /// A byte per slot 0 to 7 counting its placements, so a main-queue
+    /// record of a slot can tell its key from a later one. Only writers use
+    /// it.
     generations: AtomicU64,
 }
 
 impl Bucket {
-    /// Puts `raw` in `slot` and returns the handle it held. Requires the
+    /// Puts `handle` in `slot` and returns the handle it held. Requires the
     /// shard lock, under which writers make every change to a handle: the
     /// load sees the current handle, and the lock orders the entry it names
-    /// before this writer. Readers acquire the entry `raw` names through the
-    /// release store. Readers still holding the old handle are covered by
-    /// the writer's pin, as for any unpublication, so a swap's
+    /// before this writer. Readers acquire the entry `handle` names through
+    /// the release store. Readers still holding the old handle are covered
+    /// by the writer's pin, as for any unpublication, so a swap's
     /// read-modify-write would buy nothing.
     #[inline]
-    fn exchange(&self, slot: usize, raw: u64) -> u64 {
-        let handle = &self.handles[slot];
-        let previous = handle.load(Ordering::Relaxed);
-        handle.store(raw, Ordering::Release);
+    fn exchange(&self, slot: usize, handle: u32) -> u32 {
+        let current = &self.handles[slot];
+        let previous = current.load(Ordering::Relaxed);
+        current.store(handle, Ordering::Release);
         previous
+    }
+
+    /// The word holding `slot`'s tag, and the tag's shift in it.
+    #[inline]
+    fn tag_word(&self, slot: usize) -> (&AtomicU64, usize) {
+        if slot < WORD_SLOTS {
+            (&self.tags, slot * 8)
+        } else {
+            (&self.meta, (slot - WORD_SLOTS) * 8)
+        }
+    }
+
+    /// `slot`'s tag. Requires the shard lock.
+    #[inline]
+    fn tag(&self, slot: usize) -> u8 {
+        let (word, shift) = self.tag_word(slot);
+        (word.load(Ordering::Relaxed) >> shift).to_le_bytes()[0]
+    }
+
+    /// `slot`'s placement count. Requires the shard lock.
+    #[inline]
+    fn generation(&self, slot: usize) -> u8 {
+        let word = if slot < WORD_SLOTS {
+            self.generations.load(Ordering::Relaxed) >> (slot * 8)
+        } else {
+            self.meta.load(Ordering::Relaxed) >> (META_GENERATION_SHIFT + (slot - WORD_SLOTS) * 8)
+        };
+        word.to_le_bytes()[0]
+    }
+
+    /// Whether the key in `slot` lives in its alternate bucket.
+    #[inline]
+    fn is_displaced(&self, slot: usize) -> bool {
+        self.meta.load(Ordering::Relaxed) >> (DISPLACED_SHIFT + slot) & 1 != 0
+    }
+
+    /// The lowest empty slot. Requires the shard lock.
+    #[inline]
+    fn empty_slot(&self) -> Option<usize> {
+        // The lowest flag of `zero_tag_bytes` is always exact.
+        let empty = zero_tag_bytes(self.tags.load(Ordering::Relaxed));
+        if empty != 0 {
+            return Some(empty.trailing_zeros() as usize / 8);
+        }
+        let empty = zero_tag_bytes(self.meta.load(Ordering::Relaxed)) & META_TAG_HIGH_BITS;
+        (empty != 0).then(|| WORD_SLOTS + empty.trailing_zeros() as usize / 8)
+    }
+
+    /// Adds `delta` to the count of keys that probed past this bucket. A
+    /// saturated count stays saturated: lookups past it are only slower,
+    /// never wrong. Requires the shard lock.
+    #[inline]
+    fn add_overflow(&self, delta: i8) {
+        let meta = self.meta.load(Ordering::Relaxed);
+        let count = overflow(meta);
+        debug_assert!(
+            delta > 0 || count != 0,
+            "a key in its alternate is counted at home"
+        );
+        if count < OVERFLOW_MAX {
+            let count = count.wrapping_add_signed(i64::from(delta)) & OVERFLOW_MAX;
+            self.meta.store(
+                meta & !(OVERFLOW_MAX << OVERFLOW_SHIFT) | count << OVERFLOW_SHIFT,
+                Ordering::Release,
+            );
+        }
     }
 }
 
@@ -661,9 +750,9 @@ struct ShardWriter {
 /// published with, whose entry evictions prefetch alongside its bucket.
 #[derive(Clone, Copy)]
 struct Probationary {
-    record: u32,
     hash: u64,
-    handle: u64,
+    record: u32,
+    handle: u32,
 }
 
 /// A shard's writer state under its lock, with the counts kept beside it.
@@ -1034,6 +1123,35 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
+        let found = self.shard(hash).find_in_region(hash, |handle| {
+            // SAFETY: `find_in_region` passes handles published in this
+            // cache's table while `pin` was held.
+            unsafe { entry(pin, handle) }.value().0.borrow() == key
+        });
+        match found {
+            // SAFETY: as above.
+            Ok(found) => found.map(|(_, handle)| unsafe { entry(pin, handle) }),
+            Err(Overflowed) => self.find_entry_decoding(pin, key, hash),
+        }
+    }
+
+    /// [`Self::find_entry`] for a key whose lookup met an overflow handle.
+    #[allow(
+        unsafe_code,
+        reason = "dereferences handles the table publishes under the caller's pin"
+    )]
+    #[cold]
+    #[inline(never)]
+    fn find_entry_decoding<'pin, Q>(
+        &self,
+        pin: &'pin EpochPin<'_>,
+        key: &Q,
+        hash: u64,
+    ) -> Option<Entry<'pin, (K, V)>>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let (_, handle) = self.shard(hash).find(hash, |handle| {
             // SAFETY: `find` passes handles published in this cache's table
             // while `pin` was held.
@@ -1146,11 +1264,11 @@ where
         let expires_at = ttl.map_or(NEVER_EXPIRES, |ttl| self.deadline(ttl));
         let mut now = None;
         let pin = self.epochs.pin();
-        let slot = self.slots.take();
+        let (slot, raw) = self.slots.take();
         // SAFETY: `take` handed this vacant slot to this caller alone, and
         // nothing can reach it before it is published below.
         unsafe { fill(slot, (key, value), compact_weight, expires_at) };
-        let handle = Handle(slot);
+        let handle = Handle { raw, slot };
         // SAFETY: the caller's own filled slot, published below or never.
         let key = &unsafe { entry(&pin, handle) }.value().0;
         let mut removed = Removed::new();
@@ -1165,7 +1283,7 @@ where
             });
             if let Some((index, _)) = found {
                 let previous =
-                    Handle::from_raw(shard.bucket(index).exchange(index % SLOTS, handle.raw()));
+                    shard.handle(shard.bucket(index).exchange(index % SLOTS, handle.raw));
                 // SAFETY: the exchange unpublished `previous` while `pin` is
                 // held.
                 let previous_entry = unsafe { entry(&pin, previous) };
@@ -1234,7 +1352,7 @@ where
                     writer.probation.push_back(Probationary {
                         record,
                         hash,
-                        handle: handle.raw(),
+                        handle: handle.raw,
                     });
                 }
             }
@@ -1256,7 +1374,7 @@ where
         let mut foreign = Reclaimed::new();
         let advance = self.retired.retire(
             &pin,
-            removed.iter().map(|(handle, _)| handle.0),
+            removed.iter().map(|(handle, _)| handle.slot),
             &mut reclaimed,
             &mut foreign,
         );
@@ -1318,15 +1436,20 @@ where
             {
                 let mut writer = shard.lock();
                 for bucket in shard.buckets {
-                    if bucket.control.load(Ordering::Relaxed) == 0 {
+                    let meta = bucket.meta.load(Ordering::Relaxed);
+                    if bucket.tags.load(Ordering::Relaxed) == 0 && meta & !META_GENERATIONS == 0 {
                         continue;
                     }
-                    // Tags first, as `Shard::clear` does, then the handles.
-                    bucket.control.store(0, Ordering::Release);
+                    // Tags first, as `ShardView::clear` does, then the
+                    // handles.
+                    bucket.tags.store(0, Ordering::Release);
+                    bucket
+                        .meta
+                        .store(meta & META_GENERATIONS, Ordering::Release);
                     for slot in 0..SLOTS {
                         let raw = bucket.exchange(slot, 0);
                         if raw != 0 {
-                            removed.push(Handle::from_raw(raw), RemovalCause::Explicit);
+                            removed.push(shard.handle(raw), RemovalCause::Explicit);
                         }
                     }
                 }
@@ -1375,6 +1498,7 @@ where
         ShardView {
             state: &self.shards[index],
             buckets: &self.table[first..first + self.shard_buckets],
+            slots: self.slots.decoder(),
         }
     }
 
@@ -1403,11 +1527,11 @@ where
                 continue;
             };
             let raw = shard.bucket(slot).handles[slot % SLOTS].load(Ordering::Relaxed);
-            if protected.is_some_and(|protected| protected.raw() == raw) {
+            if protected.is_some_and(|protected| protected.raw == raw) {
                 continue;
             }
             // SAFETY: the shard lock keeps this published handle in the table.
-            let entry = unsafe { entry(pin, Handle::<(K, V)>::from_raw(raw)) };
+            let entry = unsafe { entry(pin, shard.handle(raw)) };
             let expired = self.expired(entry, now);
             if !expired && entry.take_accessed() {
                 // Read during probation: it joins the main area.
@@ -1433,9 +1557,9 @@ where
             };
             let raw = shard.bucket(slot).handles[slot % SLOTS].load(Ordering::Relaxed);
             // SAFETY: the shard lock keeps this published handle in the table.
-            let entry = unsafe { entry(pin, Handle::<(K, V)>::from_raw(raw)) };
+            let entry = unsafe { entry(pin, shard.handle(raw)) };
             let expired = self.expired(entry, now);
-            if protected.is_some_and(|protected| protected.raw() == raw)
+            if protected.is_some_and(|protected| protected.raw == raw)
                 || (!expired && entry.take_accessed())
             {
                 writer.main.push_back(record);
@@ -1458,11 +1582,11 @@ where
             let slot = writer.hand;
             writer.hand = if slot + 1 == slots { 0 } else { slot + 1 };
             let raw = shard.bucket(slot).handles[slot % SLOTS].load(Ordering::Relaxed);
-            if raw == 0 || protected.is_some_and(|protected| protected.raw() == raw) {
+            if raw == 0 || protected.is_some_and(|protected| protected.raw == raw) {
                 continue;
             }
             // SAFETY: the shard lock keeps this published handle in the table.
-            let entry = unsafe { entry(pin, Handle::<(K, V)>::from_raw(raw)) };
+            let entry = unsafe { entry(pin, shard.handle(raw)) };
             let expired = self.expired(entry, now);
             if !expired && entry.take_accessed() && step < 2 * slots {
                 continue;
@@ -1502,7 +1626,7 @@ where
                 let raw = shard.bucket(slot).handles[slot % SLOTS].load(Ordering::Relaxed);
                 debug_assert_ne!(raw, 0, "both candidate buckets are full");
                 // SAFETY: the shard lock keeps this published handle in the table.
-                let entry = unsafe { entry(pin, Handle::<(K, V)>::from_raw(raw)) };
+                let entry = unsafe { entry(pin, shard.handle(raw)) };
                 let expired = self.expired(entry, now);
                 let keep = match pass {
                     0 => !expired,
@@ -1567,7 +1691,7 @@ impl<K, V, W, S, L> Drop for ShardedCache<K, V, W, S, L> {
                     // SAFETY: a published slot holds an initialized value,
                     // each slot is published once, and nothing reaches it
                     // after this exclusive drop.
-                    unsafe { drop_value(Handle::<(K, V)>::from_raw(raw).0) };
+                    unsafe { drop_value(self.slots.slot(raw)) };
                 }
             }
         }
@@ -1620,8 +1744,11 @@ impl<T> ShardView<'_, T> {
         if let Some(next) = writer.probation.front() {
             let slot = usize::try_from(next.record >> 8).expect("a slot fits usize");
             prefetch_write(self.buckets.as_ptr().wrapping_add(slot / SLOTS));
-            let handle = usize::try_from(next.handle).expect("a handle fits usize");
-            prefetch(ptr::without_provenance::<u8>(handle));
+            // The record may be stale; only a region handle decodes without
+            // reading anything.
+            if next.handle & OVERFLOW_HANDLE == 0 {
+                prefetch(self.slots.slot(next.handle).as_ptr());
+            }
             prefetch_write(writer.filters.ghost_line(next.hash));
         }
         prefetch_write(self.buckets.as_ptr().wrapping_add(self.home(hash)));
@@ -1696,8 +1823,8 @@ impl<T> ShardView<'_, T> {
     fn other_bucket(&self, slot: usize) -> (usize, bool) {
         let bucket = slot / SLOTS;
         let current = &self.buckets[bucket];
-        let tag = current.control.load(Ordering::Relaxed).to_le_bytes()[slot % SLOTS];
-        if is_displaced(current, slot % SLOTS) {
+        let tag = current.tag(slot % SLOTS);
+        if current.is_displaced(slot % SLOTS) {
             (self.displaced_home(bucket, tag), true)
         } else {
             (self.alternate(bucket, tag), false)
@@ -1706,51 +1833,127 @@ impl<T> ShardView<'_, T> {
 
     /// Finds the slot whose handle `matches` in the key's home bucket, then
     /// in its alternate if any key from that home lives in its alternate.
-    /// Lock-free.
+    /// Lock-free; decodes overflow handles, for writers.
     #[inline]
     fn find(
         &self,
         hash: u64,
-        mut matches: impl FnMut(Handle<T>) -> bool,
+        matches: impl FnMut(Handle<T>) -> bool,
     ) -> Option<(usize, Handle<T>)> {
-        let tag = tag(hash);
-        let home = self.home(hash);
-        let control = self.buckets[home].control.load(Ordering::Acquire);
-        if let Some(found) = self.find_in(home, control, tag, &mut matches) {
-            return Some(found);
+        match self.search::<true>(hash, matches) {
+            Ok(found) => found,
+            Err(Overflowed) => unreachable!("writers decode overflow handles"),
         }
-        if control >> OVERFLOW_SHIFT & OVERFLOW_MAX == 0 {
-            return None;
-        }
-        let alternate = self.alternate(home, tag);
-        let control = self.buckets[alternate].control.load(Ordering::Acquire);
-        self.find_in(alternate, control, tag, &mut matches)
     }
 
+    /// As [`Self::find`], but gives up on reaching an overflow handle with
+    /// the key's tag; the caller then searches again with `find`. Readers
+    /// use it: decoding an overflow handle within the lookup, though no
+    /// such handle exists while the region has room, made the compiler lay
+    /// out `get` so that resident hits at 1,000,000 entries ran 23% slower
+    /// on Apple Silicon.
     #[inline]
-    fn find_in(
+    fn find_in_region(
+        &self,
+        hash: u64,
+        matches: impl FnMut(Handle<T>) -> bool,
+    ) -> Result<Option<Found<T>>, Overflowed> {
+        self.search::<false>(hash, matches)
+    }
+
+    #[allow(
+        clippy::inline_always,
+        reason = "out of line, its call passed the view and the found entry through memory"
+    )]
+    #[inline(always)]
+    fn search<const DECODE_OVERFLOW: bool>(
+        &self,
+        hash: u64,
+        mut matches: impl FnMut(Handle<T>) -> bool,
+    ) -> Result<Option<Found<T>>, Overflowed> {
+        let tag = tag(hash);
+        let home = self.home(hash);
+        let (found, meta) = self.find_in::<DECODE_OVERFLOW>(home, tag, &mut matches)?;
+        if found.is_some() || overflow(meta) == 0 {
+            return Ok(found);
+        }
+        Ok(self
+            .find_in::<DECODE_OVERFLOW>(self.alternate(home, tag), tag, &mut matches)?
+            .0)
+    }
+
+    /// Finds the slot whose handle `matches` among `bucket`'s slots with
+    /// `tag`, and returns the meta word if it loaded it. The meta word,
+    /// with slots 8 and 9's tags and the overflow count, is acquired only
+    /// after slots 0 to 7 miss: a hit there waits on one acquiring load
+    /// before its handle's, not two.
+    #[allow(
+        clippy::inline_always,
+        reason = "out of line, its call passed the view and the found entry through memory"
+    )]
+    #[inline(always)]
+    fn find_in<const DECODE_OVERFLOW: bool>(
         &self,
         bucket: usize,
-        control: u64,
         tag: u8,
         matches: &mut impl FnMut(Handle<T>) -> bool,
-    ) -> Option<(usize, Handle<T>)> {
+    ) -> Result<(Option<Found<T>>, u64), Overflowed> {
         let current = &self.buckets[bucket];
-        let mut candidates = zero_tag_bytes(control ^ (BYTE_ONES * u64::from(tag)));
+        let pattern = BYTE_ONES * u64::from(tag);
+        let tags = current.tags.load(Ordering::Acquire);
+        let candidates = zero_tag_bytes(tags ^ pattern);
+        if let Some(found) = self.find_among::<DECODE_OVERFLOW>(bucket, candidates, 0, matches)? {
+            return Ok((Some(found), 0));
+        }
+        let meta = current.meta.load(Ordering::Acquire);
+        let candidates = zero_tag_bytes(meta ^ pattern) & META_TAG_HIGH_BITS;
+        Ok((
+            self.find_among::<DECODE_OVERFLOW>(bucket, candidates, WORD_SLOTS, matches)?,
+            meta,
+        ))
+    }
+
+    /// Finds the slot whose handle `matches` among `candidates`, tag-byte
+    /// flags for slots from `first` on.
+    #[allow(
+        clippy::inline_always,
+        reason = "out of line, its call passed the view and the found entry through memory"
+    )]
+    #[inline(always)]
+    fn find_among<const DECODE_OVERFLOW: bool>(
+        &self,
+        bucket: usize,
+        mut candidates: u64,
+        first: usize,
+        matches: &mut impl FnMut(Handle<T>) -> bool,
+    ) -> Result<Option<Found<T>>, Overflowed> {
+        let current = &self.buckets[bucket];
         while candidates != 0 {
-            let slot = candidates.trailing_zeros() as usize / 8;
+            let slot = first + candidates.trailing_zeros() as usize / 8;
             candidates &= candidates - 1;
             // Acquire pairs with the release store of a replacement handle,
-            // which does not touch the control word.
+            // which does not touch the tag words.
             let raw = current.handles[slot].load(Ordering::Acquire);
+            if !DECODE_OVERFLOW && raw & OVERFLOW_HANDLE != 0 {
+                return Err(Overflowed);
+            }
             if raw != 0 {
-                let handle = Handle::from_raw(raw);
+                let handle = self.handle(raw);
                 if matches(handle) {
-                    return Some((bucket * SLOTS + slot, handle));
+                    return Ok(Some((bucket * SLOTS + slot, handle)));
                 }
             }
         }
-        None
+        Ok(None)
+    }
+
+    /// The handle `raw`, published in this shard's table.
+    #[inline]
+    fn handle(&self, raw: u32) -> Handle<T> {
+        Handle {
+            raw,
+            slot: self.slots.slot(raw),
+        }
     }
 
     /// Publishes `handle` in a free slot of the key's home bucket, or else of
@@ -1759,32 +1962,22 @@ impl<T> ShardView<'_, T> {
     #[inline]
     fn place(&self, hash: u64, handle: Handle<T>) -> Option<usize> {
         let (home, alternate) = self.candidates(hash);
-        if let Some(slot) = self.place_in(home, tag(hash), handle, false) {
+        if let Some(slot) = self.place_in(home, tag(hash), handle.raw, false) {
             return Some(slot);
         }
-        let alternate_control = self.buckets[alternate].control.load(Ordering::Relaxed);
-        if zero_tag_bytes(alternate_control) == 0 {
-            return None;
-        }
-        let home_bucket = &self.buckets[home];
-        let control = home_bucket.control.load(Ordering::Relaxed);
-        if control >> OVERFLOW_SHIFT & OVERFLOW_MAX < OVERFLOW_MAX {
-            // A saturated count stays saturated: lookups past it are only
-            // slower, never wrong. Six keys per bucket keep it far below.
-            home_bucket
-                .control
-                .store(control + (1 << OVERFLOW_SHIFT), Ordering::Release);
-        }
-        self.place_in(alternate, tag(hash), handle, true)
+        self.buckets[alternate].empty_slot()?;
+        // Counted before lookups can need it. Ten keys per bucket keep the
+        // count far below saturation.
+        self.buckets[home].add_overflow(1);
+        self.place_in(alternate, tag(hash), handle.raw, true)
     }
 
     /// A main-queue record of `slot`'s current key.
     #[inline]
     fn record(&self, slot: usize) -> u32 {
-        let generation =
-            (self.bucket(slot).generations.load(Ordering::Relaxed) >> ((slot % SLOTS) * 8)) & 0xff;
+        let generation = self.bucket(slot).generation(slot % SLOTS);
         let slot = u32::try_from(slot).expect("shard slots fit 24 bits");
-        (slot << 8) | u32::try_from(generation).expect("a generation is one byte")
+        (slot << 8) | u32::from(generation)
     }
 
     /// The slot a main-queue record names, if it still holds the key the
@@ -1804,9 +1997,7 @@ impl<T> ShardView<'_, T> {
             return false;
         }
         let bucket = self.bucket(slot);
-        let generation =
-            (bucket.generations.load(Ordering::Relaxed) >> ((slot % SLOTS) * 8)) & 0xff;
-        (generation == u64::from(record & 0xff))
+        (u32::from(bucket.generation(slot % SLOTS)) == record & 0xff)
             & (bucket.handles[slot % SLOTS].load(Ordering::Relaxed) != 0)
     }
 
@@ -1822,22 +2013,17 @@ impl<T> ShardView<'_, T> {
     /// before its old slot is cleared. Requires the shard lock.
     #[inline]
     fn relocate(&self, slot: usize, (other, to_home): (usize, bool)) -> Option<usize> {
-        if zero_tag_bytes(self.buckets[other].control.load(Ordering::Relaxed)) == 0 {
-            return None;
-        }
+        self.buckets[other].empty_slot()?;
         let current = self.bucket(slot);
-        let control = current.control.load(Ordering::Relaxed);
         let raw = current.handles[slot % SLOTS].load(Ordering::Relaxed);
-        if !to_home && control >> OVERFLOW_SHIFT & OVERFLOW_MAX < OVERFLOW_MAX {
+        if !to_home {
             // Leaving its home: counted there before lookups can need it.
-            current
-                .control
-                .store(control + (1 << OVERFLOW_SHIFT), Ordering::Release);
+            current.add_overflow(1);
         }
-        let tag = control.to_le_bytes()[slot % SLOTS];
-        let moved_to = self.place_in(other, tag, Handle::from_raw(raw), !to_home)?;
+        let tag = current.tag(slot % SLOTS);
+        let moved_to = self.place_in(other, tag, raw, !to_home)?;
         let moved = self.clear(slot);
-        debug_assert_eq!(moved.raw(), raw);
+        debug_assert_eq!(moved.raw, raw);
         Some(moved_to)
     }
 
@@ -1869,34 +2055,33 @@ impl<T> ShardView<'_, T> {
     /// marking whether that is the key's alternate. Returns the slot, or
     /// `None` when `bucket` is full. Requires the shard lock.
     #[inline]
-    fn place_in(
-        &self,
-        bucket: usize,
-        tag: u8,
-        handle: Handle<T>,
-        displaced: bool,
-    ) -> Option<usize> {
+    fn place_in(&self, bucket: usize, tag: u8, handle: u32, displaced: bool) -> Option<usize> {
         let current = &self.buckets[bucket];
-        let control = current.control.load(Ordering::Relaxed);
-        let empty = zero_tag_bytes(control);
-        if empty == 0 {
-            return None;
-        }
-        // The lowest flagged byte of `zero_tag_bytes` is always exact.
-        let slot = empty.trailing_zeros() as usize / 8;
-        current.handles[slot].store(handle.raw(), Ordering::Release);
-        current
-            .control
-            .store(control | (u64::from(tag) << (slot * 8)), Ordering::Release);
-        let generations = current.generations.load(Ordering::Relaxed);
-        let bumped = ((generations >> (slot * 8)) + 1) & 0xff;
+        let slot = current.empty_slot()?;
+        // The handle first: a reader that sees the tag acquires it.
+        current.handles[slot].store(handle, Ordering::Release);
+        let generation = u64::from(current.generation(slot).wrapping_add(1));
         let flag = 1 << (DISPLACED_SHIFT + slot);
-        current.generations.store(
-            (generations & !(0xff << (slot * 8)) & !flag)
-                | (bumped << (slot * 8))
-                | if displaced { flag } else { 0 },
-            Ordering::Relaxed,
-        );
+        let meta = current.meta.load(Ordering::Relaxed);
+        let mut placed = meta & !flag | if displaced { flag } else { 0 };
+        if slot < WORD_SLOTS {
+            let tags = current.tags.load(Ordering::Relaxed);
+            current
+                .tags
+                .store(tags | u64::from(tag) << (slot * 8), Ordering::Release);
+            let generations = current.generations.load(Ordering::Relaxed);
+            current.generations.store(
+                generations & !(0xff << (slot * 8)) | generation << (slot * 8),
+                Ordering::Relaxed,
+            );
+        } else {
+            let shift = (slot - WORD_SLOTS) * 8;
+            let counts = META_GENERATION_SHIFT + shift;
+            placed = placed & !(0xff << counts) | generation << counts | u64::from(tag) << shift;
+        }
+        if placed != meta {
+            current.meta.store(placed, Ordering::Release);
+        }
         Some(bucket * SLOTS + slot)
     }
 
@@ -1907,23 +2092,15 @@ impl<T> ShardView<'_, T> {
     fn clear(&self, slot: usize) -> Handle<T> {
         let bucket = slot / SLOTS;
         let current = &self.buckets[bucket];
-        let control = current.control.load(Ordering::Relaxed);
-        current.control.store(
-            control & !(TAG_MASK << ((slot % SLOTS) * 8)),
+        let tag = current.tag(slot % SLOTS);
+        let (word, shift) = current.tag_word(slot % SLOTS);
+        word.store(
+            word.load(Ordering::Relaxed) & !(TAG_MASK << shift),
             Ordering::Release,
         );
-        let removed = Handle::from_raw(current.exchange(slot % SLOTS, 0));
-        if is_displaced(current, slot % SLOTS) {
-            let tag = control.to_le_bytes()[slot % SLOTS];
-            let home_bucket = &self.buckets[self.displaced_home(bucket, tag)];
-            let control = home_bucket.control.load(Ordering::Relaxed);
-            let overflow = control >> OVERFLOW_SHIFT & OVERFLOW_MAX;
-            debug_assert_ne!(overflow, 0, "a key in its alternate is counted at home");
-            if overflow < OVERFLOW_MAX {
-                home_bucket
-                    .control
-                    .store(control - (1 << OVERFLOW_SHIFT), Ordering::Release);
-            }
+        let removed = self.handle(current.exchange(slot % SLOTS, 0));
+        if current.is_displaced(slot % SLOTS) {
+            self.buckets[self.displaced_home(bucket, tag)].add_overflow(-1);
         }
         removed
     }
@@ -1937,22 +2114,24 @@ thread_local! {
 }
 
 const BYTE_ONES: u64 = 0x0101_0101_0101_0101;
-/// High bits of the six tag bytes.
-const TAG_HIGH_BITS: u64 = 0x0000_8080_8080_8080;
+/// High bits of a word's bytes.
+const BYTE_HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+/// High bits of the meta word's two tag bytes.
+const META_TAG_HIGH_BITS: u64 = 0x8080;
 
-/// Flags tag bytes of `word` that are zero in their high bit. The lowest flag
-/// is exact; a borrow can also flag a 0x01 byte above a zero byte, which
-/// callers tolerate: a candidate tag is checked against the entry's key, and
-/// only the lowest empty slot is used.
+/// Flags bytes of `word` that are zero in their high bit. The lowest flag is
+/// exact; a borrow can also flag a 0x01 byte above a zero byte, which callers
+/// tolerate: a candidate tag is checked against the entry's key, and only the
+/// lowest empty slot is used.
 #[inline]
 const fn zero_tag_bytes(word: u64) -> u64 {
-    word.wrapping_sub(BYTE_ONES) & !word & TAG_HIGH_BITS
+    word.wrapping_sub(BYTE_ONES) & !word & BYTE_HIGH_BITS
 }
 
-/// Whether the key in `bucket`'s `slot` lives in its alternate bucket.
+/// A meta word's count of keys that probed past its bucket.
 #[inline]
-fn is_displaced(bucket: &Bucket, slot: usize) -> bool {
-    bucket.generations.load(Ordering::Relaxed) >> (DISPLACED_SHIFT + slot) & 1 != 0
+const fn overflow(meta: u64) -> u64 {
+    meta >> OVERFLOW_SHIFT & OVERFLOW_MAX
 }
 
 /// A slot tag: eight hash bits other than the shard and home-bucket bits,
@@ -1962,9 +2141,18 @@ fn tag(hash: u64) -> u8 {
     (hash >> 32).to_le_bytes()[0].max(1)
 }
 
-/// A table handle: the address of an entry's slot, stored in the table as a
-/// nonzero `u64`.
-struct Handle<T>(NonNull<Slot<T>>);
+/// A lookup reached an overflow handle with its key's tag.
+struct Overflowed;
+
+/// A found key's slot index and handle.
+type Found<T> = (usize, Handle<T>);
+
+/// An entry's slot with the nonzero four-byte handle the table publishes
+/// for it (see `SlotStore`).
+struct Handle<T> {
+    raw: u32,
+    slot: NonNull<Slot<T>>,
+}
 
 impl<T> Clone for Handle<T> {
     fn clone(&self) -> Self {
@@ -1973,20 +2161,6 @@ impl<T> Clone for Handle<T> {
 }
 
 impl<T> Copy for Handle<T> {}
-
-impl<T> Handle<T> {
-    #[inline]
-    fn raw(self) -> u64 {
-        // Targets are 64-bit, so an address fits.
-        self.0.as_ptr().expose_provenance() as u64
-    }
-
-    #[inline]
-    fn from_raw(raw: u64) -> Self {
-        let address = usize::try_from(raw).expect("a handle fits usize");
-        Self(NonNull::new(ptr::with_exposed_provenance_mut(address)).expect("a handle is nonzero"))
-    }
-}
 
 /// An entry reached through its handle for the life of an epoch pin.
 struct Entry<'pin, T> {
@@ -2046,7 +2220,7 @@ impl<'pin, T> Entry<'pin, T> {
 #[allow(unsafe_code, reason = "centralizes the table-handle and pin proof")]
 unsafe fn entry<'pin, T>(_pin: &'pin EpochPin<'_>, handle: Handle<T>) -> Entry<'pin, T> {
     // SAFETY: the caller proves the slot and its value outlive the pin.
-    let slot = unsafe { handle.0.as_ref() };
+    let slot = unsafe { handle.slot.as_ref() };
     Entry { slot }
 }
 
@@ -2564,9 +2738,7 @@ mod tests {
                     continue;
                 }
                 // SAFETY: the table publishes this handle while `pin` is held.
-                let key = unsafe { entry(&pin, Handle::<(u64, u64)>::from_raw(raw)) }
-                    .value()
-                    .0;
+                let key = unsafe { entry(&pin, shard.handle(raw)) }.value().0;
                 let (home, alternate) = shard.candidates(cache.hash(&key));
                 assert!(
                     bucket == home || bucket == alternate,
@@ -2574,7 +2746,7 @@ mod tests {
                 );
                 // Relocation and clears find a key's other bucket from its
                 // slot alone.
-                assert_eq!(is_displaced(current, slot), bucket != home);
+                assert_eq!(current.is_displaced(slot), bucket != home);
                 let other = if bucket == home { alternate } else { home };
                 assert_eq!(
                     shard.other_bucket(bucket * SLOTS + slot),
@@ -2584,7 +2756,7 @@ mod tests {
             }
         }
         for (bucket, displaced) in shard.buckets.iter().zip(displaced_from) {
-            let overflow = bucket.control.load(Ordering::Relaxed) >> OVERFLOW_SHIFT & OVERFLOW_MAX;
+            let overflow = overflow(bucket.meta.load(Ordering::Relaxed));
             assert_eq!(
                 overflow, displaced,
                 "a home counts its keys in their alternate"
@@ -2832,47 +3004,51 @@ mod tests {
 
     #[test]
     fn colliding_keys_fill_their_two_buckets_and_unlink_cleanly() {
-        // Every key shares one home bucket, so keys beyond its six slots
+        // Every key shares one home bucket, so keys beyond its ten slots
         // live in the alternate and count in the home's overflow.
         let cache = ShardedCacheBuilder::new(40).hasher(Colliding).build();
-        for key in 0..12_u64 {
+        let pair = 2 * SLOTS as u64;
+        for key in 0..pair {
             cache.insert(key, key);
         }
-        for key in 0..12_u64 {
+        for key in 0..pair {
             assert_eq!(cache.get(&key), Some(key));
         }
         let shard = cache.view(0);
-        let overflow = |bucket: usize| {
-            shard.buckets[bucket].control.load(Ordering::Relaxed) >> OVERFLOW_SHIFT & OVERFLOW_MAX
-        };
         let (home, _) = shard.candidates(0);
-        assert_eq!(overflow(home), 6);
-        for key in (0..12_u64).step_by(2) {
+        assert_eq!(
+            overflow(shard.buckets[home].meta.load(Ordering::Relaxed)),
+            SLOTS as u64
+        );
+        for key in (0..pair).step_by(2) {
             assert!(cache.remove(&key));
         }
-        for key in 0..12_u64 {
+        for key in 0..pair {
             assert_eq!(cache.get(&key), (key % 2 == 1).then_some(key));
         }
-        // Freed slots are reused; a thirteenth colliding key evicts one.
-        for key in 100..107_u64 {
+        // Freed slots are reused; one more colliding key evicts one.
+        let last = 100 + SLOTS as u64;
+        for key in 100..=last {
             cache.insert(key, key);
         }
-        assert_eq!(cache.len(), 12);
-        assert_eq!(cache.get(&106), Some(106));
-        let resident: Vec<u64> = (0..12_u64)
-            .chain(100..107)
+        assert_eq!(cache.len(), 2 * SLOTS);
+        assert_eq!(cache.get(&last), Some(last));
+        let resident: Vec<u64> = (0..pair)
+            .chain(100..=last)
             .filter(|key| cache.get(key).is_some())
             .collect();
-        assert_eq!(resident.len(), 12);
+        assert_eq!(resident.len(), 2 * SLOTS);
         for key in resident {
             assert!(cache.remove(&key));
         }
         assert!(cache.is_empty());
         assert!(
-            shard
-                .buckets
-                .iter()
-                .all(|bucket| bucket.control.load(Ordering::Relaxed) == 0),
+            shard.buckets.iter().all(|bucket| {
+                let meta = bucket.meta.load(Ordering::Relaxed);
+                bucket.tags.load(Ordering::Relaxed) == 0
+                    && zero_tag_bytes(meta) & META_TAG_HIGH_BITS == META_TAG_HIGH_BITS
+                    && overflow(meta) == 0
+            }),
             "removing every key restores empty buckets and zero overflow"
         );
     }
@@ -3333,11 +3509,13 @@ mod tests {
             for handle in &current.handles {
                 let raw = handle.load(Ordering::Relaxed);
                 if raw != 0 {
+                    let handle = Handle {
+                        raw,
+                        slot: cache.slots.slot(raw),
+                    };
                     // SAFETY: the table publishes this handle while
                     // `pin` is held.
-                    let key = unsafe { entry(&pin, Handle::<(u64, Arc<()>)>::from_raw(raw)) }
-                        .value()
-                        .0;
+                    let key = unsafe { entry(&pin, handle) }.value().0;
                     assert!(key >= refill, "cleared key {key} is still published");
                     assert!(cache.contains_key(&key), "key {key} is not findable");
                     resident += 1;
@@ -3380,6 +3558,67 @@ mod tests {
             Arc::strong_count(&value),
             1,
             "maintain dropped every removed value"
+        );
+    }
+
+    #[test]
+    fn the_table_holds_ten_slots_per_cache_line() {
+        // Four-byte handles fit ten slots in a 64-byte bucket, where
+        // eight-byte addresses fit six: 8 bytes of table per entry at 80%
+        // load instead of 13.3.
+        assert_eq!(std::mem::size_of::<Bucket>(), 64);
+        assert_eq!(SLOTS, 10);
+        let cache = ShardedCacheBuilder::new(100_000)
+            .shards(16)
+            .build::<u64, u64>();
+        let bytes = cache.table.len() * std::mem::size_of::<Bucket>();
+        assert!(
+            bytes <= 8 * 100_000 + 16 * 64,
+            "{bytes} table bytes for 100,000 entries"
+        );
+    }
+
+    #[test]
+    fn memory_a_guard_held_is_freed_after_it_drops() {
+        let cache = ShardedCacheBuilder::new(256).shards(1).build::<u64, u64>();
+        let guard = cache.pin();
+        for key in 0..20_000 {
+            cache.insert(key, key);
+        }
+        assert!(
+            cache.slots.overflow_chunks() > 0,
+            "a guard keeps every removed entry, past the slab region"
+        );
+        let in_overflow = cache
+            .table
+            .iter()
+            .flat_map(|bucket| &bucket.handles)
+            .filter(|handle| handle.load(Ordering::Relaxed) & OVERFLOW_HANDLE != 0)
+            .count();
+        assert!(in_overflow > 0, "cached entries live in overflow slots");
+        let found = (0..20_000_u64)
+            .filter(|key| {
+                let value = cache.get(key);
+                assert!(value.is_none_or(|value| value == *key));
+                value.is_some()
+            })
+            .count();
+        assert_eq!(found, cache.len(), "every cached entry reads back");
+        drop(guard);
+        cache.clear();
+        cache.maintain();
+        assert_eq!(
+            cache.slots.overflow_chunks(),
+            0,
+            "the slots the guard held stayed allocated"
+        );
+        for key in 0..20_000 {
+            cache.insert(key, key);
+        }
+        assert_eq!(
+            cache.slots.overflow_chunks(),
+            0,
+            "writes took overflow slots while region slots were vacant"
         );
     }
 
