@@ -554,6 +554,76 @@ single-thread writes by −2 to +4%, and a retired-queue lock that unlocks
 with a store by 0 to +1%, delete and reinsert by +14% within −2 to +34%
 (see "Rejected and reverted").
 
+### On mokabench
+
+[mokabench](https://github.com/moka-rs/mokabench), the moka project's load
+generator, replays the ARC paper traces from a pool of client threads. Each
+client takes 200 trace lines at a time, reads every block, and on a miss
+builds a 128-byte `Arc<[u8]>` value and inserts it. `scripts/mokabench.sh`
+adds a ShardedCache driver that mirrors mokabench's quick_cache driver, and
+moves quick_cache to 0.7. Most of these cells miss more often than they hit,
+so the replay weighs writes more than the tables above do.
+
+Each figure is ShardedCache's throughput against quick_cache 0.7, the median
+of three runs; positive means ShardedCache is faster. Hit ratios, as
+ShardedCache / quick_cache, are from one client, whose replay order is
+fixed. On macOS:
+
+| Cell | Hit ratio | 1 client | 4 | 8 | 16 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| OLTP 256 | 21.9 / 19.3 | −19% | +2% | −8% | +24% |
+| OLTP 512 | 31.5 / 28.0 | −11% | −3% | −6% | +27% |
+| OLTP 1,000 | 39.8 / 36.4 | −7% | −18% | +0% | +28% |
+| OLTP 2,000 | 46.4 / 43.9 | −5% | −24% | +5% | +38% |
+| P3 20,000 | 9.0 / 8.3 | −7% | −1% | −3% | +7% |
+| P3 160,000 | 53.5 / 53.8 | −19% | +0% | +34% | +62% |
+| P8 20,000 | 22.3 / 22.6 | +2% | −11% | +0% | +24% |
+| P8 160,000 | 76.6 / 76.5 | −10% | +9% | +58% | +124% |
+| S1 100,000 | 9.5 / 9.6 | −8% | +14% | +6% | +29% |
+| S1 800,000 | 57.3 / 56.9 | +9% | +21% | +72% | +112% |
+| S3 100,000 | 12.6 / 12.8 | +4% | +12% | +17% | +65% |
+| S3 400,000 | 42.3 / 42.3 | +17% | +12% | +41% | +87% |
+| S3 800,000 | 69.5 / 68.3 | +26% | +44% | +62% | +156% |
+| DS1 1,000,000 | 15.3 / 14.9 | +6% | +4% | +16% | +52% |
+| DS1 4,000,000 | 45.1 / 44.8 | −3% | +25% | +55% | +104% |
+| DS1 8,000,000 | 70.3 / 69.3 | −7% | +38% | +85% | +163% |
+| Geometric mean | | −3% | +6% | +24% | +63% |
+
+Geometric means over the same 16 cells on each host:
+
+| Host | 1 client | 2 | 4 | 8 | 16 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| macOS | −3% | | +6% | +24% | +63% |
+| Linux VM | −12% | | +3% | +25% | +40% |
+| x86_64, 4 vCPUs | −4% | +14% | +27% | | |
+
+- ShardedCache's mean one-client hit ratio was 38.92%, against 37.99% for
+  quick_cache and 37.87% for moka 0.12's sync cache. On the six S3 and DS1
+  cells both replay, mokabench's ratios agree with `hit_ratio_sim`'s to
+  0.02 points for both caches (see "Hit ratio").
+- moka's sync cache ran at 2.4 to 22 times less throughput than
+  ShardedCache in one macOS run.
+- The lead grows with the cache and the client count: on DS1 at 8,000,000
+  entries, from −7% at one client to +163% at sixteen on macOS, and from
+  +3% at one client to +29% at four on x86_64.
+- The losses are single clients and small caches: OLTP at up to 2,000
+  entries and P3 and P8 at 20,000, where 54 to 91% of reads miss and most
+  operations insert and evict. At one client these cells read −24% to
+  +2% across the hosts. On the Linux VM, P3 and P8 at 20,000 trailed at every
+  client count, by 5 to 17%.
+- Sixteen clients fill the macOS host's 16 cores, four of them efficiency
+  cores, beside the other load described above. quick_cache slowed from
+  eight clients to sixteen in 15 of the 16 cells, and ShardedCache in 1.
+- OLTP's runs last 40 to 90 ms, so its cells vary most.
+
+A Linux profile of P3 at one client puts the difference in writes. Lookups
+took about 420 ms for both caches; the write path took about 570 ms for
+ShardedCache and 300 for quick_cache, in queuing, placing, and later freeing
+removed entries, as on the probe (see "Throughput against quick_cache
+0.7"). Within the difference, mokabench's own zeroing of new values took 77
+ms against 16, which points to colder memory from the allocator: evicted
+values are freed three advances after their eviction rather than at once.
+
 ## Tail latency against quick_cache 0.7
 
 Every operation was timed (`LATENCY_STRIDE` 1) at 1,000,000 entries,
@@ -828,4 +898,6 @@ cargo test --release --lib sharded_cache
 sh scripts/compare_sharded_quick.sh 3 "1 4" 50000 target/compare-50k.csv
 python3 scripts/summarize_compare.py target/compare-50k.csv
 git push origin HEAD:refs/heads/bench/NAME   # the same on x86_64, and against HEAD^
+sh scripts/mokabench.sh 3 1,4,8,16 "s3 ds1 p8 s1 p3 oltp" target/mokabench.csv
+python3 scripts/summarize_mokabench.py target/mokabench.csv
 ```

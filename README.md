@@ -46,6 +46,15 @@ Each shard sizes its probationary queue to the keys it sees return. On the
 ARC paper traces, its summed hit rate over 18 cells was 12.5 points above
 single-shard quick_cache and 9.5 above quick_cache's sharded cache.
 
+On [mokabench](https://github.com/moka-rs/mokabench), moka's trace-replay
+load generator, over 16 cells of six ARC traces, ShardedCache's throughput
+against quick_cache had a geometric mean of −3% at one client, +24% at
+eight, and +63% at sixteen on Apple Silicon; −12% at one client to +40% at
+sixteen on Linux; and −4% at one client to +27% at four on a 4-vCPU x86_64
+runner. It lost mostly where reads miss and most operations insert and
+evict: by up to 24% at one client, and on Linux by up to 20% with more.
+moka's sync cache ran 2.4 to 22 times slower.
+
 Design, correctness evidence, tables, and rejected alternatives are in
 [`docs/SHARDED_CACHE_2026-10-17.md`](docs/SHARDED_CACHE_2026-10-17.md).
 
