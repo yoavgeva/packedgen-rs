@@ -303,6 +303,45 @@ On the Linux VM the change was neutral: one build pair read 10 to 14% slower
 on one thread, and the same sources rebuilt with one codegen unit read 3%
 faster. Builds with inline LSE atomics also measured within noise.
 
+### Hashing without `hash_one`
+
+`BuildHasher::hash_one` is a generic default method, and whether the
+compiler inlines it depends on code elsewhere in the crate. Built with one
+codegen unit, as release profiles tuned for speed often are, `get` called it
+out of line, and on an M4 Max resident hits ran 23 to 25% slower than in the
+default build, which inlined it. The two `get` functions differed in nothing
+else. Writing `hash_one`'s three steps (`build_hasher`, `Hash::hash`,
+`finish`) out in `get` restored the one-codegen-unit build, and making the
+hash an opaque value cost it 10% more. The cause is the shape of the
+generated code, not the hash: on Apple Silicon a cycle profile placed the
+lost time on the entry's key load and the unpin.
+
+Every operation now hashes through one always-inlined helper with the steps
+written out. Against the previous commit, each build compared with the
+previous default build, in millions of operations per second (median of
+three pairs):
+
+| Workload | Entries | Threads | Before, default | After, default | Before, one unit | After, one unit |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Resident hit | 50,000 | 1 | 31.3 | 30.1 | 27.0 | 30.6 |
+| Resident hit | 50,000 | 8 | 384 | 354 | 297 | 372 |
+| Resident hit | 1,000,000 | 1 | 7.44 | 7.48 | 5.70 | 7.37 |
+| Resident hit | 1,000,000 | 8 | 65.2 | 65.6 | 49.1 | 65.8 |
+| Turnover | 50,000 | 1 | 18.6 | 18.3 | 16.2 | 17.9 |
+| Turnover | 1,000,000 | 1 | 7.51 | 7.37 | 6.42 | 7.30 |
+
+Misses and writes moved within noise in both builds. The default build's
+50,000-entry, eight-thread cells varied by up to 30% between runs. On the
+Linux VM, where the default build was the slower one, each build compared
+with its own previous build: turnover gained 5 to 13% in the default build
+and 2 to 20% with one codegen unit, and resident hits −0.4 to +6% and −3 to
++11%; misses and replaces moved by −9 to +8%, within their run-to-run
+ranges.
+
+A `BuildHasher` that overrides `hash_one`, as ahash's nightly-only
+specialization does, is bypassed; on stable Rust it computes the same
+steps.
+
 Other variants, none kept:
 
 - A `Release` unpin instead of `SeqCst`, hashing before or after the pin:

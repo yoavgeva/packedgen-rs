@@ -20,7 +20,7 @@
 use std::borrow::Borrow;
 use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::hash::{BuildHasher, Hash};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::ptr::{self, NonNull};
@@ -855,7 +855,7 @@ where
     {
         // Hashed before pinning: the pin's atomics hold back the loads after
         // them, so hashing first overlaps it with the previous read's end.
-        let hash = self.hash_builder.hash_one(key);
+        let hash = self.hash(key);
         let pin = self.epochs.pin();
         let value = self.lookup(&pin, key, hash).cloned();
         self.count(value.is_some());
@@ -870,7 +870,7 @@ where
         Q: Hash + Eq + ?Sized,
         V: Clone,
     {
-        let hash = self.hash_builder.hash_one(key);
+        let hash = self.hash(key);
         let pin = self.epochs.pin();
         self.live_entry(&pin, key, hash)
             .map(|entry| entry.value().1.clone())
@@ -882,7 +882,7 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let hash = self.hash_builder.hash_one(key);
+        let hash = self.hash(key);
         let pin = self.epochs.pin();
         self.live_entry(&pin, key, hash).is_some()
     }
@@ -925,7 +925,7 @@ where
         Q: Hash + Eq + ToOwned<Owned = K> + ?Sized,
         V: Clone,
     {
-        let hash = self.hash_builder.hash_one(key);
+        let hash = self.hash(key);
         let cached = self.lookup(&self.epochs.pin(), key, hash).cloned();
         self.count(cached.is_some());
         if let Some(value) = cached {
@@ -1043,6 +1043,22 @@ where
         Some(unsafe { entry(pin, handle) })
     }
 
+    /// Hashes `key` with the cache's hasher, its steps written out:
+    /// `BuildHasher::hash_one` is a generic default method the compiler may
+    /// keep out of line, and built with one codegen unit it did, costing
+    /// resident hits 23% on Apple Silicon.
+    #[allow(
+        clippy::inline_always,
+        clippy::manual_hash_one,
+        reason = "`hash_one` and a hinted helper alike can stay out of line"
+    )]
+    #[inline(always)]
+    fn hash<Q: Hash + ?Sized>(&self, key: &Q) -> u64 {
+        let mut state = self.hash_builder.build_hasher();
+        key.hash(&mut state);
+        state.finish()
+    }
+
     fn count(&self, hit: bool) {
         if let Some(stripes) = &self.stats {
             count_read(stripes, hit);
@@ -1117,7 +1133,7 @@ where
         reason = "fills, publishes, and unpublishes slab slots under the shard lock"
     )]
     fn insert_expiring(&self, key: K, value: V, ttl: Option<Duration>) -> bool {
-        let hash = self.hash_builder.hash_one(&key);
+        let hash = self.hash(&key);
         let shard = self.shard(hash);
         let weight = self.weighter.weight(&key, &value);
         let Some(compact_weight) = u32::try_from(weight)
@@ -1263,7 +1279,7 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let hash = self.hash_builder.hash_one(key);
+        let hash = self.hash(key);
         let shard = self.shard(hash);
         let pin = self.epochs.pin();
         let mut removed = Removed::new();
@@ -1425,7 +1441,7 @@ where
                 writer.main.push_back(record);
                 continue;
             }
-            let hash = self.hash_builder.hash_one(&entry.value().0);
+            let hash = self.hash(&entry.value().0);
             let removed = shard.clear(slot);
             if !expired {
                 writer.filters.remember_main(hash);
@@ -1451,7 +1467,7 @@ where
             if !expired && entry.take_accessed() && step < 2 * slots {
                 continue;
             }
-            let hash = self.hash_builder.hash_one(&entry.value().0);
+            let hash = self.hash(&entry.value().0);
             let removed = shard.clear(slot);
             if !expired {
                 writer.filters.remember_main(hash);
@@ -1524,9 +1540,7 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let value = self
-            .cache
-            .lookup(&self.pin, key, self.cache.hash_builder.hash_one(key));
+        let value = self.cache.lookup(&self.pin, key, self.cache.hash(key));
         self.cache.count(value.is_some());
         value
     }
@@ -2553,7 +2567,7 @@ mod tests {
                 let key = unsafe { entry(&pin, Handle::<(u64, u64)>::from_raw(raw)) }
                     .value()
                     .0;
-                let (home, alternate) = shard.candidates(cache.hash_builder.hash_one(key));
+                let (home, alternate) = shard.candidates(cache.hash(&key));
                 assert!(
                     bucket == home || bucket == alternate,
                     "key {key} lives in bucket {bucket}, outside {home} and {alternate}"
@@ -2613,7 +2627,7 @@ mod tests {
                 .lock()
                 .probation
                 .iter()
-                .any(|probationary| probationary.hash == cache.hash_builder.hash_one(key))
+                .any(|probationary| probationary.hash == cache.hash(&key))
             {
                 let _ = cache.get(&key);
             }
@@ -2721,6 +2735,44 @@ mod tests {
         type Hasher = PinWatchingHasher;
         fn build_hasher(&self) -> PinWatchingHasher {
             PinWatchingHasher(DefaultHasher::new())
+        }
+    }
+
+    /// A hasher whose one-shot `hash_one` must not be called.
+    #[derive(Clone, Default)]
+    struct NoOneShot;
+
+    impl BuildHasher for NoOneShot {
+        type Hasher = DefaultHasher;
+        fn build_hasher(&self) -> DefaultHasher {
+            DefaultHasher::new()
+        }
+        fn hash_one<T: Hash>(&self, _: T) -> u64 {
+            panic!("the cache hashed through `hash_one`");
+        }
+    }
+
+    #[test]
+    fn operations_hash_keys_through_build_hasher() {
+        // `hash_one` is a generic default method that the compiler may keep
+        // out of line. Built with one codegen unit, it was, and resident
+        // hits at 1,000,000 entries ran 23% slower on Apple Silicon than
+        // with the hasher's steps written out.
+        let cache = ShardedCacheBuilder::new(100).hasher(NoOneShot).build();
+        assert!(cache.insert(1_u64, 1_u64));
+        assert!(cache.insert_with_ttl(2, 2, Duration::from_secs(60)));
+        assert_eq!(cache.get(&1), Some(1));
+        assert_eq!(cache.peek(&2), Some(2));
+        assert!(cache.contains_key(&1));
+        assert_eq!(cache.pin().get(&1), Some(&1));
+        assert_eq!(cache.get_or_insert_with(&3, || 3), 3);
+        assert_eq!(
+            cache.get_or_try_insert_with(&4, || Ok::<_, Infallible>(4)),
+            Ok(4)
+        );
+        assert!(cache.remove(&1));
+        for key in 10..1_000 {
+            cache.insert(key, key);
         }
     }
 
@@ -3012,14 +3064,14 @@ mod tests {
     fn is_marked(cache: &ShardedCache<u64, u64>, key: u64) -> bool {
         let pin = cache.epochs.pin();
         cache
-            .live_entry(&pin, &key, cache.hash_builder.hash_one(key))
+            .live_entry(&pin, &key, cache.hash(&key))
             .is_some_and(|entry| entry.slot.accessed())
     }
 
     /// Waits until exactly `waiters` callers besides the leader wait on the
     /// load of `key`.
     fn wait_for_waiters(cache: &ShardedCache<u64, u64>, key: u64, waiters: usize) {
-        let lane = &cache.flights[cache.shard_index(cache.hash_builder.hash_one(key))];
+        let lane = &cache.flights[cache.shard_index(cache.hash(&key))];
         for _ in 0..10_000 {
             let joined = lane
                 .0
@@ -3487,7 +3539,7 @@ mod tests {
             cache.insert(key, key);
             key += 1;
         }
-        let fresh = cache.hash_builder.hash_one(5_000_u64);
+        let fresh = cache.hash(&5_000_u64);
         let (victim, lines) = {
             let writer = shard.lock();
             let front = *writer.probation.front().expect("probation holds a key");
@@ -3524,7 +3576,7 @@ mod tests {
     fn keys_evicted_from_probation_return_to_the_main_area() {
         let cache = ShardedCacheBuilder::new(256).shards(1).build::<u64, u64>();
         let in_probation = |key: u64| {
-            let hash = cache.hash_builder.hash_one(key);
+            let hash = cache.hash(&key);
             cache.shards[0]
                 .lock()
                 .probation
