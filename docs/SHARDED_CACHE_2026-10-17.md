@@ -439,8 +439,8 @@ overhead.
 
 ## Throughput against quick_cache 0.7
 
-Measured with `bounded_cache_probe` after adaptive probation and the latest
-write-path changes: 32-byte keys, 64-byte `Arc<[u8]>` values, and 50,000
+Measured with `bounded_cache_probe` after adaptive probation and the
+write-path changes through the next-slot prefetch: 32-byte keys, 64-byte `Arc<[u8]>` values, and 50,000
 entries. Reads ran
 16 million requests and writes 8 million on macOS, and half that on Linux.
 Each figure is the paired median of three runs; positive means
@@ -460,20 +460,27 @@ figures moved as much. Direct before-and-after comparisons, as quoted under
 
 | Workload | macOS 1T | macOS 2T | macOS 8T | Linux 1T | Linux 2T | Linux 8T |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Resident hit | 0% | +40% | +283% | −12% | +6% | +136% |
-| Read miss | +87% | +163% | +634% | +79% | +238% | +551% |
-| Turnover (95% reads) | −13% | +7% | +42% | −18% | −16% | +46% |
-| Cold fill | −9% | −23% | −12% | −21% | −13% | −22% |
-| Replace | −3% | −12% | +22% | −15% | −16% | −14% |
-| Delete and reinsert | +5% | −2% | +29% | −14% | −9% | +27% |
+| Resident hit | −8% | +45% | +292% | −11% | +22% | +156% |
+| Read miss | +90% | +196% | +685% | +74% | +182% | +582% |
+| Turnover (95% reads) | −3% | −5% | +42% | −22% | 0% | +65% |
+| Cold fill | −5% | −23% | −14% | −12% | −16% | −13% |
+| Replace | −1% | −10% | +13% | −18% | −15% | −1% |
+| Delete and reinsert | −5% | −1% | +54% | −10% | −14% | +44% |
+
+The macOS single-thread resident-hit cell ranged from −23 to −1% across
+its three pairs. Before the next-slot prefetch, a session earlier, the
+table read 0%, +40%, and +283% for macOS resident hits, −13%, +7%, and
++42% for macOS turnover, and for single-thread cold fill, replace, and
+delete and reinsert −9%, −3%, and +5% on macOS and −21%, −15%, and −14%
+on Linux.
 
 Before reads hashed first, macOS resident hits read −42%, −9%, and +151%,
 and macOS turnover −22%, −11%, and +27%. Before the write-path changes, the
 write rows read −10 to −53% for cold fill, −3 to −42% for replace, −10 to
 −31% for delete and reinsert, and −27 to +9% for turnover.
 
-Eight-thread resident hits reached 408 Mops/s on macOS against quick_cache's
-105, and 213 against 93 on Linux.
+Eight-thread resident hits reached 413 Mops/s on macOS against quick_cache's
+105, and 219 against 86 on Linux.
 
 At 1,000,000 entries on macOS, past the caches, one thread read misses at
 29 Mops/s against quick_cache's 66 to 73, and resident hits at 7.8 against

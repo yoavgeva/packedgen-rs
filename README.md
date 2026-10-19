@@ -23,13 +23,13 @@ key lives in one of two buckets. Overhead beyond the key and value is 29.1 to
 33.3 requested bytes per entry, against 78 to 210 for quick_cache 0.7.
 
 Against quick_cache, ShardedCache leads concurrent reads. With eight threads
-on a 16-core machine it ran 2.4 to 3.8 times quick_cache's resident-hit
-throughput and 6.5 to 7.3 times its miss throughput, and it was 42 to 46%
-ahead on a 95%-read turnover mix. At eight threads it was also 27 to 29%
-ahead on deleting and reinserting keys, between 14% behind and 22% ahead on
-replacing them, and 12 to 22% behind on inserting new keys into a full cache.
-On one thread, resident hits ranged from 12% behind to even, and writes from
-5% ahead to 21% behind; much of that write gap is epoch reclamation's
+on a 16-core machine it ran 2.6 to 3.9 times quick_cache's resident-hit
+throughput and 6.8 to 7.9 times its miss throughput, and it was 42 to 65%
+ahead on a 95%-read turnover mix. At eight threads it was also 44 to 54%
+ahead on deleting and reinserting keys, between 1% behind and 13% ahead on
+replacing them, and 13 to 14% behind on inserting new keys into a full cache.
+On one thread, resident hits were 8 to 11% behind, and writes 1 to 18%
+behind; much of that write gap is epoch reclamation's
 bookkeeping, queuing, tagging, and later freeing each removed entry. With
 1,000,000 entries, one thread trailed by about 14% on hits and 59% on
 misses, as its bucket table outgrew the caches. Those figures are from
