@@ -1051,7 +1051,11 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
   fast, near quick_cache's on one thread. But resident hits lost 13 to 34%
   with an acquiring load of the summary and a prefetch of the bucket, and 9
   to 20% with a relaxed load and no prefetch, at 50,000 entries as well;
-  turnover lost 3 to 13%.
+  turnover lost 3 to 13%. At 50,000 entries the summaries stay cached, and
+  `get` then saved one more register pair and kept a larger frame: the
+  summary slice was one more value live through the lookup, the
+  register-pressure shape that cost hits under "Four-byte handles", so the
+  loss may be mostly code shape rather than the summary's own cost.
 - **Decoding overflow handles inside readers' lookups.** Resident hits at
   1,000,000 entries lost 20 to 25% on Apple Silicon, though no overflow
   handle existed; see "Four-byte handles".
