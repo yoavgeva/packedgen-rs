@@ -702,6 +702,27 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
 - **Trying an advance every 32 retirements per shard.** Each try scans 128
   reader counters; eight-thread replace fell 63%. Tries now wait for 512
   retirements across the cache.
+- **A fuller table.** At 89% load instead of 80%, 48% of keys lived in
+  their alternates instead of 34%, relocations rose from 0.05 to 0.19 per
+  insert, and 16 inserts in 100,000 evicted from a full pair, overriding
+  the policy, to save 1.3 bytes per entry. At 91% load, 44 to 55 inserts in
+  100,000 did; at 95%, 1,700.
+- **Prefetching every lookup's alternate bucket.** A third of a churned
+  table's keys live in their alternates, and a miss checks the alternate
+  whenever its home has overflowed. At 1,000,000 entries the prefetch made
+  eight-thread misses 8% faster and single-thread turnover 6%, but at
+  50,000 entries, with both lines cached, it cost resident hits 8% on one
+  thread and 24% on eight.
+- **Tags in an array of their own.** Apart from the handles, a
+  1,000,000-entry cache's control words fit in 1.4 MB, which stays in L2,
+  and misses ran 2.7 times as fast. But a hit then waited for its tag word
+  before loading the handle line, and resident hits lost 13 to 20% at both
+  50,000 and 1,000,000 entries. Prefetching the handle line with the tags
+  restored hits and kept misses at 1,000,000 entries 1.6 to 2 times as
+  fast, but eight-thread turnover lost 9 to 14%: a line of control words
+  covers eight buckets, so each write invalidates it for readers of all
+  eight. The split would also have fit seven handles in a line, about 0.5
+  bytes per entry less.
 - **Scanning only the reader shards in use.** Each pin marked its reader
   shard in a per-cache mask; tries scanned only marked shards' counters and
   came due after 32 retirements per marked shard. A lone writer's backlog
