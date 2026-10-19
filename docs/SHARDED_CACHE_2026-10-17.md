@@ -662,65 +662,73 @@ overhead.
 
 ## Throughput against quick_cache 0.7
 
-Measured with `bounded_cache_probe` after adaptive probation and the
-write-path changes through the next-slot prefetch: 32-byte keys, 64-byte `Arc<[u8]>` values, and 50,000
-entries. Reads ran
-16 million requests and writes 8 million on macOS, and half that on Linux.
-Each figure is the paired median of three runs; positive means
+Measured with `bounded_cache_probe` at the end of the changes described
+above, through advances over the reader shards in use: 32-byte keys, 64-byte
+`Arc<[u8]>` values, and 50,000 entries. Reads ran 16 million requests and
+writes 8 million on macOS, and half that on Linux. Each figure is the paired
+median of three runs, from default release builds; positive means
 `ShardedCache` is faster.
 
 Hosts:
-- macOS: a shared 16-core Apple Silicon machine (an M4 Max), with other
-  containers and services using about four cores during the runs.
+- macOS: a shared 16-core Apple Silicon machine (an M4 Max). Other
+  containers and services kept about ten cores busy during these runs, a
+  load average of 9 to 10, against about four for the previous table.
 - Linux: an aarch64 Docker VM on the same machine, using glibc's allocator.
 
-Two-thread cells varied most between runs, by up to 30% for one build, as
-threads landed on performance or efficiency cores. On Linux, rebuilding the
-same sources with a different code layout moved single-thread cells by up to
-14%, and whole runs drifted by about 10% between sessions: quick_cache's own
-figures moved as much. Direct before-and-after comparisons, as quoted under
-"Write path" and "Adaptive probation", are the better guide to each change.
+Two-thread cells have varied most between runs, by up to 30% for one
+build, as threads land on performance or efficiency cores, and eight-thread
+cells suffer most from the other load. Code layout alone moved some cells by
+20% or more (see "Hashing without `hash_one`"). Direct before-and-after
+comparisons, as quoted for each change, are the better guide to it.
 
 | Workload | macOS 1T | macOS 2T | macOS 8T | Linux 1T | Linux 2T | Linux 8T |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Resident hit | −8% | +45% | +292% | −11% | +22% | +156% |
-| Read miss | +90% | +196% | +685% | +74% | +182% | +582% |
-| Turnover (95% reads) | −3% | −5% | +42% | −22% | 0% | +65% |
-| Cold fill | −5% | −23% | −14% | −12% | −16% | −13% |
-| Replace | −1% | −10% | +13% | −18% | −15% | −1% |
-| Delete and reinsert | −5% | −1% | +54% | −10% | −14% | +44% |
+| Resident hit | −1% | +68% | +223% | −4% | +37% | +130% |
+| Read miss | +87% | +178% | +370% | +79% | +277% | +493% |
+| Turnover (95% reads) | +2% | +16% | +51% | −20% | −6% | +68% |
+| Cold fill | −9% | −16% | −15% | −17% | −21% | −7% |
+| Replace | +11% | −3% | +5% | −16% | −17% | +22% |
+| Delete and reinsert | −5% | +8% | +37% | −23% | −14% | +44% |
 
-The macOS single-thread resident-hit cell ranged from −23 to −1% across
-its three pairs. Before the next-slot prefetch, a session earlier, the
-table read 0%, +40%, and +283% for macOS resident hits, −13%, +7%, and
-+42% for macOS turnover, and for single-thread cold fill, replace, and
-delete and reinsert −9%, −3%, and +5% on macOS and −21%, −15%, and −14%
-on Linux.
+The previous table, before hashing without `hash_one`, the slab region,
+four-byte handles, and advances over the reader shards in use, read −8%,
++45%, and +292% for macOS resident hits; +90%, +196%, and +685% for macOS
+misses; −3%, −5%, and +42% for macOS turnover; and −11%, +22%, and +156%
+for Linux resident hits. Its single-thread writes read −5%, −1%, and −5% on
+macOS and −12%, −18%, and −10% on Linux, for cold fill, replace, and
+delete and reinsert. The eight-thread reads fell on the busier host:
+ShardedCache's eight-thread resident hits ran at 318 Mops/s on macOS,
+against 413 before, while quick_cache's ran at 110, against 105, and on
+Linux at 209 against 92.
 
-Before reads hashed first, macOS resident hits read −42%, −9%, and +151%,
-and macOS turnover −22%, −11%, and +27%. Before the write-path changes, the
-write rows read −10 to −53% for cold fill, −3 to −42% for replace, −10 to
-−31% for delete and reinsert, and −27 to +9% for turnover.
+At 1,000,000 entries on macOS, past the caches, two pairs each:
 
-Eight-thread resident hits reached 413 Mops/s on macOS against quick_cache's
-105, and 219 against 86 on Linux.
+| Workload | 1T | 8T |
+| --- | ---: | ---: |
+| Resident hit | +2% | +9% |
+| Read miss | −50% | +109% |
+| Turnover (95% reads) | +5% | +61% |
+| Cold fill | +12% | +4% |
+| Replace | +47% | +63% |
+| Delete and reinsert | +32% | +70% |
 
-At 1,000,000 entries on macOS, past the caches, one thread read misses at
-29 Mops/s against quick_cache's 66 to 73, and resident hits at 7.8 against
-8.9 to 9.1, in two runs each. A miss loads one or two 64-byte bucket lines
-from a 13 MB table, where quick_cache's control bytes for as many entries
-stay in L2; a hit loads the bucket, the entry, and the value's count, one
-line more than quick_cache (see "Rejected and reverted" for layouts tried).
-Eight threads read misses at 263 to 267 Mops/s against 105 to 111, and
-hits at 69 against 62.
+One thread read misses at 28 Mops/s against quick_cache's 55, and
+resident hits at 7.6 against 7.4; before four-byte handles they read 29
+against 66 to 73, and 7.8 against 8.9 to 9.1. A miss loads one or two
+64-byte bucket lines from the table, where quick_cache's control bytes for
+as many entries stay in L2; a hit loads the bucket, the entry, and the
+value's count (see "Four-byte handles" and "Rejected and reverted" for
+layouts tried). Eight threads read misses at 235 Mops/s against 112, and
+hits at 60 against 55.
 
 Cold fill still trails: every insert into a full shard evicts under the lock
 (see "Write path"), and single-thread writes pay what lock-free reads
 require. An insert cannot reuse the evicted entry's memory until three epoch
 advances later, where quick_cache frees under its shard lock, and every
 write pays an epoch pin and its thread's retired-queue lock. A single-thread
-`get` still waits at its unpin for the value clone's increment, the remaining
-difference from quick_cache on macOS (see "Read path").
+`get` still waits at its unpin for the value clone's increment, which keeps
+single-thread hits about level with quick_cache's rather than ahead (see
+"Read path").
 
 Two bounds, measured on one Linux thread and unsound with concurrent
 readers, locate the single-thread write cost:
@@ -732,11 +740,11 @@ readers, locate the single-thread write cost:
 
 On Apple Silicon the delay is not the cost. Scanning only the reader shards
 in use cut a lone writer's backlog from 1,536 removed entries to under 256,
-so slots and values were reused about 100 writes after their last use
-instead of 1,500 (see "Rejected and reverted"). Single-thread cold fill
-moved by +0.3% on macOS and +2 to +4% on Linux, and on x86 by +6%: there
-the delayed slot read missed, which a prefetch now hides (see "Write
-path"). A macOS profile of single-thread turnover
+so slots and values are reused about 100 writes after their last use
+instead of 1,500 (see "Reader shards in use"). Single-thread cold fill
+moved by +0.3% on macOS and +2 to +4% on Linux in the first form of that
+change, and by 7 to 12% on x86 in the current one: there the delayed slot
+read missed, which a prefetch now hides (see "Write path"). A macOS profile of single-thread turnover
 puts a write at 1.4 to 1.6 times quick_cache's cycles. Evicting costs less
 than quick_cache's eviction; queuing, tagging, and later freeing each
 removed entry take about 80 cycles, spread over the retired queue, the
@@ -755,20 +763,26 @@ storage against boxed entries").
 
 `.github/workflows/bench.yml` runs the same comparison on GitHub's x86_64
 runners when a branch under `bench/` is pushed. The last run, on an AMD EPYC
-9V74 with 4 vCPUs and the next-slot prefetch, read as follows; each figure
-is the median of three pairs, and positive means `ShardedCache` is faster:
+9V45 with 4 vCPUs and the changes above, read as follows; each figure is
+the median of three pairs, and positive means `ShardedCache` is faster:
 
 | Workload | 50,000, 1T | 50,000, 4T | 1,000,000, 1T | 1,000,000, 4T |
 | --- | ---: | ---: | ---: | ---: |
-| Resident hit | −1% | +33% | −13% | +5% |
-| Read miss | +28% | +58% | −61% | −32% |
-| Turnover (95% reads) | 0% | +30% | −8% | +17% |
-| Cold fill | −20% | +3% | +15% | +61% |
-| Replace | −23% | −17% | +6% | +9% |
-| Delete and reinsert | −23% | +6% | +5% | +23% |
+| Resident hit | +13% | +11% | +4% | −8% |
+| Read miss | +18% | +63% | −54% | −21% |
+| Turnover (95% reads) | −2% | +31% | +15% | +42% |
+| Cold fill | −21% | +4% | +48% | +86% |
+| Replace | −36% | −18% | −5% | −8% |
+| Delete and reinsert | −32% | +9% | −9% | +26% |
 
-Runners differ: an earlier run on another runner, before the prefetch, read
-single-thread writes at −27 to −31% at 50,000 entries. On x86 every
+The previous run, on an EPYC 9V74 before those changes, read −1%, +33%,
+−13%, and +5% for resident hits, +28%, +58%, −61%, and −32% for misses, and
+−20 to −23% for single-thread writes at 50,000 entries. Runners differ by
+more than the changes: single-thread replace at 50,000 entries trailed by
+15% on an EPYC 7763 and by 36 to 46% on EPYC 9V45 runners, with nearly the
+same code.
+
+On x86 every
 read-modify-write is a full barrier, and a ShardedCache replace makes seven,
 where quick_cache's makes three: the writer's pin and unpin, its retired
 queue's lock and unlock, and the shard lock and the old value's count,
@@ -788,59 +802,66 @@ moves quick_cache to 0.7. Most of these cells miss more often than they hit,
 so the replay weighs writes more than the tables above do.
 
 Each figure is ShardedCache's throughput against quick_cache 0.7, the median
-of three runs; positive means ShardedCache is faster. Hit ratios, as
-ShardedCache / quick_cache, are from one client, whose replay order is
-fixed. On macOS:
+of three runs, with the code and hosts of the throughput tables above;
+positive means ShardedCache is faster. Hit ratios, as ShardedCache /
+quick_cache, are from one client, whose replay order is fixed. On macOS:
 
 | Cell | Hit ratio | 1 client | 4 | 8 | 16 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| OLTP 256 | 21.9 / 19.3 | −19% | +2% | −8% | +24% |
-| OLTP 512 | 31.5 / 28.0 | −11% | −3% | −6% | +27% |
-| OLTP 1,000 | 39.8 / 36.4 | −7% | −18% | +0% | +28% |
-| OLTP 2,000 | 46.4 / 43.9 | −5% | −24% | +5% | +38% |
-| P3 20,000 | 9.0 / 8.3 | −7% | −1% | −3% | +7% |
-| P3 160,000 | 53.5 / 53.8 | −19% | +0% | +34% | +62% |
-| P8 20,000 | 22.3 / 22.6 | +2% | −11% | +0% | +24% |
-| P8 160,000 | 76.6 / 76.5 | −10% | +9% | +58% | +124% |
-| S1 100,000 | 9.5 / 9.6 | −8% | +14% | +6% | +29% |
-| S1 800,000 | 57.3 / 56.9 | +9% | +21% | +72% | +112% |
-| S3 100,000 | 12.6 / 12.8 | +4% | +12% | +17% | +65% |
-| S3 400,000 | 42.3 / 42.3 | +17% | +12% | +41% | +87% |
-| S3 800,000 | 69.5 / 68.3 | +26% | +44% | +62% | +156% |
-| DS1 1,000,000 | 15.3 / 14.9 | +6% | +4% | +16% | +52% |
-| DS1 4,000,000 | 45.1 / 44.8 | −3% | +25% | +55% | +104% |
-| DS1 8,000,000 | 70.3 / 69.3 | −7% | +38% | +85% | +163% |
-| Geometric mean | | −3% | +6% | +24% | +63% |
+| OLTP 256 | 22.2 / 19.3 | −17% | +2% | −13% | +15% |
+| OLTP 512 | 31.8 / 28.0 | −12% | +9% | +10% | +40% |
+| OLTP 1,000 | 39.9 / 36.4 | −11% | +9% | +4% | +32% |
+| OLTP 2,000 | 46.4 / 43.9 | −10% | +2% | −5% | +23% |
+| P3 20,000 | 8.8 / 8.3 | −10% | +3% | −5% | +19% |
+| P3 160,000 | 53.4 / 53.8 | −13% | +15% | +37% | +61% |
+| P8 20,000 | 22.5 / 22.6 | −2% | −5% | +5% | +26% |
+| P8 160,000 | 76.6 / 76.5 | +2% | +15% | +61% | +91% |
+| S1 100,000 | 9.5 / 9.6 | −9% | +6% | −14% | +11% |
+| S1 800,000 | 57.3 / 56.9 | +23% | +48% | +92% | +152% |
+| S3 100,000 | 12.6 / 12.8 | +5% | +4% | +12% | +8% |
+| S3 400,000 | 42.4 / 42.3 | +20% | +16% | +46% | +59% |
+| S3 800,000 | 69.5 / 68.3 | +25% | +26% | +57% | +113% |
+| DS1 1,000,000 | 15.3 / 14.9 | +3% | +28% | +2% | +62% |
+| DS1 4,000,000 | 45.1 / 44.8 | +2% | +27% | +47% | +70% |
+| DS1 8,000,000 | 70.2 / 69.3 | +2% | +48% | +90% | +129% |
+| Geometric mean | | −1% | +15% | +22% | +51% |
 
-Geometric means over the same 16 cells on each host:
+Geometric means over the same 16 cells on each host, with the previous
+run's, before hashing without `hash_one`, the slab region, four-byte
+handles, and advances over the reader shards in use, in brackets:
 
 | Host | 1 client | 2 | 4 | 8 | 16 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| macOS | −3% | | +6% | +24% | +63% |
-| Linux VM | −12% | | +3% | +25% | +40% |
-| x86_64, 4 vCPUs | −4% | +14% | +27% | | |
+| macOS | −1% (−3%) | | +15% (+6%) | +22% (+24%) | +51% (+63%) |
+| Linux VM | −5% (−12%) | | +6% (+3%) | +27% (+25%) | +35% (+40%) |
+| x86_64, 4 vCPUs | −5% (−4%) | +12% (+14%) | +21% (+27%) | | |
 
-- ShardedCache's mean one-client hit ratio was 38.92%, against 37.99% for
-  quick_cache and 37.87% for moka 0.12's sync cache. On the six S3 and DS1
-  cells both replay, mokabench's ratios agree with `hit_ratio_sim`'s to
-  0.02 points for both caches (see "Hit ratio").
+The x86_64 runs were on an AMD EPYC 7763, the previous one on an EPYC
+9V74, and the macOS host carried more other load this time, which weighs
+on sixteen clients most.
+
+- ShardedCache's mean one-client hit ratio was 38.97%, against 37.99% for
+  quick_cache; earlier, moka 0.12's sync cache read 37.87%. On the six S3
+  and DS1 cells both replay, mokabench's ratios agreed with
+  `hit_ratio_sim`'s to 0.02 points for both caches (see "Hit ratio").
 - moka's sync cache ran at 2.4 to 22 times less throughput than
-  ShardedCache in one macOS run.
+  ShardedCache in one macOS run, before these changes.
 - The lead grows with the cache and the client count: on DS1 at 8,000,000
-  entries, from −7% at one client to +163% at sixteen on macOS, and from
-  +3% at one client to +29% at four on x86_64.
+  entries, from +2% at one client to +129% at sixteen on macOS, and from
+  +7% at one client to +34% at four on x86_64.
 - The losses are single clients and small caches: OLTP at up to 2,000
-  entries and P3 and P8 at 20,000, where 54 to 91% of reads miss and most
-  operations insert and evict. At one client these cells read −24% to
-  +2% across the hosts. On the Linux VM, P3 and P8 at 20,000 trailed at every
-  client count, by 5 to 17%.
+  entries, P3 and P8 at 20,000, and S1 and S3 at 100,000, where most reads
+  miss and most operations insert and evict. At one client these cells read
+  −30% to +5% across the hosts, the worst on x86_64's OLTP. On the Linux
+  VM, P3 and P8 at 20,000 also trailed at eight and sixteen clients, by 4
+  to 29%.
 - Sixteen clients fill the macOS host's 16 cores, four of them efficiency
   cores, beside the other load described above. quick_cache slowed from
-  eight clients to sixteen in 15 of the 16 cells, and ShardedCache in 1.
+  eight clients to sixteen in all 16 cells, and ShardedCache in 4.
 - OLTP's runs last 40 to 90 ms, so its cells vary most.
 
-A Linux profile of P3 at one client puts the difference in writes. Lookups
-took about 420 ms for both caches; the write path took about 570 ms for
+A Linux profile of P3 at one client, before these changes, puts the
+difference in writes. Lookups took about 420 ms for both caches; the write path took about 570 ms for
 ShardedCache and 300 for quick_cache, in queuing, placing, and later freeing
 removed entries, as on the probe (see "Throughput against quick_cache
 0.7"). Within the difference, mokabench's own zeroing of new values took 77
@@ -850,44 +871,47 @@ values are freed three advances after their eviction rather than at once.
 ## Tail latency against quick_cache 0.7
 
 Every operation was timed (`LATENCY_STRIDE` 1) at 1,000,000 entries,
-8,000,000 operations, and 64-byte values. Each cell is the median of three
-runs, in nanoseconds, as ShardedCache / quick_cache; both hosts' timers tick
-every 42 ns. Cold fill includes filling the empty cache.
+8,000,000 operations, and 64-byte values, with the code and hosts of the
+throughput tables above. Each cell is the median of three runs, in
+nanoseconds, as ShardedCache / quick_cache; both hosts' timers tick every
+42 ns. Cold fill includes filling the empty cache.
 
 macOS:
 
 | Cell | p99 | p99.9 | p99.99 | p99.999 |
 | --- | ---: | ---: | ---: | ---: |
-| Cold fill, 1 thread | 375 / 292 | 1,959 / 1,167 | 5,000 / 5,375 | 8,583 / 191,625 |
-| Cold fill, 8 threads | 875 / 792 | 4,750 / 10,750 | 12,792 / 99,291 | 27,500 / 385,791 |
-| Turnover, 1 thread | 458 / 375 | 2,334 / 1,833 | 5,083 / 5,000 | 9,000 / 10,917 |
-| Turnover, 8 threads | 709 / 750 | 1,166 / 10,583 | 5,333 / 28,666 | 14,042 / 78,125 |
+| Cold fill, 1 thread | 458 / 416 | 1,375 / 1,917 | 5,458 / 8,958 | 14,917 / 232,208 |
+| Cold fill, 8 threads | 917 / 917 | 2,625 / 13,958 | 23,042 / 122,959 | 83,833 / 416,041 |
+| Turnover, 1 thread | 584 / 542 | 2,250 / 3,708 | 6,125 / 6,583 | 13,500 / 21,750 |
+| Turnover, 8 threads | 709 / 875 | 1,708 / 14,208 | 10,125 / 62,125 | 36,958 / 115,083 |
 
 Linux:
 
 | Cell | p99 | p99.9 | p99.99 | p99.999 |
 | --- | ---: | ---: | ---: | ---: |
-| Cold fill, 1 thread | 583 / 500 | 5,083 / 4,708 | 7,583 / 9,042 | 14,625 / 255,250 |
-| Cold fill, 8 threads | 1,292 / 1,209 | 6,583 / 29,166 | 43,459 / 140,750 | 122,292 / 496,916 |
-| Turnover, 1 thread | 709 / 708 | 4,834 / 5,250 | 7,333 / 7,709 | 14,166 / 15,292 |
-| Turnover, 8 threads | 833 / 958 | 2,292 / 13,625 | 11,750 / 54,292 | 25,750 / 90,000 |
+| Cold fill, 1 thread | 625 / 625 | 1,708 / 3,083 | 8,958 / 14,666 | 20,625 / 264,041 |
+| Cold fill, 8 threads | 1,334 / 1,333 | 7,833 / 33,292 | 44,958 / 178,917 | 127,167 / 575,333 |
+| Turnover, 1 thread | 791 / 916 | 3,208 / 4,958 | 10,083 / 11,375 | 19,208 / 25,667 |
+| Turnover, 8 threads | 750 / 1,166 | 1,834 / 31,250 | 16,041 / 107,000 | 64,500 / 243,500 |
 
-From p99.99 on, ShardedCache's tail is the shorter one in every cell but
-macOS single-thread turnover, which was level: up to 22 times shorter at
-p99.999 for single-thread cold fill, where quick_cache stalled for 190 to
-255 µs. At eight threads it is 2.3 to 14 times shorter from p99.9, as
-readers never wait on a shard lock. On one thread its p99 trails by up to two
-timer ticks (83 ns), and on macOS its p99.9 by 0.5 to 0.8 µs: the bounded
-steps below run on a fraction of a percent of inserts there.
+From p99.9 on, ShardedCache's tail is the shorter one in every cell: up to
+16 times shorter at p99.999 for single-thread cold fill, where quick_cache
+stalled for 232 to 264 µs, and 3 to 17 times shorter from p99.9 at eight
+threads, as readers never wait on a shard lock. At p99 ShardedCache trails
+by one timer tick (42 ns) on one macOS thread, is level for cold fill
+elsewhere, and is shorter for turnover on Linux and at eight threads. In the previous run,
+before the changes since "Hashing without `hash_one`", single-thread cold
+fill's p99.9 trailed, 1,959 against 1,167 ns on macOS, and the p99.999 for
+macOS single-thread turnover was level.
 
 Two steps of a write used to take time proportional to the shard under its
 lock: compacting the whole main queue and clearing the ghost's next
 generation. Each now does a bounded share, and relocation no longer reads the
 residents it tries (see "Write path"). What remains is the CLOCK sweep past
-read keys, as in quick_cache's hot ring, and a scan of 128 reader counters
-every 512 retirements. On turnover with 1,000,000 entries per shard, the
-sweep averaged 3.3 records per main-area eviction; 13 of 908,149 sweeps
-passed 1,000 records, and the longest took 1,504.
+read keys, as in quick_cache's hot ring, and a scan of two reader counters
+per shard in use every 32 retirements per shard. On turnover with 1,000,000
+entries per shard, the sweep averaged 3.3 records per main-area eviction;
+13 of 908,149 sweeps passed 1,000 records, and the longest took 1,504.
 
 ## Hit ratio
 

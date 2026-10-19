@@ -10,41 +10,41 @@ maps, lock-free and lock-based concurrent maps, the byte-keyed
 `DirectPackedCache`, and paper-derived Elastic and Funnel hashing backends.
 They are experimental; see [Research components](#research-components).
 
-PackedGen currently supports 64-bit targets only. The caches store native
-pointers in compact 64-bit handles, and unsupported pointer widths fail with
-an explicit compile-time error rather than relying on incidental layout or
-shift failures.
+PackedGen currently supports 64-bit targets only. The research caches store
+native pointers in compact 64-bit handles, and unsupported pointer widths
+fail with an explicit compile-time error rather than relying on incidental
+layout or shift failures.
 
 ## ShardedCache
 
 Writers take per-shard locks; readers take none. The shards share one table
-of six-slot buckets of tags and handles to epoch-reclaimed entries, and every
-key lives in one of two buckets, and buckets hold ten four-byte handles to
-entries in one slab region per cache. Overhead beyond the key and value is
+of 64-byte buckets, each with ten tag bytes and ten four-byte handles to
+epoch-reclaimed entries in one slab region per cache, and every key lives in
+one of two buckets. Overhead beyond the key and value is
 23.7 to 24.1 requested bytes per entry at 1,000,000 entries and 26.9 to 31.0
 at 100,000, against 78 to 210 for quick_cache 0.7.
 
 Against quick_cache, ShardedCache leads concurrent reads. With eight threads
-on a 16-core machine it ran 2.6 to 3.9 times quick_cache's resident-hit
-throughput and 6.8 to 7.9 times its miss throughput, and it was 42 to 65%
-ahead on a 95%-read turnover mix. At eight threads it was also 44 to 54%
-ahead on deleting and reinserting keys, between 1% behind and 13% ahead on
-replacing them, and 13 to 14% behind on inserting new keys into a full cache.
-On one thread, resident hits were 8 to 11% behind, and writes 1 to 18%
-behind; much of that write gap is epoch reclamation's
-bookkeeping, queuing, tagging, and later freeing each removed entry. With
-1,000,000 entries, one thread was level with quick_cache on hits (+2%) and
-9% ahead on turnover, but 51% behind on misses, whose tag words share cache
-lines with the handles; eight threads led by 29% on hits and ran 2.4 times
-quick_cache's miss throughput. Those figures are from
-Apple Silicon; on a 4-vCPU x86_64 runner at 50,000 entries, four threads
-led by 30 to 58% on reads and turnover, and one thread trailed by 20 to 23%
-on writes. In
-process memory, 1,000,000 entries took 46 to 136 bytes each, against 83 to
-332 for quick_cache. Timing every operation at
-1,000,000 entries, its p99.999 latency was 1.1 to 22 times shorter than
-quick_cache's, and 2.3 to 14 times shorter from p99.9 at eight threads; on
-one thread its p99 trailed by up to two 42 ns timer ticks.
+on a busy 16-core machine at 50,000 entries, it ran 2.3 to 3.2 times
+quick_cache's resident-hit throughput and 4.7 to 5.9 times its miss
+throughput, and it was 51 to 68% ahead on a 95%-read turnover mix, 37 to 44%
+ahead on deleting and reinserting keys, 5 to 22% ahead on replacing them,
+and 7 to 15% behind on inserting new keys into a full cache. On one thread,
+resident hits were level (−1 to −4%) and misses 79 to 87% faster; writes
+ranged from 11% ahead to 9% behind on Apple Silicon and trailed by 16 to 23%
+on Linux. Much of the single-thread write gap is epoch reclamation's
+bookkeeping: queuing, tagging, and later freeing each removed entry. With
+1,000,000 entries on Apple Silicon, one thread was level on hits (+2%),
+ahead on writes by 12 to 47%, and 50% behind on misses, whose tag words
+share cache lines with the handles; eight threads led on every workload, by
+4 to 109%. On a 4-vCPU x86_64 runner, four threads led on reads and turnover
+at 50,000 entries, and one thread trailed by 21 to 36% on writes. In
+process memory, before four-byte handles, 1,000,000 entries took 46 to 136
+bytes each, against 83 to 332 for quick_cache. Timing every operation at
+1,000,000 entries, its tail from p99.9 on was the shorter one in every cell:
+up to 16 times shorter at p99.999, and 3 to 17 times shorter from p99.9 at
+eight threads; on one thread its p99 was level or one 42 ns timer tick
+behind.
 
 Each shard sizes its probationary queue to the keys it sees return. On the
 ARC paper traces, its summed hit rate over 18 cells was 12.5 points above
@@ -52,11 +52,11 @@ single-shard quick_cache and 9.5 above quick_cache's sharded cache.
 
 On [mokabench](https://github.com/moka-rs/mokabench), moka's trace-replay
 load generator, over 16 cells of six ARC traces, ShardedCache's throughput
-against quick_cache had a geometric mean of −3% at one client, +24% at
-eight, and +63% at sixteen on Apple Silicon; −12% at one client to +40% at
-sixteen on Linux; and −4% at one client to +27% at four on a 4-vCPU x86_64
+against quick_cache had a geometric mean of −1% at one client, +22% at
+eight, and +51% at sixteen on Apple Silicon; −5% at one client to +35% at
+sixteen on Linux; and −5% at one client to +21% at four on a 4-vCPU x86_64
 runner. It lost mostly where reads miss and most operations insert and
-evict: by up to 24% at one client, and on Linux by up to 20% with more.
+evict: by up to 30% at one client, and on Linux by up to 29% with more.
 moka's sync cache ran 2.4 to 22 times slower.
 
 Design, correctness evidence, tables, and rejected alternatives are in
