@@ -338,6 +338,11 @@ and 2 to 20% with one codegen unit, and resident hits −0.4 to +6% and −3 to
 +11%; misses and replaces moved by −9 to +8%, within their run-to-run
 ranges.
 
+On an x86_64 runner (an AMD EPYC 7763, four vCPUs), against the previous
+commit over five pairs at 50,000 entries, every cell of the default build
+moved by −5 to +1%; with one codegen unit, resident hits gained 7% on one
+thread and misses 3 to 4%, and the rest moved by −2 to +1%.
+
 A `BuildHasher` that overrides `hash_one`, as ahash's nightly-only
 specialization does, is bypassed; on stable Rust it computes the same
 steps.
