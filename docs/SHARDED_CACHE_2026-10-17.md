@@ -995,6 +995,15 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
   cores on every write.
 - **Reclaiming in batches of 32.** Freeing values together was meant to
   overlap their cache misses; eight-thread writes fell 12 to 16% instead.
+- **A per-bucket summary of tags for misses.** A 32-bit word per bucket,
+  in an array of its own, held a bit per tag class present and a bit for
+  keys displaced to the alternate; readers checked it before loading the
+  bucket, and writers refreshed it when its bits changed. At 1,000,000
+  entries the 2 MB array stayed in L2 and misses ran 1.4 to 1.95 times as
+  fast, near quick_cache's on one thread. But resident hits lost 13 to 34%
+  with an acquiring load of the summary and a prefetch of the bucket, and 9
+  to 20% with a relaxed load and no prefetch, at 50,000 entries as well;
+  turnover lost 3 to 13%.
 - **Decoding overflow handles inside readers' lookups.** Resident hits at
   1,000,000 entries lost 20 to 25% on Apple Silicon, though no overflow
   handle existed; see "Four-byte handles".
