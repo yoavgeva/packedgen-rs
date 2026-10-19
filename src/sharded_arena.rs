@@ -17,7 +17,7 @@
 //!   queue of a thread that stopped retiring.
 //! - Values are dropped outside the shard lock by the reclaiming thread, and
 //!   their slots join that thread's stack, so it refills slots it just
-//!   touched.
+//!   touched. Each write prefetches the slot its thread reclaims next.
 
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::cell::{RefCell, UnsafeCell};
@@ -215,6 +215,62 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn pins_held() -> usize {
     PINS_HELD.get()
+}
+
+/// Starts loading the cache line at `address`. A prefetch reads nothing in
+/// the language's sense, so any address is allowed, a stale one included.
+#[inline]
+#[allow(unsafe_code, reason = "issues a prefetch hint")]
+pub(crate) fn prefetch<T>(address: *const T) {
+    #[cfg(test)]
+    PREFETCHED.with(|lines| lines.borrow_mut().push(address as usize));
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    // SAFETY: a prefetch hint never faults and changes no program state.
+    unsafe {
+        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(address.cast());
+    }
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    // SAFETY: as above.
+    unsafe {
+        core::arch::asm!(
+            "prfm pldl1keep, [{address}]",
+            address = in(reg) address,
+            options(nostack, preserves_flags, readonly)
+        );
+    }
+    #[cfg(any(miri, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
+    let _ = address;
+}
+
+/// Like [`prefetch`], for a line about to be written: fetching it for
+/// ownership saves the upgrade a write after a read would wait for.
+#[inline]
+#[allow(unsafe_code, reason = "issues a prefetch hint")]
+pub(crate) fn prefetch_write<T>(address: *const T) {
+    #[cfg(test)]
+    PREFETCHED.with(|lines| lines.borrow_mut().push(address as usize));
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    // SAFETY: a prefetch hint never faults and changes no program state.
+    unsafe {
+        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_ET0 }>(address.cast());
+    }
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    // SAFETY: as above.
+    unsafe {
+        core::arch::asm!(
+            "prfm pstl1keep, [{address}]",
+            address = in(reg) address,
+            options(nostack, preserves_flags, readonly)
+        );
+    }
+    #[cfg(any(miri, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
+    let _ = address;
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Addresses this thread prefetched, for tests of what writers fetch.
+    pub(crate) static PREFETCHED: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// One entry's storage: atomic metadata, then the value.
@@ -446,6 +502,13 @@ impl<T> RetiredSlots<T> {
             .is_some_and(|&(due, _)| due < generation)
         {
             Self::take_aged(&mut queue, generation, reclaimed, 1);
+        }
+        // The next write reclaims the front slot, a few advances after this
+        // thread last touched it: start loading the lines its drop reads.
+        if let Some(&(_, next)) = queue.slots.front() {
+            let first = next.as_ptr().cast::<u8>();
+            prefetch(first);
+            prefetch(first.wrapping_add(size_of::<Slot<T>>() - 1));
         }
         queue.unreported += retired;
         queue.until_foreign_drain = queue.until_foreign_drain.saturating_sub(1);
@@ -787,6 +850,12 @@ mod tests {
         pub(crate) fn queued(&self, queue: usize) -> usize {
             self.queues[queue].0.lock().slots.len()
         }
+
+        /// The address of the slot one queue reclaims next.
+        fn front(&self, queue: usize) -> Option<usize> {
+            let queue = self.queues[queue].0.lock();
+            queue.slots.front().map(|&(_, slot)| slot.as_ptr() as usize)
+        }
     }
 
     impl<T> SlotStore<T> {
@@ -859,6 +928,30 @@ mod tests {
             retire_filled(&epochs, &retired, &store, 1),
             0,
             "only the backlog was due"
+        );
+    }
+
+    #[test]
+    fn a_write_prefetches_the_slot_the_next_write_reclaims() {
+        // Dropping a reclaimed value reads its slot, last touched a few
+        // advances earlier. On x86, with a 1 MB L2, that read and the
+        // value's own then missed in series.
+        let epochs = Epochs::new();
+        // Declared first so it drops last: retired values live in its chunks.
+        let store = SlotStore::new();
+        let retired = RetiredSlots::new();
+        assert_eq!(retire_filled(&epochs, &retired, &store, 4), 0);
+        for _ in 0..3 {
+            assert!(epochs.try_advance());
+        }
+        PREFETCHED.with(|lines| lines.borrow_mut().clear());
+        assert_eq!(retire_filled(&epochs, &retired, &store, 1), 1);
+        let next = retired
+            .front(retired_queue_index())
+            .expect("three aged slots remain");
+        assert!(
+            PREFETCHED.with(|lines| lines.borrow().contains(&next)),
+            "the next slot to reclaim was not prefetched"
         );
     }
 

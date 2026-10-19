@@ -32,9 +32,11 @@ use hashbrown::DefaultHashBuilder;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use crate::cache_arena::direct_arena_thread;
+#[cfg(test)]
+use crate::sharded_arena::PREFETCHED;
 use crate::sharded_arena::{
     EpochPin, Epochs, MAX_EXPIRY_TICK, MAX_WEIGHT, Reclaimed, RetiredSlots, Slot, SlotStore,
-    drop_value, fill,
+    drop_value, fill, prefetch, prefetch_write,
 };
 
 const SLOTS: usize = 6;
@@ -662,62 +664,6 @@ struct Probationary {
     record: u32,
     hash: u64,
     handle: u64,
-}
-
-/// Starts loading the cache line at `address`. A prefetch reads nothing in
-/// the language's sense, so any address is allowed, a stale one included.
-#[inline]
-#[allow(unsafe_code, reason = "issues a prefetch hint")]
-fn prefetch<T>(address: *const T) {
-    #[cfg(test)]
-    PREFETCHED.with(|lines| lines.borrow_mut().push(address as usize));
-    #[cfg(all(target_arch = "x86_64", not(miri)))]
-    // SAFETY: a prefetch hint never faults and changes no program state.
-    unsafe {
-        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(address.cast());
-    }
-    #[cfg(all(target_arch = "aarch64", not(miri)))]
-    // SAFETY: as above.
-    unsafe {
-        core::arch::asm!(
-            "prfm pldl1keep, [{address}]",
-            address = in(reg) address,
-            options(nostack, preserves_flags, readonly)
-        );
-    }
-    #[cfg(any(miri, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
-    let _ = address;
-}
-
-/// Like [`prefetch`], for a line about to be written: fetching it for
-/// ownership saves the upgrade a write after a read would wait for.
-#[inline]
-#[allow(unsafe_code, reason = "issues a prefetch hint")]
-fn prefetch_write<T>(address: *const T) {
-    #[cfg(test)]
-    PREFETCHED.with(|lines| lines.borrow_mut().push(address as usize));
-    #[cfg(all(target_arch = "x86_64", not(miri)))]
-    // SAFETY: a prefetch hint never faults and changes no program state.
-    unsafe {
-        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_ET0 }>(address.cast());
-    }
-    #[cfg(all(target_arch = "aarch64", not(miri)))]
-    // SAFETY: as above.
-    unsafe {
-        core::arch::asm!(
-            "prfm pstl1keep, [{address}]",
-            address = in(reg) address,
-            options(nostack, preserves_flags, readonly)
-        );
-    }
-    #[cfg(any(miri, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
-    let _ = address;
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Addresses this thread prefetched, for tests of what writers fetch.
-    static PREFETCHED: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// A shard's writer state under its lock, with the counts kept beside it.
