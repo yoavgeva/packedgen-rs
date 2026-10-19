@@ -791,6 +791,11 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
   to +4% on x86, and multi-thread writes by +1 to +8%. A sound replacement still needs a
   release that the next advance acquires, so it would save one of the two
   read-modify-writes at most.
+- **A floor under the probation target.** With no key ever read again,
+  probation adapts down to one entry, so each cold-fill insert evicts the
+  shard's previous insert, whose lines another core may still hold. A floor
+  of 64 entries made eight-thread cold fill 4.5% faster and single-thread
+  cold fill 16% slower; floors of 4 and 16 moved eight threads by 1 to 2%.
 - **A spin lock for the retired queues.** Its uncontended unlock is a
   store, where the mutex's is a read-modify-write, a full barrier on x86.
   On x86, single-thread writes moved by 0 to +1%, delete and reinsert by
