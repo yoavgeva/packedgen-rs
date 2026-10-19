@@ -3568,13 +3568,14 @@ mod tests {
         // load instead of 13.3.
         assert_eq!(std::mem::size_of::<Bucket>(), 64);
         assert_eq!(SLOTS, 10);
-        let cache = ShardedCacheBuilder::new(100_000)
-            .shards(16)
+        // Small enough to stay quick under Miri.
+        let cache = ShardedCacheBuilder::new(10_000)
+            .shards(1)
             .build::<u64, u64>();
         let bytes = cache.table.len() * std::mem::size_of::<Bucket>();
         assert!(
-            bytes <= 8 * 100_000 + 16 * 64,
-            "{bytes} table bytes for 100,000 entries"
+            bytes <= 8 * 10_000 + 64,
+            "{bytes} table bytes for 10,000 entries"
         );
     }
 
