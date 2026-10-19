@@ -829,6 +829,16 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
 - **Trying an advance every 32 retirements per shard.** Each try scans 128
   reader counters; eight-thread replace fell 63%. Tries now wait for 512
   retirements across the cache.
+- **Shorter reclamation delays on mokabench.** On the Linux VM, P3 at
+  20,000 entries and one client, where probation evicts keys soon after
+  they enter, advancing every 128, 32, or 8 retirements across the cache
+  instead of 512 took −1%, 0%, and +6% time over five runs. At 32,
+  mokabench's zeroing of new values fell from 5.6% of the time to 2.5%, as
+  freed values came back warmer, but evicting, retiring, and the counter
+  scans grew by as much.
+- **Fewer retirement reports, or no foreign drains, on mokabench.** On the
+  same cell at eight clients, reporting retirements every 128 instead of 16
+  took 8% more time, and skipping drains of other threads' queues 1% more.
 - **A fuller table.** At 89% load instead of 80%, 48% of keys lived in
   their alternates instead of 34%, relocations rose from 0.05 to 0.19 per
   insert, and 16 inserts in 100,000 evicted from a full pair, overriding
