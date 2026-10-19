@@ -482,11 +482,16 @@ readers, locate the single-thread write cost:
   ahead of quick_cache, which led by 13 to 20%.
 - Dropping only the retired queue's lock moved the same cells by −4 to +1%.
 
-The cost is the delay, not the bookkeeping. A slot and its value's
-allocation are reused about 1,500 writes after their last use, from L2
-rather than L1. Shortening the delay means scanning the 128 reader counters
-more often, which costs more at eight threads (see "Rejected and
-reverted").
+The delay is not the cost. Scanning only the reader shards in use cut a
+lone writer's backlog from 1,536 removed entries to under 256, so slots and
+values were reused about 100 writes after their last use instead of 1,500
+(see "Rejected and reverted"). Single-thread cold fill moved by +0.3% on
+macOS and +2 to +4% on Linux. A macOS profile of single-thread turnover
+puts a write at 1.4 to 1.6 times quick_cache's cycles. Evicting costs less
+than quick_cache's eviction; queuing, tagging, and later freeing each
+removed entry take about 80 cycles, spread over the retired queue, the
+reclamation batches, and the slot stacks, with no single step
+dominating.
 
 The earlier boxed-entry storage measured macOS resident hits at −32%, +2%,
 and +241%. On macOS those boxes often sat beside their values (see "Slab
@@ -697,6 +702,16 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
 - **Trying an advance every 32 retirements per shard.** Each try scans 128
   reader counters; eight-thread replace fell 63%. Tries now wait for 512
   retirements across the cache.
+- **Scanning only the reader shards in use.** Each pin marked its reader
+  shard in a per-cache mask; tries scanned only marked shards' counters and
+  came due after 32 retirements per marked shard. A lone writer's backlog
+  fell from 1,536 removed entries to under 256, and requested memory at
+  100,000 entries by 0.7 to 1.6 bytes per entry. Single-thread writes on
+  Linux gained 2 to 12%, and eight-thread replace 2 to 6%. But the mark
+  check on every pin cost reads: misses lost 1.2 to 1.6% on macOS and 1.8 to
+  3.4% on Linux, and eight-thread resident hits 3.2 to 3.6% on Linux. A
+  process-wide mask set once per thread would cost reads nothing, but fills
+  once 64 threads have used any cache, as under thread churn.
 
 ## Reproduce
 
