@@ -466,6 +466,15 @@ write rows read −10 to −53% for cold fill, −3 to −42% for replace, −10
 Eight-thread resident hits reached 408 Mops/s on macOS against quick_cache's
 105, and 213 against 93 on Linux.
 
+At 1,000,000 entries on macOS, past the caches, one thread read misses at
+29 Mops/s against quick_cache's 66 to 73, and resident hits at 7.8 against
+8.9 to 9.1, in two runs each. A miss loads one or two 64-byte bucket lines
+from a 13 MB table, where quick_cache's control bytes for as many entries
+stay in L2; a hit loads the bucket, the entry, and the value's count, one
+line more than quick_cache (see "Rejected and reverted" for layouts tried).
+Eight threads read misses at 263 to 267 Mops/s against 105 to 111, and
+hits at 69 against 62.
+
 Cold fill still trails: every insert into a full shard evicts under the lock
 (see "Write path"), and single-thread writes pay what lock-free reads
 require. An insert cannot reuse the evicted entry's memory until three epoch

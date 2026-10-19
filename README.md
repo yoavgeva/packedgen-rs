@@ -30,7 +30,9 @@ ahead on deleting and reinserting keys, between 14% behind and 22% ahead on
 replacing them, and 12 to 22% behind on inserting new keys into a full cache.
 On one thread, resident hits ranged from 12% behind to even, and writes from
 5% ahead to 21% behind; much of that write gap is epoch reclamation's
-bookkeeping, queuing, tagging, and later freeing each removed entry. In
+bookkeeping, queuing, tagging, and later freeing each removed entry. With
+1,000,000 entries, one thread trailed by about 14% on hits and 59% on
+misses, as its bucket table outgrew the caches. In
 process memory, 1,000,000 entries took 46 to 136 bytes each, against 83 to
 332 for quick_cache. Timing every operation at
 1,000,000 entries, its p99.999 latency was 1.1 to 22 times shorter than
