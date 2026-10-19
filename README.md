@@ -32,7 +32,10 @@ On one thread, resident hits ranged from 12% behind to even, and writes from
 5% ahead to 21% behind; much of that write gap is epoch reclamation's
 bookkeeping, queuing, tagging, and later freeing each removed entry. With
 1,000,000 entries, one thread trailed by about 14% on hits and 59% on
-misses, as its bucket table outgrew the caches. In
+misses, as its bucket table outgrew the caches. Those figures are from
+Apple Silicon; on a 4-vCPU x86_64 runner at 50,000 entries, four threads
+led by 30 to 58% on reads and turnover, and one thread trailed by 20 to 23%
+on writes. In
 process memory, 1,000,000 entries took 46 to 136 bytes each, against 83 to
 332 for quick_cache. Timing every operation at
 1,000,000 entries, its p99.999 latency was 1.1 to 22 times shorter than

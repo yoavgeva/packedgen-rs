@@ -408,6 +408,15 @@ These changes followed, each measured against the one before:
   generation instead cost 0.79 points of the trace hit-ratio sum, and over
   its last quarter 0.10; the bounded version moved the sum from 667.05 to
   667.08, and throughput stayed within noise on macOS and Linux.
+- **Prefetching the next slot to reclaim.** Reclaiming drops a value, which
+  reads its slot, last touched a few advances earlier, and then the value's
+  own memory. On x86 the slot had left the 1 MB L2, so the two missed in
+  series: dropping reclaimed values took 22% of single-thread replace
+  time, against 11% for quick_cache's drop of a replaced value. Each write
+  now prefetches the slot its thread reclaims next, a write ahead.
+  Single-thread writes gained 5 to 9% on x86, 9 to 11% for cold fill and
+  replace on the Linux VM, and 6% for cold fill on macOS; four- and
+  eight-thread writes moved by −3 to +7%, and reads stayed within noise.
 
 Pacing is a trade-off between allocators and workloads. Freeing up to four
 entries per write instead changed Linux throughput by:
@@ -491,11 +500,13 @@ readers, locate the single-thread write cost:
   ahead of quick_cache, which led by 13 to 20%.
 - Dropping only the retired queue's lock moved the same cells by −4 to +1%.
 
-The delay is not the cost. Scanning only the reader shards in use cut a
-lone writer's backlog from 1,536 removed entries to under 256, so slots and
-values were reused about 100 writes after their last use instead of 1,500
-(see "Rejected and reverted"). Single-thread cold fill moved by +0.3% on
-macOS and +2 to +4% on Linux. A macOS profile of single-thread turnover
+On Apple Silicon the delay is not the cost. Scanning only the reader shards
+in use cut a lone writer's backlog from 1,536 removed entries to under 256,
+so slots and values were reused about 100 writes after their last use
+instead of 1,500 (see "Rejected and reverted"). Single-thread cold fill
+moved by +0.3% on macOS and +2 to +4% on Linux, and on x86 by +6%: there
+the delayed slot read missed, which a prefetch now hides (see "Write
+path"). A macOS profile of single-thread turnover
 puts a write at 1.4 to 1.6 times quick_cache's cycles. Evicting costs less
 than quick_cache's eviction; queuing, tagging, and later freeing each
 removed entry take about 80 cycles, spread over the retired queue, the
@@ -509,6 +520,32 @@ allocator filled shortly before.
 The earlier boxed-entry storage measured macOS resident hits at −32%, +2%,
 and +241%. On macOS those boxes often sat beside their values (see "Slab
 storage against boxed entries").
+
+### On x86_64
+
+`.github/workflows/bench.yml` runs the same comparison on GitHub's x86_64
+runners when a branch under `bench/` is pushed. The last run, on an AMD EPYC
+9V74 with 4 vCPUs and the next-slot prefetch, read as follows; each figure
+is the median of three pairs, and positive means `ShardedCache` is faster:
+
+| Workload | 50,000, 1T | 50,000, 4T | 1,000,000, 1T | 1,000,000, 4T |
+| --- | ---: | ---: | ---: | ---: |
+| Resident hit | −1% | +33% | −13% | +5% |
+| Read miss | +28% | +58% | −61% | −32% |
+| Turnover (95% reads) | 0% | +30% | −8% | +17% |
+| Cold fill | −20% | +3% | +15% | +61% |
+| Replace | −23% | −17% | +6% | +9% |
+| Delete and reinsert | −23% | +6% | +5% | +23% |
+
+Runners differ: an earlier run on another runner, before the prefetch, read
+single-thread writes at −27 to −31% at 50,000 entries. On x86 every
+read-modify-write is a full barrier, and a ShardedCache replace makes seven,
+where quick_cache's makes three: the writer's pin and unpin, its retired
+queue's lock and unlock, and the shard lock and the old value's count,
+which both share. As upper bounds, skipping the writer's pin moved
+single-thread writes by −2 to +4%, and a retired-queue lock that unlocks
+with a store by 0 to +1%, delete and reinsert by +14% within −2 to +34%
+(see "Rejected and reverted").
 
 ## Tail latency against quick_cache 0.7
 
@@ -743,10 +780,15 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
 - **Writers without a pin.** A writer holds its shard's lock while it
   reads entries, so its pin serves only the retirement tag. As an upper
   bound, writes that skipped the pin altogether, unsoundly, moved
-  single-thread writes by −1 to +4% on macOS and −5 to +2% on Linux, and
-  eight-thread writes by +1 to +7%. A sound replacement still needs a
+  single-thread writes by −1 to +4% on macOS, −5 to +2% on Linux, and −2
+  to +4% on x86, and multi-thread writes by +1 to +8%. A sound replacement still needs a
   release that the next advance acquires, so it would save one of the two
   read-modify-writes at most.
+- **A spin lock for the retired queues.** Its uncontended unlock is a
+  store, where the mutex's is a read-modify-write, a full barrier on x86.
+  On x86, single-thread writes moved by 0 to +1%, delete and reinsert by
+  +14% within −2 to +34%; on macOS, by −2 to +7% within wider ranges. Not
+  enough to replace the mutex with unsafe code of our own.
 - **Scanning only the reader shards in use.** Each pin marked its reader
   shard in a per-cache mask; tries scanned only marked shards' counters and
   came due after 32 retirements per marked shard. A lone writer's backlog
@@ -754,7 +796,8 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
   100,000 entries by 0.7 to 1.6 bytes per entry. Single-thread writes on
   Linux gained 2 to 12%, and eight-thread replace 2 to 6%. But the mark
   check on every pin cost reads: misses lost 1.2 to 1.6% on macOS and 1.8 to
-  3.4% on Linux, and eight-thread resident hits 3.2 to 3.6% on Linux. A
+  3.4% on Linux, and eight-thread resident hits 3.2 to 3.6% on Linux. On
+  x86, single-thread cold fill gained 6% and reads lost 2 to 3%. A
   process-wide mask set once per thread would cost reads nothing, but fills
   once 64 threads have used any cache, as under thread churn.
 
@@ -770,4 +813,7 @@ $PROBE sharded cold-fill 1000000 8000000 1 64 1 1
 target/release/examples/hit_ratio_sim file:PATH/DS1.keys 8000000 0 1 sharded quick
 target/release/examples/hit_ratio_sim arc:PATH/P3.lis 131072 0 1 sharded/shards=64 sharded
 cargo test --release --lib sharded_cache
+sh scripts/compare_sharded_quick.sh 3 "1 4" 50000 target/compare-50k.csv
+python3 scripts/summarize_compare.py target/compare-50k.csv
+git push origin HEAD:refs/heads/bench/NAME   # the same on x86_64, and against HEAD^
 ```
