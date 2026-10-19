@@ -726,6 +726,10 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
   eight-thread misses 8% faster and single-thread turnover 6%, but at
   50,000 entries, with both lines cached, it cost resident hits 8% on one
   thread and 24% on eight.
+- **Prefetching the home bucket before pinning.** A pin's acquiring
+  read-modify-write holds back the loads after it, but not a prefetch. At
+  1,000,000 entries hits moved by −0.5 to +1%; at 50,000, reads lost 5 to
+  9% to the extra instruction.
 - **Tags in an array of their own.** Apart from the handles, a
   1,000,000-entry cache's control words fit in 1.4 MB, which stays in L2,
   and misses ran 2.7 times as fast. But a hit then waited for its tag word
