@@ -1273,6 +1273,11 @@ mod tests {
             self.depot.in_region(slot.cast())
         }
 
+        /// Slots the region holds.
+        pub(crate) fn region_slots(&self) -> usize {
+            self.depot.region_slots
+        }
+
         /// Overflow chunks the store holds.
         pub(crate) fn overflow_chunks(&self) -> usize {
             self.depot.state.lock().overflow.len()

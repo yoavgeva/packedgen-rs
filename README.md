@@ -21,7 +21,7 @@ Writers take per-shard locks; readers take none. The shards share one table
 of six-slot buckets of tags and handles to epoch-reclaimed entries, and every
 key lives in one of two buckets, and buckets hold ten four-byte handles to
 entries in one slab region per cache. Overhead beyond the key and value is
-23.8 to 24.4 requested bytes per entry at 1,000,000 entries and 27.9 to 34.5
+23.7 to 24.1 requested bytes per entry at 1,000,000 entries and 26.9 to 31.0
 at 100,000, against 78 to 210 for quick_cache 0.7.
 
 Against quick_cache, ShardedCache leads concurrent reads. With eight threads

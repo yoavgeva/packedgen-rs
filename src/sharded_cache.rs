@@ -65,8 +65,9 @@ const WIDE_SHARD_CAPACITY: usize = 256;
 /// Main-queue records encode a slot in 24 bits.
 const MAX_SHARD_SLOTS: usize = 1 << 24;
 /// Slab region slots beyond the entry limit, for entries removed but not
-/// yet reclaimed: about what reclamation trails by on one thread.
-const REGION_SPARE: usize = 4_096;
+/// yet reclaimed: well past what reclamation trails by on one thread, about
+/// a hundred while few threads have claimed reader shards.
+const REGION_SPARE: usize = 1_024;
 /// More region slots per available thread, for each thread's stack of
 /// vacant slots and its share of the reclamation backlog.
 const REGION_SPARE_PER_THREAD: usize = 256;
@@ -3577,6 +3578,16 @@ mod tests {
             bytes <= 8 * 10_000 + 64,
             "{bytes} table bytes for 10,000 entries"
         );
+    }
+
+    #[test]
+    fn the_slab_region_spares_a_lone_writers_backlog_and_each_threads_stack() {
+        // Advances over the reader shards in use keep a lone writer's
+        // removed entries to about a hundred, so the spare past the entry
+        // limit is 1,024 slots and 256 per available thread.
+        let threads = std::thread::available_parallelism().map_or(1, usize::from);
+        let cache = ShardedCacheBuilder::new(100_000).build::<u64, u64>();
+        assert_eq!(cache.slots.region_slots(), 100_000 + 1_024 + 256 * threads);
     }
 
     #[test]

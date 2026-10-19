@@ -212,17 +212,17 @@ rounding of the boxed entries is not included.
 
 | Entries | Key | Value | ShardedCache | DirectPackedCache | quick_cache |
 | ---: | --- | --- | ---: | ---: | ---: |
-| 100,000 | 8 B | `u64` | 43.9 | 47.4 | 118.0 |
-| 100,000 | 32 B | `[u8; 64]` | 130.5 | 128.2 | 306.7 |
-| 1,000,000 | 8 B | `u64` | 39.8 | 44.2 | 94.4 |
-| 1,000,000 | 32 B | `u64` | 64.0 | 69.0 | 144.7 |
-| 1,000,000 | 32 B | `[u8; 64]` | 120.4 | 125.1 | 245.4 |
+| 100,000 | 8 B | `u64` | 42.9 | 46.7 | 118.0 |
+| 100,000 | 32 B | `[u8; 64]` | 127.0 | 128.4 | 306.7 |
+| 1,000,000 | 8 B | `u64` | 39.7 | 44.2 | 94.4 |
+| 1,000,000 | 32 B | `u64` | 63.8 | 69.0 | 144.7 |
+| 1,000,000 | 32 B | `[u8; 64]` | 120.1 | 125.1 | 245.4 |
 
-Overhead beyond the key and value is 23.8 to 24.4 bytes per entry at
-1,000,000 entries, and 27.9 to 34.5 at 100,000, where the slab region's
-spare slots, which a single-threaded fill never touches, add 2 to 8.5 (see
-"The slab region"). Before four-byte handles it was 29.1 to 33.3 at both
-sizes. On a 16-thread machine, a 100,000-entry cache has 256 shards, and
+Overhead beyond the key and value is 23.7 to 24.1 bytes per entry at
+1,000,000 entries, and 26.9 to 31.0 at 100,000, where the slab region's
+spare slots, which a single-threaded fill never touches, add 1 to 4.6 on a
+16-thread machine (see "The slab region"). Before four-byte handles it was
+29.1 to 33.3 at both sizes. On a 16-thread machine, a 100,000-entry cache has 256 shards, and
 their fixed state adds about 1.4 bytes per entry; at 1,000,000 entries it
 adds about 0.5:
 
@@ -263,9 +263,11 @@ A 1,000-entry cache reached 17,900 slots at eight threads. At 56 bytes a
 slot, the worst run above kept 94 bytes per entry of slab beyond the
 cache's own.
 
-Each cache now reserves one region at build: its entry limit, plus 4,096
-slots, plus 256 per available thread, the reclamation backlog of one thread
-and each thread's stack of vacant slots. Its pages are touched only as
+Each cache now reserves one region at build: its entry limit, plus 1,024
+slots, plus 256 per available thread, for the reclamation backlog and each
+thread's stack of vacant slots. The spare was 4,096 slots plus 256 per
+thread until advances followed the reader shards in use (see "Reader shards
+in use"). Its pages are touched only as
 slots are first handed out. Past the region, writers take slots one at a
 time from overflow chunks of 64, the lowest-addressed chunk with room
 first. Overflow slots return to their chunk, never to a thread's stack,
@@ -276,8 +278,9 @@ moved: a value with interior mutability, such as an atomic, would lose
 updates readers made through a guard to the old copy.
 
 Requested bytes now include the region's spare slots, which a
-single-threaded fill never touches: at 100,000 entries on 16 threads they
-added 2 to 8.5 bytes per entry, and at 1,000,000 entries under 1.
+single-threaded fill never touches: at 100,000 entries on 16 threads the
+first spare added 2 to 8.5 bytes per entry, and the current one 1 to 4.6;
+at 1,000,000 entries, under 1.
 
 Throughput against the previous commit was level, but only once both
 sides were built alike. In the first comparison, built with the default
@@ -378,7 +381,12 @@ retirements: 1,536 of them were still held after 100,000 inserts into a
 1,000-entry cache. They now wait for three of 32, and
 `tests/sharded_cache_reclamation.rs` checks that at most 256 are held. At
 50,000 entries, a single writer's slab high-water mark fell from 51,600 to
-50,200 slots; with more threads, preemption decided it either way.
+50,200 slots; with more threads, preemption decided it either way. The
+region's spare then fell from 4,096 slots plus 256 per thread to 1,024 plus
+256: at 1,000 and 50,000 entries, one to four threads' cold fill and
+turnover and eight threads' turnover stayed in the region, while bursts
+behind preempted readers at eight and sixteen threads spilled into
+overflow chunks with either spare.
 
 Reading the mask with a load was enough under the C++ sequentially
 consistent order, by the argument above, but not under the Loom model's,
