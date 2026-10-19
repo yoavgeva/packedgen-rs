@@ -1,0 +1,40 @@
+name: Benchmarks
+
+# Push a branch under bench/ to measure it on GitHub's x86_64 runners. Shared
+# runners are noisy: read medians across pairs, and only large differences.
+on:
+  push:
+    branches: ['bench/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  x86:
+    name: ShardedCache against quick_cache on x86_64
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bench
+      - name: Machine
+        run: lscpu | sed -n '1,20p'
+      - name: 50,000 entries
+        run: |
+          sh scripts/compare_sharded_quick.sh 3 "1 4" 50000 target/compare-50k.csv
+          python3 scripts/summarize_sharded_quick.py target/compare-50k.csv | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: 1,000,000 entries
+        run: |
+          sh scripts/compare_sharded_quick.sh 3 "1 4" 1000000 target/compare-1m.csv
+          python3 scripts/summarize_sharded_quick.py target/compare-1m.csv | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Raw results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compare-sharded-quick-${{ github.run_id }}
+          path: target/compare-*.csv
+          if-no-files-found: warn
