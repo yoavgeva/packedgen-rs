@@ -56,6 +56,12 @@ const MIN_SHARD_CAPACITY: usize = 64;
 const WIDE_SHARD_CAPACITY: usize = 256;
 /// Main-queue records encode a slot in 24 bits.
 const MAX_SHARD_SLOTS: usize = 1 << 24;
+/// Slab region slots beyond the entry limit, for entries removed but not
+/// yet reclaimed: about what reclamation trails by on one thread.
+const REGION_SPARE: usize = 4_096;
+/// More region slots per available thread, for each thread's stack of
+/// vacant slots and its share of the reclamation backlog.
+const REGION_SPARE_PER_THREAD: usize = 256;
 /// Main-queue records compaction examines per append.
 const MAIN_CLEANUP_CHUNK: usize = 64;
 const NEVER_EXPIRES: u64 = u64::MAX;
@@ -343,12 +349,10 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
         L: RemovalListener<K, V>,
     {
         let max_entries = self.max_entries.max(1);
-        let shards = self.shards.unwrap_or_else(|| {
-            default_shards(
-                max_entries,
-                std::thread::available_parallelism().map_or(1, usize::from),
-            )
-        });
+        let parallelism = std::thread::available_parallelism().map_or(1, usize::from);
+        let shards = self
+            .shards
+            .unwrap_or_else(|| default_shards(max_entries, parallelism));
         // Every shard holds an entry: a shard with none would admit one.
         let most = 1 << max_entries.ilog2();
         // Main-queue records hold a slot in 24 bits.
@@ -399,7 +403,11 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
             shard_shift: u64::BITS - shards.trailing_zeros(),
             epochs: Epochs::new(),
             retired: RetiredSlots::new(),
-            slots: SlotStore::new(),
+            slots: SlotStore::new(
+                max_entries
+                    .saturating_add(REGION_SPARE)
+                    .saturating_add(REGION_SPARE_PER_THREAD.saturating_mul(parallelism)),
+            ),
             weighter: self.weighter,
             hash_builder: self.hash_builder,
             listener: self.listener,
@@ -3380,6 +3388,35 @@ mod tests {
             Arc::strong_count(&value),
             1,
             "maintain dropped every removed value"
+        );
+    }
+
+    #[test]
+    fn memory_a_guard_held_is_freed_after_it_drops() {
+        let cache = ShardedCacheBuilder::new(256).shards(1).build::<u64, u64>();
+        let guard = cache.pin();
+        for key in 0..20_000 {
+            cache.insert(key, key);
+        }
+        assert!(
+            cache.slots.overflow_chunks() > 0,
+            "a guard keeps every removed entry, past the slab region"
+        );
+        drop(guard);
+        cache.clear();
+        cache.maintain();
+        assert_eq!(
+            cache.slots.overflow_chunks(),
+            0,
+            "the slots the guard held stayed allocated"
+        );
+        for key in 0..20_000 {
+            cache.insert(key, key);
+        }
+        assert_eq!(
+            cache.slots.overflow_chunks(),
+            0,
+            "writes took overflow slots while region slots were vacant"
         );
     }
 

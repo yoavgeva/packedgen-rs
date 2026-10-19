@@ -2,7 +2,8 @@
 //!
 //! Readers and writers pin an epoch with the direct arena's reader protocol
 //! and its shared state machine in `direct_epoch_protocol`. Entries live in
-//! slab chunks rather than individual allocations:
+//! one slab region per cache rather than in individual allocations, with
+//! overflow chunks for bursts past the region (see `SlotStore`):
 //!
 //! - Writers take vacant slots from their thread's stack for the cache, and
 //!   write entries into them before taking the shard lock to publish.
@@ -21,7 +22,7 @@
 
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::cell::{RefCell, UnsafeCell};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::ptr::{self, NonNull};
@@ -54,10 +55,6 @@ const ACCESS_BIT: u64 = 1 << 63;
 /// try scans every reader counter, so trying per shard write would cost more
 /// than the writes.
 const ADVANCE_AFTER: usize = 512;
-/// The first chunk a shard allocates holds this many slots; later chunks
-/// double up to `MAX_CHUNK_SLOTS`.
-const MIN_CHUNK_SLOTS: usize = 8;
-const MAX_CHUNK_SLOTS: usize = 256;
 
 #[repr(align(128))]
 struct ReaderCount(AtomicUsize);
@@ -440,7 +437,7 @@ struct QueueState<T> {
     next_foreign: usize,
 }
 
-// SAFETY: queues only name slots of their cache's chunks, which outlive them,
+// SAFETY: queues only name slots of their cache's store, which outlives them,
 // and are only touched under their mutexes.
 #[allow(unsafe_code, reason = "retired queues hold raw slot pointers")]
 unsafe impl<T: Send> Send for QueueState<T> {}
@@ -589,7 +586,7 @@ const REPORT_EVERY: usize = 16;
 
 impl<T> Drop for RetiredSlots<T> {
     /// Drops every queued value. The owning cache is gone with every pin on
-    /// it, and its store frees the chunks only after this.
+    /// it, and its store frees the slots' memory only after this.
     #[allow(unsafe_code, reason = "drops retired values no pin reaches")]
     fn drop(&mut self) {
         for queue in &mut self.queues {
@@ -604,12 +601,21 @@ impl<T> Drop for RetiredSlots<T> {
 
 /// A cache's vacant slots.
 ///
-/// Each thread keeps its own stack of vacant slots for each cache it writes,
+/// Slots live in one region the store reserves up front, sized for the
+/// cache's entries and the retired entries reclamation usually trails by.
+/// Its pages are touched only as slots are first handed out. Each thread
+/// keeps its own stack of vacant region slots for each cache it writes,
 /// filled by the slots it reclaims, so a slot whose value a thread just
-/// dropped is refilled from that thread's cache lines. Threads draw new
-/// slots from the shared depot, in batches, and the depot from new chunks.
-/// A thread's stack overflows into the depot, and returns to it when the
-/// thread exits while the cache lives.
+/// dropped is refilled from that thread's cache lines. Threads draw region
+/// slots from the shared depot, in batches. A thread's stack overflows into
+/// the depot, and returns to it when the thread exits while the cache lives.
+///
+/// Once the region is used up, as while a pinned reader holds back
+/// reclamation, slots come one at a time from small overflow chunks, the
+/// lowest-addressed chunk with room first. Overflow slots return to their
+/// chunk, never to a thread's stack, and vacant region slots are taken
+/// first, so a chunk whose entries are all removed and reclaimed is freed.
+/// An entry that stays cached keeps its chunk.
 pub(crate) struct SlotStore<T> {
     id: u64,
     depot: Arc<Depot>,
@@ -622,44 +628,166 @@ static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
 const THREAD_BATCH: usize = 32;
 /// A thread's stack moves a batch to the depot past this many slots.
 const THREAD_LIMIT: usize = 4 * THREAD_BATCH;
+/// Slots per overflow chunk: few, so that the entries a cache keeps for long
+/// keep little memory allocated past the region.
+const OVERFLOW_CHUNK_SLOTS: usize = 64;
+/// The largest region: 2^31 eight-byte words.
+const MAX_REGION_BYTES: usize = 1 << 34;
 
-/// Vacant slots and chunks of one store, with slot types erased so threads'
-/// stacks can name the depot without naming the cache's entry type.
+/// A store's region, vacant slots, and overflow chunks, with slot types
+/// erased so threads' stacks can name the depot without naming the cache's
+/// entry type.
 struct Depot {
+    region: NonNull<u8>,
+    region_slots: usize,
+    /// The layout of one slot.
+    slot: Layout,
     state: Mutex<DepotState>,
 }
 
 struct DepotState {
+    /// Vacant region slots.
     vacant: Vec<NonNull<u8>>,
-    /// Every chunk the store allocated, with its layout, freed when the
-    /// depot drops.
-    chunks: Vec<(NonNull<u8>, Layout)>,
-    next_chunk: usize,
+    /// Region slots from this index on have never been handed out.
+    fresh: usize,
+    /// Overflow chunks by address.
+    overflow: BTreeMap<usize, OverflowChunk>,
+    /// Addresses of the overflow chunks with a slot to hand out.
+    open: BTreeSet<usize>,
 }
 
-// SAFETY: the depot only names slots of chunks it owns, behind its mutex.
-// Slots carry values between threads; `SlotStore<T>` is `Send` and `Sync`
-// only as `Slot<T>` is.
+struct OverflowChunk {
+    start: NonNull<u8>,
+    /// Slots from this index on have never been handed out.
+    fresh: usize,
+    vacant: Vec<NonNull<u8>>,
+    /// Slots handed out and not yet returned.
+    outstanding: usize,
+}
+
+// SAFETY: the depot only names slots of its own region and chunks, behind
+// its mutex. Slots carry values between threads; `SlotStore<T>` is `Send`
+// and `Sync` only as `Slot<T>` is.
 #[allow(unsafe_code, reason = "depots own raw slot pointers")]
 unsafe impl Send for Depot {}
-// SAFETY: as above; all access goes through the mutex.
+// SAFETY: as above; the region's address and size never change, and the
+// rest is behind the mutex.
 #[allow(unsafe_code, reason = "depots own raw slot pointers")]
 unsafe impl Sync for Depot {}
 
-impl Drop for Depot {
-    /// Frees every chunk. Values are dropped or vacant by now: the cache
-    /// dropped its published and retired values before releasing the depot.
-    #[allow(unsafe_code, reason = "frees chunks this depot allocated")]
-    fn drop(&mut self) {
-        for (chunk, layout) in self.state.get_mut().chunks.drain(..) {
-            // SAFETY: allocated with this layout; slots need no drop.
-            unsafe { dealloc(chunk.as_ptr(), layout) };
+impl Depot {
+    #[inline]
+    fn in_region(&self, slot: NonNull<u8>) -> bool {
+        slot.addr().get().wrapping_sub(self.region.addr().get())
+            < self.region_slots * self.slot.size()
+    }
+
+    #[allow(unsafe_code, reason = "indexes the region's slots")]
+    #[inline]
+    fn region_slot(&self, index: usize) -> NonNull<u8> {
+        debug_assert!(index < self.region_slots);
+        // SAFETY: the index is within the region.
+        unsafe { self.region.add(index * self.slot.size()) }
+    }
+
+    fn chunk_layout(&self, slots: usize) -> Layout {
+        Layout::from_size_align(slots * self.slot.size(), self.slot.align())
+            .expect("an overflow chunk's size fits isize")
+    }
+
+    /// A vacant slot of the lowest-addressed overflow chunk with one, or of
+    /// a new chunk.
+    #[allow(unsafe_code, reason = "allocates and indexes overflow chunks")]
+    #[cold]
+    fn take_overflow(&self, state: &mut DepotState) -> NonNull<u8> {
+        let address = if let Some(&address) = state.open.first() {
+            address
+        } else {
+            let layout = self.chunk_layout(OVERFLOW_CHUNK_SLOTS);
+            // SAFETY: a slot has a nonzero size: it holds an `AtomicU64`.
+            let start = NonNull::new(unsafe { alloc(layout) })
+                .unwrap_or_else(|| handle_alloc_error(layout));
+            let address = start.addr().get();
+            state.overflow.insert(
+                address,
+                OverflowChunk {
+                    start,
+                    fresh: 0,
+                    vacant: Vec::new(),
+                    outstanding: 0,
+                },
+            );
+            state.open.insert(address);
+            address
+        };
+        let chunk = state.overflow.get_mut(&address).expect("open chunks exist");
+        let slot = chunk.vacant.pop().unwrap_or_else(|| {
+            chunk.fresh += 1;
+            // SAFETY: an open chunk without vacant slots has fresh ones, so
+            // the index is within the chunk.
+            unsafe { chunk.start.add((chunk.fresh - 1) * self.slot.size()) }
+        });
+        chunk.outstanding += 1;
+        if chunk.vacant.is_empty() && chunk.fresh == OVERFLOW_CHUNK_SLOTS {
+            state.open.remove(&address);
+        }
+        slot
+    }
+
+    /// Returns an overflow slot to its chunk, freeing the chunk once all of
+    /// its slots are back.
+    #[allow(
+        unsafe_code,
+        reason = "frees an overflow chunk none of whose slots is out"
+    )]
+    #[cold]
+    fn give_overflow(&self, state: &mut DepotState, slot: NonNull<u8>) {
+        let (&address, chunk) = state
+            .overflow
+            .range_mut(..=slot.addr().get())
+            .next_back()
+            .expect("an overflow slot belongs to a chunk");
+        debug_assert!(
+            slot.addr().get() - address < OVERFLOW_CHUNK_SLOTS * self.slot.size(),
+            "an overflow slot belongs to a chunk"
+        );
+        chunk.outstanding -= 1;
+        if chunk.outstanding == 0 {
+            let chunk = state
+                .overflow
+                .remove(&address)
+                .expect("the chunk was found");
+            state.open.remove(&address);
+            let layout = self.chunk_layout(OVERFLOW_CHUNK_SLOTS);
+            // SAFETY: allocated with this layout, and none of its slots is
+            // out: each holds no value and is named nowhere else.
+            unsafe { dealloc(chunk.start.as_ptr(), layout) };
+        } else {
+            chunk.vacant.push(slot);
+            state.open.insert(address);
         }
     }
 }
 
-/// One thread's vacant slots for one store. Only the store whose id matches
-/// casts the pointers back to slots.
+impl Drop for Depot {
+    /// Frees the region and every overflow chunk. Values are dropped or
+    /// vacant by now: the cache dropped its published and retired values
+    /// before releasing the depot.
+    #[allow(unsafe_code, reason = "frees memory this depot allocated")]
+    fn drop(&mut self) {
+        let layout = self.chunk_layout(self.region_slots);
+        // SAFETY: the region was allocated with this layout.
+        unsafe { dealloc(self.region.as_ptr(), layout) };
+        let layout = self.chunk_layout(OVERFLOW_CHUNK_SLOTS);
+        for chunk in std::mem::take(&mut self.state.get_mut().overflow).into_values() {
+            // SAFETY: allocated with this layout.
+            unsafe { dealloc(chunk.start.as_ptr(), layout) };
+        }
+    }
+}
+
+/// One thread's vacant region slots for one store. Only the store whose id
+/// matches casts the pointers back to slots.
 struct ThreadSlots {
     store: u64,
     depot: Weak<Depot>,
@@ -684,14 +812,26 @@ thread_local! {
 }
 
 impl<T> SlotStore<T> {
-    pub(crate) fn new() -> Self {
+    /// A store whose region holds `region_slots` slots, at most 16 GiB.
+    #[allow(unsafe_code, reason = "allocates the region")]
+    pub(crate) fn new(region_slots: usize) -> Self {
+        let slot = Layout::new::<Slot<T>>();
+        let region_slots = region_slots.clamp(1, MAX_REGION_BYTES / slot.size());
+        let layout = Layout::array::<Slot<T>>(region_slots).expect("the region's size fits isize");
+        // SAFETY: `Slot<T>` has a nonzero size: it holds an `AtomicU64`.
+        let region =
+            NonNull::new(unsafe { alloc(layout) }).unwrap_or_else(|| handle_alloc_error(layout));
         Self {
             id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
             depot: Arc::new(Depot {
+                region,
+                region_slots,
+                slot,
                 state: Mutex::new(DepotState {
                     vacant: Vec::new(),
-                    chunks: Vec::new(),
-                    next_chunk: MIN_CHUNK_SLOTS,
+                    fresh: 0,
+                    overflow: BTreeMap::new(),
+                    open: BTreeSet::new(),
                 }),
             }),
             _slots: PhantomData,
@@ -711,7 +851,7 @@ impl<T> SlotStore<T> {
                         index
                     } else {
                         // Forget stacks of stores that no longer exist: their
-                        // chunks are gone, and their pointers are never read.
+                        // regions are gone, and their pointers are never read.
                         stores.0.retain(|stack| stack.depot.strong_count() != 0);
                         stores.0.push(ThreadSlots {
                             store: self.id,
@@ -729,67 +869,81 @@ impl<T> SlotStore<T> {
     /// A vacant slot the caller now owns.
     #[inline]
     pub(crate) fn take(&self) -> NonNull<Slot<T>> {
-        if let Some(slot) = self.with_stack(|stack| {
+        if let Some(Some(slot)) = self.with_stack(|stack| {
             if stack.is_empty() {
                 self.refill(stack);
             }
-            stack.pop().expect("a refill yields a slot")
+            stack.pop()
         }) {
             return slot.cast();
         }
-        // Thread-local storage is gone: draw straight from the depot.
-        let mut stack = Vec::new();
-        self.refill(&mut stack);
-        let slot = stack.pop().expect("a refill yields a slot");
-        self.depot.state.lock().vacant.extend(stack);
-        slot.cast()
+        self.take_unbatched()
     }
 
-    /// Moves a batch of vacant slots into `stack`, from the depot or else
-    /// from a new chunk.
-    #[allow(unsafe_code, reason = "indexes slots of a chunk just allocated")]
+    /// A slot straight from the depot: the region is used up, or
+    /// thread-local storage is gone.
+    #[cold]
+    fn take_unbatched(&self) -> NonNull<Slot<T>> {
+        let depot = &*self.depot;
+        let mut state = depot.state.lock();
+        if let Some(slot) = state.vacant.pop() {
+            return slot.cast();
+        }
+        if state.fresh < depot.region_slots {
+            state.fresh += 1;
+            return depot.region_slot(state.fresh - 1).cast();
+        }
+        depot.take_overflow(&mut state).cast()
+    }
+
+    /// Moves a batch of vacant region slots into `stack`, from the depot or
+    /// else from the region's untouched rest. Moves none once the region is
+    /// used up.
     fn refill(&self, stack: &mut Vec<NonNull<u8>>) {
-        let mut depot = self.depot.state.lock();
-        if !depot.vacant.is_empty() {
-            let keep = depot.vacant.len().saturating_sub(THREAD_BATCH);
-            stack.extend(depot.vacant.drain(keep..));
+        let depot = &*self.depot;
+        let mut state = depot.state.lock();
+        if !state.vacant.is_empty() {
+            let keep = state.vacant.len().saturating_sub(THREAD_BATCH);
+            stack.extend(state.vacant.drain(keep..));
             return;
         }
-        let len = depot.next_chunk;
-        depot.next_chunk = (len * 2).min(MAX_CHUNK_SLOTS);
-        let layout = Layout::array::<Slot<T>>(len).expect("a chunk's size fits isize");
-        // SAFETY: `Slot<T>` has a nonzero size: it holds an `AtomicU64`.
-        let chunk =
-            NonNull::new(unsafe { alloc(layout) }).unwrap_or_else(|| handle_alloc_error(layout));
-        depot.chunks.push((chunk, layout));
-        drop(depot);
-        let first = chunk.cast::<Slot<T>>();
-        // Last first, so pops walk the chunk in address order. `fill`
+        let first = state.fresh;
+        let end = (first + THREAD_BATCH).min(depot.region_slots);
+        state.fresh = end;
+        drop(state);
+        // Last first, so pops walk the region in address order. `fill`
         // initializes each slot before anything reads it.
-        stack.extend(
-            (0..len)
-                .rev()
-                // SAFETY: every index is within the new chunk.
-                .map(|index| unsafe { first.add(index) }.cast::<u8>()),
-        );
+        stack.extend((first..end).rev().map(|index| depot.region_slot(index)));
     }
 
-    /// Gives this thread vacant slots, overflowing into the depot.
+    /// Gives back vacant slots: region slots to this thread's stack, which
+    /// overflows into the depot, and overflow slots to their chunks.
     #[inline]
-    fn give(&self, slots: &[NonNull<Slot<T>>]) {
-        let given = self.with_stack(|stack| {
+    pub(crate) fn give(&self, slots: &[NonNull<Slot<T>>]) {
+        let depot = &*self.depot;
+        let mut overflow = false;
+        let stacked = self.with_stack(|stack| {
             for slot in slots {
-                stack.push(slot.cast());
+                if depot.in_region(slot.cast()) {
+                    stack.push(slot.cast());
+                } else {
+                    overflow = true;
+                }
             }
             if stack.len() > THREAD_LIMIT {
                 let keep = stack.len() - THREAD_BATCH;
-                self.depot.state.lock().vacant.extend(stack.drain(keep..));
+                depot.state.lock().vacant.extend(stack.drain(keep..));
             }
         });
-        if given.is_none() {
-            let mut depot = self.depot.state.lock();
+        if stacked.is_none() || overflow {
+            let mut state = depot.state.lock();
             for slot in slots {
-                depot.vacant.push(slot.cast());
+                let slot = slot.cast();
+                if !depot.in_region(slot) {
+                    depot.give_overflow(&mut state, slot);
+                } else if stacked.is_none() {
+                    state.vacant.push(slot);
+                }
             }
         }
     }
@@ -863,6 +1017,58 @@ mod tests {
         pub(crate) fn depot_len(&self) -> usize {
             self.depot.state.lock().vacant.len()
         }
+
+        pub(crate) fn in_region(&self, slot: NonNull<Slot<T>>) -> bool {
+            self.depot.in_region(slot.cast())
+        }
+
+        /// Overflow chunks the store holds.
+        pub(crate) fn overflow_chunks(&self) -> usize {
+            self.depot.state.lock().overflow.len()
+        }
+    }
+
+    #[test]
+    fn slots_come_from_one_region_until_it_fills() {
+        let store = SlotStore::<u64>::new(100);
+        let slots: Vec<_> = (0..100).map(|_| store.take()).collect();
+        assert!(
+            slots.iter().all(|&slot| store.in_region(slot)),
+            "a slot came from outside the region"
+        );
+        let mut addresses: Vec<_> = slots.iter().map(|slot| slot.as_ptr() as usize).collect();
+        addresses.sort_unstable();
+        addresses.dedup();
+        assert_eq!(addresses.len(), 100, "a region slot was handed out twice");
+        let extra = store.take();
+        assert!(!store.in_region(extra), "the region holds only 100 slots");
+        store.give(&slots);
+        store.give(&[extra]);
+    }
+
+    #[test]
+    fn overflow_chunks_are_freed_once_their_slots_return() {
+        let store = SlotStore::<u64>::new(16);
+        let region: Vec<_> = (0..16).map(|_| store.take()).collect();
+        let overflow: Vec<_> = (0..1_000).map(|_| store.take()).collect();
+        assert!(overflow.iter().all(|&slot| !store.in_region(slot)));
+        assert!(store.overflow_chunks() > 0);
+        store.give(&overflow[..500]);
+        assert!(
+            store.overflow_chunks() > 0,
+            "half the overflow is still out"
+        );
+        store.give(&overflow[500..]);
+        assert_eq!(
+            store.overflow_chunks(),
+            0,
+            "a vacant overflow chunk was kept"
+        );
+        store.give(&region);
+        assert!(
+            store.in_region(store.take()),
+            "vacant region slots come first"
+        );
     }
 
     #[test]
@@ -906,8 +1112,8 @@ mod tests {
     #[test]
     fn writes_reclaim_as_many_slots_as_they_retire() {
         let epochs = Epochs::new();
-        // Declared first so it drops last: retired values live in its chunks.
-        let store = SlotStore::new();
+        // Declared first so it drops last: retired values live in its region.
+        let store = SlotStore::new(4_096);
         let retired = RetiredSlots::new();
         assert_eq!(retire_filled(&epochs, &retired, &store, 64), 0);
         for _ in 0..3 {
@@ -937,8 +1143,8 @@ mod tests {
         // advances earlier. On x86, with a 1 MB L2, that read and the
         // value's own then missed in series.
         let epochs = Epochs::new();
-        // Declared first so it drops last: retired values live in its chunks.
-        let store = SlotStore::new();
+        // Declared first so it drops last: retired values live in its region.
+        let store = SlotStore::new(4_096);
         let retired = RetiredSlots::new();
         assert_eq!(retire_filled(&epochs, &retired, &store, 4), 0);
         for _ in 0..3 {
@@ -958,8 +1164,8 @@ mod tests {
     #[test]
     fn foreign_drains_leave_a_retiring_threads_queue_alone() {
         let epochs = Epochs::new();
-        // Declared first so it drops last: retired values live in its chunks.
-        let store = SlotStore::new();
+        // Declared first so it drops last: retired values live in its region.
+        let store = SlotStore::new(4_096);
         let retired = RetiredSlots::new();
         let (to_other, other_requests) = mpsc::channel::<usize>();
         let (to_main, other_retired) = mpsc::channel();

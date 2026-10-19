@@ -80,9 +80,10 @@ entry. Tables are sized once and never rebuilt.
   - Past 1.25 times the shard's capacity, the main queue drops stale records
     from its front in chunks of 64. A table sweep remains the fallback when
     the queue is exhausted.
-- **Storage and reclamation.** Entries live in slab chunks of 8 to 256
-  slots, in `src/sharded_arena.rs`, under the direct arena's reader protocol
-  and epoch state machine.
+- **Storage and reclamation.** Entries live in one slab region per cache,
+  with small overflow chunks past it (see "The slab region"), in
+  `src/sharded_arena.rs`, under the direct arena's reader protocol and
+  epoch state machine.
   - A writer pins, takes a vacant slot from its thread's stack for the
     cache, and fills it before taking the shard lock.
   - After the lock, still pinned, it queues the entries it unpublished in its
@@ -100,8 +101,8 @@ entry. Tables are sized once and never rebuilt.
     nothing for three advances, and then returns to it until it is empty.
     `maintain()` drains every queue.
   - A thread's stack overflows into a shared depot, draws from it in batches
-    of 32, and returns to it when the thread exits. Chunks are freed when the
-    cache drops; a stack left for a dropped cache is forgotten without
+    of 32, and returns to it when the thread exits. The region is freed when
+    the cache drops; a stack left for a dropped cache is forgotten without
     touching its slots.
   - The generation advances once 512 retirements are pending across the
     cache. A failed try waits for 256 more.
@@ -229,10 +230,56 @@ For comparison, the overhead is 28 to 32 for `DirectPackedCache` and 78 to 210
 for quick_cache. The main queue added about 3.5 bytes per entry and bought
 about 3.4 points of trace hit rate.
 
+## The slab region
+
+Entries lived in slab chunks of 8 to 256 slots, allocated as a cache grew
+and freed only when it dropped. Under write churn on more threads than free
+cores, a reader preempted while pinned holds back every advance for its
+time slice while the other threads go on retiring entries, so the slab's
+high-water mark climbed past the cache's capacity and stayed there. Slots
+allocated at 50,000 entries, replacing keys, on the 16-core M4 Max with
+other work keeping about seven cores busy:
+
+| Threads | Slots allocated | Over capacity |
+| ---: | ---: | ---: |
+| 2 to 4 | 52,000 to 54,000 | +5 to 8% |
+| 8 | 57,000 to 59,000 | +14 to 18% |
+| 12 to 16 | 77,000 to 134,000 | +54 to 168% |
+
+A 1,000-entry cache reached 17,900 slots at eight threads. At 56 bytes a
+slot, the worst run above kept 94 bytes per entry of slab beyond the
+cache's own.
+
+Each cache now reserves one region at build: its entry limit, plus 4,096
+slots, plus 256 per available thread, the reclamation backlog of one thread
+and each thread's stack of vacant slots. Its pages are touched only as
+slots are first handed out. Past the region, writers take slots one at a
+time from overflow chunks of 64, the lowest-addressed chunk with room
+first. Overflow slots return to their chunk, never to a thread's stack,
+and vacant region slots are taken first, so a chunk is freed once every
+entry in it has been removed and reclaimed. An entry that stays cached
+keeps its chunk; small chunks keep that cost small. Entries are never
+moved: a value with interior mutability, such as an atomic, would lose
+updates readers made through a guard to the old copy.
+
+Requested bytes now include the region's spare slots, which a
+single-threaded fill never touches: at 100,000 entries on 16 threads they
+added 2 to 8.5 bytes per entry, and at 1,000,000 entries under 1.
+
+Throughput against the previous commit was level, but only once both
+sides were built alike. In the first comparison, built with the default
+16 codegen units, resident hits ran 11 to 16% slower and turnover 10 to
+14%, with `get`'s machine code identical but for the compiler declining to
+inline `BuildHasher::hash_one` (see "Hashing without `hash_one`"). Built
+with one codegen unit, and again with the hashing change in both, resident
+hits moved by −2 to +14% at 50,000 entries and by 0 to +1% at 1,000,000,
+and writes by −3 to +4%.
+
 ## Slab storage against boxed entries
 
 Entries first lived in individually allocated boxes in the direct arena.
-They now live in slab chunks (see "Storage and reclamation").
+They then lived in slab chunks, and now in a slab region (see "Storage and
+reclamation").
 
 Process RSS per resident entry with 1,000,000 entries after 3,000,000
 inserts. Unlike the requested-bytes table above, this includes allocator
