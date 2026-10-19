@@ -31,7 +31,7 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use parking_lot::Mutex;
 
-use crate::cache_arena::direct_arena_thread;
+use crate::cache_arena::{assigned_thread_shards, claimed_thread_shards, direct_arena_thread};
 pub(crate) use crate::direct_epoch_protocol::reclaim_at;
 use crate::direct_epoch_protocol::{EPOCHS, enter_epoch, leave_epoch, plan_epoch_advance};
 
@@ -55,6 +55,16 @@ const ACCESS_BIT: u64 = 1 << 63;
 /// try scans every reader counter, so trying per shard write would cost more
 /// than the writes.
 const ADVANCE_AFTER: usize = 512;
+/// Retirements per reader shard in use before an advance is tried.
+const ADVANCE_PER_SHARD: usize = 32;
+
+/// Retirements pending across a cache before an advance is tried: 32 per
+/// reader shard any thread has used, at most `ADVANCE_AFTER`.
+#[inline]
+fn advance_after() -> usize {
+    (ADVANCE_PER_SHARD * assigned_thread_shards().count_ones() as usize)
+        .clamp(ADVANCE_PER_SHARD, ADVANCE_AFTER)
+}
 
 #[repr(align(128))]
 struct ReaderCount(AtomicUsize);
@@ -90,7 +100,7 @@ impl Epochs {
     /// across the cache to try advancing the generation.
     #[inline]
     pub(crate) fn note_retired(&self, count: usize) -> bool {
-        self.pending.0.fetch_add(count, Ordering::Relaxed) + count >= ADVANCE_AFTER
+        self.pending.0.fetch_add(count, Ordering::Relaxed) + count >= advance_after()
     }
 
     /// Pins the current epoch: slots unpublished after this returns are not
@@ -151,16 +161,28 @@ impl Epochs {
             return false;
         };
         let generation = self.generation.load(Ordering::SeqCst);
+        // Read after the generation, and with a read-modify-write, as the
+        // counters are: a reader in an epoch this advance must find quiescent
+        // claimed its shard before loading the generation that an earlier
+        // advance replaced.
+        let shards = claimed_thread_shards();
         let Some(advance) = plan_epoch_advance(generation, |epoch| {
-            self.readers[epoch * READER_SHARDS..(epoch + 1) * READER_SHARDS]
-                .iter()
+            let counters = &self.readers[epoch * READER_SHARDS..(epoch + 1) * READER_SHARDS];
+            let mut remaining = shards;
+            while remaining != 0 {
+                let shard = remaining.trailing_zeros() as usize;
+                remaining &= remaining - 1;
                 // A zero-delta RMW observes the immediately preceding counter
                 // modification, which a load racing a registration may not.
-                .all(|count| count.0.fetch_add(0, Ordering::SeqCst) == 0)
+                if counters[shard].0.fetch_add(0, Ordering::SeqCst) != 0 {
+                    return false;
+                }
+            }
+            true
         }) else {
             // Readers still hold an old epoch: wait for half as many more
             // retirements before scanning again.
-            self.pending.0.store(ADVANCE_AFTER / 2, Ordering::Relaxed);
+            self.pending.0.store(advance_after() / 2, Ordering::Relaxed);
             return false;
         };
         self.pending.0.store(0, Ordering::Relaxed);
