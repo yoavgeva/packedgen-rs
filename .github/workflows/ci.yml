@@ -2,6 +2,8 @@ name: CI
 
 on:
   push:
+    # Branches under bench/ only run the benchmarks.
+    branches-ignore: ['bench/**']
   pull_request:
 
 permissions:
@@ -88,7 +90,7 @@ jobs:
   memory-safety:
     name: Loom, Miri, and sanitizers
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

@@ -11,7 +11,8 @@
 //! models `model-clock`, `model-s3clock`, `model-s3fifo`, `model-quick`
 //! (`QuickCache` 0.7's policy), and `model-tinylfu` (W-TinyLFU). One CSV row is
 //! printed per policy. A packed policy accepts `/batch=N`, `/probation=BPS`,
-//! `/maint=N`, and `/overlay=N` (see `packed_config`); a model accepts the
+//! `/maint=N`, and `/overlay=N` (see `packed_config`); `sharded` accepts
+//! `/probation=BPS` and `/shards=N`; a model accepts the
 //! options listed at `ClockModel::parse`.
 //!
 //! Reads are look-aside, as in `bounded_cache_probe`: a miss admits the key.
@@ -1257,20 +1258,24 @@ fn run_policy(policy: &str, trace: &Trace, entries: usize) -> Outcome {
             )),
         ),
         sharded if sharded.starts_with("sharded") => {
-            let probation = sharded
+            let builder = ShardedCacheBuilder::new(entries);
+            let builder = match sharded
                 .split('/')
                 .find_map(|option| option.strip_prefix("probation="))
-                .map_or(200, |bps| {
-                    bps.parse().expect("probation= takes basis points")
-                });
-            replay(
-                trace,
-                &mut ShardedSession(
-                    ShardedCacheBuilder::new(entries)
-                        .probation_bps(probation)
-                        .build(),
-                ),
-            )
+            {
+                Some(bps) => {
+                    builder.probation_bps(bps.parse().expect("probation= takes basis points"))
+                }
+                None => builder,
+            };
+            let builder = match sharded
+                .split('/')
+                .find_map(|option| option.strip_prefix("shards="))
+            {
+                Some(shards) => builder.shards(shards.parse().expect("shards= takes a count")),
+                None => builder,
+            };
+            replay(trace, &mut ShardedSession(builder.build()))
         }
         "lru" => replay(trace, &mut Lru::new(entries)),
         model if model.starts_with("model-") => {

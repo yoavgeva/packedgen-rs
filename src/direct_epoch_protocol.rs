@@ -13,18 +13,40 @@ pub(crate) struct EpochAdvance {
     pub(crate) next_epoch: usize,
 }
 
+#[inline]
 pub(crate) const fn epoch_slot(token: usize) -> usize {
     let slot = token & EPOCH_SLOT_MASK;
     debug_assert!(slot < EPOCHS);
     slot
 }
 
+#[inline]
 pub(crate) const fn next_epoch_token(token: usize) -> Option<usize> {
     match epoch_slot(token) {
         0 | 1 => token.checked_add(1),
         2 => token.checked_add(2),
         _ => unreachable!(),
     }
+}
+
+/// Generation advances between retiring a slot and reclaiming it.
+pub(crate) const AGING_ADVANCES: usize = 3;
+
+/// The first generation token at which a slot tagged `tag` may be
+/// reclaimed: `AGING_ADVANCES` advances later. The advance that reuses the
+/// tag's epoch slot found that slot and the next quiescent. Saturates, never
+/// reclaiming, past the last representable token.
+#[allow(dead_code, reason = "each including crate uses a different subset")]
+#[inline]
+pub(crate) fn reclaim_at(tag: usize) -> usize {
+    let mut aged = tag;
+    for _ in 0..AGING_ADVANCES {
+        let Some(next) = next_epoch_token(aged) else {
+            return usize::MAX;
+        };
+        aged = next;
+    }
+    aged
 }
 
 #[inline]

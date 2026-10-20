@@ -2245,12 +2245,20 @@ fn production_diagnostics_capture_capacity_debt_and_admission_reasons() {
             CacheAdmissionOutcome::Inserted
         );
     }
-    assert_eq!(
+    // The doorkeeper is approximate: it reads about 2% of unseen keys as
+    // seen, and admits them. Offer fresh keys until its first rejection.
+    let rejected = (0..16).any(|attempt| {
         cache
-            .insert_if_absent_with_options(b"one-off", vec![1; 8], 1, None)
-            .unwrap(),
-        CacheAdmissionOutcome::Rejected
-    );
+            .insert_if_absent_with_options(
+                format!("one-off {attempt}").as_bytes(),
+                vec![1; 8],
+                1,
+                None,
+            )
+            .unwrap()
+            == CacheAdmissionOutcome::Rejected
+    });
+    assert!(rejected, "the doorkeeper admitted 16 unseen keys");
     for key in CAPACITY as u64..CAPACITY as u64 + 24 {
         cache
             .insert_discard_with_options(&key.to_le_bytes(), vec![2; 8], 1, None)

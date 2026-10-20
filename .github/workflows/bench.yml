@@ -1,0 +1,87 @@
+name: Benchmarks
+
+# Push a branch under bench/ to measure it on GitHub's x86_64 runners: its
+# tip against quick_cache, against its parent commit with the default and
+# with one codegen unit, and on mokabench's ARC trace replay. Shared runners are noisy: read medians across pairs, and only
+# large differences.
+on:
+  push:
+    branches: ['bench/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  x86:
+    name: x86_64 benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bench
+      - name: Machine
+        run: lscpu | sed -n '1,20p'
+      - name: 50,000 entries
+        run: |
+          sh scripts/compare_sharded_quick.sh 3 "1 4" 50000 target/compare-50k.csv
+          python3 scripts/summarize_compare.py target/compare-50k.csv | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: 1,000,000 entries
+        run: |
+          sh scripts/compare_sharded_quick.sh 3 "1 4" 1000000 target/compare-1m.csv
+          python3 scripts/summarize_compare.py target/compare-1m.csv | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Against the parent commit
+        run: |
+          cp target/release/examples/bounded_cache_probe target/probe-head
+          git worktree add ../parent HEAD^
+          (cd ../parent && cargo build --locked --release --example bounded_cache_probe --target-dir ../target-parent)
+          sh scripts/compare_sharded_builds.sh ../target-parent/release/examples/bounded_cache_probe \
+            target/probe-head 5 "1 4" 50000 target/compare-parent.csv
+          python3 scripts/summarize_compare.py target/compare-parent.csv head base | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Against the parent commit, one codegen unit
+        # Code layout alone moves some cells by 20% or more, so a change
+        # should hold its sign with both codegen settings.
+        env:
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 1
+        run: |
+          cargo build --locked --release --example bounded_cache_probe --target-dir target-cgu1
+          (cd ../parent && cargo build --locked --release --example bounded_cache_probe --target-dir ../target-parent-cgu1)
+          sh scripts/compare_sharded_builds.sh ../target-parent-cgu1/release/examples/bounded_cache_probe \
+            target-cgu1/release/examples/bounded_cache_probe 5 "1 4" 50000 target/compare-parent-cgu1.csv
+          echo "One codegen unit:" | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 scripts/summarize_compare.py target/compare-parent-cgu1.csv head base | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Raw results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compare-sharded-quick-${{ github.run_id }}
+          path: target/compare-*.csv
+          if-no-files-found: warn
+
+  mokabench:
+    name: x86_64 mokabench
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Machine
+        run: lscpu | sed -n '1,20p'
+      - name: ARC traces
+        env:
+          MOKABENCH_CACHES: packedgen,quick_cache
+        run: |
+          sh scripts/mokabench.sh 3 1,2,4 "s3 ds1 p8 s1 p3 oltp" target/mokabench.csv
+          python3 scripts/summarize_mokabench.py target/mokabench.csv | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Raw results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mokabench-${{ github.run_id }}
+          path: target/mokabench.csv
+          if-no-files-found: warn

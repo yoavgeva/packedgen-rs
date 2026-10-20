@@ -6,8 +6,7 @@
 //! arena uses `seize`. Both retire values only after they become unreachable,
 //! and owned guards keep returned values alive after removal or cache drop.
 
-use std::alloc::Layout;
-use std::cell::{Cell, RefCell, UnsafeCell};
+use std::cell::{Cell, UnsafeCell};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
@@ -75,6 +74,26 @@ pub(crate) const DIRECT_MAX_EXPIRY_TICK: u64 = 0x7fff_fffe;
 pub(crate) const MAX_EXPIRY_TICK: u64 = u32::MAX as u64 - 1;
 
 static NEXT_DIRECT_ARENA_THREAD: AtomicUsize = AtomicUsize::new(0);
+/// Bit `index & 63` is set for every thread index assigned so far.
+static ASSIGNED_THREAD_SHARDS: AtomicU64 = AtomicU64::new(0);
+
+/// The low six bits of every thread index assigned so far, as a mask. A
+/// thread's bit is set, with a sequentially consistent read-modify-write,
+/// before its index is first returned. A load, which may lag a recent
+/// assignment: for pacing only.
+#[inline]
+pub(crate) fn assigned_thread_shards() -> u64 {
+    ASSIGNED_THREAD_SHARDS.load(Ordering::Relaxed)
+}
+
+/// As [`assigned_thread_shards`], read with a zero-delta read-modify-write,
+/// which observes every assignment before it in the mask's modification
+/// order, where a load may not. Epoch advances use it to choose which
+/// reader counters to scan (see `tests/cache_concurrency_model.rs`).
+#[inline]
+pub(crate) fn claimed_thread_shards() -> u64 {
+    ASSIGNED_THREAD_SHARDS.fetch_or(0, Ordering::SeqCst)
+}
 
 thread_local! {
     static DIRECT_ARENA_THREAD: Cell<usize> = const { Cell::new(usize::MAX) };
@@ -392,6 +411,7 @@ impl DirectHandle {
         Self(NonMaxU64::new(tagged).expect("allocated pointer is not the reserved marker"))
     }
 
+    #[cfg(feature = "prepared-keys")]
     fn from_recycled_boxed_pointer<V>(pointer: *mut DirectArenaEntry<V>) -> Self {
         let address = pointer.expose_provenance();
         debug_assert_eq!(address & DIRECT_POINTER_TAGS, 0);
@@ -639,16 +659,7 @@ enum DirectMutationReservation {
 impl<V> DirectValueArena<V> {
     pub(crate) fn new(partitions: usize) -> Self {
         Self {
-            owner: Arc::new(DirectArenaOwner::new(partitions, false)),
-        }
-    }
-
-    /// An arena whose reclaimed recycled boxes go to the reclaiming thread's
-    /// lock-free stash for `allocate_recycled`, rather than to the shard
-    /// pools that prepared reservations draw from.
-    pub(crate) fn new_stashing(partitions: usize) -> Self {
-        Self {
-            owner: Arc::new(DirectArenaOwner::new(partitions, true)),
+            owner: Arc::new(DirectArenaOwner::new(partitions)),
         }
     }
 
@@ -683,21 +694,6 @@ impl<V> DirectValueArena<V> {
         ))))
     }
 
-    /// Allocates a boxed entry, reusing a box this thread's earlier
-    /// retirements returned to the pool when one is available, so steady
-    /// churn neither allocates nor frees entry memory.
-    #[allow(unsafe_code, reason = "initializes one uniquely reserved recycled box")]
-    pub(crate) fn allocate_recycled(&self, value: V, weight: u32, expires_at: u64) -> DirectHandle {
-        let pointer = direct_stash_take(self.owner.id).map_or_else(
-            || Box::into_raw(Box::new(MaybeUninit::<DirectArenaEntry<V>>::uninit())).cast(),
-            |stashed| stashed.as_ptr().cast::<DirectArenaEntry<V>>(),
-        );
-        // SAFETY: the pointer is a unique, uninitialized box owned by this
-        // arena, and nothing can observe it before it is published.
-        unsafe { pointer.write(DirectArenaEntry::new(value, weight, expires_at)) };
-        DirectHandle::from_recycled_boxed_pointer(pointer)
-    }
-
     #[cfg(feature = "prepared-keys")]
     pub(crate) fn recycled_boxed_reservation(
         &self,
@@ -725,6 +721,7 @@ impl<V> DirectValueArena<V> {
         Arc::strong_count(&self.owner)
     }
 
+    #[inline]
     pub(crate) fn pin(&self) -> DirectArenaPin<'_, V> {
         let thread_id = direct_arena_thread();
         let reader_shard = thread_id & (DIRECT_READER_SHARDS - 1);
@@ -1091,6 +1088,7 @@ impl<V> Drop for DirectArenaValue<'_, V> {
 }
 
 impl<V> Drop for DirectArenaPin<'_, V> {
+    #[inline]
     fn drop(&mut self) {
         if self.active {
             self.arena.owner.leave(self.reader_epoch, self.reader_shard);
@@ -1912,76 +1910,6 @@ impl Drop for DirectRetiredBatch<'_> {
     }
 }
 
-static NEXT_DIRECT_ARENA_ID: AtomicU64 = AtomicU64::new(1);
-/// Boxes a thread keeps for reuse, and the largest box it keeps: together
-/// they bound what a thread can hold after its arenas are gone.
-const DIRECT_BOX_STASH_CAPACITY: usize = 256;
-const DIRECT_BOX_STASH_MAX_BYTES: usize = 512;
-
-/// Entry boxes this thread reclaimed, reused by its own allocations without
-/// any lock. Each is tagged with its arena's id and layout; a box whose arena
-/// is gone is freed when evicted or when the thread exits.
-struct DirectBoxStash(std::collections::VecDeque<(u64, NonNull<u8>, Layout)>);
-
-#[allow(
-    unsafe_code,
-    reason = "frees boxes the stash exclusively owns with their recorded layouts"
-)]
-impl Drop for DirectBoxStash {
-    fn drop(&mut self) {
-        for (_, pointer, layout) in self.0.drain(..) {
-            // SAFETY: each stashed pointer is an uninitialized box allocated
-            // with `layout` and owned only by this stash.
-            unsafe { std::alloc::dealloc(pointer.as_ptr(), layout) };
-        }
-    }
-}
-
-thread_local! {
-    static DIRECT_BOX_STASH: RefCell<DirectBoxStash> =
-        const { RefCell::new(DirectBoxStash(std::collections::VecDeque::new())) };
-}
-
-/// Takes one of `arena_id`'s boxes from this thread's stash.
-fn direct_stash_take(arena_id: u64) -> Option<NonNull<u8>> {
-    DIRECT_BOX_STASH
-        .try_with(|stash| {
-            let mut stash = stash.try_borrow_mut().ok()?;
-            let position = stash.0.iter().rposition(|(id, _, _)| *id == arena_id)?;
-            stash.0.remove(position).map(|(_, pointer, _)| pointer)
-        })
-        .ok()
-        .flatten()
-}
-
-/// Parks an uninitialized box in this thread's stash. Returns `false`, and
-/// leaves the box with the caller, when it cannot be stashed.
-#[allow(
-    unsafe_code,
-    reason = "frees the oldest stashed box with its recorded layout"
-)]
-fn direct_stash_put(arena_id: u64, pointer: NonNull<u8>, layout: Layout) -> bool {
-    if layout.size() > DIRECT_BOX_STASH_MAX_BYTES {
-        return false;
-    }
-    DIRECT_BOX_STASH
-        .try_with(|stash| {
-            let Ok(mut stash) = stash.try_borrow_mut() else {
-                return false;
-            };
-            if stash.0.len() == DIRECT_BOX_STASH_CAPACITY
-                && let Some((_, oldest, oldest_layout)) = stash.0.pop_front()
-            {
-                // SAFETY: the stash exclusively owned this uninitialized box,
-                // allocated with the layout recorded beside it.
-                unsafe { std::alloc::dealloc(oldest.as_ptr(), oldest_layout) };
-            }
-            stash.0.push_back((arena_id, pointer, layout));
-            true
-        })
-        .unwrap_or(false)
-}
-
 struct DirectRecycledBoxGuard<V> {
     pointer: *mut DirectArenaEntry<V>,
 }
@@ -2004,10 +1932,6 @@ impl<V> Drop for DirectRecycledBoxGuard<V> {
 
 struct DirectArenaOwner<V> {
     state: DirectArenaState<V>,
-    /// Tags this arena's boxes in thread stashes; never reused.
-    id: u64,
-    /// Whether reclaimed recycled boxes go to thread stashes first.
-    stashes_boxes: bool,
     // Monotonic token. The low two bits select physical slot 0, 1, or 2; the
     // remaining bits prevent a stalled reader from accepting a slot after the
     // collector completes a full cycle. Encoding the slot avoids division on
@@ -2040,11 +1964,9 @@ struct DirectArenaOwner<V> {
 }
 
 impl<V> DirectArenaOwner<V> {
-    fn new(partitions: usize, stashes_boxes: bool) -> Self {
+    fn new(partitions: usize) -> Self {
         Self {
             state: DirectArenaState::new(partitions),
-            id: NEXT_DIRECT_ARENA_ID.fetch_add(1, Ordering::Relaxed),
-            stashes_boxes,
             current_epoch: AtomicUsize::new(0),
             mutator_overflow: AtomicUsize::new(0),
             mutator_activity: AtomicBool::new(false),
@@ -2277,6 +2199,7 @@ impl<V> DirectArenaOwner<V> {
         }
     }
 
+    #[inline]
     fn enter(&self, reader_shard: usize) -> usize {
         enter_epoch(
             || self.current_epoch.load(Ordering::SeqCst),
@@ -2320,6 +2243,7 @@ impl<V> DirectArenaOwner<V> {
         DirectMutationReservation::Overflow
     }
 
+    #[inline]
     fn leave(&self, reader_epoch: usize, reader_shard: usize) {
         leave_epoch(reader_epoch, |epoch| {
             self.readers[epoch * DIRECT_READER_SHARDS + reader_shard]
@@ -2712,21 +2636,11 @@ impl<V> DirectArenaOwner<V> {
                 // SAFETY: boxed handles originate from Box::into_raw and the
                 // quiescent-state proof gives this reclaimer unique access.
                 unsafe { ptr::drop_in_place(pointer) };
-                // The value is gone, so no user code runs while the stash is
-                // borrowed; overflow goes to the shard pool reservations use.
-                let stashed = self.stashes_boxes
-                    && NonNull::new(pointer.cast::<u8>()).is_some_and(|box_pointer| {
-                        direct_stash_put(self.id, box_pointer, Layout::new::<DirectArenaEntry<V>>())
-                    });
-                if stashed {
+                let recycled =
+                    recycled.get_or_insert_with(|| self.recycled_boxes()[retired_shard].0.lock());
+                if recycled.len() < DIRECT_RECYCLED_BOX_CAPACITY_PER_SHARD {
                     std::mem::forget(allocation);
-                } else {
-                    let recycled = recycled
-                        .get_or_insert_with(|| self.recycled_boxes()[retired_shard].0.lock());
-                    if recycled.len() < DIRECT_RECYCLED_BOX_CAPACITY_PER_SHARD {
-                        std::mem::forget(allocation);
-                        recycled.push(handle);
-                    }
+                    recycled.push(handle);
                 }
                 #[cfg(feature = "cache-production-diagnostics")]
                 self.note_reclaimed(1, retired_bytes);
@@ -2991,6 +2905,7 @@ impl<V> DirectArenaState<V> {
     }
 }
 
+#[inline]
 pub(crate) fn direct_arena_thread() -> usize {
     DIRECT_ARENA_THREAD.with(|thread| {
         let current = thread.get();
@@ -2998,6 +2913,7 @@ pub(crate) fn direct_arena_thread() -> usize {
             return current;
         }
         let assigned = NEXT_DIRECT_ARENA_THREAD.fetch_add(1, Ordering::Relaxed);
+        ASSIGNED_THREAD_SHARDS.fetch_or(1 << (assigned & 63), Ordering::SeqCst);
         thread.set(assigned);
         assigned
     })
@@ -3683,7 +3599,7 @@ mod tests {
 
     #[test]
     fn direct_mutation_slots_fall_back_and_release_exactly() {
-        let owner = DirectArenaOwner::<u64>::new(1, false);
+        let owner = DirectArenaOwner::<u64>::new(1);
         owner.activate_mutators();
         let reservations = (0..=DIRECT_READER_SHARDS)
             .map(|_| owner.enter_mutator(0))
@@ -4301,7 +4217,7 @@ mod tests {
             for _ in 0..8 {
                 scope.spawn(|| {
                     for _ in 0..1_000 {
-                        drop(DirectArenaOwner::<u64>::new(1, false));
+                        drop(DirectArenaOwner::<u64>::new(1));
                     }
                 });
             }
