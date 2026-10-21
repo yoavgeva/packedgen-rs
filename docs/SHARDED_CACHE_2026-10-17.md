@@ -1072,18 +1072,37 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
 - **Reclaiming in batches of 32.** Freeing values together was meant to
   overlap their cache misses; eight-thread writes fell 12 to 16% instead.
 - **A per-bucket summary of tags for misses.** A 32-bit word per bucket,
-  in an array of its own, held a bit per tag class present and a bit for
-  keys displaced to the alternate; readers checked it before loading the
-  bucket, and writers refreshed it when its bits changed. At 1,000,000
-  entries the 2 MB array stayed in L2 and misses ran 1.4 to 1.95 times as
-  fast, near quick_cache's on one thread. But resident hits lost 13 to 34%
-  with an acquiring load of the summary and a prefetch of the bucket, and 9
-  to 20% with a relaxed load and no prefetch, at 50,000 entries as well;
-  turnover lost 3 to 13%. At 50,000 entries the summaries stay cached, and
-  `get` then saved one more register pair and kept a larger frame: the
-  summary slice was one more value live through the lookup, the
-  register-pressure shape that cost hits under "Four-byte handles", so the
-  loss may be mostly code shape rather than the summary's own cost.
+  in an array beside the table, about 0.5 bytes per entry, held a bit per
+  class of the tags in its slots and a bit set while its overflow count
+  was nonzero.
+  - A first version, checked before loading the bucket, cost resident hits
+    9 to 34%, likely from the shape it gave `get`'s code.
+  - A second version checked the home's summary, and the alternate's when
+    the home had overflowed, before pinning, so a miss it ruled out took no
+    pin and loaded no bucket. A tag's class was its low five bits, with 31
+    sharing 30's bit. In a full cache about a quarter of misses passed.
+    Writers kept summaries exact under the shard lock: a placement set its
+    tag's bit, and a removal cleared it unless a word-wide byte test found
+    another tag of its class in the bucket.
+  - On one thread of an M4 Max, misses at 1,000,000 entries ran at 62 to
+    68 Mops/s instead of 26 to 30, and 7 to 17% faster at 50,000. Resident
+    hits lost 1 to 2% at 1,000,000 entries and moved by −11 to +4% at
+    50,000, in noisy runs, for about 30 more instructions per read.
+    Single-thread cold fills lost 5 to 6%, and eight-thread writes 6 to 14%.
+  - On mokabench, against the same commit without summaries, over three
+    paired repetitions of 16 cells, the geometric mean was −6% at one
+    client, −8% at four, −11% at eight, and −12.5% at sixteen. It lost even
+    where 9 to 13% of reads hit. A miss in a cache is mostly followed by an insert of
+    the same key, which loads the same bucket line, so ruling the miss out
+    early saved little, while every read paid the check and every write the
+    upkeep.
+  - Recomputing a bucket's summary from all ten slots after each removal
+    retired 17% more instructions in a cold fill, and cost it 12 to 13%:
+    the loop over the tag bytes did not compile to straight-line code.
+    Updating it in place, storing it without testing for a change, and
+    inlining the placement brought the cost to 5 to 6%. Release stores,
+    relaxed ones, prefetching the summary lines, and sending every
+    summary store to one word each left that cost unchanged.
 - **Decoding overflow handles inside readers' lookups.** Resident hits at
   1,000,000 entries lost 20 to 25% on Apple Silicon, though no overflow
   handle existed; see "Four-byte handles".
@@ -1155,6 +1174,21 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
   hits 3.2 to 3.6% on Linux. On x86, single-thread cold fill gained 6% and
   reads lost 2 to 3%. The process-wide mask set once per thread replaced it
   (see "Reader shards in use").
+- **Reads without a pin, as a bound.** With `get`'s pin removed, which is
+  unsound, one-thread resident hits on an M4 Max ran 11 to 20% faster at
+  50,000 entries and 8 to 9% at 1,000,000, and misses 15% and 26 to 28%.
+  An acquiring pin and a releasing unpin, in place of `SeqCst` both, moved
+  reads by −2 to +7%, with no consistent sign.
+- **Misses that skip the alternate bucket, as a bound.** One-thread misses
+  moved by −1 to +2% at both 50,000 and 1,000,000 entries: a miss pays for
+  its home bucket's line, not its alternate's.
+- **Freeing removed entries at once, as a bound.** On the Linux VM at
+  50,000 entries, freeing each removed entry without waiting for readers,
+  which is unsound, made one-thread cold fills 4 to 6% faster, and delete
+  and reinsert and turnover 3 to 10%; replace moved within its noise. The
+  same bound had been 29 to 35% before advances over the reader shards in
+  use and the eviction prefetch. Deferred reclamation is no longer the main
+  single-thread write cost.
 
 ## Reproduce
 
