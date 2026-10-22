@@ -401,14 +401,13 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
                     )
                 })
                 .collect(),
-            table: (0..shards * shard_buckets)
-                .map(|_| Bucket {
-                    tags: AtomicU64::new(0),
-                    meta: AtomicU64::new(0),
-                    handles: std::array::from_fn(|_| AtomicU32::new(0)),
-                    generations: AtomicU64::new(0),
-                })
-                .collect(),
+            table: {
+                let table = Box::<[Bucket]>::new_zeroed_slice(shards * shard_buckets);
+                crate::sharded_arena::thp_experiment(table.as_ptr().cast(), table.len() * size_of::<Bucket>());
+                // SAFETY: experiment: an all-zero bucket is empty.
+                #[allow(unsafe_code)]
+                unsafe { table.assume_init() }
+            },
             shard_buckets,
             shard_shift: u64::BITS - shards.trailing_zeros(),
             epochs: Epochs::new(),

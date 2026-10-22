@@ -1024,6 +1024,7 @@ impl<T> SlotStore<T> {
         // SAFETY: the layout has a nonzero size.
         let allocation =
             NonNull::new(unsafe { alloc(layout) }).unwrap_or_else(|| handle_alloc_error(layout));
+        thp_experiment(allocation.as_ptr(), layout.size());
         // SAFETY: the header lies within the allocation.
         let region = unsafe { allocation.add(header) };
         // SAFETY: the header holds at least one word.
@@ -1520,5 +1521,25 @@ mod tests {
         drop(pin);
         assert!(epochs.try_advance());
         assert!(epochs.try_advance());
+    }
+}
+
+/// Experiment: `PG_THP=on|off` advises the range for or against huge pages.
+#[allow(unsafe_code)]
+pub(crate) fn thp_experiment(start: *const u8, len: usize) {
+    unsafe extern "C" {
+        fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+    }
+    let advice = match std::env::var("PG_THP").as_deref() {
+        Ok("on") => 14,
+        Ok("off") => 15,
+        _ => return,
+    };
+    let page = 4096;
+    let first = (start as usize).next_multiple_of(page);
+    let end = (start as usize + len) / page * page;
+    if end > first {
+        let result = unsafe { madvise(first as *mut _, end - first, advice) };
+        assert_eq!(result, 0, "madvise failed");
     }
 }
