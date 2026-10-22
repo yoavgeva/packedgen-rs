@@ -1818,20 +1818,6 @@ impl<T> ShardView<'_, T> {
         (home, self.alternate(home, tag(hash)))
     }
 
-    /// The other candidate bucket of the key in occupied `slot`, and
-    /// whether that bucket is the key's home.
-    #[inline]
-    fn other_bucket(&self, slot: usize) -> (usize, bool) {
-        let bucket = slot / SLOTS;
-        let current = &self.buckets[bucket];
-        let tag = current.tag(slot % SLOTS);
-        if current.is_displaced(slot % SLOTS) {
-            (self.displaced_home(bucket, tag), true)
-        } else {
-            (self.alternate(bucket, tag), false)
-        }
-    }
-
     /// Finds the slot whose handle `matches` in the key's home bucket, then
     /// in its alternate if any key from that home lives in its alternate.
     /// Lock-free; decodes overflow handles, for writers.
@@ -1877,6 +1863,10 @@ impl<T> ShardView<'_, T> {
         let (found, meta) = self.find_in::<DECODE_OVERFLOW>(home, tag, &mut matches)?;
         if found.is_some() || overflow(meta) == 0 {
             return Ok(found);
+        }
+        #[cfg(test)]
+        if let Some(between) = BETWEEN_BUCKETS.take() {
+            between();
         }
         Ok(self
             .find_in::<DECODE_OVERFLOW>(self.alternate(home, tag), tag, &mut matches)?
@@ -2009,36 +1999,44 @@ impl<T> ShardView<'_, T> {
         prefetch(self.buckets.as_ptr().wrapping_add(slot / SLOTS));
     }
 
-    /// Moves the key in `slot` to `other`, its other candidate bucket, if
-    /// that has room, and returns its new slot. The key is published there
-    /// before its old slot is cleared. Requires the shard lock.
+    /// Moves the key in `slot`, its home, to `alternate`, its alternate
+    /// bucket, if that has room, and returns its new slot. The key is
+    /// counted in its home's overflow and published in the alternate before
+    /// its old slot is cleared, so a lookup that misses it at home finds it
+    /// there. Requires the shard lock.
     #[inline]
-    fn relocate(&self, slot: usize, (other, to_home): (usize, bool)) -> Option<usize> {
-        self.buckets[other].empty_slot()?;
+    fn relocate(&self, slot: usize, alternate: usize) -> Option<usize> {
+        self.buckets[alternate].empty_slot()?;
         let current = self.bucket(slot);
         let raw = current.handles[slot % SLOTS].load(Ordering::Relaxed);
-        if !to_home {
-            // Leaving its home: counted there before lookups can need it.
-            current.add_overflow(1);
-        }
+        current.add_overflow(1);
         let tag = current.tag(slot % SLOTS);
-        let moved_to = self.place_in(other, tag, raw, !to_home)?;
+        let moved_to = self.place_in(alternate, tag, raw, true)?;
         let moved = self.clear(slot);
         debug_assert_eq!(moved.raw, raw);
         Some(moved_to)
     }
 
     /// Frees a slot in the two full buckets `hash` may occupy by moving one
-    /// resident key to its own other bucket, which follows from its slot:
-    /// no resident's entry is read. Requires the shard lock.
+    /// resident key from its home to its alternate, which follows from its
+    /// slot: no resident's entry is read. Requires the shard lock.
+    ///
+    /// Keys never move back home. A lookup searches the home before the
+    /// alternate, so a key published at home after the lookup searched
+    /// there, and cleared from its alternate before the lookup arrived,
+    /// would be missed though resident throughout.
     fn relocate_candidate(self, writer: &mut LockedShard<'_>, hash: u64) -> bool {
         let (home, alternate) = self.candidates(hash);
         for slot in [home, alternate]
             .into_iter()
             .flat_map(|bucket| bucket * SLOTS..(bucket + 1) * SLOTS)
         {
-            let other = self.other_bucket(slot);
-            if other.0 == home || other.0 == alternate {
+            let bucket = self.bucket(slot);
+            if bucket.is_displaced(slot % SLOTS) {
+                continue;
+            }
+            let other = self.alternate(slot / SLOTS, bucket.tag(slot % SLOTS));
+            if other == home || other == alternate {
                 continue;
             }
             if let Some(moved_to) = self.relocate(slot, other) {
@@ -2112,6 +2110,10 @@ thread_local! {
     static WINDOW_EVICTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static RELOCATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static MAIN_RECORDS_EXAMINED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Runs once, when a search on this thread has missed in a key's home
+    /// and is about to search its alternate.
+    static BETWEEN_BUCKETS: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::Cell::new(None) };
 }
 
 const BYTE_ONES: u64 = 0x0101_0101_0101_0101;
@@ -2748,11 +2750,12 @@ mod tests {
                 // Relocation and clears find a key's other bucket from its
                 // slot alone.
                 assert_eq!(current.is_displaced(slot), bucket != home);
-                let other = if bucket == home { alternate } else { home };
-                assert_eq!(
-                    shard.other_bucket(bucket * SLOTS + slot),
-                    (other, other == home)
-                );
+                let tag = current.tag(slot);
+                if bucket == home {
+                    assert_eq!(shard.alternate(bucket, tag), alternate);
+                } else {
+                    assert_eq!(shard.displaced_home(bucket, tag), home);
+                }
                 displaced_from[home] += u64::from(bucket != home);
             }
         }
@@ -2879,6 +2882,96 @@ mod tests {
         type Hasher = CollidingHasher;
         fn build_hasher(&self) -> CollidingHasher {
             CollidingHasher(0)
+        }
+    }
+
+    /// A hasher whose hash is the `u64` key itself, so tests can choose keys
+    /// by their candidate buckets.
+    #[derive(Clone, Default)]
+    struct Identity;
+
+    struct IdentityHasher(u64);
+
+    impl Hasher for IdentityHasher {
+        fn finish(&self) -> u64 {
+            self.0
+        }
+        fn write(&mut self, _: &[u8]) {
+            unreachable!("only `u64` keys");
+        }
+        fn write_u64(&mut self, key: u64) {
+            self.0 = key;
+        }
+    }
+
+    impl BuildHasher for Identity {
+        type Hasher = IdentityHasher;
+        fn build_hasher(&self) -> IdentityHasher {
+            IdentityHasher(0)
+        }
+    }
+
+    #[test]
+    fn readers_find_a_key_that_moves_while_they_search_its_buckets() {
+        // A key moving back home was published there after a reader missed
+        // it at home, and cleared from its alternate before the reader
+        // looked there: the reader reported a resident key absent.
+        let cache = Arc::new(
+            ShardedCacheBuilder::new(64)
+                .shards(1)
+                .hasher(Identity)
+                .build::<u64, u64>(),
+        );
+        let shard = cache.view(0);
+        let (home, alternate, other, spare) = (0, 1, 2, 3);
+        assert!(shard.buckets.len() > spare);
+        let mut unused = (1..).map(|index: u64| index.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let mut keys = |count: usize, wanted: &dyn Fn((usize, usize)) -> bool| -> Vec<u64> {
+            unused
+                .by_ref()
+                .filter(|&key| wanted(shard.candidates(key)))
+                .take(count)
+                .collect()
+        };
+        let at_home = keys(SLOTS, &|(first, second)| {
+            first == home && second != alternate
+        });
+        let moving = keys(1, &|buckets| buckets == (home, alternate))[0];
+        let at_alternate = keys(SLOTS - 1, &|buckets| buckets == (alternate, spare));
+        let in_other = keys(SLOTS, &|(first, _)| first == other);
+        let arriving = keys(1, &|buckets| buckets == (alternate, other))[0];
+        for &key in &at_home {
+            cache.insert(key, key);
+        }
+        // Its home is full, so it takes its alternate's first slot.
+        cache.insert(moving, moving);
+        for &key in at_alternate.iter().chain(&in_other) {
+            cache.insert(key, key);
+        }
+        assert!(cache.remove(&at_home[0]));
+        assert!(shard.buckets[alternate].is_displaced(0));
+        assert!(shard.buckets[home].empty_slot().is_some());
+        assert!(shard.buckets[alternate].empty_slot().is_none());
+        assert!(shard.buckets[other].empty_slot().is_none());
+
+        // Both of the arriving key's buckets are full, so its insert moves
+        // a resident while the reader is between the moving key's buckets.
+        let writer = Arc::clone(&cache);
+        BETWEEN_BUCKETS.set(Some(Box::new(move || {
+            writer.insert(arriving, arriving);
+        })));
+        assert_eq!(cache.get(&moving), Some(moving));
+        assert!(
+            BETWEEN_BUCKETS.take().is_none(),
+            "the read searched both buckets"
+        );
+        for key in at_home[1..]
+            .iter()
+            .chain([&moving, &arriving])
+            .chain(&at_alternate)
+            .chain(&in_other)
+        {
+            assert_eq!(cache.get(key), Some(*key));
         }
     }
 
