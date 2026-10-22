@@ -51,12 +51,14 @@ entry. Tables are sized once and never rebuilt.
   The alternate lies an offset past the home that the key's tag picks.
   - The home's overflow count is the number of its keys that live in their
     alternates. A lookup reads the alternate only when that count is nonzero.
-  - A bit per slot, in the writer-only generations word, marks a key living
-    in its alternate. With the slot's tag it names the key's other bucket, so
-    relocation and removal never read a resident's key to find it.
-  - When both buckets are full, the cache first moves one resident key to its
-    own other bucket. The copy is published before the old slot is cleared, so
-    readers always find it.
+  - A bit per slot, in the meta word, marks a key living in its alternate.
+    With the slot's tag it names the key's other bucket, so relocation and
+    removal never read a resident's key to find it.
+  - When both buckets are full, the cache first moves one resident key from
+    its home to its own alternate. The key is counted in its home's overflow
+    and published in the alternate before its home slot is cleared, so
+    readers always find it. Keys never move back home (see "Relocating only
+    away from home").
   - If no resident key can move, the cache evicts an unread entry from the two
     buckets. This happened on fewer than 0.1% of inserts into a full shard.
 - **Eviction.** Each shard uses an S3-FIFO-style policy:
@@ -166,6 +168,8 @@ entry. Tables are sized once and never rebuilt.
   - drop releasing every value;
   - guard reads surviving replacement;
   - two-bucket placement under a million-key churn;
+  - a reader finding a key that relocation moves between its search of the
+    key's home and of its alternate;
   - unread main-area keys leaving in insertion order;
   - forced pair evictions staying under 0.1%;
   - an 8-thread race of replacements, removals, loads, clears, and evictions
@@ -640,6 +644,27 @@ These changes followed, each measured against the one before:
   Single-thread writes gained 5 to 9% on x86, 9 to 11% for cold fill and
   replace on the Linux VM, and 6% for cold fill on macOS; four- and
   eight-thread writes moved by −3 to +7%, and reads stayed within noise.
+- **Relocating only away from home.** Relocation also moved keys from their
+  alternates back home, and a lookup could then miss a resident key. It
+  searched the home before the key was published there, and the alternate
+  after the key was cleared from it. `get` returned `None`, and
+  `get_or_insert_with` ran its loader again and replaced the value. A
+  test-only hook that runs an insert between a lookup's two buckets
+  reproduces it. Keys now move only from home to alternate, an order no
+  lookup can miss. Over 40 churns of a full shard:
+  - relocations fell from 0.018 to 0.009 per insert, and no insert evicted
+    from a full pair;
+  - 23.6% of keys lived in their alternates instead of 17.4%;
+  - 57% of buckets counted overflow instead of 53%, so more lookups read a
+    second bucket.
+
+  None of this showed in throughput. On macOS, single-thread hits, misses,
+  cold fill, and turnover at 50,000 and 1,000,000 entries moved by −4 to
+  +7%, with almost every range crossing zero; hits at 1,000,000 entries by
+  0% and misses by −1%. Mokabench moved by +0.1 to +1.4% (geometric means
+  at 1 to 16 clients), and x86_64 cells against the parent commit stayed
+  within the runner's noise. The trace hit-ratio sum read 667.60 and 667.75
+  against 667.66 and 667.62.
 
 Pacing is a trade-off between allocators and workloads. Freeing up to four
 entries per write instead changed Linux throughput by:
