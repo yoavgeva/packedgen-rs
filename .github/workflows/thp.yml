@@ -1,0 +1,66 @@
+name: Huge page experiment
+
+# Throwaway: compares the bucket table and slab region with and without
+# MADV_HUGEPAGE (PG_THP=on / off) on a fresh x86_64 runner.
+on:
+  push:
+    branches: ['bench/thp-*']
+
+jobs:
+  thp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Machine
+        run: |
+          lscpu | sed -n '1,20p'
+          free -m
+          for f in enabled defrag; do echo "$f: $(cat /sys/kernel/mm/transparent_hugepage/$f)"; done
+      - name: Build
+        run: cargo build --locked --release --example bounded_cache_probe
+      - name: Huge pages taken
+        run: |
+          B=target/release/examples/bounded_cache_probe
+          for v in on off; do
+            PG_THP=$v $B sharded resident-hit 1000000 400000000 1 64 1 0 > /dev/null &
+            pid=$!
+            sleep 6
+            echo "$v: $(grep -E '^(Rss|AnonHugePages)' /proc/$pid/smaps_rollup | tr -s ' ' | tr '\n' ' ')"
+            kill $pid
+          done
+      - name: A/B
+        run: |
+          B=target/release/examples/bounded_cache_probe
+          for pair in 1 2 3 4 5 6 7; do
+            for entries in 50000 1000000; do
+              for workers in 1 4; do
+                for workload in resident-hit read-miss turnover cold-fill replace; do
+                  case $workload in resident-hit|read-miss) ops=4000000;; *) ops=2000000;; esac
+                  list="on off"; [ $((pair % 2)) -eq 0 ] && list="off on"
+                  for v in $list; do
+                    printf '%s,' "$v" >> thp.csv
+                    PG_THP=$v $B sharded $workload $entries $ops $workers 64 $pair 0 | tail -n 1 >> thp.csv
+                  done
+                done
+              done
+            done
+          done
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import csv, collections, statistics
+          rows = collections.defaultdict(list)
+          for f in csv.reader(open('thp.csv')):
+              rows[(f[2], int(f[3]), f[6], f[0])].append(float(f[10]))
+          print('| Workload | Capacity | Threads | huge | none | change | range |')
+          print('| --- | ---: | ---: | ---: | ---: | ---: | --- |')
+          for k in sorted({k[:3] for k in rows}):
+              on, off = rows[k + ('on',)], rows[k + ('off',)]
+              r = sorted(a / b - 1 for a, b in zip(on, off))
+              print(f'| {k[0]} | {k[1]} | {k[2]} | {statistics.median(on):.1f} | {statistics.median(off):.1f} | {100*(statistics.median(on)/statistics.median(off)-1):+.0f}% | {100*r[0]:+.0f} to {100*r[-1]:+.0f}% |')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: thp-${{ github.run_id }}
+          path: thp.csv
