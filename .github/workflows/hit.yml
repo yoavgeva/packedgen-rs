@@ -1,4 +1,4 @@
-name: x86 read-path variants
+name: parked pins
 
 on:
   push:
@@ -9,12 +9,13 @@ permissions:
 
 jobs:
   reads:
-    name: reads ${{ matrix.entries }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
+    name: ${{ matrix.runner }} ${{ matrix.entries }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
         entries: [50000, 1000000]
     steps:
       - uses: actions/checkout@v4
@@ -22,11 +23,11 @@ jobs:
       - name: Machine
         run: |
           lscpu | sed -n '1,20p'
-          cat /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag
+          uname -r
       - name: Build
         run: |
           cargo build --locked --release --example bounded_cache_probe --target-dir ../t-base
-          for v in thpoff align64; do
+          for v in parked; do
             git worktree add ../$v HEAD
             git -C ../$v apply "$PWD/bench-hit/$v.diff"
             (cd ../$v && cargo build --locked --release --example bounded_cache_probe --target-dir ../t-$v)
@@ -36,11 +37,13 @@ jobs:
           P=release/examples/bounded_cache_probe
           W=$(cd .. && pwd)
           sh bench-hit/ab.sh 5 "resident-hit read-miss turnover" "${{ matrix.entries }}" "1 4" reads.csv \
-            base=$W/t-base/$P:sharded guard=$W/t-base/$P:sharded-guard thpoff=$W/t-thpoff/$P:sharded \
-            align64=$W/t-align64/$P:sharded quick=$W/t-base/$P:quickcache
+            base=$W/t-base/$P:sharded guard=$W/t-base/$P:sharded-guard parked=$W/t-parked/$P:sharded \
+            quick=$W/t-base/$P:quickcache
+          sh bench-hit/ab.sh 3 "cold-fill replace delete-reinsert" "${{ matrix.entries }}" "1 4" reads.csv \
+            base=$W/t-base/$P:sharded parked=$W/t-parked/$P:sharded quick=$W/t-base/$P:quickcache
           python3 bench-hit/hitsum.py reads.csv | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: reads-${{ matrix.entries }}
+          name: reads-${{ matrix.runner }}-${{ matrix.entries }}
           path: reads.csv
