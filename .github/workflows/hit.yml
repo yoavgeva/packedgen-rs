@@ -1,0 +1,46 @@
+name: x86 read-path variants
+
+on:
+  push:
+    branches: ['bench/**']
+
+permissions:
+  contents: read
+
+jobs:
+  reads:
+    name: reads ${{ matrix.entries }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        entries: [50000, 1000000]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Machine
+        run: |
+          lscpu | sed -n '1,20p'
+          cat /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag
+      - name: Build
+        run: |
+          cargo build --locked --release --example bounded_cache_probe --target-dir ../t-base
+          for v in thpoff align64; do
+            git worktree add ../$v HEAD
+            git -C ../$v apply "$PWD/bench-hit/$v.diff"
+            (cd ../$v && cargo build --locked --release --example bounded_cache_probe --target-dir ../t-$v)
+          done
+      - name: Run
+        run: |
+          P=release/examples/bounded_cache_probe
+          W=$(cd .. && pwd)
+          sh bench-hit/ab.sh 5 "resident-hit read-miss turnover" "${{ matrix.entries }}" "1 4" reads.csv \
+            base=$W/t-base/$P:sharded guard=$W/t-base/$P:sharded-guard thpoff=$W/t-thpoff/$P:sharded \
+            align64=$W/t-align64/$P:sharded quick=$W/t-base/$P:quickcache
+          python3 bench-hit/hitsum.py reads.csv | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reads-${{ matrix.entries }}
+          path: reads.csv

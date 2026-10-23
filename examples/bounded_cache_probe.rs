@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use packedgen::{
     CacheAdmissionOutcome, CacheConfig, CacheWriteOutcome, DirectCacheGuard, DirectPackedCache,
-    ShardedCache,
+    ShardedCache, ShardedCacheGuard,
 };
 use quick_cache::{Weighter, sync::Cache};
 
@@ -334,6 +334,45 @@ impl<const OWNED: bool, const GUARDED: bool> Session for DirectSession<'_, OWNED
     }
 }
 
+
+/// Reads through one guard refreshed every 64 operations: the cost of a
+/// per-read pin, by difference with `sharded`.
+struct ShardedGuardSession<'a> {
+    cache: &'a ShardedCache<Key, Value>,
+    guard: ShardedCacheGuard<'a, Key, Value>,
+    since_refresh: usize,
+}
+
+impl Session for ShardedGuardSession<'_> {
+    fn apply(&mut self, operation: &Operation, config: &Config, sample: &mut Sample) {
+        self.since_refresh += 1;
+        if self.since_refresh == 64 {
+            self.guard.refresh();
+            self.since_refresh = 0;
+        }
+        match operation.action {
+            Action::Read => {
+                let value = self.guard.get(&operation.key).cloned();
+                sample.observe(value.as_ref(), &operation.key);
+                if value.is_none() && config.workload == Workload::Turnover {
+                    self.cache.insert(
+                        operation.key,
+                        payload(&operation.key, config.value_bytes, operation.version),
+                    );
+                    sample.writes += 1;
+                }
+            }
+            Action::Insert => {
+                let value = payload(&operation.key, config.value_bytes, operation.version);
+                sample.writes += 1;
+                sample.inserts += 1;
+                self.cache.insert(operation.key, value);
+            }
+            _ => panic!("sharded-guard runs reads and inserts"),
+        }
+    }
+}
+
 struct ShardedSession<'a>(&'a ShardedCache<Key, Value>);
 
 impl Session for ShardedSession<'_> {
@@ -424,6 +463,11 @@ impl Session for ShardedBatchSession<'_> {
 }
 
 fn sharded_run(config: &Config, batched: bool) -> (Sample, Duration, usize, u64, Duration) {
+    sharded_run_with(config, if batched { 1 } else { 0 })
+}
+
+fn sharded_run_with(config: &Config, mode: u8) -> (Sample, Duration, usize, u64, Duration) {
+    let batched = mode == 1;
     let cache = ShardedCache::new(config.capacity_entries());
     for id in 0..seed_count(config) {
         let key = key(id as u64);
@@ -436,7 +480,13 @@ fn sharded_run(config: &Config, batched: bool) -> (Sample, Duration, usize, u64,
             "resident control requires every seed to remain resident"
         );
     }
-    let (sample, elapsed) = if batched {
+    let (sample, elapsed) = if mode == 2 {
+        parallel_run(config, || ShardedGuardSession {
+            cache: &cache,
+            guard: cache.pin(),
+            since_refresh: 0,
+        })
+    } else if batched {
         parallel_run(config, || ShardedBatchSession {
             cache: &cache,
             pending: Vec::with_capacity(WRITE_BATCH),
@@ -741,6 +791,7 @@ fn main() {
         "quickcache" => quick_run(&config),
         "sharded" => sharded_run(&config, false),
         "sharded-batch" => sharded_run(&config, true),
+        "sharded-guard" => sharded_run_with(&config, 2),
         _ => panic!("unknown backend: {backend}"),
     };
     sample.latencies.sort_unstable();
