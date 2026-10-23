@@ -117,6 +117,9 @@ entry. Tables are sized once and never rebuilt.
 - **Reads.** `get` hashes the key, then pins and clones the value. Hashing
   before pinning lets the hash run while the previous call's unpin completes
   (see "Read path"). `pin()` returns a guard for borrowed reads that pins once.
+  On Linux a thread's pins reuse an epoch announcement it keeps parked
+  between them, without a read-modify-write (see "Parked pin
+  announcements").
 - **Weights.** Weights come from a `Weighter`. A value heavier than its shard's
   share of the weight limit is refused, and any previous value for its key is
   removed, so readers never see a value the caller replaced.
@@ -203,7 +206,14 @@ entry. Tables are sized once and never rebuilt.
     without the foreign drains), and leaving a retiring thread's alone;
   - writes reclaiming as many entries as they retire, and as many more while
     a backlog is due;
-  - a write's reclamation batch fitting one cache line.
+  - a write's reclamation batch fitting one cache line;
+  - a thread's consecutive pins reusing one announcement until the epoch
+    moves (1,000 of 1,000 pins took a read-modify-write before);
+  - exiting threads returning their announcer slots, and a thread exiting
+    under a pin a thread-local still holds keeping its slot (each verified
+    to fail without its condition);
+  - on Linux, `membarrier` registering and an advance evicting a parked
+    announcement.
 - **Layout and sizing tests.** They check that a write's shard state spans
   two cache lines, that shards share one bucket table, that the default
   shard count gives every extra shard at least 256 entries, that a cache
@@ -220,6 +230,13 @@ entry. Tables are sized once and never rebuilt.
   claiming its shard while the writer retires and the main thread
   advances; its negative control reads the mask with a load instead of a
   read-modify-write, and the model finds a reclamation beneath the reader.
+  A third model runs parked announcements: a reader reusing a parked
+  epoch while a pinned writer retires and the main thread advances,
+  evicting it, and a reader announcing afresh and then reusing. Negative
+  controls drop the light fence and the heavy fence in turn; the model
+  finds a reclamation beneath the reader in each (see "Parked pin
+  announcements"). These models take minutes unoptimized, so they run with
+  `--release`, as CI's model step does.
 - **CI tools.** `scripts/cache_proof.sh` runs the module under Miri, ASan, and
   TSan.
 
@@ -444,6 +461,87 @@ between pairs. An earlier form, which marked the shard on
 every pin, gained 2 to 12% on single-thread writes before later
 write-path changes took most of that, and cost misses 1.2 to 3.4% (see
 "Rejected and reverted").
+
+## Parked pin announcements
+
+A pin counted itself in its reader shard's counter with a sequentially
+consistent read-modify-write, and its unpin uncounted it with another. On
+x86 either is a full barrier, so a read's loads waited for the previous
+read's misses to finish.
+
+On Linux, threads now announce their pins:
+
+- A thread claims one of 64 announcer slots on its first pin, and each cache
+  has a 128-byte line per slot. A pin writes the epoch it pins there, and
+  the last pin to leave keeps that epoch announced, parked.
+- The thread's next pin marks the parked announcement active with a store
+  and a compiler fence, then loads the line's eviction flag and the
+  generation. If no advance evicted the announcement and the generation
+  still names its epoch, the pin holds that epoch. No read-modify-write or
+  fence instruction runs, and the unpin is a store.
+- Otherwise the pin announces afresh: a store, a sequentially consistent
+  fence, and a check that the generation has not moved, as with the
+  counters. A thread that keeps reading does this once per advance.
+- An advance that a parked announcement blocks evicts it. It sets the
+  line's eviction flag, issues `membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED)`,
+  and reads the line again. The system call makes every running thread of
+  the process execute a full barrier, so either the advance sees a pin that
+  marked the line active, and waits, or that pin sees the flag and
+  announces afresh.
+- Only a thread that stopped pinning since the last advance needs evicting.
+  On 4-vCPU runners, one barrier cost its caller 3 to 4.4 µs, and every
+  other running thread 1 to 2 µs. That is too much to pay on every advance,
+  which comes due after 32 to 512 retirements.
+- A thread returns its slot when it exits, unless it still holds a pin
+  that another thread-local's destructor drops later. The slot then stays
+  held for good.
+- These pin through the counters as before: threads past the 64th, threads
+  pinning during their exit, kernels without `membarrier`, and other
+  platforms.
+
+The announcement state machine lives in `src/direct_epoch_protocol.rs`,
+which the Loom models include. A compiler fence orders only with the
+system call, not with an ordinary fence, so the model does not issue one.
+Instead the reader holds a mutex across its reuse, and the eviction takes
+the same mutex in place of the system call. The reuse then falls wholly
+before or wholly after the barrier, as when the barrier lands before its
+store or after its loads; landing between them only adds ordering. Removing
+either side lets the model reclaim a slot under the reader.
+
+Each cache spends 8 KB on the lines: 0.16 bytes per entry at 50,000
+entries. Throughput over the counters, from builds of their own on GitHub
+runners, five pairs per read cell and three per write cell. Guard reads
+pin once per 64 reads, a bound:
+
+| CPU | Entries | Threads | Hits | Misses | Guard hits | Guard misses |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| AMD EPYC 7763 | 50,000 | 1 | −2% | +2% | +33% | +18% |
+| AMD EPYC 7763 | 50,000 | 4 | +1% | +3% | +7% | +18% |
+| AMD EPYC 7763 | 1,000,000 | 1 | 0% | +4% | +47% | +39% |
+| AMD EPYC 7763 | 1,000,000 | 4 | −2% | +3% | +1% | +8% |
+| AMD EPYC 9V45 | 50,000 | 1 | +9% | +22% | +15% | +39% |
+| AMD EPYC 9V45 | 50,000 | 4 | +7% | +10% | +22% | +30% |
+| Intel Xeon 8573C | 1,000,000 | 1 | +4% | +9% | +10% | +18% |
+| Intel Xeon 8573C | 1,000,000 | 4 | +6% | +14% | +16% | +38% |
+| Neoverse N2 | 50,000 | 1 | +6 to +26% | +8 to +10% | +21 to +28% | +18 to +19% |
+| Neoverse N2 | 50,000 | 4 | +17% | +6 to +9% | +17 to +25% | +17 to +22% |
+| Neoverse N2 | 1,000,000 | 1 | 0 to +3% | −1 to +3% | +2 to +6% | +10 to +13% |
+| Neoverse N2 | 1,000,000 | 4 | +1 to +3% | −6 to +3% | +4 to +5% | +3 to +12% |
+
+Writes moved by −7 to +11%, mostly within 4%; single-thread turnover
+gained 3 to 11%, except on the EPYC 7763 at 1,000,000 entries (−1%). The 4-vCPU runners are two cores
+with two threads each, so four threads share execution units, and the
+announcements' few added instructions weigh more there than at one
+thread. On the EPYC 7763, where guard reads ran up to 47% faster, the
+announcements left reads level: what a guard saves there is not the
+barrier.
+
+macOS keeps the counters. It has no `membarrier`, and announcements with a
+sequentially consistent fence on each reuse read hits 12 to 24% slower on
+an M4 Max (see "Rejected and reverted"). Builds that cannot announce
+compile the counters alone: a first version that checked for an announcer
+slot on every pin read resident hits 12 to 15% slower there at 50,000
+entries, while `get` now compiles to the same instructions as before.
 
 ## Slab storage against boxed entries
 
@@ -1429,9 +1527,22 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
   - Huge pages turned off: −5 to +5%. Slots aligned to 64 bytes, which
     puts each 56-byte entry in one cache line: −4 to +9%.
 
-  The pin's barrier is the whole gap to guard reads, and removing it needs
-  an asymmetric fence: readers announcing with plain stores, and advances
-  issuing a process-wide barrier (`membarrier` on Linux).
+  Removing the pin's barrier needs an asymmetric fence: readers announcing
+  with plain stores, and advances issuing a process-wide barrier
+  (`membarrier` on Linux). Parked announcements now do that on Linux, and
+  gained up to 26%; on the EPYC 7763 they left reads level, so there the
+  barrier was not the gap (see "Parked pin announcements").
+- **A barrier on every advance.** Announcing with plain stores but
+  unparking on every unpin would make each advance issue `membarrier`. It
+  cost its caller 3 to 4.4 µs and each other running thread 1 to 2 µs on
+  4-vCPU runners (Intel Xeon 8573C, Neoverse N2), while advances come due
+  after 32 to 512 retirements, a few microseconds of writes. Parking the
+  announcement confines the barrier to threads that stopped pinning.
+- **Announcements on macOS, with fences.** Without `membarrier`, a reuse
+  needs a sequentially consistent fence in place of the compiler fence. On
+  an M4 Max that read hits 12 to 24% slower than the counters' read-modify-
+  writes, and turnover 10 to 15% slower in three of four cells; misses
+  moved by −6 to +13%.
 - **Closing scc's lead on eight-thread writes.** scc 3.8's `HashCache`
   locks one 32-entry bucket per write, evicts that bucket's least recently
   used entry in place, and drops it at once, as its readers lock buckets
@@ -1452,6 +1563,24 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
   probation and main queues, ghost and shadow words, and the victim's
   bucket and entry, where scc touches one bucket. Its hit ratio is the
   other side of that: 32.8% against 39.0% on the mokabench traces.
+- **Smaller shards.** Shards of at least 128 entries instead of 256, and
+  up to 64 per thread instead of 16, on macOS, five pairs: eight-thread
+  writes +3 to +13%, single-thread cold fill −4 to −6%, and eight-thread
+  misses at 1,000,000 entries −13%. The 18 hit-ratio cells summed 1.80
+  points lower, P3 at 131,072 entries 0.71 lower, and bytes per entry rose
+  by 2.1 at 50,000 entries, 4.4 at 131,072, and 0.5 at 1,000,000.
+- **Buffered policy updates, bounded first.** Caffeine places an entry at
+  once and queues its policy work for a batched pass. A bound for that: a
+  build with no policy, where an insert into a full shard evicts the next
+  occupied slot of a table sweep, without probation, the main queue, or
+  filters. On macOS, five pairs, eight-thread cold fill gained 13% at
+  50,000 entries and 2.5% at 1,000,000, delete-reinsert 25% and 14%;
+  replace was level, turnover fell 9 to 11% with the lost hit ratio, and
+  single-thread cold fill fell 24 to 38% to the sweep. Buffering moves the
+  policy's work rather than removing it, so it gains no more than that,
+  against scc's 88% lead on eight-thread cold fill at 50,000 entries. The
+  rest of that lead is scc's per-bucket locks and its entries stored in
+  the bucket.
 
 ## Reproduce
 
