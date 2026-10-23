@@ -129,6 +129,40 @@ jobs:
       - name: PackedGen tests
         run: cargo test --locked -p packedgen --all-targets --features "${{ matrix.features }}"
 
+  test-windows:
+    name: Stable tests on Windows (${{ matrix.name }})
+    # Windows has neither membarrier nor madvise, so this runs the portable
+    # fallbacks under Windows' scheduler, timers, and allocator.
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default features
+            key: default
+            packages: --workspace
+            features: ""
+          - name: prepared keys and diagnostics
+            key: prepared
+            packages: -p packedgen
+            features: prepared-keys,prepared-batch-gate,cache-production-diagnostics
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Tests read sources with include_str!; keep the LF endings the other
+      # runners check out.
+      - name: Check out with LF line endings
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-${{ matrix.key }}
+      - name: Tests
+        run: cargo test --locked ${{ matrix.packages }} --all-targets --features "${{ matrix.features }}"
+
   loom:
     name: Loom models
     runs-on: ubuntu-latest
