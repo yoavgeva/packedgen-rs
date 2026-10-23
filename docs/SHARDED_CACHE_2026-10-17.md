@@ -306,6 +306,26 @@ with one codegen unit, and again with the hashing change in both, resident
 hits moved by −2 to +14% at 50,000 entries and by 0 to +1% at 1,000,000,
 and writes by −3 to +4%.
 
+### Huge pages on Linux
+
+Many distributions enable transparent huge pages only where `madvise`
+asks for them; GitHub's x86_64 runners do. There a million-entry cache's
+table and region took 4 KB pages, a TLB entry each. On x86_64 and aarch64
+Linux both allocations are now advised with `MADV_HUGEPAGE` over the whole
+huge pages they span, before anything touches them, and the table is
+allocated zeroed, an empty table, so a large one comes untouched from the
+kernel instead of being written bucket by bucket. A test reads the
+mappings' flags from `/proc/self/smaps`.
+
+On a runner, with 4,000,000-entry resident hits running, the advised
+process held 54 MB of huge pages and the parent none. Against the parent
+commit, over seven pairs, cells at 1,000,000 entries gained 0 to 12% (cold
+fill +2% on one thread, +1 to +7% between pairs; turnover +3 to +4%;
+four-thread resident hits +6%), and cells at 50,000 entries moved by −5 to
++6%. The Linux VM could not show it: its memory was fragmented by other
+containers, and even advised, it gave the process 2 MB of huge pages out of
+2 GB.
+
 ## Four-byte handles
 
 A bucket held six eight-byte entry addresses beside a control word and a
@@ -710,6 +730,14 @@ Hosts:
   containers and services kept about ten cores busy during these runs, a
   load average of 9 to 10, against about four for the previous table.
 - Linux: an aarch64 Docker VM on the same machine, using glibc's allocator.
+
+On aarch64 Linux, Rust's default target calls an out-of-line helper for
+every atomic read-modify-write, which picks LSE instructions at run time.
+Built with `-C target-feature=+lse` on the Linux VM, single-thread resident
+hits ran 25% faster for ShardedCache and 32% faster for quick_cache, and
+turnover 18% and 9%. The gaps between the two moved by under 8 points
+either way, and replace varied too much between pairs to read. On aarch64
+servers, either cache gains from a build that inlines LSE atomics.
 
 Two-thread cells have varied most between runs, by up to 30% for one
 build, as threads land on performance or efficiency cores, and eight-thread
