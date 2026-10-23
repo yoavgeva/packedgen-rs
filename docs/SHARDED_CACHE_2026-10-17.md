@@ -1413,6 +1413,25 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
   writes moved by −5 to +8% on macOS; but single-thread resident hits fell
   7 to 14%, eight-thread hits 5 to 12%, and eight-thread turnover 6%. A hit
   had to find its bucket again and load the marks after comparing its key.
+- **Read-path variants on x86_64, as bounds.** On GitHub runners, five
+  pairs per cell against the same commit, in builds of their own:
+  - Reads through one guard refreshed every 64 operations, so without a
+    per-read pin: single-thread resident hits +7 to +21% at 50,000 entries
+    (EPYC 9V74 and 9V45) and +45 to +47% at 1,000,000 (EPYC 7763), misses
+    +15 to +37% and +61 to +71%, and turnover +4 to +5% and +32 to +33%.
+    Four threads gained 0 to +18%.
+  - An unpin that stores the decremented count instead of a
+    read-modify-write, sound only while each reader shard has one thread,
+    as in the probe: −11 to +4% on every workload. The pin's own
+    read-modify-write remains, and on x86 any read-modify-write holds back
+    the next read's loads until the previous read's have finished, so
+    consecutive reads' misses still run in series.
+  - Huge pages turned off: −5 to +5%. Slots aligned to 64 bytes, which
+    puts each 56-byte entry in one cache line: −4 to +9%.
+
+  The pin's barrier is the whole gap to guard reads, and removing it needs
+  an asymmetric fence: readers announcing with plain stores, and advances
+  issuing a process-wide barrier (`membarrier` on Linux).
 
 ## Reproduce
 
