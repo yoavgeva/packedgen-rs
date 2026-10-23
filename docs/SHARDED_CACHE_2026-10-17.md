@@ -97,7 +97,8 @@ entry. Tables are sized once and never rebuilt.
     tag's epoch slot found that slot and the next one quiescent, the direct
     arena's two-rotation aging.
   - In the same queue lock, the writer takes as many aged entries as it
-    retired, plus one while entries due since an earlier advance remain. It
+    retired, and as many more while entries due since an earlier advance
+    remain, within one reclamation batch of four. It
     drops their values and pushes the slots onto its own stack, so it refills
     slots whose lines it just touched. Paced this way, frees keep step with
     the writes' allocations (see "Write path").
@@ -162,8 +163,10 @@ entry. Tables are sized once and never rebuilt.
   buckets prefetched, before the chunk is inserted. The pin is refreshed
   between chunks: held across a long batch, it would block every advance past
   its epoch, and in a test 49,500 removed entries waited, against 96 for
-  single inserts. A call with one pair is a plain insert. See "Batched
-  inserts" under "Throughput against quick_cache 0.7" for its effect.
+  single inserts. Removed entries are retired two at a time, so each
+  retirement can also drain two of a backlog. A call with one pair is a
+  plain insert. See "Batched inserts" under "Throughput against quick_cache
+  0.7" for its effect.
 
 ## Correctness evidence
 
@@ -184,8 +187,9 @@ entry. Tables are sized once and never rebuilt.
     that counts live values to prove each one is dropped exactly once;
   - eight racing callers loading a missing key once;
   - batched inserts leaving the cache as single inserts do, pinning once,
-    prefetching each home bucket, and letting their removed entries be
-    reclaimed;
+    prefetching each home bucket, letting their removed entries be
+    reclaimed, and draining a reclamation backlog as single inserts do
+    (verified to fail with retirements four at a time);
   - failing and panicking loads handing the key to a waiter;
   - expired entries reading as missing, and leaving before read live keys;
   - statistics, every removal cause, `clear`, and `peek`.
@@ -197,8 +201,8 @@ entry. Tables are sized once and never rebuilt.
   - a dropped cache leaving other threads' stacks harmless;
   - other writers dropping an idle thread's retired values (verified to fail
     without the foreign drains), and leaving a retiring thread's alone;
-  - writes reclaiming as many entries as they retire, and one more while a
-    backlog is due;
+  - writes reclaiming as many entries as they retire, and as many more while
+    a backlog is due;
   - a write's reclamation batch fitting one cache line.
 - **Layout and sizing tests.** They check that a write's shard state spans
   two cache lines, that shards share one bucket table, that the default
@@ -847,19 +851,32 @@ gained 3 to 10%.
 
 `bounded_cache_probe`'s `sharded-batch` backend writes through
 `insert_many`, 64 writes per call. On macOS, against `insert` in the same
-build, the paired median of five runs:
+build, the paired median of three runs:
 
 | Workload | 50,000, 1T | 50,000, 8T | 1,000,000, 1T | 1,000,000, 8T |
 | --- | ---: | ---: | ---: | ---: |
-| Replace | +20% | +21% | +74% | +51% |
-| Cold fill | −1% | +17% | +19% | −11% |
+| Replace | +24% | +20% | +60% | +44% |
+| Cold fill | +5% | +19% | +36% | +11% |
 
 Replace finds each key before writing it, and with the batch's buckets
 prefetched its finds overlap: at 1,000,000 entries batched replace ran at
-6.4 Mops/s on one thread, against quick_cache's 2.9. Cold fill at 50,000
+5.7 Mops/s on one thread, against quick_cache's 2.5. Cold fill at 50,000
 entries evicts on every insert from buckets already cached, and gains
-nothing. Eight-thread cold fill at 1,000,000 entries ranged from −84% to
-+15% between pairs, as the shared host's load moved.
+little.
+
+Batches first retired their removed entries four at a time. A retirement
+reclaims as many aged entries as it queues, and then drained one more of a
+due backlog, but only within its reclamation batch of four, so retiring
+four never drained any. On a loaded host, a pinned thread preempted for its
+time slice leaves a backlog behind it. Batches then kept it until the slab
+region ran out, and writers took overflow slots one at a time under the
+depot's lock: eight-thread batched cold fill ran at 9.2 and 12.3 Mops/s at
+50,000 and 1,000,000 entries, against 17.1 and 21.6 for single inserts,
+and some runs fell to 1.8. Batches now retire two at a time, and a
+retirement reclaims twice what it queues while a backlog is due, which
+brought those cells to 20.2 and 24.0 Mops/s. Batched replace gave up 2 to
+12% of its gain against four at a time, and single inserts moved within
+noise.
 
 Sharing `insert`'s body with `insert_many` first cost single replaces 12%
 at 50,000 entries. With two copies of the body, the compiler stopped

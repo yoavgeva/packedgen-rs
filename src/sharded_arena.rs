@@ -14,8 +14,8 @@
 //!   advanced three times past its tag: the advance that reuses the tag's
 //!   epoch slot found that slot and the one after it quiescent, which is the
 //!   direct arena's two-rotation aging. Each write reclaims as many slots as
-//!   it retires, one more while a backlog is due, and other writers drain the
-//!   queue of a thread that stopped retiring.
+//!   it retires, twice as many while a backlog is due, and other writers
+//!   drain the queue of a thread that stopped retiring.
 //! - Values are dropped outside the shard lock by the reclaiming thread, and
 //!   their slots join that thread's stack, so it refills slots it just
 //!   touched. Each write prefetches the slot its thread reclaims next.
@@ -540,7 +540,7 @@ impl<T> RetiredSlots<T> {
 
     /// Queues `slots`, unpublished by this thread while it held `pin`, taken
     /// before unpublishing them, and moves as many aged slots as it queued,
-    /// one more while a backlog is due, from this thread's queue into
+    /// twice as many while a backlog is due, from this thread's queue into
     /// `reclaimed`. Periodically it also
     /// moves aged slots into `foreign` from another queue, if that queue's
     /// thread has stopped retiring. Reads the generation that tags the slots
@@ -571,14 +571,14 @@ impl<T> RetiredSlots<T> {
         // Reclaim as many slots as this write retired, so values are dropped
         // as steadily as writes allocate them, which allocators' per-thread
         // caches absorb. Slots due since an earlier advance are a backlog,
-        // and each write drains one more of it.
+        // and each write drains as many more of it, within one batch.
         Self::take_aged(&mut queue, generation, reclaimed, retired);
         if queue
             .slots
             .front()
             .is_some_and(|&(due, _)| due < generation)
         {
-            Self::take_aged(&mut queue, generation, reclaimed, 1);
+            Self::take_aged(&mut queue, generation, reclaimed, retired);
         }
         // The next write reclaims the front slot, a few advances after this
         // thread last touched it: start loading the lines its drop reads.
@@ -1488,9 +1488,13 @@ mod tests {
         }
         assert!(epochs.try_advance());
         // The 32 left became due before the latest advance: a backlog, which
-        // each write drains by one more.
-        for _ in 0..16 {
+        // each write drains by as many more as it retires, while they fit
+        // one reclamation batch.
+        for _ in 0..8 {
             assert_eq!(retire_filled(&epochs, &retired, &store, 1), 2);
+        }
+        for _ in 0..4 {
+            assert_eq!(retire_filled(&epochs, &retired, &store, 2), 4);
         }
         assert_eq!(
             retire_filled(&epochs, &retired, &store, 1),

@@ -35,8 +35,9 @@ use crate::cache_arena::direct_arena_thread;
 #[cfg(test)]
 use crate::sharded_arena::PREFETCHED;
 use crate::sharded_arena::{
-    EpochPin, Epochs, MAX_EXPIRY_TICK, MAX_WEIGHT, OVERFLOW_HANDLE, Reclaimed, RetiredSlots, Slot,
-    SlotDecoder, SlotStore, advise_huge_pages, drop_value, fill, prefetch, prefetch_write,
+    EpochPin, Epochs, MAX_EXPIRY_TICK, MAX_WEIGHT, OVERFLOW_HANDLE, RECLAIM_BATCH, Reclaimed,
+    RetiredSlots, Slot, SlotDecoder, SlotStore, advise_huge_pages, drop_value, fill, prefetch,
+    prefetch_write,
 };
 
 const SLOTS: usize = 10;
@@ -1288,8 +1289,8 @@ where
             } else {
                 pinned.insert(self.epochs.pin())
             };
-            let mut removed = Removed::new();
             let mut advance = false;
+            let mut removed = Removed::new();
             for (hash, key, value) in chunk.drain(..) {
                 cached += usize::from(self.insert_pinned(
                     key,
@@ -1299,7 +1300,10 @@ where
                     pin,
                     &mut removed,
                 ));
-                if removed.len == removed.first.len() {
+                // While a backlog is due, a retirement reclaims twice what it
+                // queues, within one reclamation batch: retiring more at
+                // once would leave the backlog for good.
+                if removed.len >= RECLAIM_BATCH / 2 {
                     advance |= self.retire_removed(&removed, pin);
                     removed = Removed::new();
                 }
@@ -4158,6 +4162,45 @@ mod tests {
         assert!(
             batched <= 2 * single.max(INSERT_MANY_CHUNK),
             "{batched} removed entries await reclamation, against {single} for single inserts"
+        );
+    }
+
+    #[test]
+    fn insert_many_drains_a_reclamation_backlog_as_inserts_do() {
+        // A pinned reader holds back every removal's reclamation. Once it
+        // leaves, each write reclaims one more entry than it retires until
+        // the backlog is gone; batches that retire a full reclamation batch
+        // at a time never would, and the slab region would run out.
+        let queued = |batched: bool| {
+            let cache = ShardedCacheBuilder::new(500).shards(1).build::<u64, u64>();
+            {
+                let _reader = cache.pin();
+                for key in 0..5_000 {
+                    cache.insert(key, key);
+                }
+            }
+            let backlog = cache
+                .retired
+                .queued(crate::sharded_arena::retired_queue_index());
+            let keys = 5_000..20_000;
+            if batched {
+                cache.insert_many(keys.map(|key| (key, key)));
+            } else {
+                for key in keys {
+                    cache.insert(key, key);
+                }
+            }
+            let left = cache
+                .retired
+                .queued(crate::sharded_arena::retired_queue_index());
+            (backlog, left)
+        };
+        let ((backlog, single), (_, batched)) = (queued(false), queued(true));
+        assert!(backlog > 4_000, "the reader held back {backlog} removals");
+        assert!(
+            batched <= 2 * single.max(INSERT_MANY_CHUNK),
+            "{batched} of {backlog} held-back removals await reclamation after a batch, \
+             against {single} after single inserts"
         );
     }
 
