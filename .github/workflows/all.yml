@@ -1,0 +1,81 @@
+name: Every cache
+
+on:
+  push:
+    branches: ['bench/**']
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: probe ${{ matrix.entries }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        entries: [50000, 1000000]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Machine
+        run: lscpu | sed -n '1,20p'
+      - name: Build
+        run: cargo build --release --manifest-path bench-all/probe/Cargo.toml --target-dir target-all
+      - name: Run
+        run: |
+          P=$PWD/target-all/release/probeall
+          sh bench-all/ab.sh 3 "resident-hit read-miss cold-fill turnover replace delete-reinsert" "${{ matrix.entries }}" "1 4" all.csv \
+            sharded=$P:sharded quick=$P:quickcache moka=$P:moka mini-moka=$P:mini-moka tinyufo=$P:tinyufo scc=$P:scc
+          python3 bench-all/allsum.py all.csv | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: probe-${{ matrix.entries }}
+          path: all.csv
+
+  mokabench:
+    name: mokabench ${{ matrix.trace }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        trace: [s3, ds1, p8, s1, p3, oltp]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Machine
+        run: lscpu | sed -n '1,20p'
+      - name: Build
+        run: |
+          git clone --quiet https://github.com/moka-rs/mokabench.git target/mokabench
+          git -C target/mokabench checkout --quiet --force a0d61f64d007057a72b328c5d17cafc27c2905a1
+          git -C target/mokabench apply "$PWD/bench-all/mokabench-all.diff"
+          cargo build --quiet --release --manifest-path target/mokabench/Cargo.toml \
+            --target-dir target/mokabench/target --features packedgen,quick_cache,tiny-ufo,mini-moka,scc
+      - name: Trace
+        run: |
+          trace=${{ matrix.trace }}
+          case $trace in *) file=$(echo "$trace" | tr '[:lower:]' '[:upper:]').lis ;; esac
+          mkdir -p target/mokabench/cache-trace/arc
+          curl --fail --silent --show-error --location --retry 3 \
+            --output "target/mokabench/cache-trace/arc/$file.zst" \
+            "https://raw.githubusercontent.com/moka-rs/cache-trace/ef0a9de8cf0202a1f2fee186a0af497774b0f0a9/arc/$file.zst"
+          zstd --decompress --quiet --rm "target/mokabench/cache-trace/arc/$file.zst"
+      - name: Replay
+        env:
+          MOKABENCH_CACHES: packedgen,quick_cache,moka,scc,tinyufo,mini-moka
+        run: |
+          trace=${{ matrix.trace }}
+          for rep in 1 2 3; do
+            (cd target/mokabench && ./target/release/mokabench --trace-file $trace --num-clients 1,2,4) > run.out
+            grep -E '^[A-Za-z][^{]*, [0-9]+, [0-9]+, ' run.out | sed "s/^/$trace,$rep,/" >> mokabench-$trace.csv
+          done
+          cat mokabench-$trace.csv
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mokabench-${{ matrix.trace }}
+          path: mokabench-${{ matrix.trace }}.csv

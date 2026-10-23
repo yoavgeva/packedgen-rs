@@ -1,0 +1,19 @@
+[package]
+name = "probeall"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+packedgen = { path = "../.." }
+quick_cache = "=0.7.0"
+moka = { version = "0.12.16", features = ["sync"] }
+mini-moka = "0.10.3"
+stretto = { version = "0.9.0", features = ["sync"] }
+TinyUFO = "0.9.0"
+scc = "3.8.8"
+
+[profile.release]
+debug = false
+
+[workspace]
