@@ -822,6 +822,27 @@ The earlier boxed-entry storage measured macOS resident hits at −32%, +2%,
 and +241%. On macOS those boxes often sat beside their values (see "Slab
 storage against boxed entries").
 
+The Linux VM has no hardware counters, and neither has a GitHub x86_64
+runner, where `perf stat` reports cycles and cache misses as unsupported.
+Cachegrind, which counts instructions exactly and simulates caches, ran
+each write workload at 400,000 and 800,000 operations; the difference is
+per operation, with setup removed. At 50,000 entries on one Linux thread:
+
+| Per operation | Cold fill | Replace | Delete and reinsert |
+| --- | ---: | ---: | ---: |
+| ShardedCache instructions | 1,805 | 1,410 | 2,045 |
+| quick_cache instructions | 1,217 | 963 | 1,349 |
+| ShardedCache L1 data misses | 15.2 | 11.8 | 17.6 |
+| quick_cache L1 data misses | 12.8 | 10.4 | 13.9 |
+
+Allocator work was identical for the two caches, and ShardedCache hashed
+once per insert where quick_cache hashed twice. Retiring and reclaiming
+removed entries took 370 to 410 instructions per write, 60 to 80% of the
+difference, spread over about a hundred source lines with none above 16;
+the rest was spread over the policy, the table, and the insert itself.
+Those instructions are cheap, as the bound above shows: freeing at once
+gained 3 to 10%.
+
 ### Batched inserts
 
 `bounded_cache_probe`'s `sharded-batch` backend writes through
@@ -1278,6 +1299,25 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
   same bound had been 29 to 35% before advances over the reader shards in
   use and the eviction prefetch. Deferred reclamation is no longer the main
   single-thread write cost.
+- **Trimming the retire path.** Fusing its two scans for aged slots into one
+  loop added 8 instructions per write in Cachegrind. Earlier redesigns of
+  that path (per-thread lanes, a lock-free free stack, a spin lock, larger
+  batches) are above.
+- **Batched reads.** A guard method looking up eight `u64` keys at a time,
+  prefetching their home buckets first, ran single-thread resident hits on
+  an M4 Max at 175 to 207 Mops/s against 201 to 208 for the guard's own
+  reads at 50,000 entries, and at 43 to 49 against 38 to 41 at 1,000,000.
+  Prefetching each key's first candidate entry as well made both sizes
+  slower. The core already overlaps independent guard reads, so a batched
+  read API did not pay for itself.
+- **Access marks in the bucket.** Each entry's two access marks moved into
+  the top bits of its slot's generation byte, leaving six bits of placement
+  count. That would let caches without weights or deadlines drop the 8-byte
+  entry metadata, and let eviction sweeps read marks from bucket lines they
+  already load. Trace hit ratios stayed level (667.65 and 667.63), and
+  writes moved by −5 to +8% on macOS; but single-thread resident hits fell
+  7 to 14%, eight-thread hits 5 to 12%, and eight-thread turnover 6%. A hit
+  had to find its bucket again and load the marks after comparing its key.
 
 ## Reproduce
 
@@ -1296,4 +1336,8 @@ python3 scripts/summarize_compare.py target/compare-50k.csv
 git push origin HEAD:refs/heads/bench/NAME   # the same on x86_64, and against HEAD^
 sh scripts/mokabench.sh 3 1,4,8,16 "s3 ds1 p8 s1 p3 oltp" target/mokabench.csv
 python3 scripts/summarize_mokabench.py target/mokabench.csv
+$PROBE sharded-batch replace 1000000 4000000 1 64 1
+# Instructions per write, on Linux: run twice and subtract.
+valgrind --tool=cachegrind --cache-sim=yes $PROBE sharded replace 50000 400000 1 64 1
+valgrind --tool=cachegrind --cache-sim=yes $PROBE sharded replace 50000 800000 1 64 1
 ```
