@@ -135,24 +135,34 @@ jobs:
     # fallbacks under Windows' scheduler, timers, and allocator.
     runs-on: windows-latest
     timeout-minutes: 30
+    # cargo test runs one test binary at a time, about nine minutes here.
+    # nextest runs every binary's tests at once, so the test legs take about
+    # as long as their slowest test, direct_cache_memory's three minutes.
+    # It runs each benchmark in its own process, though, and every Criterion
+    # process repeats its bench's setup (about 16 s for mixed_workloads), so
+    # the benches run under cargo test on a runner of their own.
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: default features
             key: default
-            packages: --workspace
-            features: ""
+            command: nextest run --no-fail-fast --workspace --lib --bins --tests --examples
           - name: prepared keys and diagnostics
             key: prepared
-            packages: -p packedgen
-            features: prepared-keys,prepared-batch-gate,cache-production-diagnostics
+            command: >-
+              nextest run --no-fail-fast -p packedgen --lib --bins --tests --examples
+              --features prepared-keys,prepared-batch-gate,cache-production-diagnostics
+          - name: benches in test mode
+            key: benches
+            command: test --workspace --benches
     defaults:
       run:
         shell: bash
     env:
-      # Writing PDBs dominates linking the ~90 test, example, and bench
-      # binaries. Panic messages keep their source locations without them.
+      # Without debug info, the uncached build took 1m12s against 2m20s, as
+      # the linker skips writing PDBs for the ~90 test, example, and bench
+      # binaries. Panic messages keep their source locations.
       CARGO_PROFILE_DEV_DEBUG: 0
     steps:
       # Tests read sources with include_str!; keep the LF endings the other
@@ -165,14 +175,12 @@ jobs:
         with:
           key: windows-${{ matrix.key }}
       - uses: taiki-e/install-action@v2
+        if: startsWith(matrix.command, 'nextest')
         with:
           tool: cargo-nextest@0.9.148
           fallback: none
-      # cargo test runs one binary at a time, about nine minutes here, while
-      # nextest runs every binary's tests at once. The run then takes about
-      # as long as the slowest test, direct_cache_memory's three minutes.
       - name: Tests
-        run: cargo nextest run --locked --no-fail-fast ${{ matrix.packages }} --all-targets --features "${{ matrix.features }}"
+        run: cargo ${{ matrix.command }} --locked
 
   loom:
     name: Loom models
