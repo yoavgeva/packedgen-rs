@@ -156,6 +156,14 @@ entry. Tables are sized once and never rebuilt.
 - **Clearing.** `clear` sweeps each shard under its lock. It retires every
   entry, resets the probation, main, and ghost state, and leaves the eviction
   and expiration counts in place.
+- **Batched inserts.** `insert_many` inserts pairs in order, as single inserts
+  would, and returns how many it cached. It takes one epoch pin per call
+  instead of one per insert. Each chunk of 32 keys is hashed, and their home
+  buckets prefetched, before the chunk is inserted. The pin is refreshed
+  between chunks: held across a long batch, it would block every advance past
+  its epoch, and in a test 49,500 removed entries waited, against 96 for
+  single inserts. A call with one pair is a plain insert. See "Batched
+  inserts" under "Throughput against quick_cache 0.7" for its effect.
 
 ## Correctness evidence
 
@@ -175,6 +183,9 @@ entry. Tables are sized once and never rebuilt.
   - an 8-thread race of replacements, removals, loads, clears, and evictions
     that counts live values to prove each one is dropped exactly once;
   - eight racing callers loading a missing key once;
+  - batched inserts leaving the cache as single inserts do, pinning once,
+    prefetching each home bucket, and letting their removed entries be
+    reclaimed;
   - failing and panicking loads handing the key to a waiter;
   - expired entries reading as missing, and leaving before read live keys;
   - statistics, every removal cause, `clear`, and `peek`.
@@ -783,6 +794,32 @@ allocator filled shortly before.
 The earlier boxed-entry storage measured macOS resident hits at −32%, +2%,
 and +241%. On macOS those boxes often sat beside their values (see "Slab
 storage against boxed entries").
+
+### Batched inserts
+
+`bounded_cache_probe`'s `sharded-batch` backend writes through
+`insert_many`, 64 writes per call. On macOS, against `insert` in the same
+build, the paired median of five runs:
+
+| Workload | 50,000, 1T | 50,000, 8T | 1,000,000, 1T | 1,000,000, 8T |
+| --- | ---: | ---: | ---: | ---: |
+| Replace | +20% | +21% | +74% | +51% |
+| Cold fill | −1% | +17% | +19% | −11% |
+
+Replace finds each key before writing it, and with the batch's buckets
+prefetched its finds overlap: at 1,000,000 entries batched replace ran at
+6.4 Mops/s on one thread, against quick_cache's 2.9. Cold fill at 50,000
+entries evicts on every insert from buckets already cached, and gains
+nothing. Eight-thread cold fill at 1,000,000 entries ranged from −84% to
++15% between pairs, as the shared host's load moved.
+
+Sharing `insert`'s body with `insert_many` first cost single replaces 12%
+at 50,000 entries. With two copies of the body, the compiler stopped
+inlining five helpers it had inlined for their single call site:
+Cachegrind counted 1,439 instructions per replace against 1,410. Forcing
+them inline, and giving the slot stacks one shared thread-local accessor,
+brought it to 1,405, and single-operation cells against the parent commit
+moved by −4 to +12%, every range but one crossing zero.
 
 ### On x86_64
 
