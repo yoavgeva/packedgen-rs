@@ -1,0 +1,29 @@
+name: membarrier cost
+
+on:
+  push:
+    branches: ['bench/**']
+
+permissions:
+  contents: read
+
+jobs:
+  cost:
+    name: membarrier ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Machine
+        run: |
+          lscpu | sed -n '1,20p'
+          uname -r
+      - name: Run
+        run: |
+          cd bench-mb
+          set -o pipefail; cargo run --release | tee -a "$GITHUB_STEP_SUMMARY"
