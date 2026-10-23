@@ -1,0 +1,71 @@
+name: Huge page A/B
+
+# Throwaway: this branch's code (HEAD^) against its parent PR (HEAD~2), at
+# sizes where the table and slab region span many huge pages.
+on:
+  push:
+    branches: ['bench/thp-*']
+
+jobs:
+  thp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 3
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Machine
+        run: |
+          lscpu | sed -n '1,20p'
+          free -m
+          for f in enabled defrag; do echo "$f: $(cat /sys/kernel/mm/transparent_hugepage/$f)"; done
+      - name: Build
+        run: |
+          cargo build --locked --release --example bounded_cache_probe
+          git worktree add ../parent HEAD~2
+          (cd ../parent && cargo build --locked --release --example bounded_cache_probe --target-dir ../target-parent)
+      - name: Huge pages taken
+        run: |
+          for v in new parent; do
+            if [ $v = new ]; then B=target/release/examples/bounded_cache_probe; else B=../target-parent/release/examples/bounded_cache_probe; fi
+            $B sharded resident-hit 1000000 400000000 1 64 1 0 > /dev/null &
+            pid=$!
+            sleep 6
+            echo "$v: $(grep -E '^(Rss|AnonHugePages)' /proc/$pid/smaps_rollup | tr -s ' ' | tr '\n' ' ')"
+            kill $pid
+          done
+      - name: A/B
+        run: |
+          for pair in 1 2 3 4 5 6 7; do
+            for entries in 50000 1000000; do
+              for workers in 1 4; do
+                for workload in resident-hit read-miss turnover cold-fill replace; do
+                  case $workload in resident-hit|read-miss) ops=4000000;; *) ops=2000000;; esac
+                  list="new parent"; [ $((pair % 2)) -eq 0 ] && list="parent new"
+                  for v in $list; do
+                    if [ $v = new ]; then B=target/release/examples/bounded_cache_probe; else B=../target-parent/release/examples/bounded_cache_probe; fi
+                    printf '%s,' "$v" >> thp.csv
+                    $B sharded $workload $entries $ops $workers 64 $pair 0 | tail -n 1 >> thp.csv
+                  done
+                done
+              done
+            done
+          done
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import csv, collections, statistics
+          rows = collections.defaultdict(list)
+          for f in csv.reader(open('thp.csv')):
+              rows[(f[2], int(f[3]), f[6], f[0])].append(float(f[10]))
+          print('| Workload | Capacity | Threads | new | parent | change | range |')
+          print('| --- | ---: | ---: | ---: | ---: | ---: | --- |')
+          for k in sorted({k[:3] for k in rows}):
+              new, old = rows[k + ('new',)], rows[k + ('parent',)]
+              r = sorted(a / b - 1 for a, b in zip(new, old))
+              print(f'| {k[0]} | {k[1]} | {k[2]} | {statistics.median(new):.1f} | {statistics.median(old):.1f} | {100*(statistics.median(new)/statistics.median(old)-1):+.0f}% | {100*r[0]:+.0f} to {100*r[-1]:+.0f}% |')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: thp-impl-${{ github.run_id }}
+          path: thp.csv
