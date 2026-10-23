@@ -1,0 +1,52 @@
+name: x86 Cachegrind of reads
+
+on:
+  push:
+    branches: ['bench/**']
+
+permissions:
+  contents: read
+
+jobs:
+  cachegrind:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Machine
+        run: lscpu | sed -n '1,20p'
+      - name: Tools
+        run: sudo apt-get update -q && sudo apt-get install -y -q valgrind
+      - name: Build
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+        run: cargo build --locked --release --example bounded_cache_probe
+      - name: Cachegrind
+        run: |
+          P=target/release/examples/bounded_cache_probe
+          mkdir -p cg
+          for b in sharded quickcache; do
+            for w in resident-hit read-miss turnover; do
+              for e in 50000 1000000; do
+                for ops in 2000000 4000000; do
+                  valgrind --tool=cachegrind --cache-sim=yes --cachegrind-out-file=cg/$b-$w-$e-$ops.cg \
+                    $P $b $w $e $ops 1 64 1 > /dev/null 2>&1 &
+                done
+              done
+            done
+            wait
+          done
+          for b in sharded quickcache; do
+            for w in resident-hit read-miss turnover; do
+              for e in 50000 1000000; do
+                python3 bench-cg/pydiff.py cg/$b-$w-$e-2000000.cg cg/$b-$w-$e-4000000.cg cg/$b-$w-$e.diff.cg
+              done
+            done
+          done
+          python3 bench-cg/sum.py 2000000 cg/*.diff.cg | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cachegrind
+          path: cg/
