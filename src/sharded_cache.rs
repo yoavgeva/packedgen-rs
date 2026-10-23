@@ -1907,6 +1907,125 @@ where
         live
     }
 
+    /// Removes `key` if `remove` returns true for its live value, deciding
+    /// and removing under the shard lock, so no write to the key lands in
+    /// between. Returns whether it removed a value. An expired entry is
+    /// removed without being offered, as [`Self::remove`] removes it.
+    ///
+    /// `remove` runs under the shard lock: it must not write to the cache.
+    #[allow(
+        unsafe_code,
+        reason = "dereferences handles published, then unpublished, under the shard lock"
+    )]
+    pub fn remove_if<Q>(&self, key: &Q, remove: impl FnOnce(&V) -> bool) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let hash = self.hash(key);
+        let shard = self.shard(hash);
+        let pin = self.epochs.pin();
+        let mut removed = Removed::new();
+        let mut live = false;
+        {
+            let mut writer = shard.lock();
+            let found = shard.find(hash, |handle| {
+                // SAFETY: published in this table while `pin` is held.
+                unsafe { entry(&pin, handle) }.value().0.borrow() == key
+            });
+            if let Some((index, handle)) = found {
+                // SAFETY: as above; the lock keeps it published until the
+                // clear below, which `pin` outlives.
+                let current = unsafe { entry(&pin, handle) };
+                let expired = self.expired(current, &mut None);
+                if expired || remove(&current.value().1) {
+                    let handle = shard.clear(index);
+                    writer.left(current.weight());
+                    let cause = if expired {
+                        writer.count_expiration();
+                        RemovalCause::Expired
+                    } else {
+                        live = true;
+                        RemovalCause::Explicit
+                    };
+                    removed.push(handle, cause);
+                }
+            }
+        }
+        self.after_write(&removed, pin);
+        live
+    }
+
+    /// Replaces the value of `key` if it holds a live one, as
+    /// [`Self::insert`] would, and returns the pair otherwise, leaving the
+    /// cache as it was. The new entry expires after the builder's time to
+    /// live or time to idle, if either.
+    ///
+    /// # Errors
+    ///
+    /// Returns the pair if `key` holds no live value, or if the value is
+    /// too heavy to cache; the latter removes the old value, as
+    /// [`Self::insert`] does.
+    #[allow(
+        unsafe_code,
+        reason = "fills a slot it owns, and swaps handles, under the shard lock"
+    )]
+    pub fn replace(&self, key: K, value: V) -> Result<(), (K, V)> {
+        let hash = self.hash(&key);
+        let shard = self.shard(hash);
+        let weight = self.weighter.weight(&key, &value);
+        let Some(compact_weight) = u32::try_from(weight)
+            .ok()
+            .filter(|weight| *weight <= MAX_WEIGHT && u64::from(*weight) <= shard.limits.weight())
+        else {
+            self.remove(&key);
+            return Err((key, value));
+        };
+        let expires_at = self
+            .lifetime()
+            .map_or(NEVER_EXPIRES, |ttl| self.deadline(ttl));
+        let pin = self.epochs.pin();
+        let mut removed = Removed::new();
+        let mut now = None;
+        // Taken before locking, as inserts take theirs; filled only once a
+        // live value is found, and otherwise given back unwritten.
+        let (slot, raw) = self.slots.take();
+        {
+            let mut writer = shard.lock();
+            let found = shard.find(hash, |current| {
+                // SAFETY: published in this table while `pin` is held.
+                unsafe { entry(&pin, current) }.value().0 == key
+            });
+            let Some((index, _)) = found.filter(|(_, current)| {
+                // SAFETY: as above.
+                !self.expired(unsafe { entry(&pin, *current) }, &mut now)
+            }) else {
+                drop(writer);
+                self.slots.give(&[slot]);
+                return Err((key, value));
+            };
+            // SAFETY: `take` handed this vacant slot to this caller alone,
+            // and nothing reaches it before the exchange publishes it.
+            unsafe { fill(slot, (key, value), compact_weight, expires_at) };
+            let handle = Handle { raw, slot };
+            let previous = shard.handle(shard.bucket(index).exchange(index % SLOTS, raw));
+            // SAFETY: the exchange unpublished `previous` while `pin` is held.
+            let previous_entry = unsafe { entry(&pin, previous) };
+            writer.set_weight(writer.weight() - previous_entry.weight() + weight);
+            removed.push(previous, RemovalCause::Replaced);
+            while writer.weight() > shard.limits.weight() {
+                let Some((victim, cause)) =
+                    self.evict(shard, &mut writer, &pin, Some(handle), &mut now)
+                else {
+                    break;
+                };
+                removed.push(victim, cause);
+            }
+        }
+        self.after_write(&removed, pin);
+        Ok(())
+    }
+
     /// Removes every entry. Inserts racing the sweep may survive it.
     pub fn clear(&self) {
         for index in 0..self.shards.len() {
@@ -4628,6 +4747,109 @@ mod tests {
         for key in 0..100 {
             assert_eq!(cache.get(&key), Some(key + 1_000), "replaced key {key}");
         }
+    }
+
+    /// Each removal a listener heard, with its cause.
+    type Heard = Arc<Mutex<Vec<(u64, RemovalCause)>>>;
+
+    /// A cache whose removal listener records each key and cause.
+    fn heard_cache(
+        capacity: usize,
+    ) -> (
+        ShardedCache<u64, u64, UnitWeighter, DefaultHashBuilder, impl RemovalListener<u64, u64>>,
+        Heard,
+    ) {
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let cache = ShardedCacheBuilder::new(capacity)
+            .removal_listener({
+                let heard = Arc::clone(&heard);
+                move |key: &u64, _: &u64, cause| heard.lock().push((*key, cause))
+            })
+            .build::<u64, u64>();
+        (cache, heard)
+    }
+
+    #[test]
+    fn remove_if_decides_and_removes_under_one_lock() {
+        let (cache, heard) = heard_cache(100);
+        cache.insert(1, 10);
+        cache.insert(2, 20);
+        cache.insert_with_ttl(3, 30, HOUR);
+        assert!(!cache.remove_if(&1, |value| *value == 11));
+        assert_eq!(
+            cache.get(&1),
+            Some(10),
+            "a rejected removal leaves the value"
+        );
+        assert!(cache.remove_if(&1, |value| *value == 10));
+        assert_eq!(cache.get(&1), None);
+        assert!(!cache.remove_if(&9, |_| unreachable!("an absent key is not offered")));
+        cache.advance_clock(HOUR + MINUTE);
+        assert!(!cache.remove_if(&3, |_| unreachable!("an expired value is not offered")));
+        assert!(!cache.contains_key(&3));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(
+            *heard.lock(),
+            [(1, RemovalCause::Explicit), (3, RemovalCause::Expired)]
+        );
+        assert_eq!(cache.stats().expirations, 1);
+    }
+
+    #[test]
+    fn replace_writes_only_a_live_key_and_returns_the_pair_otherwise() {
+        let (cache, heard) = heard_cache(100);
+        assert_eq!(cache.replace(1, 10), Err((1, 10)), "absent");
+        assert!(cache.is_empty());
+        // A failed replace gives its slot back: slots are reused last in,
+        // first out, so the next one taken is the one it borrowed.
+        let (slot, _) = cache.slots.take();
+        cache.slots.give(&[slot]);
+        assert_eq!(cache.replace(7, 70), Err((7, 70)));
+        assert_eq!(cache.slots.take().0, slot, "the slot came back");
+        cache.insert(1, 10);
+        assert_eq!(cache.replace(1, 11), Ok(()));
+        assert_eq!(cache.get(&1), Some(11));
+        cache.insert_with_ttl(2, 20, HOUR);
+        cache.advance_clock(HOUR + MINUTE);
+        assert_eq!(cache.replace(2, 21), Err((2, 21)), "expired");
+        assert_eq!(cache.get(&2), None);
+        assert_eq!(cache.len(), 2, "the expired entry waits for eviction");
+        assert_eq!(*heard.lock(), [(1, RemovalCause::Replaced)]);
+        // Replacing restarts the time to live, as inserting does.
+        let expiring = ShardedCacheBuilder::new(100)
+            .time_to_live(HOUR)
+            .build::<u64, u64>();
+        expiring.insert(1, 10);
+        expiring.advance_clock(59 * MINUTE);
+        assert_eq!(expiring.replace(1, 11), Ok(()));
+        expiring.advance_clock(59 * MINUTE);
+        assert_eq!(expiring.get(&1), Some(11));
+    }
+
+    #[test]
+    fn replace_reweighs_and_a_value_too_heavy_removes_the_old_one() {
+        let cache = ShardedCacheBuilder::new(100)
+            .max_weight(100)
+            .shards(1)
+            .weighter(|_: &u64, value: &u64| *value)
+            .build::<u64, u64>();
+        for key in 0..4 {
+            cache.insert(key, 20);
+        }
+        assert_eq!(cache.weight(), 80);
+        assert_eq!(cache.replace(0, 50), Ok(()));
+        assert!(cache.weight() <= 100, "evicted down to the limit");
+        assert_eq!(
+            cache.get(&0),
+            Some(50),
+            "the replacement is never evicted for itself"
+        );
+        assert_eq!(cache.replace(0, 101), Err((0, 101)));
+        assert_eq!(
+            cache.get(&0),
+            None,
+            "too heavy: the old value goes, as with insert"
+        );
     }
 
     #[test]

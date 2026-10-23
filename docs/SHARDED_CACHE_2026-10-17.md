@@ -196,6 +196,14 @@ entry. Tables are sized once and never rebuilt.
     offered stays.
   - Expired entries are removed without being offered, as `Expired`; the
     rest as `Explicit`.
+- **Conditional writes.** `remove_if` offers a live value to its
+  predicate and removes it under the same shard lock, so no write to the
+  key lands between the decision and the removal; the predicate must not
+  write to the cache. `replace` writes a key only if it holds a live value
+  and otherwise hands the pair back. It takes its slot before locking, as
+  inserts do, fills it only once it finds the live value, and otherwise
+  gives it back unwritten; a value too heavy to cache removes the old one,
+  as an insert's does. Expired entries count as absent for both.
 - **Resizing.** `set_capacity` and `set_max_weight` change the limits at
   run time.
   - Tables are never rebuilt, so the builder's `max_capacity` reserves the
@@ -258,6 +266,11 @@ entry. Tables are sized once and never rebuilt.
     loop body and another thread write;
   - `retain` removing rejected and expired entries with their causes, and
     sparing entries its predicate replaced;
+  - `remove_if` removing only what its predicate accepts and never
+    offering absent or expired values; `replace` writing only live keys,
+    restarting the time to live, reweighing, removing the old value when
+    the new one is too heavy, and giving its slot back when it fails
+    (verified to fail without the give-back);
   - `set_capacity` evicting down at once and growing back within the
     reserve, `set_max_weight` evicting down and refusing values heavier
     than the new shares, and resizes racing four writing threads.

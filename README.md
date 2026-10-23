@@ -73,6 +73,8 @@ It offers:
 - a removal listener told why each entry left;
 - `iter` over cloned entries, or borrowed ones through `pin()`, and
   `retain`, whose predicate may write to the cache;
+- `remove_if`, which decides and removes under one lock, and `replace`,
+  which writes only a key that holds a live value;
 - `peek`, `contains_key`, `clear`, and `maintain`, which drops removed
   values promptly after a burst of writes;
 - weighted limits, `set_capacity` and `set_max_weight` to resize at run
