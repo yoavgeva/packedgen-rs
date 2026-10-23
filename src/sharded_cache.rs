@@ -102,6 +102,8 @@ const GHOST_KEY_BITS: u32 = 5;
 const EXPIRY_TICK_NANOS: u128 = 100_000_000;
 /// Hit and miss counts spread over this many cache lines, by thread.
 const STAT_STRIPES: usize = 32;
+/// Inserts an `insert_many` batch prefetches for and runs under one pin.
+const INSERT_MANY_CHUNK: usize = 32;
 
 /// Charges each entry against a cache's weight limit.
 pub trait Weighter<K, V> {
@@ -1247,12 +1249,104 @@ where
         self.insert_expiring(key, value, Some(ttl))
     }
 
+    /// Inserts each pair in order, as [`Self::insert`] would one at a time,
+    /// and returns how many values were cached. A batch takes one epoch pin,
+    /// refreshed between chunks of inserts, instead of one per insert, and
+    /// starts loading every key's home bucket before inserting the chunk.
+    ///
+    /// # Panics
+    ///
+    /// As for [`Self::insert`].
+    pub fn insert_many<I>(&self, entries: I) -> usize
+    where
+        I: IntoIterator<Item = (K, V)>,
+    {
+        let mut entries = entries.into_iter();
+        let Some(first) = entries.next() else {
+            return 0;
+        };
+        let Some(second) = entries.next() else {
+            // Nothing to share: a chunk's buffer and pin refresh would cost
+            // a lone insert more than they save.
+            let (key, value) = first;
+            return usize::from(self.insert(key, value));
+        };
+        let mut entries = [first, second].into_iter().chain(entries).peekable();
+        let mut chunk = Vec::with_capacity(INSERT_MANY_CHUNK);
+        let mut cached = 0;
+        let mut pinned: Option<EpochPin<'_>> = None;
+        while entries.peek().is_some() {
+            chunk.extend(
+                entries
+                    .by_ref()
+                    .take(INSERT_MANY_CHUNK)
+                    .map(|(key, value)| (self.hash(&key), key, value)),
+            );
+            for &(hash, ..) in &chunk {
+                let shard = self.shard(hash);
+                prefetch(&raw const shard.buckets[shard.home(hash)]);
+            }
+            // The first chunk hashes before pinning, as an insert does. A
+            // pin held past two advances would hold back every removal
+            // since, the batch's own included, so later chunks refresh it.
+            let pin = if let Some(pin) = &mut pinned {
+                pin.refresh();
+                pin
+            } else {
+                pinned.insert(self.epochs.pin())
+            };
+            let mut removed = Removed::new();
+            let mut advance = false;
+            for (hash, key, value) in chunk.drain(..) {
+                cached += usize::from(self.insert_pinned(
+                    key,
+                    value,
+                    self.time_to_live,
+                    hash,
+                    pin,
+                    &mut removed,
+                ));
+                if removed.len == removed.first.len() {
+                    advance |= self.retire_removed(&removed, pin);
+                    removed = Removed::new();
+                }
+            }
+            if self.retire_removed(&removed, pin) || advance {
+                self.epochs.try_advance();
+            }
+        }
+        cached
+    }
+
+    fn insert_expiring(&self, key: K, value: V, ttl: Option<Duration>) -> bool {
+        let hash = self.hash(&key);
+        let pin = self.epochs.pin();
+        let mut removed = Removed::new();
+        let inserted = self.insert_pinned(key, value, ttl, hash, &pin, &mut removed);
+        self.after_write(&removed, pin);
+        inserted
+    }
+
+    /// Inserts under `pin`, pushing what the insert unpublished to `removed`
+    /// for the caller to retire while still pinned.
+    #[allow(
+        clippy::inline_always,
+        reason = "`insert`'s body; out of line, the key and value passed through memory"
+    )]
     #[allow(
         unsafe_code,
         reason = "fills, publishes, and unpublishes slab slots under the shard lock"
     )]
-    fn insert_expiring(&self, key: K, value: V, ttl: Option<Duration>) -> bool {
-        let hash = self.hash(&key);
+    #[inline(always)]
+    fn insert_pinned(
+        &self,
+        key: K,
+        value: V,
+        ttl: Option<Duration>,
+        hash: u64,
+        pin: &EpochPin<'_>,
+        removed: &mut Removed<(K, V)>,
+    ) -> bool {
         let shard = self.shard(hash);
         let weight = self.weighter.weight(&key, &value);
         let Some(compact_weight) = u32::try_from(weight)
@@ -1264,15 +1358,13 @@ where
         };
         let expires_at = ttl.map_or(NEVER_EXPIRES, |ttl| self.deadline(ttl));
         let mut now = None;
-        let pin = self.epochs.pin();
         let (slot, raw) = self.slots.take();
         // SAFETY: `take` handed this vacant slot to this caller alone, and
         // nothing can reach it before it is published below.
         unsafe { fill(slot, (key, value), compact_weight, expires_at) };
         let handle = Handle { raw, slot };
         // SAFETY: the caller's own filled slot, published below or never.
-        let key = &unsafe { entry(&pin, handle) }.value().0;
-        let mut removed = Removed::new();
+        let key = &unsafe { entry(pin, handle) }.value().0;
         {
             let mut writer = shard.lock();
             if writer.over_limit(weight) {
@@ -1280,14 +1372,14 @@ where
             }
             let found = shard.find(hash, |current| {
                 // SAFETY: published in this table while `pin` is held.
-                unsafe { entry(&pin, current) }.value().0 == *key
+                unsafe { entry(pin, current) }.value().0 == *key
             });
             if let Some((index, _)) = found {
                 let previous =
                     shard.handle(shard.bucket(index).exchange(index % SLOTS, handle.raw));
                 // SAFETY: the exchange unpublished `previous` while `pin` is
                 // held.
-                let previous_entry = unsafe { entry(&pin, previous) };
+                let previous_entry = unsafe { entry(pin, previous) };
                 let reweighed = writer.weight() - previous_entry.weight() + weight;
                 writer.set_weight(reweighed);
                 let cause = if self.expired(previous_entry, &mut now) {
@@ -1299,7 +1391,7 @@ where
                 removed.push(previous, cause);
                 while writer.weight() > shard.limits.weight {
                     let Some((victim, cause)) =
-                        self.evict(shard, &mut writer, &pin, Some(handle), &mut now)
+                        self.evict(shard, &mut writer, pin, Some(handle), &mut now)
                     else {
                         break;
                     };
@@ -1307,8 +1399,7 @@ where
                 }
             } else {
                 while writer.over_limit(weight) {
-                    let Some((victim, cause)) =
-                        self.evict(shard, &mut writer, &pin, None, &mut now)
+                    let Some((victim, cause)) = self.evict(shard, &mut writer, pin, None, &mut now)
                     else {
                         break;
                     };
@@ -1326,7 +1417,7 @@ where
                         #[cfg(test)]
                         WINDOW_EVICTIONS.with(|count| count.set(count.get() + 1));
                         let (victim, cause) =
-                            self.evict_candidate(shard, &mut writer, &pin, hash, &mut now);
+                            self.evict_candidate(shard, &mut writer, pin, hash, &mut now);
                         removed.push(victim, cause);
                     }
                     let placed = shard.place(hash, handle);
@@ -1358,33 +1449,45 @@ where
                 }
             }
         }
-        self.after_write(&removed, pin);
         true
     }
 
-    /// Ends a write after its shard lock, still pinned: tells the listener
-    /// what left, queues the unpublished entries for reclamation, drops the
-    /// values of entries aged enough to reclaim, unpins, and advances the
-    /// epoch generation if enough retirements are pending.
+    /// Ends a write after its shard lock, still pinned: retires what it
+    /// removed, unpins, and advances the epoch generation if enough
+    /// retirements are pending.
     fn after_write(&self, removed: &Removed<(K, V)>, pin: EpochPin<'_>) {
-        if removed.len == 0 {
-            return;
+        let advance = self.retire_removed(removed, &pin);
+        drop(pin);
+        if advance {
+            self.epochs.try_advance();
         }
-        removed.notify(&self.listener, &pin);
+    }
+
+    /// Tells the listener what left, queues the unpublished entries for
+    /// reclamation, and drops the values of entries aged enough to reclaim.
+    /// Requires the pin taken before the entries were unpublished. Returns
+    /// whether enough retirements are pending to try advancing.
+    #[allow(
+        clippy::inline_always,
+        reason = "with `insert_many` as a second caller of the insert body, it stayed out of line"
+    )]
+    #[inline(always)]
+    fn retire_removed(&self, removed: &Removed<(K, V)>, pin: &EpochPin<'_>) -> bool {
+        if removed.len == 0 {
+            return false;
+        }
+        removed.notify(&self.listener, pin);
         let mut reclaimed = Reclaimed::new();
         let mut foreign = Reclaimed::new();
         let advance = self.retired.retire(
-            &pin,
+            pin,
             removed.iter().map(|(handle, _)| handle.slot),
             &mut reclaimed,
             &mut foreign,
         );
         reclaimed.finish(&self.slots);
         foreign.finish(&self.slots);
-        drop(pin);
-        if advance {
-            self.epochs.try_advance();
-        }
+        advance
     }
 
     /// Removes `key`, returning whether it held a live value. An expired
@@ -1821,7 +1924,11 @@ impl<T> ShardView<'_, T> {
     /// Finds the slot whose handle `matches` in the key's home bucket, then
     /// in its alternate if any key from that home lives in its alternate.
     /// Lock-free; decodes overflow handles, for writers.
-    #[inline]
+    #[allow(
+        clippy::inline_always,
+        reason = "with `insert_many` as a second caller of the insert body, it stayed out of line"
+    )]
+    #[inline(always)]
     fn find(
         &self,
         hash: u64,
@@ -2405,7 +2512,11 @@ impl Filters {
     /// Whether the ghost remembers `hash`, a missed key the shard now
     /// inserts. Moves the probation target if the ghost's current
     /// generation or the main filter remembers it.
-    #[inline]
+    #[allow(
+        clippy::inline_always,
+        reason = "with `insert_many` as a second caller of the insert body, it stayed out of line"
+    )]
+    #[inline(always)]
     fn admit(&mut self, hash: u64, max: usize) -> bool {
         let mixed = Self::mixed(hash);
         let mask = Self::mask(mixed);
@@ -3915,6 +4026,88 @@ mod tests {
             assert!(prefetched.contains(&line), "{name} was not prefetched");
         }
         assert!(shard.lock().filters.admit(victim, usize::MAX));
+    }
+
+    #[test]
+    fn insert_many_leaves_the_cache_as_inserting_one_at_a_time_does() {
+        // Batches share a pin and retire their removals together; the
+        // entries, replacements, and evictions are those of single inserts.
+        let build = || {
+            ShardedCacheBuilder::new(500)
+                .shards(1)
+                .hasher(BuildHasherDefault::<DefaultHasher>::default())
+                .build::<u64, u64>()
+        };
+        let (one, many) = (build(), build());
+        let pairs: Vec<(u64, u64)> = (0..5_000).map(|index| (index % 1_700, index)).collect();
+        for &(key, value) in &pairs {
+            one.insert(key, value);
+        }
+        assert_eq!(many.insert_many(pairs.iter().copied()), pairs.len());
+        assert_eq!(many.len(), one.len());
+        assert_eq!(many.stats().evictions, one.stats().evictions);
+        for key in 0..1_700 {
+            assert_eq!(many.peek(&key), one.peek(&key), "key {key}");
+        }
+        assert_eq!(many.insert_many(std::iter::empty()), 0);
+        assert_eq!(many.insert_many([(9_999, 1)]), 1);
+        assert_eq!(many.peek(&9_999), Some(1));
+        // A value over the weight limit is refused and removes the key.
+        let weighted = ShardedCacheBuilder::new(100)
+            .max_weight(100)
+            .weighter(|_: &u64, value: &u64| *value)
+            .build::<u64, u64>();
+        assert_eq!(weighted.insert_many([(1, 1), (2, 2), (1, 1_000)]), 2);
+        assert_eq!(weighted.peek(&1), None);
+        assert_eq!(weighted.peek(&2), Some(2));
+    }
+
+    #[test]
+    fn insert_many_pins_once_and_prefetches_each_home_bucket_first() {
+        // A pin per insert holds back the loads after it; a batch takes one
+        // and starts loading every key's home bucket before inserting.
+        let cache = ShardedCacheBuilder::new(1_000).build::<u64, u64>();
+        let homes: Vec<usize> = (0..64_u64)
+            .map(|key| {
+                let hash = cache.hash(&key);
+                let shard = cache.shard(hash);
+                std::ptr::from_ref(&shard.buckets[shard.home(hash)]) as usize
+            })
+            .collect();
+        let pins = crate::sharded_arena::pins_taken();
+        PREFETCHED.with(|prefetched| prefetched.borrow_mut().clear());
+        assert_eq!(cache.insert_many((0..64).map(|key| (key, key))), 64);
+        assert_eq!(crate::sharded_arena::pins_taken() - pins, 1);
+        let prefetched = PREFETCHED.with(std::cell::RefCell::take);
+        assert_eq!(prefetched, homes, "an empty cache prefetches nothing else");
+        for key in 0..64 {
+            assert_eq!(cache.get(&key), Some(key));
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "fifty thousand inserts")]
+    fn a_long_insert_many_lets_its_removed_entries_be_reclaimed() {
+        // One pin held for a whole batch would block every advance past
+        // its epoch, so each removed entry would wait for the batch's end.
+        let queued = |batched: bool| {
+            let cache = ShardedCacheBuilder::new(500).shards(1).build::<u64, u64>();
+            if batched {
+                cache.insert_many((0..50_000).map(|key| (key, key)));
+            } else {
+                for key in 0..50_000 {
+                    cache.insert(key, key);
+                }
+            }
+            cache
+                .retired
+                .queued(crate::sharded_arena::retired_queue_index())
+        };
+        let (single, batched) = (queued(false), queued(true));
+        assert!(
+            batched <= 2 * single.max(INSERT_MANY_CHUNK),
+            "{batched} removed entries await reclamation, against {single} for single inserts"
+        );
     }
 
     #[test]

@@ -110,6 +110,8 @@ impl Epochs {
         let shard = direct_arena_thread() & (READER_SHARDS - 1);
         #[cfg(test)]
         PINS_HELD.set(PINS_HELD.get() + 1);
+        #[cfg(test)]
+        PINS_TAKEN.set(PINS_TAKEN.get() + 1);
         EpochPin {
             epochs: self,
             epoch: self.enter(shard),
@@ -227,6 +229,15 @@ impl Drop for EpochPin<'_> {
 thread_local! {
     /// The epoch pins this thread holds.
     static PINS_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The epoch pins this thread has taken.
+    static PINS_TAKEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many epoch pins this thread has taken, for tests of work sharing
+/// one.
+#[cfg(test)]
+pub(crate) fn pins_taken() -> usize {
+    PINS_TAKEN.get()
 }
 
 /// How many epoch pins this thread holds, for tests of work kept outside
@@ -1010,6 +1021,15 @@ thread_local! {
     static THREAD_STORES: RefCell<ThreadStores> = RefCell::new(ThreadStores::default());
 }
 
+/// This thread's slot stacks, or `None` while thread-local storage is
+/// unavailable, as during thread exit. Every caller shares this one small
+/// `try_with`, so the compiler inlines it into each; a closure per caller
+/// stayed out of line once the insert body had two copies.
+#[inline]
+fn thread_stores() -> Option<NonNull<RefCell<ThreadStores>>> {
+    THREAD_STORES.try_with(|stores| NonNull::from(stores)).ok()
+}
+
 impl<T> SlotStore<T> {
     /// A store whose region holds `region_slots` slots, at most 16 GiB.
     #[allow(unsafe_code, reason = "allocates the region")]
@@ -1090,33 +1110,39 @@ impl<T> SlotStore<T> {
     /// Runs `with` on this thread's stack for this store, creating it if
     /// needed. Returns `None` when thread-local storage is unavailable, as
     /// during thread exit.
-    #[inline]
+    #[allow(
+        clippy::inline_always,
+        reason = "with `insert_many` as a second caller of the insert body, it stayed out of line"
+    )]
+    #[inline(always)]
+    #[allow(unsafe_code, reason = "reads this thread's own thread-local")]
     fn with_stack<R>(&self, with: impl FnOnce(&mut Vec<NonNull<u8>>) -> R) -> Option<R> {
-        THREAD_STORES
-            .try_with(|stores| {
-                let mut stores = stores.try_borrow_mut().ok()?;
-                let index =
-                    if let Some(index) = stores.0.iter().position(|stack| stack.store == self.id) {
-                        index
-                    } else {
-                        // Forget stacks of stores that no longer exist: their
-                        // regions are gone, and their pointers are never read.
-                        stores.0.retain(|stack| stack.depot.strong_count() != 0);
-                        stores.0.push(ThreadSlots {
-                            store: self.id,
-                            depot: Arc::downgrade(&self.depot),
-                            slots: Vec::new(),
-                        });
-                        stores.0.len() - 1
-                    };
-                Some(with(&mut stores.0[index].slots))
-            })
-            .ok()
-            .flatten()
+        let stores = thread_stores()?;
+        // SAFETY: a thread-local lives at a fixed address until its thread
+        // exits, past this call on this thread.
+        let mut stores = unsafe { stores.as_ref() }.try_borrow_mut().ok()?;
+        let index = if let Some(index) = stores.0.iter().position(|stack| stack.store == self.id) {
+            index
+        } else {
+            // Forget stacks of stores that no longer exist: their regions are
+            // gone, and their pointers are never read.
+            stores.0.retain(|stack| stack.depot.strong_count() != 0);
+            stores.0.push(ThreadSlots {
+                store: self.id,
+                depot: Arc::downgrade(&self.depot),
+                slots: Vec::new(),
+            });
+            stores.0.len() - 1
+        };
+        Some(with(&mut stores.0[index].slots))
     }
 
     /// A vacant slot the caller now owns, with its handle.
-    #[inline]
+    #[allow(
+        clippy::inline_always,
+        reason = "with `insert_many` as a second caller of the insert body, it stayed out of line"
+    )]
+    #[inline(always)]
     pub(crate) fn take(&self) -> (NonNull<Slot<T>>, u32) {
         if let Some(Some(slot)) = self.with_stack(|stack| {
             if stack.is_empty() {

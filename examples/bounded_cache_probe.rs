@@ -2,8 +2,9 @@
 //!
 //! Usage: `bounded_cache_probe BACKEND WORKLOAD ENTRIES OPS WORKERS VALUE_BYTES
 //! SEED [LATENCY_STRIDE]`. BACKEND is `direct-owned`, `direct-borrowed`,
-//! `direct-guarded-owned`, `direct-guarded-borrowed`, `direct-background`, or
-//! `sharded`, or `quickcache`. The direct backends run full maintenance on each worker every
+//! `direct-guarded-owned`, `direct-guarded-borrowed`, `direct-background`,
+//! `sharded`, `sharded-batch`, or `quickcache`. `sharded-batch` writes through
+//! `insert_many`, 64 writes at a time, flushing before every read or removal. The direct backends run full maintenance on each worker every
 //! 4096 writes, inside the timing; `direct-background` instead starts the
 //! cache's maintenance thread (a 10 ms interval) and reads owned values.
 //! The guarded insertion variants require `cold-fill` (unique new keys).
@@ -366,7 +367,63 @@ impl Session for ShardedSession<'_> {
     }
 }
 
-fn sharded_run(config: &Config) -> (Sample, Duration, usize, u64, Duration) {
+/// Writes per `insert_many` batch in the `sharded-batch` backend.
+const WRITE_BATCH: usize = 64;
+
+struct ShardedBatchSession<'a> {
+    cache: &'a ShardedCache<Key, Value>,
+    pending: Vec<(Key, Value)>,
+}
+
+impl ShardedBatchSession<'_> {
+    fn flush(&mut self) {
+        if !self.pending.is_empty() {
+            self.cache.insert_many(self.pending.drain(..));
+        }
+    }
+}
+
+impl Session for ShardedBatchSession<'_> {
+    fn apply(&mut self, operation: &Operation, config: &Config, sample: &mut Sample) {
+        match operation.action {
+            Action::Read => {
+                self.flush();
+                let value = self.cache.get(&operation.key);
+                sample.observe(value.as_ref(), &operation.key);
+                if value.is_none() && config.workload == Workload::Turnover {
+                    self.pending.push((
+                        operation.key,
+                        payload(&operation.key, config.value_bytes, operation.version),
+                    ));
+                    sample.writes += 1;
+                }
+            }
+            Action::Insert | Action::Replace | Action::DeleteReinsert => {
+                if matches!(operation.action, Action::DeleteReinsert) {
+                    self.flush();
+                    sample.removed += u64::from(self.cache.remove(&operation.key));
+                }
+                let value = payload(&operation.key, config.value_bytes, operation.version);
+                sample.writes += 1;
+                self.pending.push((operation.key, value));
+                if matches!(operation.action, Action::Replace) {
+                    sample.replacements += 1;
+                } else {
+                    sample.inserts += 1;
+                }
+                if self.pending.len() == WRITE_BATCH {
+                    self.flush();
+                }
+            }
+        }
+    }
+
+    fn quiesce(&mut self) {
+        self.flush();
+    }
+}
+
+fn sharded_run(config: &Config, batched: bool) -> (Sample, Duration, usize, u64, Duration) {
     let cache = ShardedCache::new(config.capacity_entries());
     for id in 0..seed_count(config) {
         let key = key(id as u64);
@@ -379,7 +436,14 @@ fn sharded_run(config: &Config) -> (Sample, Duration, usize, u64, Duration) {
             "resident control requires every seed to remain resident"
         );
     }
-    let (sample, elapsed) = parallel_run(config, || ShardedSession(&cache));
+    let (sample, elapsed) = if batched {
+        parallel_run(config, || ShardedBatchSession {
+            cache: &cache,
+            pending: Vec::with_capacity(WRITE_BATCH),
+        })
+    } else {
+        parallel_run(config, || ShardedSession(&cache))
+    };
     let entries = cache.len();
     let weight = entries as u64 * config.charge();
     validate_result(config, &sample, entries, weight);
@@ -675,7 +739,8 @@ fn main() {
         "direct-guarded-borrowed" => direct_guarded_run::<false>(&config),
         "direct-background" => direct_background_run(&config),
         "quickcache" => quick_run(&config),
-        "sharded" => sharded_run(&config),
+        "sharded" => sharded_run(&config, false),
+        "sharded-batch" => sharded_run(&config, true),
         _ => panic!("unknown backend: {backend}"),
     };
     sample.latencies.sort_unstable();
