@@ -4094,14 +4094,21 @@ mod tests {
                 .build::<u64, u64>()
         };
         let (one, many) = (build(), build());
-        let pairs: Vec<(u64, u64)> = (0..5_000).map(|index| (index % 1_700, index)).collect();
+        // Under Miri, a fifth of the inserts over fewer keys: still more
+        // keys than the shard holds, and repeats that replace and re-admit.
+        let (inserts, keys) = if cfg!(miri) {
+            (1_000, 700)
+        } else {
+            (5_000, 1_700)
+        };
+        let pairs: Vec<(u64, u64)> = (0..inserts).map(|index| (index % keys, index)).collect();
         for &(key, value) in &pairs {
             one.insert(key, value);
         }
         assert_eq!(many.insert_many(pairs.iter().copied()), pairs.len());
         assert_eq!(many.len(), one.len());
         assert_eq!(many.stats().evictions, one.stats().evictions);
-        for key in 0..1_700 {
+        for key in 0..keys {
             assert_eq!(many.peek(&key), one.peek(&key), "key {key}");
         }
         assert_eq!(many.insert_many(std::iter::empty()), 0);
