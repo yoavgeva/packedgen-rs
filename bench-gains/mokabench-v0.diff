@@ -1,0 +1,281 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 7ad743f..1812d6c 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -5,6 +5,9 @@ edition = "2021"
+ 
+ # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+ 
++# Its own workspace, so it builds from inside another repository.
++[workspace]
++
+ [features]
+ default = ["moka-v012", "rt-tokio"]
+ 
+@@ -16,6 +19,7 @@ moka-v08 = ["dep:moka08"]
+ hashlink = ["dep:hashlink"]
+ mini-moka = ["dep:mini-moka"]
+ quick_cache = ["dep:quick_cache"]
++packedgen = ["dep:packedgen"]
+ stretto = ["dep:stretto"]
+ tiny-ufo = ["dep:TinyUFO"]
+ 
+@@ -41,7 +45,8 @@ async-std = { optional = true, version = "1.12.0", features = ["attributes"] }
+ # Cache implementations
+ hashlink = { optional = true, version = "0.8.1" }
+ mini-moka = { optional = true, version = "0.10.0" }
+-quick_cache = { optional = true, version = "0.6" }
++quick_cache = { optional = true, version = "=0.7.0" }
++packedgen = { optional = true, path = "../.." }
+ stretto = { optional = true, version = "0.8.4" }
+ TinyUFO = { optional = true, version = "0.1" }
+ 
+diff --git a/src/cache.rs b/src/cache.rs
+index 77b2e85..2e8c909 100644
+--- a/src/cache.rs
++++ b/src/cache.rs
+@@ -14,6 +14,8 @@ pub(crate) mod hashlink;
+ #[cfg(any(feature = "mini-moka", feature = "moka-v08", feature = "moka-v09"))]
+ pub(crate) mod mini_moka_driver;
+ pub(crate) mod moka_driver;
++#[cfg(feature = "packedgen")]
++pub(crate) mod packedgen;
+ #[cfg(feature = "quick_cache")]
+ pub(crate) mod quick_cache;
+ #[cfg(feature = "stretto")]
+diff --git a/src/cache/packedgen.rs b/src/cache/packedgen.rs
+new file mode 100644
+index 0000000..cb458dd
+--- /dev/null
++++ b/src/cache/packedgen.rs
+@@ -0,0 +1,91 @@
++use super::{CacheDriver, Counters, DefaultHasher, Key, Value};
++use crate::{config::Config, parser::TraceEntry, report::Report};
++
++use ::packedgen::{ShardedCache, ShardedCacheBuilder, UnitWeighter};
++
++use std::sync::Arc;
++
++type ShardedCacheImpl = ShardedCache<Key, Value, UnitWeighter, DefaultHasher>;
++
++#[derive(Clone)]
++pub struct PackedGenCache {
++    config: Arc<Config>,
++    cache: Arc<ShardedCacheImpl>,
++}
++
++impl PackedGenCache {
++    pub fn new(config: &Config, capacity: usize) -> Self {
++        if let Some(_ttl) = config.ttl {
++            todo!()
++        }
++        if let Some(_tti) = config.tti {
++            todo!()
++        }
++
++        Self {
++            config: Arc::new(config.clone()),
++            cache: Arc::new(
++                ShardedCacheBuilder::new(capacity)
++                    .hasher(DefaultHasher)
++                    .build(),
++            ),
++        }
++    }
++
++    fn get(&self, key: &usize) -> bool {
++        self.cache.get(key).is_some()
++    }
++
++    fn insert(&self, key: usize, req_id: usize) {
++        let value = super::make_value(&self.config, key, req_id);
++        super::sleep_thread_for_insertion(&self.config);
++        self.cache.insert(key, value);
++    }
++}
++
++impl CacheDriver<TraceEntry> for PackedGenCache {
++    fn get_or_insert(&mut self, entry: &TraceEntry, report: &mut Report) {
++        let mut counters = Counters::default();
++        let mut req_id = entry.line_number();
++
++        for block in entry.range() {
++            if self.get(&block) {
++                counters.read_hit();
++            } else {
++                self.insert(block, req_id);
++                counters.inserted();
++                counters.read_missed();
++            }
++            req_id += 1;
++        }
++
++        counters.add_to_report(report);
++    }
++
++    fn get_or_insert_once(&mut self, _entry: &TraceEntry, _report: &mut Report) {
++        unimplemented!();
++    }
++
++    fn update(&mut self, entry: &TraceEntry, report: &mut Report) {
++        let mut counters = Counters::default();
++        let mut req_id = entry.line_number();
++
++        for block in entry.range() {
++            self.insert(block, req_id);
++            counters.inserted();
++            req_id += 1;
++        }
++
++        counters.add_to_report(report);
++    }
++
++    fn invalidate(&mut self, entry: &TraceEntry) {
++        for block in entry.range() {
++            self.cache.remove(&block);
++        }
++    }
++
++    fn invalidate_all(&mut self) {
++        unimplemented!();
++    }
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index db28a61..6118b03 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -62,6 +62,8 @@ use crate::cache::hashlink::HashLink;
+ use crate::cache::mini_moka_driver::{
+     sync_cache::MiniMokSyncCache, unsync_cache::MiniMokaUnsyncCache,
+ };
++#[cfg(feature = "packedgen")]
++use crate::cache::packedgen::PackedGenCache;
+ #[cfg(feature = "quick_cache")]
+ use crate::cache::quick_cache::QuickCache;
+ #[cfg(feature = "stretto")]
+@@ -200,6 +202,18 @@ pub fn run_multi_threads_quick_cache(
+     run_multi_threads(config, num_clients, cache_driver, report_builder)
+ }
+ 
++#[cfg(feature = "packedgen")]
++pub fn run_multi_threads_packedgen(
++    config: &Config,
++    capacity: usize,
++    num_clients: u16,
++) -> anyhow::Result<Report> {
++    let cache_driver = PackedGenCache::new(config, capacity);
++    let report_builder =
++        ReportBuilder::new("PackedGen ShardedCache", capacity as _, Some(num_clients));
++    run_multi_threads(config, num_clients, cache_driver, report_builder)
++}
++
+ #[cfg(feature = "stretto")]
+ pub fn run_multi_threads_stretto(
+     config: &Config,
+diff --git a/src/main.rs b/src/main.rs
+index de2c899..e4179d4 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -55,7 +55,7 @@ async fn run_with_capacity(config: &Config, capacity: usize) -> anyhow::Result<(
+     // as it doesn't use the producer/consumer thread pattern as the other caches.
+ 
+     #[cfg(any(feature = "mini-moka", feature = "moka-v08", feature = "moka-v09"))]
+-    if !config.insert_once && !config.is_eviction_listener_enabled() {
++    if !config.insert_once && !config.is_eviction_listener_enabled() && run_cache("mini-moka-unsync") {
+         let report = mokabench::run_single(config, capacity)?;
+         println!("{}", report.to_csv_record());
+     }
+@@ -65,6 +65,7 @@ async fn run_with_capacity(config: &Config, capacity: usize) -> anyhow::Result<(
+         && !config.size_aware
+         && !config.invalidate_entries_if
+         && !config.is_eviction_listener_enabled()
++        && run_cache("hashlink")
+     {
+         for num_clients in num_clients_slice {
+             let report = mokabench::run_multi_threads_hashlink(config, capacity, *num_clients)?;
+@@ -77,6 +78,7 @@ async fn run_with_capacity(config: &Config, capacity: usize) -> anyhow::Result<(
+         && !config.size_aware
+         && !config.invalidate_entries_if
+         && !config.is_eviction_listener_enabled()
++        && run_cache("quick_cache")
+     {
+         for num_clients in num_clients_slice {
+             let report = mokabench::run_multi_threads_quick_cache(config, capacity, *num_clients)?;
+@@ -84,11 +86,25 @@ async fn run_with_capacity(config: &Config, capacity: usize) -> anyhow::Result<(
+         }
+     }
+ 
++    #[cfg(feature = "packedgen")]
++    if !config.insert_once
++        && !config.size_aware
++        && !config.invalidate_entries_if
++        && !config.is_eviction_listener_enabled()
++        && run_cache("packedgen")
++    {
++        for num_clients in num_clients_slice {
++            let report = mokabench::run_multi_threads_packedgen(config, capacity, *num_clients)?;
++            println!("{}", report.to_csv_record());
++        }
++    }
++
+     #[cfg(feature = "stretto")]
+     if !config.insert_once
+         && !config.size_aware
+         && !config.invalidate_entries_if
+         && !config.is_eviction_listener_enabled()
++        && run_cache("stretto")
+     {
+         for num_clients in num_clients_slice {
+             let report = mokabench::run_multi_threads_stretto(config, capacity, *num_clients)?;
+@@ -101,6 +117,7 @@ async fn run_with_capacity(config: &Config, capacity: usize) -> anyhow::Result<(
+         && !config.size_aware
+         && !config.invalidate_entries_if
+         && !config.is_eviction_listener_enabled()
++        && run_cache("tinyufo")
+     {
+         for num_clients in num_clients_slice {
+             let report = mokabench::run_multi_threads_tiny_ufo(config, capacity, *num_clients)?;
+@@ -112,6 +129,7 @@ async fn run_with_capacity(config: &Config, capacity: usize) -> anyhow::Result<(
+     if !config.insert_once
+         && !config.invalidate_entries_if
+         && !config.is_eviction_listener_enabled()
++        && run_cache("mini-moka")
+     {
+         for num_clients in num_clients_slice {
+             let report = mokabench::run_multi_threads_moka_dash(config, capacity, *num_clients)?;
+@@ -119,19 +137,19 @@ async fn run_with_capacity(config: &Config, capacity: usize) -> anyhow::Result<(
+         }
+     }
+ 
+-    for num_clients in num_clients_slice {
++    for num_clients in num_clients_slice.iter().filter(|_| run_cache("moka")) {
+         let report = mokabench::run_multi_threads_moka_sync(config, capacity, *num_clients)?;
+         println!("{}", report.to_csv_record());
+     }
+ 
+-    for num_clients in num_clients_slice {
++    for num_clients in num_clients_slice.iter().filter(|_| run_cache("moka-async")) {
+         let report = mokabench::run_multi_tasks_moka_async(config, capacity, *num_clients).await?;
+         println!("{}", report.to_csv_record());
+     }
+ 
+     let num_segments = 8;
+ 
+-    for num_clients in num_clients_slice {
++    for num_clients in num_clients_slice.iter().filter(|_| run_cache("moka-seg8")) {
+         let report = mokabench::run_multi_threads_moka_segment(
+             config,
+             capacity,
+@@ -144,6 +162,12 @@ async fn run_with_capacity(config: &Config, capacity: usize) -> anyhow::Result<(
+     Ok(())
+ }
+ 
++/// Whether `MOKABENCH_CACHES`, a comma-separated list, names `cache`; all
++/// caches run when it is unset.
++fn run_cache(cache: &str) -> bool {
++    std::env::var("MOKABENCH_CACHES").map_or(true, |list| list.split(',').any(|c| c.trim() == cache))
++}
++
+ const OPTION_TRACE_FILE: &str = "trace-file";
+ const OPTION_TRACE_FILES: &str = "trace-files";
+ const OPTION_TTL: &str = "ttl";

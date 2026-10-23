@@ -1,0 +1,94 @@
+name: Gains against the first ShardedCache
+
+on:
+  push:
+    branches: ['bench/**']
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: probe ${{ matrix.entries }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        entries: [50000, 1000000]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Machine
+        run: lscpu | sed -n '1,20p'
+      - name: Build
+        run: |
+          cargo build --locked --release --example bounded_cache_probe --target-dir ../t-v2
+          for v in v0:f871aa6 v1:2635115; do
+            name=${v%%:*}; rev=${v#*:}
+            git worktree add ../$name $rev
+            (cd ../$name && cargo build --locked --release --example bounded_cache_probe --target-dir ../t-$name)
+          done
+      - name: Run
+        run: |
+          P=release/examples/bounded_cache_probe
+          W=$(cd .. && pwd)
+          sh bench-gains/ab.sh 3 "resident-hit read-miss cold-fill turnover replace delete-reinsert" "${{ matrix.entries }}" "1 4" gains.csv \
+            v0=$W/t-v0/$P:sharded v1=$W/t-v1/$P:sharded v2=$W/t-v2/$P:sharded quick=$W/t-v2/$P:quickcache
+          sh bench-gains/ab.sh 3 "cold-fill turnover replace" "${{ matrix.entries }}" "1 4" gains.csv batch=$W/t-v2/$P:sharded-batch
+          python3 bench-gains/gains.py gains.csv | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gains-${{ matrix.entries }}
+          path: gains.csv
+
+  mokabench:
+    name: mokabench ${{ matrix.version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: v2
+            rev: HEAD
+            caches: packedgen,quick_cache,moka
+          - version: v1
+            rev: 2635115
+            caches: packedgen,quick_cache
+          - version: v0
+            rev: f871aa6
+            caches: packedgen,quick_cache
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Machine
+        run: lscpu | sed -n '1,20p'
+      - name: Prepare
+        run: |
+          git worktree add ../src ${{ matrix.rev }}
+          mkdir -p ../src/scripts
+          cp scripts/mokabench.sh scripts/summarize_mokabench.py ../src/scripts/
+          if [ "${{ matrix.version }}" = v0 ]; then
+            cp bench-gains/mokabench-v0.diff ../src/scripts/mokabench.diff
+          else
+            cp scripts/mokabench.diff ../src/scripts/
+          fi
+      - name: ARC traces
+        env:
+          MOKABENCH_CACHES: ${{ matrix.caches }}
+        run: |
+          cd ../src
+          sh scripts/mokabench.sh 3 1,2,4 "s3 ds1 p8 s1 p3 oltp" target/mokabench.csv
+          python3 scripts/summarize_mokabench.py target/mokabench.csv | tee -a "$GITHUB_STEP_SUMMARY"
+          cp target/mokabench.csv "$GITHUB_WORKSPACE/mokabench-${{ matrix.version }}.csv"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mokabench-${{ matrix.version }}
+          path: mokabench-${{ matrix.version }}.csv
