@@ -995,6 +995,84 @@ removed entries, as on the probe (see "Throughput against quick_cache
 ms against 16, which points to colder memory from the allocator: evicted
 values are freed three advances after their eviction rather than at once.
 
+### Against the first version and moka
+
+The first `ShardedCache` (`f871aa6`, 2026-10-17) kept boxed entries in the
+direct arena, eight-byte handles, and a table per shard. Its probe, the
+version after `#24` (`2635115`), and `6d0d3be` ("now") were built alike and
+run in rotation with quick_cache 0.7; each figure is the paired median of
+three runs. The later backlog drain moved single-insert cells within noise
+(see "Batched inserts"). The x86_64 runs were on an AMD EPYC 7763 with 4
+vCPUs.
+
+Now over the first version:
+
+| Workload | macOS 50K, 1T | 50K, 8T | 1M, 1T | 1M, 8T | x86 50K, 1T | 50K, 4T | 1M, 1T | 1M, 4T |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Resident hit | +25% | +15% | +32% | +37% | +26% | +2% | −17% | −16% |
+| Read miss | +8% | −1% | +16% | +23% | +16% | +16% | +42% | +46% |
+| Cold fill | +9% | +34% | +32% | +53% | +49% | +131% | +103% | +112% |
+| Turnover (95% reads) | +9% | +36% | +77% | +32% | +16% | +38% | +12% | +59% |
+| Replace | +10% | +26% | +29% | +34% | +67% | +49% | +43% | +135% |
+| Delete and reinsert | +25% | +34% | +18% | +46% | +46% | +42% | +30% | +58% |
+
+Now over quick_cache:
+
+| Workload | macOS 50K, 1T | 50K, 8T | 1M, 1T | 1M, 8T | x86 50K, 1T | 50K, 4T | 1M, 1T | 1M, 4T |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Resident hit | −9% | +282% | −7% | +16% | −20% | +37% | −18% | +5% |
+| Read miss | +98% | +568% | −53% | +171% | +12% | +50% | −46% | −4% |
+| Cold fill | −4% | −15% | +13% | +17% | −21% | +9% | +39% | +64% |
+| Turnover (95% reads) | −11% | +52% | +10% | +34% | −3% | +33% | −9% | +42% |
+| Replace | +29% | +3% | +47% | +66% | −17% | −19% | −9% | −5% |
+| Delete and reinsert | +1% | +43% | +32% | +56% | −16% | +5% | +4% | +20% |
+
+Resident hits at 1,000,000 entries on x86_64 ran 17% slower than the first
+version, the one regression here. Cachegrind on that runner counted 388
+instructions and 4.8 L1 data misses per hit now, against 391 and 4.7 for
+the first version, with the working set inside the simulated last level
+and no mispredicted branches in either, so the difference is in the
+layout's latency rather than in work or misses. The first version's boxed
+entries were allocated after their values, as under "Slab storage against
+boxed entries". A dedicated A/B on macOS, five pairs with both codegen
+settings, read single-thread resident hits at 0 to +6% and turnover at −2
+to +1% against `#24`.
+
+On mokabench, ShardedCache's throughput over quick_cache's and moka's sync
+cache (0.12.8), as geometric means over the 16 cells. Each host ran each
+version against quick_cache in the same job, so the ratios compare across
+versions; macOS ran once and x86_64 three times:
+
+| Host | Clients | First over quick_cache | `#24` | Now | Now over moka |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| macOS | 1 | 0.85x | | 1.02x | 3.36x |
+| macOS | 4 | 0.81x | | 1.13x | 5.29x |
+| macOS | 16 | 1.11x | | 1.42x | 12.51x |
+| x86_64 | 1 | 0.73x | 0.97x | 0.99x | 4.56x |
+| x86_64 | 2 | 0.63x | 1.14x | 1.18x | 7.02x |
+| x86_64 | 4 | 0.70x | 1.27x | 1.37x | 9.54x |
+
+The mean one-client hit ratio rose from 37.75% to 38.97% (38.95% on
+x86_64), against 37.99% for quick_cache and 37.87% for moka. moka leads in
+5 of the 16 cells, by 2.9 points on P3 at 20,000 entries and by under a
+point in the others: OLTP at 256 entries, DS1 at 4,000,000, and S3 at
+400,000 and 800,000.
+
+Requested bytes per entry beyond the key and value, measured as in
+"Memory", with moka 0.12.16's sync cache read after `run_pending_tasks`:
+
+| Entries | Key, value | First version | Now | quick_cache | moka |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 100,000 | 8 B, `u64` | 30.7 | 26.9 | 102.0 | 232.0 |
+| 100,000 | 32 B, `u64` | 30.9 | 28.1 | 140.9 | 237.3 |
+| 100,000 | 32 B, `[u8; 64]` | 31.4 | 31.0 | 210.7 | 236.8 |
+| 1,000,000 | 8 B, `u64` | 29.0 | 23.7 | 78.4 | 223.7 |
+| 1,000,000 | 32 B, `u64` | 29.0 | 23.8 | 104.7 | 227.5 |
+| 1,000,000 | 32 B, `[u8; 64]` | 29.1 | 24.1 | 149.4 | 227.5 |
+
+The first version's figures leave out the allocator's rounding of its
+boxed entries.
+
 ## Tail latency against quick_cache 0.7
 
 Every operation was timed (`LATENCY_STRIDE` 1) at 1,000,000 entries,
