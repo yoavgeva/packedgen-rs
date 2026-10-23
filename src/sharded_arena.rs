@@ -263,7 +263,7 @@ pub(crate) fn advise_huge_pages(start: *const u8, length: usize) {
         not(miri)
     ))]
     {
-        /// The x86_64 and aarch64 4 KB-page huge page size. Every base page
+        /// The `x86_64` and `aarch64` 4 KB-page huge page size. Every base page
         /// size divides it, so the advised range is page-aligned on kernels
         /// with larger base pages too.
         const HUGE_PAGE: usize = 2 << 20;
