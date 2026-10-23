@@ -13,6 +13,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - name: Machine
         run: lscpu | sed -n '1,20p'
@@ -21,27 +23,26 @@ jobs:
       - name: Build
         env:
           CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
-        run: cargo build --locked --release --example bounded_cache_probe
+        run: |
+          cargo build --locked --release --example bounded_cache_probe
+          git worktree add ../v0 f871aa6
+          (cd ../v0 && cargo build --locked --release --example bounded_cache_probe --target-dir ../t-v0)
       - name: Cachegrind
         run: |
-          P=target/release/examples/bounded_cache_probe
           mkdir -p cg
-          for b in sharded quickcache; do
-            for w in resident-hit read-miss turnover; do
-              for e in 50000 1000000; do
-                for ops in 2000000 4000000; do
-                  valgrind --tool=cachegrind --cache-sim=yes --cachegrind-out-file=cg/$b-$w-$e-$ops.cg \
-                    $P $b $w $e $ops 1 64 1 > /dev/null 2>&1 &
-                done
+          for v in now:target/release/examples/bounded_cache_probe v0:../t-v0/release/examples/bounded_cache_probe; do
+            name=${v%%:*}; P=${v#*:}
+            for w in resident-hit turnover; do
+              for ops in 2000000 4000000; do
+                valgrind --tool=cachegrind --cache-sim=yes --branch-sim=yes --cachegrind-out-file=cg/$name-$w-$ops.cg \
+                  $P sharded $w 1000000 $ops 1 64 1 > /dev/null 2>&1 &
               done
             done
-            wait
           done
-          for b in sharded quickcache; do
-            for w in resident-hit read-miss turnover; do
-              for e in 50000 1000000; do
-                python3 bench-cg/pydiff.py cg/$b-$w-$e-2000000.cg cg/$b-$w-$e-4000000.cg cg/$b-$w-$e.diff.cg
-              done
+          wait
+          for name in now v0; do
+            for w in resident-hit turnover; do
+              python3 bench-cg/pydiff.py cg/$name-$w-2000000.cg cg/$name-$w-4000000.cg cg/$name-$w.diff.cg
             done
           done
           python3 bench-cg/sum.py 2000000 cg/*.diff.cg | tee -a "$GITHUB_STEP_SUMMARY"
