@@ -196,6 +196,32 @@ pub struct ShardedCacheStats {
     pub expirations: u64,
 }
 
+/// Bytes a [`ShardedCache`]'s own structures use; see
+/// [`ShardedCache::memory_used`]. Memory the keys and values own elsewhere,
+/// such as a `String`'s buffer, is not counted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ShardedCacheMemory {
+    /// The bucket table, allocated in full when the cache is built.
+    pub table: usize,
+    /// Entry slots handed out so far, holding live entries, removed ones
+    /// awaiting reclamation, or nothing while they wait for reuse. Slots
+    /// never handed out are not counted: a large slab region's untouched
+    /// pages take no memory.
+    pub entries: usize,
+    /// Each shard's policy state: its filters of evicted keys, its main
+    /// queue's ring, and its probation queue.
+    pub policy: usize,
+}
+
+impl ShardedCacheMemory {
+    /// The sum of the parts.
+    #[must_use]
+    pub fn total(&self) -> usize {
+        self.table + self.entries + self.policy
+    }
+}
+
 /// Configures a [`ShardedCache`].
 ///
 /// ```
@@ -2029,37 +2055,107 @@ where
     /// Removes every entry. Inserts racing the sweep may survive it.
     pub fn clear(&self) {
         for index in 0..self.shards.len() {
-            let shard = self.view(index);
             let pin = self.epochs.pin();
             let mut removed = Removed::new();
-            {
-                let mut writer = shard.lock();
-                for bucket in shard.buckets {
-                    let meta = bucket.meta.load(Ordering::Relaxed);
-                    if bucket.tags.load(Ordering::Relaxed) == 0 && meta & !META_GENERATIONS == 0 {
-                        continue;
-                    }
-                    // Tags first, as `ShardView::clear` does, then the
-                    // handles.
-                    bucket.tags.store(0, Ordering::Release);
-                    bucket
-                        .meta
-                        .store(meta & META_GENERATIONS, Ordering::Release);
-                    for slot in 0..SLOTS {
-                        let raw = bucket.exchange(slot, 0);
-                        if raw != 0 {
-                            removed.push(shard.handle(raw), RemovalCause::Explicit);
-                        }
-                    }
-                }
-                writer.set_len(0);
-                writer.set_weight(0);
-                writer.hand = 0;
-                writer.probation.clear();
-                writer.main.clear();
-                writer.filters.clear();
-            }
+            self.empty_shard(index, &pin, &mut removed, false);
             self.after_write(&removed, pin);
+        }
+    }
+
+    /// Removes the entries shard by shard, and yields clones of the live
+    /// ones.
+    ///
+    /// The drain empties each shard under its lock when it reaches it, then
+    /// yields that shard's live entries; expired ones leave without being
+    /// yielded. So the loop body may write to the cache, entries written to
+    /// shards already emptied stay, and dropping the iterator stops the
+    /// drain once the shard it reached is emptied. The removal listener
+    /// hears [`RemovalCause::Explicit`] for each drained entry.
+    pub fn drain(&self) -> impl Iterator<Item = (K, V)> + '_
+    where
+        K: Clone,
+        V: Clone,
+    {
+        Drain {
+            cache: self,
+            pin: self.epochs.pin(),
+            removed: Removed::new(),
+            yielded: 0,
+            next_shard: 0,
+        }
+    }
+
+    /// Unpublishes every entry of shard `index` under its lock and resets
+    /// its policy state, pushing each entry to `removed` as `Explicit`, or,
+    /// with `expiring`, as `Expired` if it has expired. Requires `pin` to
+    /// be held until `removed` is retired.
+    #[allow(
+        unsafe_code,
+        reason = "reads entries unpublished under the shard lock while `pin` is held"
+    )]
+    fn empty_shard(
+        &self,
+        index: usize,
+        pin: &EpochPin<'_>,
+        removed: &mut Removed<(K, V)>,
+        expiring: bool,
+    ) {
+        let shard = self.view(index);
+        let mut now = None;
+        let mut writer = shard.lock();
+        for bucket in shard.buckets {
+            let meta = bucket.meta.load(Ordering::Relaxed);
+            if bucket.tags.load(Ordering::Relaxed) == 0 && meta & !META_GENERATIONS == 0 {
+                continue;
+            }
+            // Tags first, as `ShardView::clear` does, then the handles.
+            bucket.tags.store(0, Ordering::Release);
+            bucket
+                .meta
+                .store(meta & META_GENERATIONS, Ordering::Release);
+            for slot in 0..SLOTS {
+                let raw = bucket.exchange(slot, 0);
+                if raw != 0 {
+                    let handle = shard.handle(raw);
+                    // SAFETY: the exchange unpublished `handle` while `pin`
+                    // is held.
+                    let cause = if expiring && self.expired(unsafe { entry(pin, handle) }, &mut now)
+                    {
+                        writer.count_expiration();
+                        RemovalCause::Expired
+                    } else {
+                        RemovalCause::Explicit
+                    };
+                    removed.push(handle, cause);
+                }
+            }
+        }
+        writer.set_len(0);
+        writer.set_weight(0);
+        writer.hand = 0;
+        writer.probation.clear();
+        writer.main.clear();
+        writer.filters.clear();
+    }
+
+    /// Bytes the cache's own structures use: the table, the entry slots
+    /// handed out so far, and the shards' policy state. Memory the keys and
+    /// values own elsewhere is not counted. Takes each shard's lock in turn.
+    pub fn memory_used(&self) -> ShardedCacheMemory {
+        let policy = self
+            .shards
+            .iter()
+            .map(|shard| {
+                let writer = shard.lock();
+                writer.filters.lines.len() * size_of::<FilterLine>()
+                    + writer.main.records.len() * size_of::<u32>()
+                    + writer.probation.capacity() * size_of::<Probationary>()
+            })
+            .sum();
+        ShardedCacheMemory {
+            table: self.table.len() * size_of::<Bucket>(),
+            entries: self.slots.bytes_used(),
+            policy,
         }
     }
 
@@ -2369,6 +2465,92 @@ where
             }
         }
         unreachable!("the last pass evicts its first slot")
+    }
+}
+
+/// Empties a cache shard by shard; see [`ShardedCache::drain`].
+struct Drain<'cache, K, V, W, S, L>
+where
+    K: Hash + Eq,
+    W: Weighter<K, V>,
+    S: BuildHasher,
+    L: RemovalListener<K, V>,
+{
+    cache: &'cache ShardedCache<K, V, W, S, L>,
+    pin: EpochPin<'cache>,
+    /// The entries the shard last reached held, unpublished under `pin`.
+    removed: Removed<(K, V)>,
+    /// How many of them the drain has passed.
+    yielded: usize,
+    next_shard: usize,
+}
+
+impl<K, V, W, S, L> Drain<'_, K, V, W, S, L>
+where
+    K: Hash + Eq,
+    W: Weighter<K, V>,
+    S: BuildHasher,
+    L: RemovalListener<K, V>,
+{
+    /// Retires the shard's entries, telling the listener, and refreshes the
+    /// pin: the drain has cloned every one it yields.
+    fn finish_shard(&mut self) {
+        let removed = std::mem::replace(&mut self.removed, Removed::new());
+        let advance = self.cache.retire_removed(&removed, &self.pin);
+        self.pin.refresh();
+        if advance {
+            self.cache.epochs.try_advance();
+        }
+    }
+}
+
+impl<K, V, W, S, L> Iterator for Drain<'_, K, V, W, S, L>
+where
+    K: Hash + Eq + Clone,
+    V: Clone,
+    W: Weighter<K, V>,
+    S: BuildHasher,
+    L: RemovalListener<K, V>,
+{
+    type Item = (K, V);
+
+    #[allow(
+        unsafe_code,
+        reason = "reads entries the drain unpublished under its pin"
+    )]
+    fn next(&mut self) -> Option<(K, V)> {
+        loop {
+            if let Some((handle, cause)) = self.removed.get(self.yielded) {
+                self.yielded += 1;
+                if cause == RemovalCause::Explicit {
+                    // SAFETY: unpublished by `empty_shard` while `pin` was
+                    // held, and `pin` has not refreshed since.
+                    let (key, value) = unsafe { entry(&self.pin, handle) }.value();
+                    return Some((key.clone(), value.clone()));
+                }
+                continue;
+            }
+            self.finish_shard();
+            if self.next_shard == self.cache.shards.len() {
+                return None;
+            }
+            self.cache
+                .empty_shard(self.next_shard, &self.pin, &mut self.removed, true);
+            self.next_shard += 1;
+            self.yielded = 0;
+        }
+    }
+}
+
+impl<K, V, W, S, L> Drop for Drain<'_, K, V, W, S, L>
+where
+    K: Hash + Eq,
+    W: Weighter<K, V>,
+    S: BuildHasher,
+    L: RemovalListener<K, V>,
+{
+    fn drop(&mut self) {
+        self.finish_shard();
     }
 }
 
@@ -3059,6 +3241,15 @@ impl<T> Removed<T> {
             self.len += 1;
         } else {
             self.more.push((handle, cause));
+        }
+    }
+
+    /// The `index`th entry pushed.
+    fn get(&self, index: usize) -> Option<(Handle<T>, RemovalCause)> {
+        if index < self.first.len() {
+            self.first[index]
+        } else {
+            self.more.get(index - self.first.len()).copied()
         }
     }
 
@@ -4850,6 +5041,99 @@ mod tests {
             None,
             "too heavy: the old value goes, as with insert"
         );
+    }
+
+    #[test]
+    fn drain_yields_live_entries_and_leaves_the_cache_empty() {
+        let (cache, heard) = heard_cache(2_000);
+        for key in 0..300_u64 {
+            cache.insert(key, key * 10);
+        }
+        cache.insert_with_ttl(1_000, 1, HOUR);
+        cache.advance_clock(HOUR + MINUTE);
+        let mut drained: Vec<(u64, u64)> = cache.drain().collect();
+        drained.sort_unstable();
+        assert_eq!(
+            drained,
+            (0..300).map(|key| (key, key * 10)).collect::<Vec<_>>()
+        );
+        assert_eq!((cache.len(), cache.weight()), (0, 0));
+        assert!((0..300).all(|key| !cache.contains_key(&key)));
+        let mut heard = heard.lock().clone();
+        heard.sort_unstable_by_key(|(key, _)| *key);
+        let mut expected: Vec<(u64, RemovalCause)> =
+            (0..300).map(|key| (key, RemovalCause::Explicit)).collect();
+        expected.push((1_000, RemovalCause::Expired));
+        assert_eq!(heard, expected);
+        assert_eq!(cache.stats().expirations, 1);
+        for key in 0..300_u64 {
+            cache.insert(key, key);
+        }
+        assert_eq!(cache.len(), 300, "a drained cache refills");
+    }
+
+    #[test]
+    fn a_dropped_drain_stops_after_the_shard_it_reached() {
+        let heard = Arc::new(AtomicUsize::new(0));
+        let cache = ShardedCacheBuilder::new(2_000)
+            .shards(4)
+            .removal_listener({
+                let heard = Arc::clone(&heard);
+                move |_: &u64, _: &u64, _| {
+                    heard.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+            .build::<u64, u64>();
+        for key in 0..400_u64 {
+            cache.insert(key, key);
+        }
+        let first_shard = cache.shards[0].writer.len.load(Ordering::Relaxed);
+        let mut drain = cache.drain();
+        let first = drain.next().expect("a drained entry");
+        // The loop body may write: each shard is emptied under its lock and
+        // its entries yielded after it is released. The key goes back to
+        // the shard just emptied.
+        cache.insert(first.0, first.1);
+        drop(drain);
+        assert_eq!(
+            heard.load(Ordering::Relaxed),
+            first_shard,
+            "dropping retires the whole shard it emptied"
+        );
+        let left = cache.len();
+        assert_eq!(left, 400 - first_shard + 1, "only the first shard drained");
+        assert_eq!(cache.drain().count(), left);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn memory_used_counts_the_table_the_slots_handed_out_and_the_policy() {
+        let cache = ShardedCacheBuilder::new(1_000)
+            .shards(2)
+            .build::<u64, u64>();
+        let empty = cache.memory_used();
+        assert_eq!(empty.table, cache.table.len() * size_of::<Bucket>());
+        assert_eq!(empty.entries, 0, "no slot handed out yet");
+        assert!(empty.policy > 0);
+        assert_eq!(empty.total(), empty.table + empty.entries + empty.policy);
+        for key in 0..500_u64 {
+            cache.insert(key, key);
+        }
+        let filled = cache.memory_used();
+        let slot = size_of::<Slot<(u64, u64)>>();
+        assert!(
+            filled.entries >= 500 * slot,
+            "{} bytes for 500 entries",
+            filled.entries
+        );
+        assert_eq!(filled.table, empty.table);
+        // Removed slots are reused, so refilling takes no new ones.
+        cache.clear();
+        cache.maintain();
+        for key in 1_000..1_500_u64 {
+            cache.insert(key, key);
+        }
+        assert_eq!(cache.memory_used().entries, filled.entries);
     }
 
     #[test]

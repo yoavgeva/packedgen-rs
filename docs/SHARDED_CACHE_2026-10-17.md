@@ -204,6 +204,16 @@ entry. Tables are sized once and never rebuilt.
   inserts do, fills it only once it finds the live value, and otherwise
   gives it back unwritten; a value too heavy to cache removes the old one,
   as an insert's does. Expired entries count as absent for both.
+- **Draining.** `drain` empties each shard under its lock when it
+  reaches it, sharing `clear`'s sweep, then yields clones of that shard's
+  live entries. The loop body may write to the cache. Dropping the
+  iterator stops it once the shard it reached is emptied, and retires that
+  shard's entries, so the listener hears each one.
+- **Memory.** `memory_used` reports the table, the entry slots handed out
+  so far, and each shard's filters, main-queue ring, and probation queue.
+  Region slots never handed out are not counted, since a large region's
+  untouched pages take no memory; memory keys and values own elsewhere is
+  not counted either, as in quick_cache's `memory_used`.
 - **Resizing.** `set_capacity` and `set_max_weight` change the limits at
   run time.
   - Tables are never rebuilt, so the builder's `max_capacity` reserves the
@@ -271,6 +281,10 @@ entry. Tables are sized once and never rebuilt.
     restarting the time to live, reweighing, removing the old value when
     the new one is too heavy, and giving its slot back when it fails
     (verified to fail without the give-back);
+  - `drain` yielding live entries once and reporting expired ones, and a
+    dropped drain retiring the shard it emptied (verified to fail without
+    the retirement on drop); `memory_used` counting the table, slots
+    handed out, and their reuse;
   - `set_capacity` evicting down at once and growing back within the
     reserve, `set_max_weight` evicting down and refusing values heavier
     than the new shares, and resizes racing four writing threads.
