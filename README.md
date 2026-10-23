@@ -75,7 +75,8 @@ It offers:
   `retain`, whose predicate may write to the cache;
 - `peek`, `contains_key`, `clear`, and `maintain`, which drops removed
   values promptly after a burst of writes;
-- weighted limits and borrowed reads through `pin()`.
+- weighted limits, `set_capacity` and `set_max_weight` to resize at run
+  time, and borrowed reads through `pin()`.
 
 ```rust
 use std::time::Duration;

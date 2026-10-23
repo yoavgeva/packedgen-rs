@@ -196,6 +196,22 @@ entry. Tables are sized once and never rebuilt.
     offered stays.
   - Expired entries are removed without being offered, as `Expired`; the
     rest as `Explicit`.
+- **Resizing.** `set_capacity` and `set_max_weight` change the limits at
+  run time.
+  - Tables are never rebuilt, so the builder's `max_capacity` reserves the
+    table, the slab region, the main queues' rings, and the shard count for
+    the largest capacity, about 8 bytes of table per reserved entry beyond
+    the limit. Without it, the reserve is the built capacity.
+  - `set_capacity` returns the limit it set: the request, raised to one
+    entry per shard or lowered to the reserve.
+  - Under a cache-wide resize lock, each shard takes its new shares under
+    its own lock and evicts down to them before the call returns, so the
+    listener hears `Size` for each. A shard whose entry share changes
+    starts its ghost and main filters afresh at the new size, keeping its
+    probation target within the new bounds.
+  - Shard limits became atomics read with relaxed loads under the shard
+    lock. `get` and `evict` compile to the same instructions; the insert
+    body to 1,229 against 1,234.
 - **Batched inserts.** `insert_many` inserts pairs in order, as single inserts
   would, and returns how many it cached. It takes one epoch pin per call
   instead of one per insert. Each chunk of 32 keys is hashed, and their home
@@ -241,7 +257,10 @@ entry. Tables are sized once and never rebuilt.
   - iteration visiting each live entry once, without marking it, while the
     loop body and another thread write;
   - `retain` removing rejected and expired entries with their causes, and
-    sparing entries its predicate replaced.
+    sparing entries its predicate replaced;
+  - `set_capacity` evicting down at once and growing back within the
+    reserve, `set_max_weight` evicting down and refusing values heavier
+    than the new shares, and resizes racing four writing threads.
 - **Arena tests.** They cover:
   - aging of exactly three advances;
   - a pin blocking the second advance past its epoch;
