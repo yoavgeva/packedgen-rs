@@ -3955,7 +3955,11 @@ mod tests {
         let cache = ShardedCacheBuilder::new(100)
             .shards(1024)
             .build::<u64, u64>();
-        for key in 0..10_000 {
+        // Under Miri, 2,000 keys: they still reach about 880 of 1,024
+        // shards, so shards that each admitted an entry would hold far over
+        // 100.
+        let keys = if cfg!(miri) { 2_000 } else { 10_000 };
+        for key in 0..keys {
             cache.insert(key, key);
         }
         assert!(
