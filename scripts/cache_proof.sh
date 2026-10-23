@@ -89,7 +89,7 @@ soak() {
     concurrent_reclamation_and_rebuild_soak -- --ignored --nocapture
 }
 
-miri() {
+miri_focused() {
   cargo +nightly miri setup
   MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
     cargo +nightly miri test --lib \
@@ -136,8 +136,27 @@ miri() {
   MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
     cargo +nightly miri test --test direct_packed_cache \
     unbounded_admission_batch_publishes_length_immediately -- --exact
-  MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
-    cargo +nightly miri test --lib -- sharded_cache::tests sharded_arena::tests
+}
+
+# ShardedCache and its arena. With PACKEDGEN_MIRI_PARTITION set to a
+# cargo-nextest partition, such as slice:1/2, this runs that share of the
+# tests through nextest, an interpreter per test, several at once.
+miri_sharded() {
+  cargo +nightly miri setup
+  if [[ -n "${PACKEDGEN_MIRI_PARTITION:-}" ]]; then
+    MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
+      cargo +nightly miri nextest run --lib --no-fail-fast \
+      --partition "$PACKEDGEN_MIRI_PARTITION" \
+      -E 'test(/^sharded_(cache|arena)::tests::/)'
+  else
+    MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
+      cargo +nightly miri test --lib -- sharded_cache::tests sharded_arena::tests
+  fi
+}
+
+miri() {
+  miri_focused
+  miri_sharded
 }
 
 sanitizers() {
@@ -266,6 +285,12 @@ case "$mode" in
   --miri)
     miri
     ;;
+  --miri-focused)
+    miri_focused
+    ;;
+  --miri-sharded)
+    miri_sharded
+    ;;
   --sanitizers)
     sanitizers
     ;;
@@ -282,7 +307,7 @@ case "$mode" in
     soak
     ;;
   *)
-    printf 'usage: %s [--quick|--msrv|--bench|--soak|--miri|--sanitizers|--memory-soak|--endurance|--all]\n' "$0" >&2
+    printf 'usage: %s [--quick|--msrv|--bench|--soak|--miri|--miri-focused|--miri-sharded|--sanitizers|--memory-soak|--endurance|--all]\n' "$0" >&2
     exit 2
     ;;
 esac

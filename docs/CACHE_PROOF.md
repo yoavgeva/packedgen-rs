@@ -84,6 +84,15 @@ scripts/cache_proof.sh --miri
 scripts/cache_proof.sh --sanitizers
 ```
 
+`--miri` runs `--miri-focused` and then `--miri-sharded`. CI runs them as
+separate jobs, and splits `--miri-sharded` in two with
+`PACKEDGEN_MIRI_PARTITION=slice:1/2` and `slice:2/2`, which run each share
+through `cargo-nextest`, an interpreter per test, several at once:
+
+```text
+PACKEDGEN_MIRI_PARTITION=slice:1/2 scripts/cache_proof.sh --miri-sharded
+```
+
 Run repeated 100% key-turnover memory checks independently for PackedGen and
 inline Papaya:
 

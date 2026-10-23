@@ -1,10 +1,18 @@
 name: CI
 
+# A pull request runs CI once, on its pull_request event; pushes run it on
+# main only, and any branch can run it by hand. Branches under bench/ only
+# run the benchmarks.
 on:
   push:
-    # Branches under bench/ only run the benchmarks.
-    branches-ignore: ['bench/**']
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+# A new push to a pull request cancels the run for the commit it replaces.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -31,30 +39,54 @@ jobs:
         run: cargo rustc -p packedgen-opthash --no-default-features --lib --crate-type rlib
 
   test:
-    name: Stable tests and lints
+    name: Stable tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test
+      - name: Tests
+        run: cargo test --workspace --all-targets
+
+  test-features:
+    name: Stable tests with every feature
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # These steps build with target-cpu=native. Runners differ in CPU, and
+      # restoring another CPU's artifacts can run instructions this one lacks
+      # (SIGILL), so the cache is keyed by CPU model.
+      - name: CPU model cache key
+        id: cpu
+        run: echo "model=$(grep -m1 'model name' /proc/cpuinfo | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: features-cpu-${{ steps.cpu.outputs.model }}
+      - name: Root runtime tests with every feature
+        env:
+          RUSTFLAGS: -C target-cpu=native
+        run: cargo test -p packedgen --all-targets --all-features
+
+  lint:
+    name: Lints, audit, and packaging
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy,rustfmt
-      # The every-feature steps build with target-cpu=native. Runners differ
-      # in CPU, and restoring another CPU's artifacts can run instructions
-      # this one lacks (SIGILL), so the cache is keyed by CPU model.
+      # Clippy below builds with target-cpu=native; see test-features.
       - name: CPU model cache key
         id: cpu
         run: echo "model=$(grep -m1 'model name' /proc/cpuinfo | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
         with:
-          key: cpu-${{ steps.cpu.outputs.model }}
+          key: lint-cpu-${{ steps.cpu.outputs.model }}
       - name: Formatting
         run: cargo fmt --all -- --check
-      - name: Tests
-        run: cargo test --workspace --all-targets
-      - name: Root runtime tests with every feature
-        env:
-          RUSTFLAGS: -C target-cpu=native
-        run: cargo test -p packedgen --all-targets --all-features
       - name: Clippy
         env:
           RUSTFLAGS: -C target-cpu=native
@@ -73,24 +105,60 @@ jobs:
         run: scripts/package_release.sh
 
   test-macos-arm:
-    name: Stable tests on Apple Silicon
+    name: Stable tests on Apple Silicon (${{ matrix.name }})
     # Exercise ARM's weak memory ordering independently of x86 CI.
     runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default features
+            key: default
+            features: ""
+          - name: prepared keys and diagnostics
+            key: prepared
+            features: prepared-keys,prepared-batch-gate,cache-production-diagnostics
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: PackedGen default-feature tests
-        run: cargo test --locked -p packedgen --all-targets
-      - name: PackedGen prepared-key and cache diagnostic tests
-        run: cargo test --locked -p packedgen --all-targets --features prepared-keys,prepared-batch-gate,cache-production-diagnostics
+        with:
+          key: macos-${{ matrix.key }}
+      - name: PackedGen tests
+        run: cargo test --locked -p packedgen --all-targets --features "${{ matrix.features }}"
 
-  memory-safety:
-    name: Loom, Miri, and sanitizers
+  loom:
+    name: Loom models
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: loom
+      - name: Exhaustive concurrency models
+        run: cargo test --release --test cache_concurrency_model
+
+  miri:
+    name: Miri (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: focused checks
+            mode: --miri-focused
+            key: focused
+          - name: ShardedCache 1/2
+            mode: --miri-sharded
+            key: sharded
+            partition: slice:1/2
+          - name: ShardedCache 2/2
+            mode: --miri-sharded
+            key: sharded
+            partition: slice:2/2
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -98,18 +166,39 @@ jobs:
           components: miri,rust-src
       - uses: Swatinem/rust-cache@v2
         with:
-          key: memory-safety
-      - name: Exhaustive concurrency models
-        run: cargo test --release --test cache_concurrency_model
-      - name: Focused interpreter checks
-        run: scripts/cache_proof.sh --miri
+          key: miri-${{ matrix.key }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.148
+          fallback: none
+      - name: Interpreter checks
+        env:
+          PACKEDGEN_MIRI_PARTITION: ${{ matrix.partition }}
+        run: scripts/cache_proof.sh ${{ matrix.mode }}
+
+  sanitizers:
+    name: Address and thread sanitizers
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: sanitizers
       - name: Address and thread sanitizers
         run: scripts/cache_proof.sh --sanitizers
 
   companion-miri:
-    name: Companion strict-provenance Miri
+    name: Companion strict-provenance Miri (${{ matrix.share }})
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        share: [1/3, 2/3, 3/3]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -118,8 +207,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: companion-miri
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.148
+          fallback: none
       - name: Strict-provenance interpreter checks
         working-directory: crates/elastic-core
+        env:
+          MIRI_PARTITION: slice:${{ matrix.share }}
         run: ci/miri.sh
 
   companion-asan:
