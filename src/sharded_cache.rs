@@ -3956,9 +3956,12 @@ mod tests {
         // A full shard taking only new keys keeps its oldest main keys, so
         // the queue's front stays live while relocations append records
         // that go stale behind it. Compacting the whole queue whenever the
-        // front had nothing stale held one write for 16 µs.
+        // front had nothing stale held one write for 16 µs. Relocating only
+        // away from home halved relocations: over 300 hash seeds, the first
+        // compaction came after 73,000 inserts at the median and 113,000 at
+        // most.
         let cache = ShardedCacheBuilder::new(1_000).shards(1).build();
-        for key in 0..100_000_u64 {
+        for key in 0..300_000_u64 {
             let before = MAIN_RECORDS_EXAMINED.with(std::cell::Cell::get);
             cache.insert(key, key);
             let examined = MAIN_RECORDS_EXAMINED.with(std::cell::Cell::get) - before;
