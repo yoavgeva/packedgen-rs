@@ -145,6 +145,15 @@ entry. Tables are sized once and never rebuilt.
     flight, and a waiter's future dropped mid-wait clears its waker. The
     futures need no particular executor and are `Send` when the cache, the
     key, and the loader are.
+- **Placeholder guards.** `get_value_or_guard` and
+  `get_value_or_guard_async` return the value, or, when no load is in
+  progress, a `PlaceholderGuard` that lists a flight as the loaders do. The
+  caller inserts through `PlaceholderGuard::insert`, which inserts and
+  hands the value to the waiters; a guard dropped without inserting
+  abandons the flight, and a waiter takes it over. Loaders and guards
+  share flights, so each waits for the other. `get_value_or_guard` waits
+  up to its timeout and returns `Timeout` past it; a deadline already
+  passed returns before parking, so a zero timeout never waits.
 - **Expiry.** `insert_with_ttl` and the builder's `time_to_live` store a
   deadline in the entry's 31-bit expiry field, in 100 ms ticks since the
   cache was built.
@@ -196,6 +205,24 @@ entry. Tables are sized once and never rebuilt.
     offered stays.
   - Expired entries are removed without being offered, as `Expired`; the
     rest as `Explicit`.
+- **Conditional writes.** `remove_if` offers a live value to its
+  predicate and removes it under the same shard lock, so no write to the
+  key lands between the decision and the removal; the predicate must not
+  write to the cache. `replace` writes a key only if it holds a live value
+  and otherwise hands the pair back. It takes its slot before locking, as
+  inserts do, fills it only once it finds the live value, and otherwise
+  gives it back unwritten; a value too heavy to cache removes the old one,
+  as an insert's does. Expired entries count as absent for both.
+- **Draining.** `drain` empties each shard under its lock when it
+  reaches it, sharing `clear`'s sweep, then yields clones of that shard's
+  live entries. The loop body may write to the cache. Dropping the
+  iterator stops it once the shard it reached is emptied, and retires that
+  shard's entries, so the listener hears each one.
+- **Memory.** `memory_used` reports the table, the entry slots handed out
+  so far, and each shard's filters, main-queue ring, and probation queue.
+  Region slots never handed out are not counted, since a large region's
+  untouched pages take no memory; memory keys and values own elsewhere is
+  not counted either, as in quick_cache's `memory_used`.
 - **Resizing.** `set_capacity` and `set_max_weight` change the limits at
   run time.
   - Tables are never rebuilt, so the builder's `max_capacity` reserves the
@@ -258,6 +285,18 @@ entry. Tables are sized once and never rebuilt.
     loop body and another thread write;
   - `retain` removing rejected and expired entries with their causes, and
     sparing entries its predicate replaced;
+  - `remove_if` removing only what its predicate accepts and never
+    offering absent or expired values; `replace` writing only live keys,
+    restarting the time to live, reweighing, removing the old value when
+    the new one is too heavy, and giving its slot back when it fails
+    (verified to fail without the give-back);
+  - a placeholder guard inserting while another caller times out, a
+    dropped guard waking its asynchronous waiter and handing it a guard,
+    and a loader and a guard caller both waiting for a guard's insert;
+  - `drain` yielding live entries once and reporting expired ones, and a
+    dropped drain retiring the shard it emptied (verified to fail without
+    the retirement on drop); `memory_used` counting the table, slots
+    handed out, and their reuse;
   - `set_capacity` evicting down at once and growing back within the
     reserve, `set_max_weight` evicting down and refusing values heavier
     than the new shares, and resizes racing four writing threads.

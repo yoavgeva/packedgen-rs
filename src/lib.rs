@@ -106,8 +106,9 @@ pub use segment_cache::{
 };
 pub use segmented_map::{KeyCompactionStats, SegmentedLoad, SegmentedMapStats, SegmentedSwissMap};
 pub use sharded_cache::{
-    NoListener, RemovalCause, RemovalListener, ShardedCache, ShardedCacheBuilder,
-    ShardedCacheGuard, ShardedCacheStats, UnitWeighter, Weighter,
+    GuardResult, NoListener, PlaceholderGuard, RemovalCause, RemovalListener, ShardedCache,
+    ShardedCacheBuilder, ShardedCacheGuard, ShardedCacheMemory, ShardedCacheStats, UnitWeighter,
+    Weighter,
 };
 pub use swiss_map::{PackedSwissMap, SwissMapStats};
 

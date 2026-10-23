@@ -67,12 +67,18 @@ It offers:
 - `get_or_insert_with` and `get_or_try_insert_with`, which load a missing key
   once however many callers miss it together, and `get_or_insert_async` and
   `get_or_try_insert_async`, which wait for that load without blocking, on
-  any executor;
+  any executor; `get_value_or_guard`, with a timeout, and
+  `get_value_or_guard_async` hand the caller a guard to insert through
+  instead;
 - per-entry and default times to live, or a time to idle that reads extend;
 - hit, miss, eviction, and expiration counts;
 - a removal listener told why each entry left;
 - `iter` over cloned entries, or borrowed ones through `pin()`, and
   `retain`, whose predicate may write to the cache;
+- `remove_if`, which decides and removes under one lock, and `replace`,
+  which writes only a key that holds a live value;
+- `drain`, and `memory_used`, which reports the table, entry slots, and
+  policy state in bytes;
 - `peek`, `contains_key`, `clear`, and `maintain`, which drops removed
   values promptly after a burst of writes;
 - weighted limits, `set_capacity` and `set_max_weight` to resize at run

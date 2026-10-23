@@ -1702,6 +1702,16 @@ impl<T> SlotStore<T> {
         stack.extend((first..end).rev().map(|index| depot.region_slot(index)));
     }
 
+    /// Bytes of the slots handed out so far: region slots up to the furthest
+    /// any thread took, whether they now hold entries or wait for reuse,
+    /// and every overflow chunk. A large region's untouched rest takes no
+    /// memory until first written.
+    pub(crate) fn bytes_used(&self) -> usize {
+        let depot = &*self.depot;
+        let state = depot.state.lock();
+        (state.fresh + state.overflow.len() * OVERFLOW_CHUNK_SLOTS) * depot.slot.size()
+    }
+
     /// Gives back vacant slots: region slots to this thread's stack, which
     /// overflows into the depot, and overflow slots to their chunks.
     #[inline]
