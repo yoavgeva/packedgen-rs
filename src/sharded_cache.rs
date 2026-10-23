@@ -4166,6 +4166,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "forty thousand inserts")]
     fn insert_many_drains_a_reclamation_backlog_as_inserts_do() {
         // A pinned reader holds back every removal's reclamation. Once it
         // leaves, each write reclaims one more entry than it retires until
