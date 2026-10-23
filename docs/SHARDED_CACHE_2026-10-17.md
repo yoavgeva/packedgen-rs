@@ -51,12 +51,14 @@ entry. Tables are sized once and never rebuilt.
   The alternate lies an offset past the home that the key's tag picks.
   - The home's overflow count is the number of its keys that live in their
     alternates. A lookup reads the alternate only when that count is nonzero.
-  - A bit per slot, in the writer-only generations word, marks a key living
-    in its alternate. With the slot's tag it names the key's other bucket, so
-    relocation and removal never read a resident's key to find it.
-  - When both buckets are full, the cache first moves one resident key to its
-    own other bucket. The copy is published before the old slot is cleared, so
-    readers always find it.
+  - A bit per slot, in the meta word, marks a key living in its alternate.
+    With the slot's tag it names the key's other bucket, so relocation and
+    removal never read a resident's key to find it.
+  - When both buckets are full, the cache first moves one resident key from
+    its home to its own alternate. The key is counted in its home's overflow
+    and published in the alternate before its home slot is cleared, so
+    readers always find it. Keys never move back home (see "Relocating only
+    away from home").
   - If no resident key can move, the cache evicts an unread entry from the two
     buckets. This happened on fewer than 0.1% of inserts into a full shard.
 - **Eviction.** Each shard uses an S3-FIFO-style policy:
@@ -95,7 +97,8 @@ entry. Tables are sized once and never rebuilt.
     tag's epoch slot found that slot and the next one quiescent, the direct
     arena's two-rotation aging.
   - In the same queue lock, the writer takes as many aged entries as it
-    retired, plus one while entries due since an earlier advance remain. It
+    retired, and as many more while entries due since an earlier advance
+    remain, within one reclamation batch of four. It
     drops their values and pushes the slots onto its own stack, so it refills
     slots whose lines it just touched. Paced this way, frees keep step with
     the writes' allocations (see "Write path").
@@ -114,6 +117,9 @@ entry. Tables are sized once and never rebuilt.
 - **Reads.** `get` hashes the key, then pins and clones the value. Hashing
   before pinning lets the hash run while the previous call's unpin completes
   (see "Read path"). `pin()` returns a guard for borrowed reads that pins once.
+  On Linux a thread's pins reuse an epoch announcement it keeps parked
+  between them, without a read-modify-write (see "Parked pin
+  announcements").
 - **Weights.** Weights come from a `Weighter`. A value heavier than its shard's
   share of the weight limit is refused, and any previous value for its key is
   removed, so readers never see a value the caller replaced.
@@ -154,6 +160,16 @@ entry. Tables are sized once and never rebuilt.
 - **Clearing.** `clear` sweeps each shard under its lock. It retires every
   entry, resets the probation, main, and ghost state, and leaves the eviction
   and expiration counts in place.
+- **Batched inserts.** `insert_many` inserts pairs in order, as single inserts
+  would, and returns how many it cached. It takes one epoch pin per call
+  instead of one per insert. Each chunk of 32 keys is hashed, and their home
+  buckets prefetched, before the chunk is inserted. The pin is refreshed
+  between chunks: held across a long batch, it would block every advance past
+  its epoch, and in a test 49,500 removed entries waited, against 96 for
+  single inserts. Removed entries are retired two at a time, so each
+  retirement can also drain two of a backlog. A call with one pair is a
+  plain insert. See "Batched inserts" under "Throughput against quick_cache
+  0.7" for its effect.
 
 ## Correctness evidence
 
@@ -166,11 +182,17 @@ entry. Tables are sized once and never rebuilt.
   - drop releasing every value;
   - guard reads surviving replacement;
   - two-bucket placement under a million-key churn;
+  - a reader finding a key that relocation moves between its search of the
+    key's home and of its alternate;
   - unread main-area keys leaving in insertion order;
   - forced pair evictions staying under 0.1%;
   - an 8-thread race of replacements, removals, loads, clears, and evictions
     that counts live values to prove each one is dropped exactly once;
   - eight racing callers loading a missing key once;
+  - batched inserts leaving the cache as single inserts do, pinning once,
+    prefetching each home bucket, letting their removed entries be
+    reclaimed, and draining a reclamation backlog as single inserts do
+    (verified to fail with retirements four at a time);
   - failing and panicking loads handing the key to a waiter;
   - expired entries reading as missing, and leaving before read live keys;
   - statistics, every removal cause, `clear`, and `peek`.
@@ -182,9 +204,16 @@ entry. Tables are sized once and never rebuilt.
   - a dropped cache leaving other threads' stacks harmless;
   - other writers dropping an idle thread's retired values (verified to fail
     without the foreign drains), and leaving a retiring thread's alone;
-  - writes reclaiming as many entries as they retire, and one more while a
-    backlog is due;
-  - a write's reclamation batch fitting one cache line.
+  - writes reclaiming as many entries as they retire, and as many more while
+    a backlog is due;
+  - a write's reclamation batch fitting one cache line;
+  - a thread's consecutive pins reusing one announcement until the epoch
+    moves (1,000 of 1,000 pins took a read-modify-write before);
+  - exiting threads returning their announcer slots, and a thread exiting
+    under a pin a thread-local still holds keeping its slot (each verified
+    to fail without its condition);
+  - on Linux, `membarrier` registering and an advance evicting a parked
+    announcement.
 - **Layout and sizing tests.** They check that a write's shard state spans
   two cache lines, that shards share one bucket table, that the default
   shard count gives every extra shard at least 256 entries, that a cache
@@ -201,6 +230,13 @@ entry. Tables are sized once and never rebuilt.
   claiming its shard while the writer retires and the main thread
   advances; its negative control reads the mask with a load instead of a
   read-modify-write, and the model finds a reclamation beneath the reader.
+  A third model runs parked announcements: a reader reusing a parked
+  epoch while a pinned writer retires and the main thread advances,
+  evicting it, and a reader announcing afresh and then reusing. Negative
+  controls drop the light fence and the heavy fence in turn; the model
+  finds a reclamation beneath the reader in each (see "Parked pin
+  announcements"). These models take minutes unoptimized, so they run with
+  `--release`, as CI's model step does.
 - **CI tools.** `scripts/cache_proof.sh` runs the module under Miri, ASan, and
   TSan.
 
@@ -290,6 +326,25 @@ inline `BuildHasher::hash_one` (see "Hashing without `hash_one`"). Built
 with one codegen unit, and again with the hashing change in both, resident
 hits moved by −2 to +14% at 50,000 entries and by 0 to +1% at 1,000,000,
 and writes by −3 to +4%.
+
+### Huge pages on Linux
+
+Many distributions enable transparent huge pages only where `madvise`
+asks for them; GitHub's x86_64 runners do. There a million-entry cache's
+table and region took 4 KB pages, a TLB entry each. On x86_64 and aarch64
+Linux both allocations are now advised with `MADV_HUGEPAGE` over the whole
+huge pages they span, before anything touches them, and the table is
+allocated zeroed, an empty table, so a large one comes untouched from the
+kernel instead of being written bucket by bucket. A test reads the
+mappings' flags from `/proc/self/smaps`.
+
+On a runner, with 4,000,000-entry resident hits running, the advised
+process held 54 MB of huge pages and the parent none. Against the parent
+commit, over seven pairs, cells at 1,000,000 entries moved by −1 to +12%
+(cold fill +2% on one thread, +1 to +7% between pairs; turnover +3 to +4%;
+four-thread resident hits +6%), and cells at 50,000 entries by −5 to +6%. The Linux VM could not show it: its memory was fragmented by other
+containers, and even advised, it gave the process 2 MB of huge pages out of
+2 GB.
 
 ## Four-byte handles
 
@@ -406,6 +461,87 @@ between pairs. An earlier form, which marked the shard on
 every pin, gained 2 to 12% on single-thread writes before later
 write-path changes took most of that, and cost misses 1.2 to 3.4% (see
 "Rejected and reverted").
+
+## Parked pin announcements
+
+A pin counted itself in its reader shard's counter with a sequentially
+consistent read-modify-write, and its unpin uncounted it with another. On
+x86 either is a full barrier, so a read's loads waited for the previous
+read's misses to finish.
+
+On Linux, threads now announce their pins:
+
+- A thread claims one of 64 announcer slots on its first pin, and each cache
+  has a 128-byte line per slot. A pin writes the epoch it pins there, and
+  the last pin to leave keeps that epoch announced, parked.
+- The thread's next pin marks the parked announcement active with a store
+  and a compiler fence, then loads the line's eviction flag and the
+  generation. If no advance evicted the announcement and the generation
+  still names its epoch, the pin holds that epoch. No read-modify-write or
+  fence instruction runs, and the unpin is a store.
+- Otherwise the pin announces afresh: a store, a sequentially consistent
+  fence, and a check that the generation has not moved, as with the
+  counters. A thread that keeps reading does this once per advance.
+- An advance that a parked announcement blocks evicts it. It sets the
+  line's eviction flag, issues `membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED)`,
+  and reads the line again. The system call makes every running thread of
+  the process execute a full barrier, so either the advance sees a pin that
+  marked the line active, and waits, or that pin sees the flag and
+  announces afresh.
+- Only a thread that stopped pinning since the last advance needs evicting.
+  On 4-vCPU runners, one barrier cost its caller 3 to 4.4 µs, and every
+  other running thread 1 to 2 µs. That is too much to pay on every advance,
+  which comes due after 32 to 512 retirements.
+- A thread returns its slot when it exits, unless it still holds a pin
+  that another thread-local's destructor drops later. The slot then stays
+  held for good.
+- These pin through the counters as before: threads past the 64th, threads
+  pinning during their exit, kernels without `membarrier`, and other
+  platforms.
+
+The announcement state machine lives in `src/direct_epoch_protocol.rs`,
+which the Loom models include. A compiler fence orders only with the
+system call, not with an ordinary fence, so the model does not issue one.
+Instead the reader holds a mutex across its reuse, and the eviction takes
+the same mutex in place of the system call. The reuse then falls wholly
+before or wholly after the barrier, as when the barrier lands before its
+store or after its loads; landing between them only adds ordering. Removing
+either side lets the model reclaim a slot under the reader.
+
+Each cache spends 8 KB on the lines: 0.16 bytes per entry at 50,000
+entries. Throughput over the counters, from builds of their own on GitHub
+runners, five pairs per read cell and three per write cell. Guard reads
+pin once per 64 reads, a bound:
+
+| CPU | Entries | Threads | Hits | Misses | Guard hits | Guard misses |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| AMD EPYC 7763 | 50,000 | 1 | −2% | +2% | +33% | +18% |
+| AMD EPYC 7763 | 50,000 | 4 | +1% | +3% | +7% | +18% |
+| AMD EPYC 7763 | 1,000,000 | 1 | 0% | +4% | +47% | +39% |
+| AMD EPYC 7763 | 1,000,000 | 4 | −2% | +3% | +1% | +8% |
+| AMD EPYC 9V45 | 50,000 | 1 | +9% | +22% | +15% | +39% |
+| AMD EPYC 9V45 | 50,000 | 4 | +7% | +10% | +22% | +30% |
+| Intel Xeon 8573C | 1,000,000 | 1 | +4% | +9% | +10% | +18% |
+| Intel Xeon 8573C | 1,000,000 | 4 | +6% | +14% | +16% | +38% |
+| Neoverse N2 | 50,000 | 1 | +6 to +26% | +8 to +10% | +21 to +28% | +18 to +19% |
+| Neoverse N2 | 50,000 | 4 | +17% | +6 to +9% | +17 to +25% | +17 to +22% |
+| Neoverse N2 | 1,000,000 | 1 | 0 to +3% | −1 to +3% | +2 to +6% | +10 to +13% |
+| Neoverse N2 | 1,000,000 | 4 | +1 to +3% | −6 to +3% | +4 to +5% | +3 to +12% |
+
+Writes moved by −7 to +11%, mostly within 4%; single-thread turnover
+gained 3 to 11%, except on the EPYC 7763 at 1,000,000 entries (−1%). The 4-vCPU runners are two cores
+with two threads each, so four threads share execution units, and the
+announcements' few added instructions weigh more there than at one
+thread. On the EPYC 7763, where guard reads ran up to 47% faster, the
+announcements left reads level: what a guard saves there is not the
+barrier.
+
+macOS keeps the counters. It has no `membarrier`, and announcements with a
+sequentially consistent fence on each reuse read hits 12 to 24% slower on
+an M4 Max (see "Rejected and reverted"). Builds that cannot announce
+compile the counters alone: a first version that checked for an announcer
+slot on every pin read resident hits 12 to 15% slower there at 50,000
+entries, while `get` now compiles to the same instructions as before.
 
 ## Slab storage against boxed entries
 
@@ -640,6 +776,27 @@ These changes followed, each measured against the one before:
   Single-thread writes gained 5 to 9% on x86, 9 to 11% for cold fill and
   replace on the Linux VM, and 6% for cold fill on macOS; four- and
   eight-thread writes moved by −3 to +7%, and reads stayed within noise.
+- **Relocating only away from home.** Relocation also moved keys from their
+  alternates back home, and a lookup could then miss a resident key. It
+  searched the home before the key was published there, and the alternate
+  after the key was cleared from it. `get` returned `None`, and
+  `get_or_insert_with` ran its loader again and replaced the value. A
+  test-only hook that runs an insert between a lookup's two buckets
+  reproduces it. Keys now move only from home to alternate, an order no
+  lookup can miss. Over 40 churns of a full shard:
+  - relocations fell from 0.018 to 0.009 per insert, and no insert evicted
+    from a full pair;
+  - 23.6% of keys lived in their alternates instead of 17.4%;
+  - 57% of buckets counted overflow instead of 53%, so more lookups read a
+    second bucket.
+
+  None of this showed in throughput. On macOS, single-thread hits, misses,
+  cold fill, and turnover at 50,000 and 1,000,000 entries moved by −4 to
+  +7%, with almost every range crossing zero; hits at 1,000,000 entries by
+  0% and misses by −1%. Mokabench moved by +0.1 to +1.4% (geometric means
+  at 1 to 16 clients), and x86_64 cells against the parent commit stayed
+  within the runner's noise. The trace hit-ratio sum read 667.60 and 667.75
+  against 667.66 and 667.62.
 
 Pacing is a trade-off between allocators and workloads. Freeing up to four
 entries per write instead changed Linux throughput by:
@@ -674,6 +831,14 @@ Hosts:
   containers and services kept about ten cores busy during these runs, a
   load average of 9 to 10, against about four for the previous table.
 - Linux: an aarch64 Docker VM on the same machine, using glibc's allocator.
+
+On aarch64 Linux, Rust's default target calls an out-of-line helper for
+every atomic read-modify-write, which picks LSE instructions at run time.
+Built with `-C target-feature=+lse` on the Linux VM, single-thread resident
+hits ran 25% faster for ShardedCache and 32% faster for quick_cache, and
+turnover 18% and 9%. The gaps between the two moved by under 8 points
+either way, and replace varied too much between pairs to read. On aarch64
+servers, either cache gains from a build that inlines LSE atomics.
 
 Two-thread cells have varied most between runs, by up to 30% for one
 build, as threads land on performance or efficiency cores, and eight-thread
@@ -758,6 +923,66 @@ allocator filled shortly before.
 The earlier boxed-entry storage measured macOS resident hits at −32%, +2%,
 and +241%. On macOS those boxes often sat beside their values (see "Slab
 storage against boxed entries").
+
+The Linux VM has no hardware counters, and neither has a GitHub x86_64
+runner, where `perf stat` reports cycles and cache misses as unsupported.
+Cachegrind, which counts instructions exactly and simulates caches, ran
+each write workload at 400,000 and 800,000 operations; the difference is
+per operation, with setup removed. At 50,000 entries on one Linux thread:
+
+| Per operation | Cold fill | Replace | Delete and reinsert |
+| --- | ---: | ---: | ---: |
+| ShardedCache instructions | 1,805 | 1,410 | 2,045 |
+| quick_cache instructions | 1,217 | 963 | 1,349 |
+| ShardedCache L1 data misses | 15.2 | 11.8 | 17.6 |
+| quick_cache L1 data misses | 12.8 | 10.4 | 13.9 |
+
+Allocator work was identical for the two caches, and ShardedCache hashed
+once per insert where quick_cache hashed twice. Retiring and reclaiming
+removed entries took 370 to 410 instructions per write, 60 to 80% of the
+difference, spread over about a hundred source lines with none above 16;
+the rest was spread over the policy, the table, and the insert itself.
+Those instructions are cheap, as the bound above shows: freeing at once
+gained 3 to 10%.
+
+### Batched inserts
+
+`bounded_cache_probe`'s `sharded-batch` backend writes through
+`insert_many`, 64 writes per call. On macOS, against `insert` in the same
+build, the paired median of three runs:
+
+| Workload | 50,000, 1T | 50,000, 8T | 1,000,000, 1T | 1,000,000, 8T |
+| --- | ---: | ---: | ---: | ---: |
+| Replace | +24% | +20% | +60% | +44% |
+| Cold fill | +5% | +19% | +36% | +11% |
+
+Replace finds each key before writing it, and with the batch's buckets
+prefetched its finds overlap: at 1,000,000 entries batched replace ran at
+5.7 Mops/s on one thread, against quick_cache's 2.5. Cold fill at 50,000
+entries evicts on every insert from buckets already cached, and gains
+little.
+
+Batches first retired their removed entries four at a time. A retirement
+reclaims as many aged entries as it queues, and then drained one more of a
+due backlog, but only within its reclamation batch of four, so retiring
+four never drained any. On a loaded host, a pinned thread preempted for its
+time slice leaves a backlog behind it. Batches then kept it until the slab
+region ran out, and writers took overflow slots one at a time under the
+depot's lock: eight-thread batched cold fill ran at 9.2 and 12.3 Mops/s at
+50,000 and 1,000,000 entries, against 17.1 and 21.6 for single inserts,
+and some runs fell to 1.8. Batches now retire two at a time, and a
+retirement reclaims twice what it queues while a backlog is due, which
+brought those cells to 20.2 and 24.0 Mops/s. Batched replace gave up 2 to
+12% of its gain against four at a time, and single inserts moved within
+noise.
+
+Sharing `insert`'s body with `insert_many` first cost single replaces 12%
+at 50,000 entries. With two copies of the body, the compiler stopped
+inlining five helpers it had inlined for their single call site:
+Cachegrind counted 1,439 instructions per replace against 1,410. Forcing
+them inline, and giving the slot stacks one shared thread-local accessor,
+brought it to 1,405, and single-operation cells against the parent commit
+moved by −4 to +12%, every range but one crossing zero.
 
 ### On x86_64
 
@@ -867,6 +1092,84 @@ removed entries, as on the probe (see "Throughput against quick_cache
 0.7"). Within the difference, mokabench's own zeroing of new values took 77
 ms against 16, which points to colder memory from the allocator: evicted
 values are freed three advances after their eviction rather than at once.
+
+### Against the first version and moka
+
+The first `ShardedCache` (`f871aa6`, 2026-10-17) kept boxed entries in the
+direct arena, eight-byte handles, and a table per shard. Its probe, the
+version after `#24` (`2635115`), and `6d0d3be` ("now") were built alike and
+run in rotation with quick_cache 0.7; each figure is the paired median of
+three runs. The later backlog drain moved single-insert cells within noise
+(see "Batched inserts"). The x86_64 runs were on an AMD EPYC 7763 with 4
+vCPUs.
+
+Now over the first version:
+
+| Workload | macOS 50K, 1T | 50K, 8T | 1M, 1T | 1M, 8T | x86 50K, 1T | 50K, 4T | 1M, 1T | 1M, 4T |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Resident hit | +25% | +15% | +32% | +37% | +26% | +2% | −17% | −16% |
+| Read miss | +8% | −1% | +16% | +23% | +16% | +16% | +42% | +46% |
+| Cold fill | +9% | +34% | +32% | +53% | +49% | +131% | +103% | +112% |
+| Turnover (95% reads) | +9% | +36% | +77% | +32% | +16% | +38% | +12% | +59% |
+| Replace | +10% | +26% | +29% | +34% | +67% | +49% | +43% | +135% |
+| Delete and reinsert | +25% | +34% | +18% | +46% | +46% | +42% | +30% | +58% |
+
+Now over quick_cache:
+
+| Workload | macOS 50K, 1T | 50K, 8T | 1M, 1T | 1M, 8T | x86 50K, 1T | 50K, 4T | 1M, 1T | 1M, 4T |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Resident hit | −9% | +282% | −7% | +16% | −20% | +37% | −18% | +5% |
+| Read miss | +98% | +568% | −53% | +171% | +12% | +50% | −46% | −4% |
+| Cold fill | −4% | −15% | +13% | +17% | −21% | +9% | +39% | +64% |
+| Turnover (95% reads) | −11% | +52% | +10% | +34% | −3% | +33% | −9% | +42% |
+| Replace | +29% | +3% | +47% | +66% | −17% | −19% | −9% | −5% |
+| Delete and reinsert | +1% | +43% | +32% | +56% | −16% | +5% | +4% | +20% |
+
+Resident hits at 1,000,000 entries on x86_64 ran 17% slower than the first
+version, the one regression here. Cachegrind on that runner counted 388
+instructions and 4.8 L1 data misses per hit now, against 391 and 4.7 for
+the first version, with the working set inside the simulated last level
+and no mispredicted branches in either, so the difference is in the
+layout's latency rather than in work or misses. The first version's boxed
+entries were allocated after their values, as under "Slab storage against
+boxed entries". A dedicated A/B on macOS, five pairs with both codegen
+settings, read single-thread resident hits at 0 to +6% and turnover at −2
+to +1% against `#24`.
+
+On mokabench, ShardedCache's throughput over quick_cache's and moka's sync
+cache (0.12.8), as geometric means over the 16 cells. Each host ran each
+version against quick_cache in the same job, so the ratios compare across
+versions; macOS ran once and x86_64 three times:
+
+| Host | Clients | First over quick_cache | `#24` | Now | Now over moka |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| macOS | 1 | 0.85x | | 1.02x | 3.36x |
+| macOS | 4 | 0.81x | | 1.13x | 5.29x |
+| macOS | 16 | 1.11x | | 1.42x | 12.51x |
+| x86_64 | 1 | 0.73x | 0.97x | 0.99x | 4.56x |
+| x86_64 | 2 | 0.63x | 1.14x | 1.18x | 7.02x |
+| x86_64 | 4 | 0.70x | 1.27x | 1.37x | 9.54x |
+
+The mean one-client hit ratio rose from 37.75% to 38.97% (38.95% on
+x86_64), against 37.99% for quick_cache and 37.87% for moka. moka leads in
+5 of the 16 cells, by 2.9 points on P3 at 20,000 entries and by under a
+point in the others: OLTP at 256 entries, DS1 at 4,000,000, and S3 at
+400,000 and 800,000.
+
+Requested bytes per entry beyond the key and value, measured as in
+"Memory", with moka 0.12.16's sync cache read after `run_pending_tasks`:
+
+| Entries | Key, value | First version | Now | quick_cache | moka |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 100,000 | 8 B, `u64` | 30.7 | 26.9 | 102.0 | 232.0 |
+| 100,000 | 32 B, `u64` | 30.9 | 28.1 | 140.9 | 237.3 |
+| 100,000 | 32 B, `[u8; 64]` | 31.4 | 31.0 | 210.7 | 236.8 |
+| 1,000,000 | 8 B, `u64` | 29.0 | 23.7 | 78.4 | 223.7 |
+| 1,000,000 | 32 B, `u64` | 29.0 | 23.8 | 104.7 | 227.5 |
+| 1,000,000 | 32 B, `[u8; 64]` | 29.1 | 24.1 | 149.4 | 227.5 |
+
+The first version's figures leave out the allocator's rounding of its
+boxed entries.
 
 ## Tail latency against quick_cache 0.7
 
@@ -1072,18 +1375,37 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
 - **Reclaiming in batches of 32.** Freeing values together was meant to
   overlap their cache misses; eight-thread writes fell 12 to 16% instead.
 - **A per-bucket summary of tags for misses.** A 32-bit word per bucket,
-  in an array of its own, held a bit per tag class present and a bit for
-  keys displaced to the alternate; readers checked it before loading the
-  bucket, and writers refreshed it when its bits changed. At 1,000,000
-  entries the 2 MB array stayed in L2 and misses ran 1.4 to 1.95 times as
-  fast, near quick_cache's on one thread. But resident hits lost 13 to 34%
-  with an acquiring load of the summary and a prefetch of the bucket, and 9
-  to 20% with a relaxed load and no prefetch, at 50,000 entries as well;
-  turnover lost 3 to 13%. At 50,000 entries the summaries stay cached, and
-  `get` then saved one more register pair and kept a larger frame: the
-  summary slice was one more value live through the lookup, the
-  register-pressure shape that cost hits under "Four-byte handles", so the
-  loss may be mostly code shape rather than the summary's own cost.
+  in an array beside the table, about 0.5 bytes per entry, held a bit per
+  class of the tags in its slots and a bit set while its overflow count
+  was nonzero.
+  - A first version, checked before loading the bucket, cost resident hits
+    9 to 34%, likely from the shape it gave `get`'s code.
+  - A second version checked the home's summary, and the alternate's when
+    the home had overflowed, before pinning, so a miss it ruled out took no
+    pin and loaded no bucket. A tag's class was its low five bits, with 31
+    sharing 30's bit. In a full cache about a quarter of misses passed.
+    Writers kept summaries exact under the shard lock: a placement set its
+    tag's bit, and a removal cleared it unless a word-wide byte test found
+    another tag of its class in the bucket.
+  - On one thread of an M4 Max, misses at 1,000,000 entries ran at 62 to
+    68 Mops/s instead of 26 to 30, and 7 to 17% faster at 50,000. Resident
+    hits lost 1 to 2% at 1,000,000 entries and moved by −11 to +4% at
+    50,000, in noisy runs, for about 30 more instructions per read.
+    Single-thread cold fills lost 5 to 6%, and eight-thread writes 6 to 14%.
+  - On mokabench, against the same commit without summaries, over three
+    paired repetitions of 16 cells, the geometric mean was −6% at one
+    client, −8% at four, −11% at eight, and −12.5% at sixteen. It lost even
+    where 9 to 13% of reads hit. A miss in a cache is mostly followed by an insert of
+    the same key, which loads the same bucket line, so ruling the miss out
+    early saved little, while every read paid the check and every write the
+    upkeep.
+  - Recomputing a bucket's summary from all ten slots after each removal
+    retired 17% more instructions in a cold fill, and cost it 12 to 13%:
+    the loop over the tag bytes did not compile to straight-line code.
+    Updating it in place, storing it without testing for a change, and
+    inlining the placement brought the cost to 5 to 6%. Release stores,
+    relaxed ones, prefetching the summary lines, and sending every
+    summary store to one word each left that cost unchanged.
 - **Decoding overflow handles inside readers' lookups.** Resident hits at
   1,000,000 entries lost 20 to 25% on Apple Silicon, though no overflow
   handle existed; see "Four-byte handles".
@@ -1155,6 +1477,110 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
   hits 3.2 to 3.6% on Linux. On x86, single-thread cold fill gained 6% and
   reads lost 2 to 3%. The process-wide mask set once per thread replaced it
   (see "Reader shards in use").
+- **Reads without a pin, as a bound.** With `get`'s pin removed, which is
+  unsound, one-thread resident hits on an M4 Max ran 11 to 20% faster at
+  50,000 entries and 8 to 9% at 1,000,000, and misses 15% and 26 to 28%.
+  An acquiring pin and a releasing unpin, in place of `SeqCst` both, moved
+  reads by −2 to +7%, with no consistent sign.
+- **Misses that skip the alternate bucket, as a bound.** One-thread misses
+  moved by −1 to +2% at both 50,000 and 1,000,000 entries: a miss pays for
+  its home bucket's line, not its alternate's.
+- **Freeing removed entries at once, as a bound.** On the Linux VM at
+  50,000 entries, freeing each removed entry without waiting for readers,
+  which is unsound, made one-thread cold fills 4 to 6% faster, and delete
+  and reinsert and turnover 3 to 10%; replace moved within its noise. The
+  same bound had been 29 to 35% before advances over the reader shards in
+  use and the eviction prefetch. Deferred reclamation is no longer the main
+  single-thread write cost.
+- **Trimming the retire path.** Fusing its two scans for aged slots into one
+  loop added 8 instructions per write in Cachegrind. Earlier redesigns of
+  that path (per-thread lanes, a lock-free free stack, a spin lock, larger
+  batches) are above.
+- **Batched reads.** A guard method looking up eight `u64` keys at a time,
+  prefetching their home buckets first, ran single-thread resident hits on
+  an M4 Max at 175 to 207 Mops/s against 201 to 208 for the guard's own
+  reads at 50,000 entries, and at 43 to 49 against 38 to 41 at 1,000,000.
+  Prefetching each key's first candidate entry as well made both sizes
+  slower. The core already overlaps independent guard reads, so a batched
+  read API did not pay for itself.
+- **Access marks in the bucket.** Each entry's two access marks moved into
+  the top bits of its slot's generation byte, leaving six bits of placement
+  count. That would let caches without weights or deadlines drop the 8-byte
+  entry metadata, and let eviction sweeps read marks from bucket lines they
+  already load. Trace hit ratios stayed level (667.65 and 667.63), and
+  writes moved by −5 to +8% on macOS; but single-thread resident hits fell
+  7 to 14%, eight-thread hits 5 to 12%, and eight-thread turnover 6%. A hit
+  had to find its bucket again and load the marks after comparing its key.
+- **Read-path variants on x86_64, as bounds.** On GitHub runners, five
+  pairs per cell against the same commit, in builds of their own:
+  - Reads through one guard refreshed every 64 operations, so without a
+    per-read pin: single-thread resident hits +7 to +21% at 50,000 entries
+    (EPYC 9V74 and 9V45) and +45 to +47% at 1,000,000 (EPYC 7763), misses
+    +15 to +37% and +61 to +71%, and turnover +4 to +5% and +32 to +33%.
+    Four threads gained 0 to +18%.
+  - An unpin that stores the decremented count instead of a
+    read-modify-write, sound only while each reader shard has one thread,
+    as in the probe: −11 to +4% on every workload. The pin's own
+    read-modify-write remains, and on x86 any read-modify-write holds back
+    the next read's loads until the previous read's have finished, so
+    consecutive reads' misses still run in series.
+  - Huge pages turned off: −5 to +5%. Slots aligned to 64 bytes, which
+    puts each 56-byte entry in one cache line: −4 to +9%.
+
+  Removing the pin's barrier needs an asymmetric fence: readers announcing
+  with plain stores, and advances issuing a process-wide barrier
+  (`membarrier` on Linux). Parked announcements now do that on Linux, and
+  gained up to 26%; on the EPYC 7763 they left reads level, so there the
+  barrier was not the gap (see "Parked pin announcements").
+- **A barrier on every advance.** Announcing with plain stores but
+  unparking on every unpin would make each advance issue `membarrier`. It
+  cost its caller 3 to 4.4 µs and each other running thread 1 to 2 µs on
+  4-vCPU runners (Intel Xeon 8573C, Neoverse N2), while advances come due
+  after 32 to 512 retirements, a few microseconds of writes. Parking the
+  announcement confines the barrier to threads that stopped pinning.
+- **Announcements on macOS, with fences.** Without `membarrier`, a reuse
+  needs a sequentially consistent fence in place of the compiler fence. On
+  an M4 Max that read hits 12 to 24% slower than the counters' read-modify-
+  writes, and turnover 10 to 15% slower in three of four cells; misses
+  moved by −6 to +13%.
+- **Closing scc's lead on eight-thread writes.** scc 3.8's `HashCache`
+  locks one 32-entry bucket per write, evicts that bucket's least recently
+  used entry in place, and drops it at once, as its readers lock buckets
+  too. On macOS it scaled cold fill 3.5 times from one thread to eight at
+  50,000 entries, against 1.9 times for ShardedCache, and led
+  delete-reinsert by 63%. At eight threads, 19% of ShardedCache's worker
+  samples waited on locks, mostly shard locks held across misses on lines
+  another core last wrote, and the rest on the slot depot. Measured:
+  - More shards: 512 and 2,048 instead of 128 lifted eight-thread cold fill
+    7% and 34% and delete-reinsert 14% and 13%. Trace hit ratios held down
+    to about 128 entries per shard, within −0.6 to +0.4 points on six
+    cells, but at 64 entries P8 at 32,768 lost 2.0 points and at 32 lost
+    7.8, and each doubling of the shard count adds about 1.4 bytes per
+    entry of shard state at 100,000 entries.
+  - Thread batches of 64 slots instead of 32: −2 to +4%.
+
+  The rest is the policy: an evicting insert touches the shard's header,
+  probation and main queues, ghost and shadow words, and the victim's
+  bucket and entry, where scc touches one bucket. Its hit ratio is the
+  other side of that: 32.8% against 39.0% on the mokabench traces.
+- **Smaller shards.** Shards of at least 128 entries instead of 256, and
+  up to 64 per thread instead of 16, on macOS, five pairs: eight-thread
+  writes +3 to +13%, single-thread cold fill −4 to −6%, and eight-thread
+  misses at 1,000,000 entries −13%. The 18 hit-ratio cells summed 1.80
+  points lower, P3 at 131,072 entries 0.71 lower, and bytes per entry rose
+  by 2.1 at 50,000 entries, 4.4 at 131,072, and 0.5 at 1,000,000.
+- **Buffered policy updates, bounded first.** Caffeine places an entry at
+  once and queues its policy work for a batched pass. A bound for that: a
+  build with no policy, where an insert into a full shard evicts the next
+  occupied slot of a table sweep, without probation, the main queue, or
+  filters. On macOS, five pairs, eight-thread cold fill gained 13% at
+  50,000 entries and 2.5% at 1,000,000, delete-reinsert 25% and 14%;
+  replace was level, turnover fell 9 to 11% with the lost hit ratio, and
+  single-thread cold fill fell 24 to 38% to the sweep. Buffering moves the
+  policy's work rather than removing it, so it gains no more than that,
+  against scc's 88% lead on eight-thread cold fill at 50,000 entries. The
+  rest of that lead is scc's per-bucket locks and its entries stored in
+  the bucket.
 
 ## Reproduce
 
@@ -1173,4 +1599,8 @@ python3 scripts/summarize_compare.py target/compare-50k.csv
 git push origin HEAD:refs/heads/bench/NAME   # the same on x86_64, and against HEAD^
 sh scripts/mokabench.sh 3 1,4,8,16 "s3 ds1 p8 s1 p3 oltp" target/mokabench.csv
 python3 scripts/summarize_mokabench.py target/mokabench.csv
+$PROBE sharded-batch replace 1000000 4000000 1 64 1
+# Instructions per write, on Linux: run twice and subtract.
+valgrind --tool=cachegrind --cache-sim=yes $PROBE sharded replace 50000 400000 1 64 1
+valgrind --tool=cachegrind --cache-sim=yes $PROBE sharded replace 50000 800000 1 64 1
 ```
