@@ -342,7 +342,9 @@ entry. Tables are sized once and never rebuilt.
   announcements"). These models take minutes unoptimized, so they run with
   `--release`, as CI's model step does.
 - **CI tools.** `scripts/cache_proof.sh` runs the module under Miri, ASan, and
-  TSan.
+  TSan. CI runs the tests on x86_64 Linux, Apple Silicon macOS, and x86_64
+  Windows; on macOS and Windows, which lack `membarrier` and `madvise`, they
+  run the portable fallbacks.
 
 ## Memory
 

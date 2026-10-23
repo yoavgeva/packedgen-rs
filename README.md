@@ -121,7 +121,8 @@ assert_eq!(sessions.stats().misses, 1);
 
 `ShardedCache` is new. Unit tests, an 8-thread race that counts live values,
 Miri, and the address and thread sanitizers cover it (`scripts/cache_proof.sh`),
-but it has no production deployments yet and its API may change before 1.0.
+and CI runs its tests on Linux, macOS, and Windows. It has no production
+deployments yet, and its API may change before 1.0.
 Its benchmarks so far ran on one 16-core Apple Silicon machine and on a Linux
 VM hosted there.
 
