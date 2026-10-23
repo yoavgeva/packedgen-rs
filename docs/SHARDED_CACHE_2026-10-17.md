@@ -319,10 +319,9 @@ mappings' flags from `/proc/self/smaps`.
 
 On a runner, with 4,000,000-entry resident hits running, the advised
 process held 54 MB of huge pages and the parent none. Against the parent
-commit, over seven pairs, cells at 1,000,000 entries gained 0 to 12% (cold
-fill +2% on one thread, +1 to +7% between pairs; turnover +3 to +4%;
-four-thread resident hits +6%), and cells at 50,000 entries moved by −5 to
-+6%. The Linux VM could not show it: its memory was fragmented by other
+commit, over seven pairs, cells at 1,000,000 entries moved by −1 to +12%
+(cold fill +2% on one thread, +1 to +7% between pairs; turnover +3 to +4%;
+four-thread resident hits +6%), and cells at 50,000 entries by −5 to +6%. The Linux VM could not show it: its memory was fragmented by other
 containers, and even advised, it gave the process 2 MB of huge pages out of
 2 GB.
 
