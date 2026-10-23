@@ -150,6 +150,10 @@ jobs:
     defaults:
       run:
         shell: bash
+    env:
+      # Writing PDBs dominates linking the ~90 test, example, and bench
+      # binaries. Panic messages keep their source locations without them.
+      CARGO_PROFILE_DEV_DEBUG: 0
     steps:
       # Tests read sources with include_str!; keep the LF endings the other
       # runners check out.
@@ -160,8 +164,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: windows-${{ matrix.key }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.148
+          fallback: none
+      # cargo test runs one binary at a time, about nine minutes here, while
+      # nextest runs every binary's tests at once. The run then takes about
+      # as long as the slowest test, direct_cache_memory's three minutes.
       - name: Tests
-        run: cargo test --locked ${{ matrix.packages }} --all-targets --features "${{ matrix.features }}"
+        run: cargo nextest run --locked --no-fail-fast ${{ matrix.packages }} --all-targets --features "${{ matrix.features }}"
 
   loom:
     name: Loom models
