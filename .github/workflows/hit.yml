@@ -26,7 +26,7 @@ jobs:
       - name: Build
         run: |
           cargo build --locked --release --example bounded_cache_probe --target-dir ../t-base
-          for v in thpoff align64; do
+          for v in unpinstore; do
             git worktree add ../$v HEAD
             git -C ../$v apply "$PWD/bench-hit/$v.diff"
             (cd ../$v && cargo build --locked --release --example bounded_cache_probe --target-dir ../t-$v)
@@ -36,8 +36,10 @@ jobs:
           P=release/examples/bounded_cache_probe
           W=$(cd .. && pwd)
           sh bench-hit/ab.sh 5 "resident-hit read-miss turnover" "${{ matrix.entries }}" "1 4" reads.csv \
-            base=$W/t-base/$P:sharded guard=$W/t-base/$P:sharded-guard thpoff=$W/t-thpoff/$P:sharded \
-            align64=$W/t-align64/$P:sharded quick=$W/t-base/$P:quickcache
+            base=$W/t-base/$P:sharded guard=$W/t-base/$P:sharded-guard unpinstore=$W/t-unpinstore/$P:sharded \
+            quick=$W/t-base/$P:quickcache
+          sh bench-hit/ab.sh 3 "cold-fill replace delete-reinsert" "${{ matrix.entries }}" "1 4" reads.csv \
+            base=$W/t-base/$P:sharded unpinstore=$W/t-unpinstore/$P:sharded quick=$W/t-base/$P:quickcache
           python3 bench-hit/hitsum.py reads.csv | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()

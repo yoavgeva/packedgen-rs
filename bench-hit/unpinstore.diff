@@ -1,0 +1,20 @@
+diff --git a/src/sharded_arena.rs b/src/sharded_arena.rs
+index 3df46de..152a9c0 100644
+--- a/src/sharded_arena.rs
++++ b/src/sharded_arena.rs
+@@ -142,10 +142,12 @@ impl Epochs {
+ 
+     #[inline]
+     fn leave(&self, epoch: usize, shard: usize) {
++        // BOUND ONLY: sound only while one thread owns each reader counter.
+         leave_epoch(epoch, |epoch| {
+-            self.readers[epoch * READER_SHARDS + shard]
+-                .0
+-                .fetch_sub(1, Ordering::SeqCst)
++            let counter = &self.readers[epoch * READER_SHARDS + shard].0;
++            let previous = counter.load(Ordering::Relaxed);
++            counter.store(previous - 1, Ordering::Release);
++            previous
+         });
+     }
+ 
