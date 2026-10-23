@@ -3,12 +3,14 @@
 #[path = "../src/direct_epoch_protocol.rs"]
 mod direct_epoch_protocol;
 
-use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
 use loom::sync::{Arc, Mutex};
 use loom::thread;
 
 use direct_epoch_protocol::{
-    EPOCHS, enter_epoch, leave_epoch, next_epoch_token, plan_epoch_advance, reclaim_at,
+    ANNOUNCED, Announced, EPOCHS, EVICTED, EVICTING, announce_afresh, classify_announcement,
+    enter_epoch, epoch_slot, eviction_outcome, leave_announcement, leave_epoch, next_epoch_token,
+    plan_epoch_advance, reclaim_at, reuse_announcement,
 };
 
 const ABSENT: usize = 0;
@@ -666,4 +668,223 @@ fn masked_advances_that_load_the_mask_can_skip_a_new_reader() {
     // Negative control: a plain load of the mask can miss a claim that a
     // read-modify-write observes.
     model_masked_reclamation(|state| state.shards.load(Ordering::SeqCst));
+}
+
+/// `ShardedCache`'s parked announcements, with one announcing reader. Its
+/// pins reuse a parked epoch behind a light fence; an advance that the
+/// parked epoch blocks evicts it behind a heavy fence.
+///
+/// Production's light fence is a compiler fence, and its heavy fence is
+/// `membarrier`, which makes each running thread execute a full barrier at
+/// some point of its program. The light fence orders with the heavy fence
+/// only, not with the advance's ordinary fence, so the model does not issue
+/// a fence for it. It holds `barrier` across a reuse instead, and the heavy
+/// fence takes `barrier`: the reader's whole reuse then precedes the heavy
+/// fence or follows it, the outcomes of a barrier before the reuse's store
+/// or after its loads. A barrier between them only adds ordering.
+struct AnnouncedModel {
+    generation: AtomicUsize,
+    /// The writer pins through a shared counter, as production threads
+    /// without an announcer slot do.
+    counters: [AtomicUsize; EPOCHS],
+    word: AtomicUsize,
+    evicted: AtomicUsize,
+    index: AtomicUsize,
+    old_alive: AtomicBool,
+    due: AtomicUsize,
+    barrier: Mutex<()>,
+    light_fence: bool,
+    heavy_fence: bool,
+}
+
+impl AnnouncedModel {
+    fn new(word: usize, light_fence: bool, heavy_fence: bool) -> Self {
+        Self {
+            generation: AtomicUsize::new(0),
+            counters: std::array::from_fn(|_| AtomicUsize::new(0)),
+            word: AtomicUsize::new(word),
+            evicted: AtomicUsize::new(0),
+            index: AtomicUsize::new(OLD),
+            old_alive: AtomicBool::new(true),
+            due: AtomicUsize::new(NO_RETIRED_EPOCH),
+            barrier: Mutex::new(()),
+            light_fence,
+            heavy_fence,
+        }
+    }
+
+    fn pin(&self) {
+        let barrier = self.light_fence.then(|| self.barrier.lock().unwrap());
+        let reused = reuse_announcement(
+            self.word.load(Ordering::Relaxed),
+            |word| self.word.store(word, Ordering::Relaxed),
+            || {},
+            || self.evicted.load(Ordering::Relaxed),
+            || self.generation.load(Ordering::Relaxed),
+        );
+        drop(barrier);
+        if reused.is_none() {
+            announce_afresh(
+                || self.generation.load(Ordering::Relaxed),
+                |word| self.word.store(word, Ordering::Release),
+                || fence(Ordering::SeqCst),
+                || self.evicted.load(Ordering::Relaxed),
+                || self.evicted.store(0, Ordering::Relaxed),
+            );
+        }
+    }
+
+    fn unpin(&self) {
+        let word = leave_announcement(self.word.load(Ordering::Relaxed));
+        self.word.store(word, Ordering::Release);
+    }
+
+    fn enter_counter(&self) -> usize {
+        enter_epoch(
+            || self.generation.load(Ordering::SeqCst),
+            |epoch| {
+                self.counters[epoch].fetch_add(1, Ordering::SeqCst);
+            },
+            |epoch| self.counters[epoch].fetch_sub(1, Ordering::SeqCst),
+        )
+    }
+
+    fn leave_counter(&self, epoch: usize) {
+        leave_epoch(epoch, |epoch| {
+            self.counters[epoch].fetch_sub(1, Ordering::SeqCst)
+        });
+    }
+
+    /// As `Epochs::try_advance` for the one announcement.
+    fn advance(&self) {
+        let generation = self.generation.load(Ordering::SeqCst);
+        fence(Ordering::SeqCst);
+        let mut evict = false;
+        let Some(advance) = plan_epoch_advance(generation, |epoch| {
+            if self.counters[epoch].fetch_add(0, Ordering::SeqCst) != 0 {
+                return false;
+            }
+            match classify_announcement(
+                self.word.load(Ordering::Acquire),
+                || self.evicted.load(Ordering::Relaxed),
+                epoch,
+            ) {
+                Announced::Clear => true,
+                Announced::Blocks => false,
+                Announced::Evict => {
+                    evict = true;
+                    true
+                }
+            }
+        }) else {
+            return;
+        };
+        if evict {
+            self.evicted.store(EVICTING, Ordering::Relaxed);
+            if self.heavy_fence {
+                drop(self.barrier.lock().unwrap());
+            }
+            match eviction_outcome(self.word.load(Ordering::Acquire), epoch_slot(generation)) {
+                None => return,
+                Some(true) => self.evicted.store(EVICTED, Ordering::Relaxed),
+                Some(false) => {}
+            }
+        }
+        let _ = self.generation.compare_exchange(
+            generation,
+            advance.next_generation,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+
+    fn reclaim_if_due(&self) {
+        let due = self.due.load(Ordering::Acquire);
+        if due != NO_RETIRED_EPOCH && self.generation.load(Ordering::SeqCst) >= due {
+            self.old_alive.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+/// A reader pins `pins` times through its announcement, starting from
+/// `word`, while a writer retires the old slot and the main thread advances
+/// through a full aging and reclaims when due. Every pin that finds the old
+/// slot published must find it alive.
+fn model_announced_reclamation(word: usize, pins: usize, light_fence: bool, heavy_fence: bool) {
+    model_bounded(move || {
+        let state = Arc::new(AnnouncedModel::new(word, light_fence, heavy_fence));
+        let reader = {
+            let state = Arc::clone(&state);
+            thread::spawn(move || {
+                for _ in 0..pins {
+                    state.pin();
+                    if state.index.load(Ordering::Acquire) == OLD {
+                        assert!(
+                            state.old_alive.load(Ordering::SeqCst),
+                            "a pinned reader observed a reclaimed slot"
+                        );
+                    }
+                    state.unpin();
+                }
+            })
+        };
+        let writer = {
+            let state = Arc::clone(&state);
+            thread::spawn(move || {
+                let epoch = state.enter_counter();
+                state.index.swap(ABSENT, Ordering::AcqRel);
+                let tag = state.generation.load(Ordering::SeqCst);
+                state.due.store(reclaim_at(tag), Ordering::Release);
+                state.leave_counter(epoch);
+            })
+        };
+        for _ in 0..EPOCHS {
+            state.advance();
+            state.reclaim_if_due();
+        }
+        reader.join().unwrap();
+        writer.join().unwrap();
+    });
+}
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "minutes unoptimized; CI runs it with --release"
+)]
+fn a_parked_announcement_reused_under_a_light_fence_survives_its_eviction() {
+    model_announced_reclamation(ANNOUNCED, 1, true, true);
+}
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "minutes unoptimized; CI runs it with --release"
+)]
+fn an_announcement_made_afresh_and_then_reused_protects_both_pins() {
+    model_announced_reclamation(0, 2, true, true);
+}
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "minutes unoptimized; CI runs it with --release"
+)]
+#[should_panic(expected = "a pinned reader observed a reclaimed slot")]
+fn reusing_a_parked_announcement_without_the_light_fence_can_miss_an_eviction() {
+    // Negative control: the light fence orders the active mark before the
+    // eviction check.
+    model_announced_reclamation(ANNOUNCED, 1, false, true);
+}
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "minutes unoptimized; CI runs it with --release"
+)]
+#[should_panic(expected = "a pinned reader observed a reclaimed slot")]
+fn evicting_without_the_heavy_fence_can_reclaim_under_a_reused_announcement() {
+    // Negative control: the heavy fence orders the eviction mark before the
+    // advance reads the announcement again.
+    model_announced_reclamation(ANNOUNCED, 1, true, false);
 }

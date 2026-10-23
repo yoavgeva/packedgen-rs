@@ -1,9 +1,12 @@
 //! Epoch-reclaimed slab storage for `ShardedCache` entries.
 //!
 //! Readers and writers pin an epoch with the direct arena's reader protocol
-//! and its shared state machine in `direct_epoch_protocol`. Entries live in
-//! one slab region per cache rather than in individual allocations, with
-//! overflow chunks for bursts past the region (see `SlotStore`):
+//! and its shared state machine in `direct_epoch_protocol`. On Linux a
+//! thread announces its pins on a line of its own instead, and keeps the
+//! announcement parked between them, so a pin is a few plain stores (see
+//! [`Announcement`]). Entries live in one slab region per cache rather than
+//! in individual allocations, with overflow chunks for bursts past the
+//! region (see `SlotStore`):
 //!
 //! - Writers take vacant slots from their thread's stack for the cache, and
 //!   write entries into them before taking the shard lock to publish.
@@ -21,19 +24,23 @@
 //!   touched. Each write prefetches the slot its thread reclaims next.
 
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
-use std::cell::{RefCell, UnsafeCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering, compiler_fence, fence};
 use std::sync::{Arc, OnceLock, Weak};
 
 use parking_lot::Mutex;
 
 use crate::cache_arena::{assigned_thread_shards, claimed_thread_shards, direct_arena_thread};
 pub(crate) use crate::direct_epoch_protocol::reclaim_at;
-use crate::direct_epoch_protocol::{EPOCHS, enter_epoch, leave_epoch, plan_epoch_advance};
+use crate::direct_epoch_protocol::{
+    Announced, EPOCHS, EVICTED, EVICTING, announce_afresh, classify_announcement, enter_epoch,
+    epoch_slot, eviction_outcome, leave_announcement, leave_epoch, plan_epoch_advance,
+    reuse_announcement,
+};
 
 /// Reader counters are spread over this many cache lines per epoch.
 const READER_SHARDS: usize = 64;
@@ -72,12 +79,202 @@ struct ReaderCount(AtomicUsize);
 #[repr(align(128))]
 struct PendingCount(AtomicUsize);
 
+/// Threads that hold one of these slots announce their pins on the slot's
+/// line in each cache, with plain stores (see [`Announcement`]). Others
+/// count their pins in the shared reader counters.
+const ANNOUNCERS: usize = 64;
+/// `ANNOUNCER`'s low byte: the thread's slot, or one of these.
+const ANNOUNCER_SLOT: usize = 0xff;
+/// The thread pins through the shared reader counters.
+const SHARED_PINNER: usize = 0xfe;
+/// The thread has not pinned yet.
+const UNCLAIMED: usize = 0xff;
+/// `ANNOUNCER` counts the pins its thread holds through its slot from here.
+const ANNOUNCER_PIN: usize = 1 << 8;
+
+/// Bit `slot` is set while a thread holds announcer slot `slot`.
+static ANNOUNCERS_HELD: AtomicU64 = AtomicU64::new(0);
+/// Bit `index & 63` is set before a thread first pins through the shared
+/// counters, as the cache arena's thread mask is.
+static SHARED_PINNERS: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// The thread's announcer slot and the pins it holds through it.
+    static ANNOUNCER: Cell<usize> = const { Cell::new(UNCLAIMED) };
+    /// Returns the thread's slot when the thread exits.
+    static ANNOUNCER_RELEASE: AnnouncerRelease = const { AnnouncerRelease };
+}
+
+/// Releases its thread's announcer slot at thread exit, unless a pin through
+/// it is still held: another thread-local's destructor may drop that pin
+/// later, and the slot then stays held for good. Pins taken after it find
+/// no slot to claim and use the shared counters.
+struct AnnouncerRelease;
+
+impl Drop for AnnouncerRelease {
+    fn drop(&mut self) {
+        let state = ANNOUNCER.get();
+        ANNOUNCER.set(state | UNCLAIMED);
+        let slot = state & ANNOUNCER_SLOT;
+        if slot < ANNOUNCERS && state < ANNOUNCER_PIN {
+            ANNOUNCERS_HELD.fetch_and(!(1 << slot), Ordering::Release);
+        }
+    }
+}
+
+/// Sets this thread's bit in `SHARED_PINNERS`, sequentially consistently,
+/// before its first pin through the shared counters.
+fn claim_shared_pinner() {
+    SHARED_PINNERS.fetch_or(1 << (direct_arena_thread() & 63), Ordering::SeqCst);
+}
+
+/// The shared pinners, read with a zero-delta read-modify-write, which
+/// observes every claim before it in the mask's modification order (see
+/// `tests/cache_concurrency_model.rs`). Builds that cannot announce pin
+/// every thread through the shared counters, by its arena thread index.
+fn shared_pinners() -> u64 {
+    if ANNOUNCEABLE {
+        SHARED_PINNERS.fetch_or(0, Ordering::SeqCst)
+    } else {
+        claimed_thread_shards()
+    }
+}
+
+/// Whether pins that reuse an announcement need only a compiler fence,
+/// with advances issuing `membarrier` to evict a parked announcement.
+const ASYMMETRIC: bool = cfg!(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    not(miri)
+));
+
+/// Whether this build can announce pins: on Linux, where `membarrier`
+/// decides at run time, and in tests and Miri elsewhere. Other builds
+/// compile the shared counters alone, as before announcements.
+const ANNOUNCEABLE: bool = ASYMMETRIC || cfg!(any(test, miri));
+
+/// Whether this process announces pins: where `membarrier` registers, and
+/// in tests and Miri elsewhere, with sequentially consistent fences on both
+/// sides in its place.
+fn announcements_supported() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        if ASYMMETRIC {
+            membarrier::register()
+        } else {
+            cfg!(any(test, miri))
+        }
+    })
+}
+
+/// The fence a pin issues after marking a parked announcement active.
+#[inline]
+fn light_fence() {
+    if ASYMMETRIC {
+        compiler_fence(Ordering::SeqCst);
+    } else {
+        fence(Ordering::SeqCst);
+    }
+}
+
+/// The fence an advance issues before deciding a parked announcement is
+/// evicted: with `light_fence`, it orders as two sequentially consistent
+/// fences would. Returns false if the barrier failed.
+fn heavy_fence() -> bool {
+    if ASYMMETRIC {
+        membarrier::private_expedited()
+    } else {
+        fence(Ordering::SeqCst);
+        true
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    not(miri)
+))]
+#[allow(unsafe_code, reason = "issues the membarrier system call")]
+mod membarrier {
+    unsafe extern "C" {
+        fn syscall(number: i64, ...) -> i64;
+    }
+    #[cfg(target_arch = "x86_64")]
+    const SYS_MEMBARRIER: i64 = 324;
+    #[cfg(target_arch = "aarch64")]
+    const SYS_MEMBARRIER: i64 = 283;
+    const CMD_QUERY: i64 = 0;
+    const CMD_PRIVATE_EXPEDITED: i64 = 1 << 3;
+    const CMD_REGISTER_PRIVATE_EXPEDITED: i64 = 1 << 4;
+
+    fn membarrier(command: i64) -> i64 {
+        // SAFETY: membarrier reads no memory of this process; its arguments
+        // are plain integers.
+        unsafe { syscall(SYS_MEMBARRIER, command, 0_i64, 0_i64) }
+    }
+
+    /// Registers this process for private expedited barriers; returns
+    /// whether the kernel supports and accepted it.
+    pub(super) fn register() -> bool {
+        let supported = membarrier(CMD_QUERY);
+        supported >= 0
+            && supported & CMD_PRIVATE_EXPEDITED != 0
+            && membarrier(CMD_REGISTER_PRIVATE_EXPEDITED) == 0
+    }
+
+    /// Makes every running thread of this process execute a full memory
+    /// barrier before returning. Re-registers once if the kernel refuses,
+    /// as a forked child's may.
+    pub(super) fn private_expedited() -> bool {
+        membarrier(CMD_PRIVATE_EXPEDITED) == 0
+            || (register() && membarrier(CMD_PRIVATE_EXPEDITED) == 0)
+    }
+}
+
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    not(miri)
+)))]
+mod membarrier {
+    pub(super) fn register() -> bool {
+        false
+    }
+
+    pub(super) fn private_expedited() -> bool {
+        false
+    }
+}
+
+/// An announcer slot's line in one cache.
+///
+/// A thread announces the epoch it pins in `word`, and leaves the
+/// announcement parked when its last pin drops, so its next pin only marks it
+/// active again: a store, a [`light_fence`], and loads of `evicted` and the
+/// generation. An advance that a parked announcement blocks evicts it:
+/// it sets `evicted`, issues a [`heavy_fence`], and finds the announcement
+/// still parked, so any pin that marks it active afterwards sees `evicted`
+/// and announces afresh. A fresh announcement, made when the epoch has moved
+/// or after an eviction, stores and issues a sequentially consistent fence,
+/// as the shared counters' read-modify-writes order.
+#[repr(C, align(128))]
+struct Announcement {
+    /// Written only by the slot's thread: `pins << 3 | ANNOUNCED | epoch`.
+    word: AtomicUsize,
+    /// `EVICTING` or `EVICTED` once an advance evicts the parked
+    /// announcement; the slot's thread clears it after announcing afresh.
+    evicted: AtomicUsize,
+}
+
 /// The epoch clock a cache's readers and writers pin.
 pub(crate) struct Epochs {
     /// Generation token: its low two bits name the current epoch slot.
     generation: AtomicUsize,
     /// `readers[epoch * READER_SHARDS + shard]`.
     readers: Box<[ReaderCount]>,
+    /// One line per announcer slot; empty where announcements are
+    /// unsupported.
+    announcements: Box<[Announcement]>,
     /// Serializes advances; a writer that finds it held skips advancing.
     advancing: Mutex<()>,
     /// Retirements reported since the generation last advanced.
@@ -86,10 +283,21 @@ pub(crate) struct Epochs {
 
 impl Epochs {
     pub(crate) fn new() -> Self {
+        let announcers = if announcements_supported() {
+            ANNOUNCERS
+        } else {
+            0
+        };
         Self {
             generation: AtomicUsize::new(0),
             readers: (0..EPOCHS * READER_SHARDS)
                 .map(|_| ReaderCount(AtomicUsize::new(0)))
+                .collect(),
+            announcements: (0..announcers)
+                .map(|_| Announcement {
+                    word: AtomicUsize::new(0),
+                    evicted: AtomicUsize::new(0),
+                })
                 .collect(),
             advancing: Mutex::new(()),
             pending: PendingCount(AtomicUsize::new(0)),
@@ -105,23 +313,129 @@ impl Epochs {
 
     /// Pins the current epoch: slots unpublished after this returns are not
     /// reclaimed until the pin is dropped or refreshed.
-    #[inline]
+    #[cfg_attr(
+        any(
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
+            test,
+            miri
+        ),
+        allow(
+            clippy::inline_always,
+            reason = "out of line, every read calls it and receives the pin through memory"
+        ),
+        inline(always)
+    )]
+    #[cfg_attr(
+        not(any(
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
+            test,
+            miri
+        )),
+        inline
+    )]
     pub(crate) fn pin(&self) -> EpochPin<'_> {
-        let shard = direct_arena_thread() & (READER_SHARDS - 1);
         #[cfg(test)]
         PINS_HELD.set(PINS_HELD.get() + 1);
         #[cfg(test)]
         PINS_TAKEN.set(PINS_TAKEN.get() + 1);
+        if !ANNOUNCEABLE {
+            return self.pin_shared();
+        }
+        let state = ANNOUNCER.get();
+        let slot = state & ANNOUNCER_SLOT;
+        if let Some(announcement) = self.announcements.get(slot) {
+            ANNOUNCER.set(state + ANNOUNCER_PIN);
+            return EpochPin {
+                epochs: self,
+                epoch: self.announce(announcement),
+                reader: ANNOUNCED_READER | slot,
+                _not_send: PhantomData,
+            };
+        }
+        if slot == UNCLAIMED {
+            return self.pin_unclaimed();
+        }
+        self.pin_shared()
+    }
+
+    /// Claims this thread's announcer slot, or else its shared bit, then
+    /// pins through it.
+    #[cold]
+    #[inline(never)]
+    fn pin_unclaimed(&self) -> EpochPin<'_> {
+        claim_announcer();
+        let state = ANNOUNCER.get();
+        let slot = state & ANNOUNCER_SLOT;
+        if let Some(announcement) = self.announcements.get(slot) {
+            ANNOUNCER.set(state + ANNOUNCER_PIN);
+            return EpochPin {
+                epochs: self,
+                epoch: self.announce(announcement),
+                reader: ANNOUNCED_READER | slot,
+                _not_send: PhantomData,
+            };
+        }
+        self.pin_shared()
+    }
+
+    /// Pins through the shared counters.
+    #[inline]
+    fn pin_shared(&self) -> EpochPin<'_> {
+        let shard = direct_arena_thread() & (READER_SHARDS - 1);
         EpochPin {
             epochs: self,
             epoch: self.enter(shard),
-            shard,
+            reader: shard,
             _not_send: PhantomData,
         }
     }
 
+    /// Pins through this thread's announcement, reusing its epoch if it is
+    /// parked in the current one and not evicted.
+    #[allow(clippy::inline_always, reason = "the body of every announced pin")]
+    #[inline(always)]
+    fn announce(&self, announcement: &Announcement) -> usize {
+        reuse_announcement(
+            announcement.word.load(Ordering::Relaxed),
+            |word| announcement.word.store(word, Ordering::Relaxed),
+            light_fence,
+            || announcement.evicted.load(Ordering::Relaxed),
+            || self.generation.load(Ordering::Relaxed),
+        )
+        .unwrap_or_else(
+            #[cold]
+            || self.announce_afresh(announcement),
+        )
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn announce_afresh(&self, announcement: &Announcement) -> usize {
+        #[cfg(test)]
+        ORDERED_PINS.set(ORDERED_PINS.get() + 1);
+        announce_afresh(
+            || self.generation.load(Ordering::Relaxed),
+            // Release: an advance that reads the new epoch takes the thread
+            // to have left its old one, so its reads under that one must
+            // happen before; a relaxed store would not carry the release
+            // of the unpin before it.
+            |word| announcement.word.store(word, Ordering::Release),
+            || fence(Ordering::SeqCst),
+            || announcement.evicted.load(Ordering::Relaxed),
+            || announcement.evicted.store(0, Ordering::Relaxed),
+        )
+    }
+
     #[inline]
     fn enter(&self, shard: usize) -> usize {
+        #[cfg(test)]
+        ORDERED_PINS.set(ORDERED_PINS.get() + 1);
         enter_epoch(
             || self.generation.load(Ordering::SeqCst),
             |epoch| {
@@ -141,9 +455,17 @@ impl Epochs {
     }
 
     #[inline]
-    fn leave(&self, epoch: usize, shard: usize) {
+    fn leave(&self, epoch: usize, reader: usize) {
+        if ANNOUNCEABLE
+            && let Some(announcement) = self.announcements.get(reader ^ ANNOUNCED_READER)
+        {
+            let word = leave_announcement(announcement.word.load(Ordering::Relaxed));
+            announcement.word.store(word, Ordering::Release);
+            ANNOUNCER.set(ANNOUNCER.get() - ANNOUNCER_PIN);
+            return;
+        }
         leave_epoch(epoch, |epoch| {
-            self.readers[epoch * READER_SHARDS + shard]
+            self.readers[epoch * READER_SHARDS + reader]
                 .0
                 .fetch_sub(1, Ordering::SeqCst)
         });
@@ -167,7 +489,18 @@ impl Epochs {
         // counters are: a reader in an epoch this advance must find quiescent
         // claimed its shard before loading the generation that an earlier
         // advance replaced.
-        let shards = claimed_thread_shards();
+        let shards = shared_pinners();
+        // Pairs with the fence of a fresh announcement: either this advance
+        // reads it, or that pin reads this generation or a later one.
+        if ANNOUNCEABLE {
+            fence(Ordering::SeqCst);
+        }
+        let announcers = if self.announcements.is_empty() {
+            0
+        } else {
+            ANNOUNCERS_HELD.load(Ordering::Relaxed)
+        };
+        let mut evicting = 0_u64;
         let Some(advance) = plan_epoch_advance(generation, |epoch| {
             let counters = &self.readers[epoch * READER_SHARDS..(epoch + 1) * READER_SHARDS];
             let mut remaining = shards;
@@ -180,6 +513,21 @@ impl Epochs {
                     return false;
                 }
             }
+            let mut remaining = announcers;
+            while remaining != 0 {
+                let slot = remaining.trailing_zeros() as usize;
+                remaining &= remaining - 1;
+                let announcement = &self.announcements[slot];
+                match classify_announcement(
+                    announcement.word.load(Ordering::Acquire),
+                    || announcement.evicted.load(Ordering::Relaxed),
+                    epoch,
+                ) {
+                    Announced::Clear => {}
+                    Announced::Blocks => return false,
+                    Announced::Evict => evicting |= 1 << slot,
+                }
+            }
             true
         }) else {
             // Readers still hold an old epoch: wait for half as many more
@@ -187,6 +535,10 @@ impl Epochs {
             self.pending.0.store(advance_after() / 2, Ordering::Relaxed);
             return false;
         };
+        if evicting != 0 && !self.evict(evicting, generation) {
+            self.pending.0.store(advance_after() / 2, Ordering::Relaxed);
+            return false;
+        }
         self.pending.0.store(0, Ordering::Relaxed);
         self.generation
             .compare_exchange(
@@ -197,13 +549,78 @@ impl Epochs {
             )
             .is_ok()
     }
+
+    /// Evicts the parked announcements in `slots`, which block the advance
+    /// from `generation`; returns false if one turned active first.
+    #[cold]
+    fn evict(&self, slots: u64, generation: usize) -> bool {
+        let mut remaining = slots;
+        while remaining != 0 {
+            let slot = remaining.trailing_zeros() as usize;
+            remaining &= remaining - 1;
+            self.announcements[slot]
+                .evicted
+                .store(EVICTING, Ordering::Relaxed);
+        }
+        if !heavy_fence() {
+            return false;
+        }
+        let current = epoch_slot(generation);
+        let mut remaining = slots;
+        while remaining != 0 {
+            let slot = remaining.trailing_zeros() as usize;
+            remaining &= remaining - 1;
+            let announcement = &self.announcements[slot];
+            match eviction_outcome(announcement.word.load(Ordering::Acquire), current) {
+                // A pin marked it active before the barrier.
+                None => return false,
+                Some(true) => announcement.evicted.store(EVICTED, Ordering::Relaxed),
+                Some(false) => {}
+            }
+        }
+        true
+    }
+}
+
+/// `EpochPin::reader` for a pin through announcer slot `reader ^ ANNOUNCED_READER`.
+const ANNOUNCED_READER: usize = 1 << 16;
+
+/// Claims an announcer slot for this thread, or a shared bit if none is
+/// free or announcements are unsupported.
+#[cold]
+fn claim_announcer() {
+    let mut held = ANNOUNCERS_HELD.load(Ordering::Relaxed);
+    if announcements_supported() && ANNOUNCER_RELEASE.try_with(|_| ()).is_ok() {
+        while held != u64::MAX {
+            let slot = held.trailing_ones() as usize;
+            match ANNOUNCERS_HELD.compare_exchange_weak(
+                held,
+                held | 1 << slot,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    // An advance that misses the claim in the mask orders
+                    // after this fence, and pins read its generation.
+                    fence(Ordering::SeqCst);
+                    ANNOUNCER.set(ANNOUNCER.get() & !ANNOUNCER_SLOT | slot);
+                    return;
+                }
+                Err(current) => held = current,
+            }
+        }
+    }
+    claim_shared_pinner();
+    ANNOUNCER.set(ANNOUNCER.get() & !ANNOUNCER_SLOT | SHARED_PINNER);
 }
 
 /// A pinned epoch; see [`Epochs::pin`].
 pub(crate) struct EpochPin<'epochs> {
     epochs: &'epochs Epochs,
     epoch: usize,
-    shard: usize,
+    /// The shared counters' shard, or `ANNOUNCED_READER` and an announcer
+    /// slot.
+    reader: usize,
     _not_send: PhantomData<*mut ()>,
 }
 
@@ -211,15 +628,25 @@ impl EpochPin<'_> {
     /// Leaves and re-enters the current epoch, letting slots unpublished
     /// since the pin be reclaimed.
     pub(crate) fn refresh(&mut self) {
-        self.epochs.leave(self.epoch, self.shard);
-        self.epoch = self.epochs.enter(self.shard);
+        self.epochs.leave(self.epoch, self.reader);
+        if ANNOUNCEABLE
+            && let Some(announcement) = self
+                .epochs
+                .announcements
+                .get(self.reader ^ ANNOUNCED_READER)
+        {
+            ANNOUNCER.set(ANNOUNCER.get() + ANNOUNCER_PIN);
+            self.epoch = self.epochs.announce(announcement);
+        } else {
+            self.epoch = self.epochs.enter(self.reader);
+        }
     }
 }
 
 impl Drop for EpochPin<'_> {
     #[inline]
     fn drop(&mut self) {
-        self.epochs.leave(self.epoch, self.shard);
+        self.epochs.leave(self.epoch, self.reader);
         #[cfg(test)]
         PINS_HELD.set(PINS_HELD.get() - 1);
     }
@@ -231,6 +658,9 @@ thread_local! {
     static PINS_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// The epoch pins this thread has taken.
     static PINS_TAKEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Pins this thread took with a read-modify-write or a sequentially
+    /// consistent fence.
+    static ORDERED_PINS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// How many epoch pins this thread has taken, for tests of work sharing
@@ -554,8 +984,13 @@ impl<T> RetiredSlots<T> {
         foreign: &mut Reclaimed<T>,
     ) -> bool {
         let epochs = pin.epochs;
-        // The pin's reader shard is the thread's index, as is its queue's.
-        let own = pin.shard;
+        // A pin through the shared counters names the thread's index, as
+        // its queue does; an announced pin names its slot instead.
+        let own = if ANNOUNCEABLE {
+            retired_queue_index()
+        } else {
+            pin.reader
+        };
         debug_assert_eq!(own, retired_queue_index());
         let generation = epochs.generation();
         let due = reclaim_at(generation);
@@ -1592,6 +2027,97 @@ mod tests {
         // Every write sets up two, its own and a foreign drain's, and hands
         // them on by value.
         assert!(std::mem::size_of::<Reclaimed<u64>>() <= 64);
+    }
+
+    #[test]
+    fn consecutive_pins_on_a_thread_reuse_one_ordered_announcement() {
+        // On x86 a pin's read-modify-write is a full barrier, so each read
+        // waited for the previous one's misses. Where announcements are
+        // supported (Linux, and tests and Miri elsewhere), a thread's
+        // later pins reuse its parked announcement until the epoch moves.
+        let epochs = Epochs::new();
+        drop(epochs.pin());
+        let before = ORDERED_PINS.get();
+        for _ in 0..1_000 {
+            drop(epochs.pin());
+        }
+        assert_eq!(ORDERED_PINS.get() - before, 0);
+        assert!(epochs.try_advance());
+        drop(epochs.pin());
+        assert_eq!(
+            ORDERED_PINS.get() - before,
+            1,
+            "a moved epoch is announced afresh, once"
+        );
+    }
+
+    #[test]
+    fn threads_that_exit_return_their_announcer_slots() {
+        // Without the release, the first 64 threads would keep every slot
+        // and later threads would pin through the shared counters.
+        let epochs = Epochs::new();
+        for _ in 0..2 * ANNOUNCERS {
+            thread::scope(|scope| {
+                scope.spawn(|| drop(epochs.pin()));
+            });
+        }
+        let slot = thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    drop(epochs.pin());
+                    ANNOUNCER.get() & ANNOUNCER_SLOT
+                })
+                .join()
+                .expect("the pinning thread finishes")
+        });
+        assert!(slot < ANNOUNCERS, "a thread found no announcer slot free");
+    }
+
+    #[test]
+    fn a_thread_that_exits_holding_a_pin_keeps_its_announcer_slot() {
+        // A thread-local that a thread fills after its first pin drops after
+        // the slot's release would: the pin it holds still writes the
+        // slot's lines, so no other thread may claim the slot.
+        // A static, as the pin outlives the thread's other locals; Miri
+        // reports a leaked box.
+        static CLOCK: std::sync::LazyLock<Epochs> = std::sync::LazyLock::new(Epochs::new);
+        let epochs: &'static Epochs = &CLOCK;
+        thread_local! {
+            static HELD: RefCell<Option<EpochPin<'static>>> = const { RefCell::new(None) };
+        }
+        let slot = thread::spawn(move || {
+            // Registered before the slot's release, so dropped after it.
+            HELD.with(|_| ());
+            HELD.with(|held| *held.borrow_mut() = Some(epochs.pin()));
+            ANNOUNCER.get() & ANNOUNCER_SLOT
+        })
+        .join()
+        .expect("the pinning thread exits");
+        assert!(slot < ANNOUNCERS);
+        assert_ne!(
+            ANNOUNCERS_HELD.load(Ordering::Relaxed) & 1 << slot,
+            0,
+            "the slot was released under a pin that its thread still held"
+        );
+        // The pin left before the thread exited: advances pass it.
+        for _ in 0..EPOCHS {
+            assert!(epochs.try_advance());
+        }
+    }
+
+    #[test]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn linux_pins_through_announcements_with_membarrier_evictions() {
+        assert!(announcements_supported());
+        let epochs = Epochs::new();
+        drop(epochs.pin());
+        assert!(epochs.try_advance());
+        // The parked announcement blocks the next advance until evicted.
+        assert!(epochs.try_advance());
+        assert!(heavy_fence());
     }
 
     #[test]
