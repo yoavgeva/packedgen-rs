@@ -1432,6 +1432,26 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
   The pin's barrier is the whole gap to guard reads, and removing it needs
   an asymmetric fence: readers announcing with plain stores, and advances
   issuing a process-wide barrier (`membarrier` on Linux).
+- **Closing scc's lead on eight-thread writes.** scc 3.8's `HashCache`
+  locks one 32-entry bucket per write, evicts that bucket's least recently
+  used entry in place, and drops it at once, as its readers lock buckets
+  too. On macOS it scaled cold fill 3.5 times from one thread to eight at
+  50,000 entries, against 1.9 times for ShardedCache, and led
+  delete-reinsert by 63%. At eight threads, 19% of ShardedCache's worker
+  samples waited on locks, mostly shard locks held across misses on lines
+  another core last wrote, and the rest on the slot depot. Measured:
+  - More shards: 512 and 2,048 instead of 128 lifted eight-thread cold fill
+    7% and 34% and delete-reinsert 14% and 13%. Trace hit ratios held down
+    to about 128 entries per shard, within −0.6 to +0.4 points on six
+    cells, but at 64 entries P8 at 32,768 lost 2.0 points and at 32 lost
+    7.8, and each doubling of the shard count adds about 1.4 bytes per
+    entry of shard state at 100,000 entries.
+  - Thread batches of 64 slots instead of 32: −2 to +4%.
+
+  The rest is the policy: an evicting insert touches the shard's header,
+  probation and main queues, ghost and shadow words, and the victim's
+  bucket and entry, where scc touches one bucket. Its hit ratio is the
+  other side of that: 32.8% against 39.0% on the mokabench traces.
 
 ## Reproduce
 
