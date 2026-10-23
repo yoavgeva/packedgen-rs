@@ -137,6 +137,14 @@ entry. Tables are sized once and never rebuilt.
     joins the flight or sees the inserted value.
   - If the loader fails or panics, the flight is abandoned and one waiter
     loads again with its own loader.
+  - `get_or_insert_async` and `get_or_try_insert_async` share the flights.
+    An asynchronous waiter leaves its waker on the flight, under the lock
+    that guards the flight's state, so it cannot miss the landing; the
+    landing wakes those wakers after releasing the lock, as it notifies
+    blocking waiters. A leader's future dropped mid-load abandons the
+    flight, and a waiter's future dropped mid-wait clears its waker. The
+    futures need no particular executor and are `Send` when the cache, the
+    key, and the loader are.
 - **Expiry.** `insert_with_ttl` and the builder's `time_to_live` store a
   deadline in the entry's 31-bit expiry field, in 100 ms ticks since the
   cache was built.
@@ -205,6 +213,9 @@ entry. Tables are sized once and never rebuilt.
   - an 8-thread race of replacements, removals, loads, clears, and evictions
     that counts live values to prove each one is dropped exactly once;
   - eight racing callers loading a missing key once;
+  - asynchronous and blocking callers, under either kind of leader, loading
+    a missing key once; a dropped or failed asynchronous load waking its
+    waiter and handing it the key;
   - batched inserts leaving the cache as single inserts do, pinning once,
     prefetching each home bucket, letting their removed entries be
     reclaimed, and draining a reclamation backlog as single inserts do

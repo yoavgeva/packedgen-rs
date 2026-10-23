@@ -23,9 +23,11 @@ use std::convert::Infallible;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
+use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use hashbrown::DefaultHashBuilder;
@@ -516,15 +518,109 @@ struct FlightLane<K, V>(Mutex<Vec<Arc<Flight<K, V>>>>);
 struct Flight<K, V> {
     hash: u64,
     key: K,
-    state: Mutex<FlightState<V>>,
+    progress: Mutex<FlightProgress<V>>,
+    /// Blocking waiters wait on it; asynchronous ones leave their wakers.
     landed: Condvar,
+}
+
+/// A flight's outcome so far, and the wakers of its asynchronous waiters.
+/// Waiters check the state and leave their wakers under one lock, so none
+/// can miss the landing.
+struct FlightProgress<V> {
+    state: FlightState<V>,
+    /// By the index each waiter holds; a waiter dropped before the landing
+    /// clears its own.
+    wakers: Vec<Option<Waker>>,
 }
 
 enum FlightState<V> {
     Loading,
     Loaded(V),
-    /// The loader failed or panicked; waiters look again.
+    /// The loader failed or panicked, or its future was dropped; waiters
+    /// look again.
     Abandoned,
+}
+
+impl<K, V: Clone> Flight<K, V> {
+    fn new(hash: u64, key: K) -> Self {
+        Self {
+            hash,
+            key,
+            progress: Mutex::new(FlightProgress {
+                state: FlightState::Loading,
+                wakers: Vec::new(),
+            }),
+            landed: Condvar::new(),
+        }
+    }
+
+    /// Blocks until the flight lands, and returns its value, or `None` if
+    /// the load was abandoned.
+    fn wait(&self) -> Option<V> {
+        let mut progress = self.progress.lock();
+        while matches!(progress.state, FlightState::Loading) {
+            self.landed.wait(&mut progress);
+        }
+        match &progress.state {
+            FlightState::Loaded(value) => Some(value.clone()),
+            FlightState::Loading | FlightState::Abandoned => None,
+        }
+    }
+}
+
+/// Waits for a flight to land without blocking its thread, and yields its
+/// value, or `None` if the load was abandoned.
+struct FlightWait<'flight, K, V> {
+    flight: &'flight Flight<K, V>,
+    /// This waiter's index among the flight's wakers, once it left one.
+    waker: Option<usize>,
+}
+
+impl<K, V: Clone> Future for FlightWait<'_, K, V> {
+    type Output = Option<V>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<V>> {
+        let flight = self.flight;
+        let mut progress = flight.progress.lock();
+        match &progress.state {
+            FlightState::Loaded(value) => return Poll::Ready(Some(value.clone())),
+            FlightState::Abandoned => return Poll::Ready(None),
+            FlightState::Loading => {}
+        }
+        let waker = context.waker();
+        if let Some(index) = self.waker {
+            let left = &mut progress.wakers[index];
+            if !left.as_ref().is_some_and(|left| left.will_wake(waker)) {
+                *left = Some(waker.clone());
+            }
+        } else {
+            progress.wakers.push(Some(waker.clone()));
+            let index = progress.wakers.len() - 1;
+            drop(progress);
+            self.waker = Some(index);
+        }
+        Poll::Pending
+    }
+}
+
+impl<K, V> Drop for FlightWait<'_, K, V> {
+    fn drop(&mut self) {
+        if let Some(index) = self.waker
+            && let Some(left) = self.flight.progress.lock().wakers.get_mut(index)
+        {
+            *left = None;
+        }
+    }
+}
+
+/// What a caller that missed a key does next.
+enum Missed<K, V> {
+    /// A load landed after the miss and inserted this value.
+    Found(V),
+    /// Wait for this flight's load.
+    Wait(Arc<Flight<K, V>>),
+    /// Load the key: this caller listed this flight.
+    Lead(Arc<Flight<K, V>>),
 }
 
 /// Unlists a leader's flight when dropped and hands `loaded` to its waiters,
@@ -549,11 +645,18 @@ impl<K, V> Drop for FlightLanding<'_, K, V> {
         // Waiters join under the lane lock, so once the flight is unlisted
         // the count only falls; alone, the leader has nobody to tell.
         if Arc::strong_count(&self.flight) > 1 {
-            *self.flight.state.lock() = self
-                .loaded
-                .take()
-                .map_or(FlightState::Abandoned, FlightState::Loaded);
+            let wakers = {
+                let mut progress = self.flight.progress.lock();
+                progress.state = self
+                    .loaded
+                    .take()
+                    .map_or(FlightState::Abandoned, FlightState::Loaded);
+                std::mem::take(&mut progress.wakers)
+            };
             self.flight.landed.notify_all();
+            for waker in wakers.into_iter().flatten() {
+                waker.wake();
+            }
         }
     }
 }
@@ -990,9 +1093,11 @@ where
     ///
     /// Callers that miss the same key while it loads wait for that load and
     /// share its value, so a key is loaded once however many callers miss
-    /// it together. If the load fails or panics, its caller gets the error
-    /// or the panic, and one waiter loads again with its own `load`. A
-    /// `load` that reads this key through the cache deadlocks.
+    /// it together, through this method or
+    /// [`Self::get_or_try_insert_async`]. If the load fails or panics, its
+    /// caller gets the error or the panic, and one waiter loads again with
+    /// its own `load`. A `load` that reads this key through the cache
+    /// deadlocks.
     ///
     /// # Errors
     ///
@@ -1020,27 +1125,14 @@ where
         let lane = &self.flights[self.shard_index(hash)];
         let mut load = Some(load);
         loop {
-            let joined = {
-                let mut flights = lane.0.lock();
-                if let Some(flight) = flights
-                    .iter()
-                    .find(|flight| flight.hash == hash && flight.key.borrow() == key)
-                {
-                    Arc::clone(flight)
-                } else {
-                    // A load that landed after this caller missed has
-                    // inserted its value; flights unlist only after that.
-                    if let Some(value) = self.lookup(&self.epochs.pin(), key, hash).cloned() {
+            match self.join_or_lead(lane, key, hash) {
+                Missed::Found(value) => return Ok(value),
+                Missed::Wait(flight) => {
+                    if let Some(value) = flight.wait() {
                         return Ok(value);
                     }
-                    let flight = Arc::new(Flight {
-                        hash,
-                        key: key.to_owned(),
-                        state: Mutex::new(FlightState::Loading),
-                        landed: Condvar::new(),
-                    });
-                    flights.push(Arc::clone(&flight));
-                    drop(flights);
+                }
+                Missed::Lead(flight) => {
                     let mut landing = FlightLanding {
                         lane,
                         flight,
@@ -1052,15 +1144,110 @@ where
                     landing.loaded = Some(value.clone());
                     return Ok(value);
                 }
-            };
-            let mut state = joined.state.lock();
-            while matches!(*state, FlightState::Loading) {
-                joined.landed.wait(&mut state);
-            }
-            if let FlightState::Loaded(value) = &*state {
-                return Ok(value.clone());
             }
         }
+    }
+
+    /// Returns the value cached for `key`, or awaits `load` and caches its
+    /// value; see [`Self::get_or_try_insert_async`].
+    pub async fn get_or_insert_async<Q>(&self, key: &Q, load: impl Future<Output = V>) -> V
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ToOwned<Owned = K> + ?Sized,
+        V: Clone,
+    {
+        let Ok(value) = self
+            .get_or_try_insert_async(key, async { Ok::<V, Infallible>(load.await) })
+            .await;
+        value
+    }
+
+    /// Returns the value cached for `key`, or awaits `load` and caches its
+    /// value, waiting without blocking the thread.
+    ///
+    /// Works with any executor. Callers that miss the same key while it
+    /// loads, through this method or [`Self::get_or_try_insert_with`], wait
+    /// for that load and share its value. If the load fails, or its future
+    /// is dropped before it completes, one waiter loads again with its own
+    /// `load`. The future is `Send` when the cache, the key, and `load` are.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error from this caller's `load`.
+    ///
+    /// # Panics
+    ///
+    /// Propagates a panic from this caller's `load`.
+    pub async fn get_or_try_insert_async<Q, E>(
+        &self,
+        key: &Q,
+        load: impl Future<Output = Result<V, E>>,
+    ) -> Result<V, E>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ToOwned<Owned = K> + ?Sized,
+        V: Clone,
+    {
+        let hash = self.hash(key);
+        let cached = self.lookup(&self.epochs.pin(), key, hash).cloned();
+        self.count(cached.is_some());
+        if let Some(value) = cached {
+            return Ok(value);
+        }
+        let lane = &self.flights[self.shard_index(hash)];
+        let mut load = Some(load);
+        loop {
+            match self.join_or_lead(lane, key, hash) {
+                Missed::Found(value) => return Ok(value),
+                Missed::Wait(flight) => {
+                    let wait = FlightWait {
+                        flight: &flight,
+                        waker: None,
+                    };
+                    if let Some(value) = wait.await {
+                        return Ok(value);
+                    }
+                }
+                Missed::Lead(flight) => {
+                    // Dropped with the future, the landing abandons the load.
+                    let mut landing = FlightLanding {
+                        lane,
+                        flight,
+                        loaded: None,
+                    };
+                    let load = load.take().expect("a caller leads at most one load");
+                    let value = load.await?;
+                    self.insert(key.to_owned(), value.clone());
+                    landing.loaded = Some(value.clone());
+                    return Ok(value);
+                }
+            }
+        }
+    }
+
+    /// Joins the flight loading `key`, or lists a new one for this caller to
+    /// lead, under `lane`'s lock.
+    fn join_or_lead<Q>(&self, lane: &FlightLane<K, V>, key: &Q, hash: u64) -> Missed<K, V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ToOwned<Owned = K> + ?Sized,
+        V: Clone,
+    {
+        let mut flights = lane.0.lock();
+        if let Some(flight) = flights
+            .iter()
+            .find(|flight| flight.hash == hash && flight.key.borrow() == key)
+        {
+            return Missed::Wait(Arc::clone(flight));
+        }
+        // A load that landed after this caller missed has inserted its
+        // value; flights unlist only after that.
+        if let Some(value) = self.lookup(&self.epochs.pin(), key, hash).cloned() {
+            return Missed::Found(value);
+        }
+        let flight = Arc::new(Flight::new(hash, key.to_owned()));
+        flights.push(Arc::clone(&flight));
+        Missed::Lead(flight)
     }
 
     /// Pins the cache for a run of borrowed reads.
@@ -2924,6 +3111,7 @@ mod tests {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{BuildHasherDefault, Hasher};
     use std::sync::Arc;
+    use std::task::Wake;
     use std::thread;
 
     /// Interpreted and sanitized runs keep the same races, fewer of them.
@@ -3711,6 +3899,170 @@ mod tests {
             }
             assert_eq!(waiter.join().expect("the waiter completes"), Ok(50));
             assert_eq!(cache.get(&5), Some(50));
+            assert!(cache.flights.iter().all(|lane| lane.0.lock().is_empty()));
+        }
+    }
+
+    /// Runs `future` on this thread, parking it while the future waits.
+    fn block_on<F: Future>(future: F) -> F::Output {
+        struct Unpark(thread::Thread);
+        impl Wake for Unpark {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let waker = Waker::from(Arc::new(Unpark(thread::current())));
+        let mut context = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        loop {
+            if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+                return output;
+            }
+            thread::park();
+        }
+    }
+
+    /// A waker that records being woken.
+    #[derive(Default)]
+    struct WakeFlag(std::sync::atomic::AtomicBool);
+
+    impl Wake for WakeFlag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    impl WakeFlag {
+        fn take(&self) -> bool {
+            self.0.swap(false, Ordering::Relaxed)
+        }
+    }
+
+    /// Pending once, then ready.
+    struct YieldOnce(bool);
+
+    impl Future for YieldOnce {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
+            if self.0 {
+                return Poll::Ready(());
+            }
+            self.0 = true;
+            context.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+
+    #[test]
+    fn async_loads_are_send_and_hit_without_loading() {
+        fn assert_send<T: Send>(_: &T) {}
+        let cache = ShardedCache::<u64, String>::new(100);
+        let load = cache.get_or_insert_async(&1, async { "one".to_owned() });
+        assert_send(&load);
+        let try_load =
+            cache.get_or_try_insert_async(&2, async { Ok::<_, std::io::Error>("two".to_owned()) });
+        assert_send(&try_load);
+        assert_eq!(block_on(load), "one");
+        assert_eq!(block_on(try_load).expect("the load succeeds"), "two");
+        let hit = cache.get_or_insert_async(&1, async { unreachable!("a hit never loads") });
+        assert_eq!(block_on(hit), "one");
+    }
+
+    #[test]
+    fn a_dropped_async_load_wakes_and_hands_the_key_to_a_waiter() {
+        // One thread: the leader is polled into its load and dropped there,
+        // as a cancelled task would be.
+        let cache = ShardedCache::<u64, u64>::new(100);
+        let flag = Arc::new(WakeFlag::default());
+        let waker = Waker::from(Arc::clone(&flag));
+        let mut context = Context::from_waker(&waker);
+        let mut leader = Box::pin(cache.get_or_insert_async(&3, std::future::pending()));
+        assert!(leader.as_mut().poll(&mut context).is_pending());
+        let mut waiter = Box::pin(cache.get_or_insert_async(&3, async { 30 }));
+        assert!(waiter.as_mut().poll(&mut context).is_pending(), "it waits");
+        let mut dropped = Box::pin(cache.get_or_insert_async(&3, async { 31 }));
+        assert!(dropped.as_mut().poll(&mut context).is_pending());
+        drop(dropped);
+        assert!(!flag.take());
+        drop(leader);
+        assert!(flag.take(), "abandoning the load wakes its waiter");
+        assert_eq!(waiter.as_mut().poll(&mut context), Poll::Ready(30));
+        assert_eq!(cache.get(&3), Some(30));
+        assert!(cache.flights.iter().all(|lane| lane.0.lock().is_empty()));
+    }
+
+    #[test]
+    fn a_failed_async_load_returns_its_error_and_hands_the_key_on() {
+        let cache = ShardedCache::<u64, u64>::new(100);
+        let flag = Arc::new(WakeFlag::default());
+        let waker = Waker::from(Arc::clone(&flag));
+        let mut context = Context::from_waker(&waker);
+        let mut leader = Box::pin(cache.get_or_try_insert_async(&4, async {
+            YieldOnce(false).await;
+            Err("the load fails")
+        }));
+        assert!(leader.as_mut().poll(&mut context).is_pending());
+        let mut waiter = Box::pin(cache.get_or_try_insert_async(&4, async { Ok::<_, &str>(40) }));
+        assert!(waiter.as_mut().poll(&mut context).is_pending());
+        flag.take();
+        assert_eq!(
+            leader.as_mut().poll(&mut context),
+            Poll::Ready(Err("the load fails"))
+        );
+        assert!(flag.take(), "the failure wakes the waiter");
+        assert_eq!(waiter.as_mut().poll(&mut context), Poll::Ready(Ok(40)));
+        assert_eq!(cache.get(&4), Some(40));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "parking_lot's futex wait fails Miri's variadic check")]
+    fn async_and_blocking_callers_that_miss_together_load_once() {
+        for async_leader in [true, false] {
+            let cache = Arc::new(ShardedCache::<u64, u64>::new(1_000));
+            let loads = Arc::new(AtomicUsize::new(0));
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let leader = {
+                let cache = Arc::clone(&cache);
+                let loads = Arc::clone(&loads);
+                thread::spawn(move || {
+                    let load = move || {
+                        loads.fetch_add(1, Ordering::Relaxed);
+                        released.recv().expect("the test releases the loader");
+                        70
+                    };
+                    if async_leader {
+                        block_on(cache.get_or_insert_async(&7, async move { load() }))
+                    } else {
+                        cache.get_or_insert_with(&7, load)
+                    }
+                })
+            };
+            wait_for_waiters(&cache, 7, 0);
+            let waiters: Vec<_> = (0..6)
+                .map(|index| {
+                    let cache = Arc::clone(&cache);
+                    let loads = Arc::clone(&loads);
+                    thread::spawn(move || {
+                        let load = move || {
+                            loads.fetch_add(1, Ordering::Relaxed);
+                            71
+                        };
+                        if index % 2 == 0 {
+                            block_on(cache.get_or_insert_async(&7, async move { load() }))
+                        } else {
+                            cache.get_or_insert_with(&7, load)
+                        }
+                    })
+                })
+                .collect();
+            wait_for_waiters(&cache, 7, 6);
+            release.send(()).expect("the leader is loading");
+            assert_eq!(leader.join().expect("the leader completes"), 70);
+            for waiter in waiters {
+                assert_eq!(waiter.join().expect("a waiter completes"), 70);
+            }
+            assert_eq!(loads.load(Ordering::Relaxed), 1, "one load");
             assert!(cache.flights.iter().all(|lane| lane.0.lock().is_empty()));
         }
     }

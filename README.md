@@ -65,7 +65,9 @@ Design, correctness evidence, tables, and rejected alternatives are in
 It offers:
 
 - `get_or_insert_with` and `get_or_try_insert_with`, which load a missing key
-  once however many callers miss it together;
+  once however many callers miss it together, and `get_or_insert_async` and
+  `get_or_try_insert_async`, which wait for that load without blocking, on
+  any executor;
 - per-entry and default times to live;
 - hit, miss, eviction, and expiration counts;
 - a removal listener told why each entry left;
