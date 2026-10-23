@@ -247,6 +247,53 @@ pub(crate) fn pins_held() -> usize {
     PINS_HELD.get()
 }
 
+/// Asks Linux to back the whole huge pages within `length` bytes from
+/// `start` with transparent huge pages. Many distributions enable them only
+/// where asked, and a large cache's table and slab region otherwise take a
+/// TLB entry per 4 KB. Elsewhere, or for less than a huge page, it does
+/// nothing; a kernel that refuses the advice leaves the pages as they were.
+#[allow(
+    unsafe_code,
+    reason = "advises the kernel about memory this process owns"
+)]
+pub(crate) fn advise_huge_pages(start: *const u8, length: usize) {
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        not(miri)
+    ))]
+    {
+        /// The x86_64 and aarch64 4 KB-page huge page size. Every base page
+        /// size divides it, so the advised range is page-aligned on kernels
+        /// with larger base pages too.
+        const HUGE_PAGE: usize = 2 << 20;
+        const MADV_HUGEPAGE: i32 = 14;
+        unsafe extern "C" {
+            fn madvise(address: *mut std::ffi::c_void, length: usize, advice: i32) -> i32;
+        }
+        let first = start.addr().next_multiple_of(HUGE_PAGE);
+        let end = (start.addr() + length) / HUGE_PAGE * HUGE_PAGE;
+        if end > first {
+            // SAFETY: the range lies within an allocation the caller owns, and
+            // the advice changes no contents. A failure is ignored: the pages
+            // stay as they were.
+            let _ = unsafe {
+                madvise(
+                    start.cast_mut().with_addr(first).cast(),
+                    end - first,
+                    MADV_HUGEPAGE,
+                )
+            };
+        }
+    }
+    #[cfg(not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        not(miri)
+    )))]
+    let _ = (start, length);
+}
+
 /// Starts loading the cache line at `address`. A prefetch reads nothing in
 /// the language's sense, so any address is allowed, a stale one included.
 #[inline]
@@ -1044,6 +1091,9 @@ impl<T> SlotStore<T> {
         // SAFETY: the layout has a nonzero size.
         let allocation =
             NonNull::new(unsafe { alloc(layout) }).unwrap_or_else(|| handle_alloc_error(layout));
+        // Before any slot is touched: the kernel picks page sizes as it
+        // first backs each page.
+        advise_huge_pages(allocation.as_ptr(), layout.size());
         // SAFETY: the header lies within the allocation.
         let region = unsafe { allocation.add(header) };
         // SAFETY: the header holds at least one word.
@@ -1302,6 +1352,15 @@ mod tests {
         /// Slots the region holds.
         pub(crate) fn region_slots(&self) -> usize {
             self.depot.region_slots
+        }
+
+        /// The address and length of the region's slots.
+        #[cfg(target_os = "linux")]
+        pub(crate) fn region_span(&self) -> (usize, usize) {
+            (
+                self.depot.region.as_ptr() as usize,
+                self.depot.region_slots * self.depot.slot.size(),
+            )
         }
 
         /// Overflow chunks the store holds.

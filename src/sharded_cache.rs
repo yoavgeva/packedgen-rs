@@ -36,7 +36,7 @@ use crate::cache_arena::direct_arena_thread;
 use crate::sharded_arena::PREFETCHED;
 use crate::sharded_arena::{
     EpochPin, Epochs, MAX_EXPIRY_TICK, MAX_WEIGHT, OVERFLOW_HANDLE, Reclaimed, RetiredSlots, Slot,
-    SlotDecoder, SlotStore, drop_value, fill, prefetch, prefetch_write,
+    SlotDecoder, SlotStore, advise_huge_pages, drop_value, fill, prefetch, prefetch_write,
 };
 
 const SLOTS: usize = 10;
@@ -403,14 +403,7 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
                     )
                 })
                 .collect(),
-            table: (0..shards * shard_buckets)
-                .map(|_| Bucket {
-                    tags: AtomicU64::new(0),
-                    meta: AtomicU64::new(0),
-                    handles: std::array::from_fn(|_| AtomicU32::new(0)),
-                    generations: AtomicU64::new(0),
-                })
-                .collect(),
+            table: empty_table(shards * shard_buckets),
             shard_buckets,
             shard_shift: u64::BITS - shards.trailing_zeros(),
             epochs: Epochs::new(),
@@ -2244,6 +2237,25 @@ const fn overflow(meta: u64) -> u64 {
     meta >> OVERFLOW_SHIFT & OVERFLOW_MAX
 }
 
+/// A table of `buckets` empty buckets. Zeroed memory is an empty table, so
+/// a large one comes straight from the kernel, untouched until written,
+/// and is advised for huge pages before its first write.
+#[allow(unsafe_code, reason = "an all-zero bucket is empty")]
+fn empty_table(buckets: usize) -> Box<[Bucket]> {
+    let layout = std::alloc::Layout::array::<Bucket>(buckets).expect("the table fits isize");
+    assert_ne!(layout.size(), 0, "a table has buckets");
+    // SAFETY: the layout has a nonzero size.
+    let table = unsafe { std::alloc::alloc_zeroed(layout) };
+    if table.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    advise_huge_pages(table, layout.size());
+    // SAFETY: the global allocator gave `table` the layout a boxed slice of
+    // `buckets` buckets uses. A bucket is atomics and arrays of them, valid
+    // as all-zero bits, and zero tags and handles mark every slot empty.
+    unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(table.cast(), buckets)) }
+}
+
 /// A slot tag: eight hash bits other than the shard and home-bucket bits,
 /// never zero.
 #[inline]
@@ -4026,6 +4038,45 @@ mod tests {
             assert!(prefetched.contains(&line), "{name} was not prefetched");
         }
         assert!(shard.lock().filters.admit(victim, usize::MAX));
+    }
+
+    /// The kernel's flags for the mapping that holds `address`.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    fn mapping_flags(address: usize) -> Vec<String> {
+        let smaps = std::fs::read_to_string("/proc/self/smaps").expect("smaps is readable");
+        let mut inside = false;
+        for line in smaps.lines() {
+            let first = line.split(' ').next().unwrap_or_default();
+            if let Some((start, end)) = first.split_once('-')
+                && let (Ok(start), Ok(end)) = (
+                    usize::from_str_radix(start, 16),
+                    usize::from_str_radix(end, 16),
+                )
+            {
+                inside = (start..end).contains(&address);
+            } else if inside && let Some(flags) = line.strip_prefix("VmFlags:") {
+                return flags.split_whitespace().map(str::to_owned).collect();
+            }
+        }
+        panic!("no mapping holds {address:#x}");
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", not(miri)))]
+    fn large_tables_and_slab_regions_ask_linux_for_huge_pages() {
+        // Hosts that enable transparent huge pages only where asked, the
+        // default on many distributions, backed a million-entry cache's 8 MB
+        // table and its slab region with 4 KB pages.
+        let cache = ShardedCacheBuilder::new(1_000_000).build::<u64, u64>();
+        let table = cache.table.as_ptr() as usize + size_of_val(&*cache.table) / 2;
+        let (region, length) = cache.slots.region_span();
+        for (name, address) in [("table", table), ("slab region", region + length / 2)] {
+            let flags = mapping_flags(address);
+            assert!(
+                flags.iter().any(|flag| flag == "hg"),
+                "the {name} is not advised for huge pages: {flags:?}"
+            );
+        }
     }
 
     #[test]
