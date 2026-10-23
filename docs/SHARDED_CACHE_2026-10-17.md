@@ -160,6 +160,22 @@ entry. Tables are sized once and never rebuilt.
 - **Clearing.** `clear` sweeps each shard under its lock. It retires every
   entry, resets the probation, main, and ghost state, and leaves the eviction
   and expiration counts in place.
+- **Iteration.** `iter` clones the live entries, and the guard's `iter`
+  borrows them, a shard at a time.
+  - Each shard's handles are copied under its lock and read after it is
+    released. A shard is seen as it was at one moment, each entry at most
+    once, and the loop body may write to the cache.
+  - Iterating is not reading: entries are neither marked nor counted.
+  - The cloning iterator refreshes its pin between shards, so a long
+    iteration holds back reclamation for one shard's copy at most.
+- **Retaining.** `retain` offers each live entry to a predicate outside
+  every lock, so the predicate may write to the cache.
+  - It removes a rejected entry only if it is still published, found again
+    under the shard lock by its handle. The caller's pin keeps that handle
+    from naming another entry meanwhile, so an entry replaced after it was
+    offered stays.
+  - Expired entries are removed without being offered, as `Expired`; the
+    rest as `Explicit`.
 - **Batched inserts.** `insert_many` inserts pairs in order, as single inserts
   would, and returns how many it cached. It takes one epoch pin per call
   instead of one per insert. Each chunk of 32 keys is hashed, and their home
@@ -195,7 +211,11 @@ entry. Tables are sized once and never rebuilt.
     (verified to fail with retirements four at a time);
   - failing and panicking loads handing the key to a waiter;
   - expired entries reading as missing, and leaving before read live keys;
-  - statistics, every removal cause, `clear`, and `peek`.
+  - statistics, every removal cause, `clear`, and `peek`;
+  - iteration visiting each live entry once, without marking it, while the
+    loop body and another thread write;
+  - `retain` removing rejected and expired entries with their causes, and
+    sparing entries its predicate replaced.
 - **Arena tests.** They cover:
   - aging of exactly three advances;
   - a pin blocking the second advance past its epoch;

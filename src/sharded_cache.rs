@@ -1565,6 +1565,135 @@ where
         }
     }
 
+    /// Iterates over clones of the live entries, shard by shard.
+    ///
+    /// A shard's entries are those it held at one moment while the
+    /// iteration reached it, so an entry written meanwhile may or may not
+    /// appear, and none appears twice. Iterating is not reading: entries are
+    /// neither marked as read nor counted in the statistics. The iterator
+    /// pins the cache, refreshing the pin between shards; see
+    /// [`ShardedCacheGuard::iter`] to borrow the entries instead.
+    #[allow(
+        unsafe_code,
+        reason = "reads entries copied from the table under the iterator's pin"
+    )]
+    pub fn iter(&self) -> impl Iterator<Item = (K, V)> + '_
+    where
+        K: Clone,
+        V: Clone,
+    {
+        let mut pin = self.epochs.pin();
+        let mut handles = Vec::new();
+        let mut next_shard = 0;
+        let mut now = None;
+        std::iter::from_fn(move || {
+            loop {
+                if let Some(raw) = handles.pop() {
+                    // SAFETY: copied from the table, under its shard's lock,
+                    // while `pin` was held, and `pin` has not refreshed since.
+                    let entry = unsafe { entry(&pin, self.published(raw)) };
+                    if !self.expired(entry, &mut now) {
+                        let (key, value) = entry.value();
+                        return Some((key.clone(), value.clone()));
+                    }
+                    continue;
+                }
+                if next_shard == self.shards.len() {
+                    return None;
+                }
+                // The previous shard's entries were cloned already.
+                pin.refresh();
+                self.copy_shard(next_shard, &mut handles);
+                next_shard += 1;
+            }
+        })
+    }
+
+    /// Keeps only the entries for which `keep` returns true, and removes
+    /// expired entries without offering them.
+    ///
+    /// Each shard's entries are copied under its lock and offered after it
+    /// is released, so `keep` may use the cache, writes included. An entry
+    /// replaced or removed after it was offered is left alone, and entries
+    /// written meanwhile may or may not be offered. The removal listener
+    /// hears [`RemovalCause::Explicit`] for each rejected entry.
+    #[allow(
+        unsafe_code,
+        reason = "reads entries copied from the table, and unpublishes them, under the call's pin"
+    )]
+    pub fn retain(&self, mut keep: impl FnMut(&K, &V) -> bool) {
+        let mut handles = Vec::new();
+        let mut doomed = Vec::new();
+        for index in 0..self.shards.len() {
+            let pin = self.epochs.pin();
+            self.copy_shard(index, &mut handles);
+            let mut now = None;
+            for raw in handles.drain(..) {
+                // SAFETY: copied from the table, under its shard's lock,
+                // while `pin` was held.
+                let entry = unsafe { entry(&pin, self.published(raw)) };
+                let (key, value) = entry.value();
+                if self.expired(entry, &mut now) || !keep(key, value) {
+                    doomed.push((self.hash(key), raw));
+                }
+            }
+            if doomed.is_empty() {
+                continue;
+            }
+            let shard = self.view(index);
+            let mut removed = Removed::new();
+            {
+                let mut writer = shard.lock();
+                for (hash, raw) in doomed.drain(..) {
+                    // Still published, though perhaps moved to its other
+                    // bucket; `pin` keeps its handle from naming another
+                    // entry meanwhile.
+                    let Some((slot, _)) = shard.find(hash, |current| current.raw == raw) else {
+                        continue;
+                    };
+                    let handle = shard.clear(slot);
+                    // SAFETY: the clear unpublished `handle` while `pin` is
+                    // held.
+                    let removed_entry = unsafe { entry(&pin, handle) };
+                    writer.left(removed_entry.weight());
+                    let cause = if self.expired(removed_entry, &mut now) {
+                        writer.count_expiration();
+                        RemovalCause::Expired
+                    } else {
+                        RemovalCause::Explicit
+                    };
+                    removed.push(handle, cause);
+                }
+            }
+            self.after_write(&removed, pin);
+        }
+    }
+
+    /// Copies the handles shard `index` publishes to `handles`, under its
+    /// lock. Copied while a pin is held, each names an entry readable for
+    /// that pin's life.
+    fn copy_shard(&self, index: usize, handles: &mut Vec<u32>) {
+        let shard = self.view(index);
+        let _writer = shard.lock();
+        handles.extend(
+            shard
+                .buckets
+                .iter()
+                .flat_map(|bucket| &bucket.handles)
+                .map(|handle| handle.load(Ordering::Relaxed))
+                .filter(|raw| *raw != 0),
+        );
+    }
+
+    /// The handle `raw`, published in this cache's table.
+    #[inline]
+    fn published(&self, raw: u32) -> Handle<(K, V)> {
+        Handle {
+            raw,
+            slot: self.slots.slot(raw),
+        }
+    }
+
     /// Drops the values of removed entries that no reader can still reach.
     ///
     /// A write drops about as many removed values as it removes, from those
@@ -1768,6 +1897,40 @@ where
         let value = self.cache.lookup(&self.pin, key, self.cache.hash(key));
         self.cache.count(value.is_some());
         value
+    }
+
+    /// Iterates over the live entries, borrowed until this guard refreshes,
+    /// shard by shard; see [`ShardedCache::iter`] for what it visits.
+    #[allow(
+        unsafe_code,
+        reason = "reads entries copied from the table under the guard's pin"
+    )]
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> + '_ {
+        let cache = self.cache;
+        let pin = &self.pin;
+        let mut handles = Vec::new();
+        let mut next_shard = 0;
+        let mut now = None;
+        std::iter::from_fn(move || {
+            loop {
+                if let Some(raw) = handles.pop() {
+                    // SAFETY: copied from the table, under its shard's lock,
+                    // while `pin` was held; the borrow of the guard keeps it
+                    // from refreshing.
+                    let entry = unsafe { entry(pin, cache.published(raw)) };
+                    if !cache.expired(entry, &mut now) {
+                        let (key, value) = entry.value();
+                        return Some((key, value));
+                    }
+                    continue;
+                }
+                if next_shard == cache.shards.len() {
+                    return None;
+                }
+                cache.copy_shard(next_shard, &mut handles);
+                next_shard += 1;
+            }
+        })
     }
 
     /// Lets entries retired since the guard pinned be reclaimed.
@@ -3699,6 +3862,139 @@ mod tests {
                 .iter()
                 .all(|(.., cause)| *cause == RemovalCause::Explicit)
         );
+    }
+
+    #[test]
+    fn iteration_visits_each_live_entry_once_without_reading_it() {
+        let cache = ShardedCacheBuilder::new(2_000)
+            .shards(4)
+            .build::<u64, u64>();
+        for key in 0..500_u64 {
+            cache.insert(key, key * 10);
+        }
+        cache.insert_with_ttl(1_000, 1, HOUR);
+        cache.advance_clock(HOUR + MINUTE);
+        let expected: Vec<(u64, u64)> = (0..500).map(|key| (key, key * 10)).collect();
+        let mut cloned: Vec<(u64, u64)> = cache.iter().collect();
+        cloned.sort_unstable();
+        assert_eq!(cloned, expected, "live entries, each once, none expired");
+        let guard = cache.pin();
+        let mut borrowed: Vec<(u64, u64)> =
+            guard.iter().map(|(key, value)| (*key, *value)).collect();
+        borrowed.sort_unstable();
+        assert_eq!(borrowed, expected);
+        drop(guard);
+        assert!(
+            (0..500).all(|key| !is_marked(&cache, key)),
+            "iteration is not a read"
+        );
+        assert_eq!(cache.stats().hits + cache.stats().misses, 0);
+    }
+
+    #[test]
+    fn iterating_while_writing_to_the_cache_neither_blocks_nor_tears() {
+        // Each shard is copied under its lock and visited after, so writes
+        // from the loop body never wait on the iteration.
+        let cache = ShardedCacheBuilder::new(1_000)
+            .shards(2)
+            .build::<u64, u64>();
+        for key in 0..200_u64 {
+            cache.insert(key, key * 10);
+        }
+        // Keys below 10,000 hold ten times the key; the loop body adds keys
+        // above it, which the iteration may also reach.
+        let consistent =
+            |key: u64, value: u64| value == key * 10 || key >= 10_000 && value == key * 10 + 1;
+        let guard = cache.pin();
+        for (key, value) in guard.iter() {
+            assert!(consistent(*key, *value), "{key} held {value}");
+            if *key < 10_000 {
+                cache.insert(key + 10_000, (key + 10_000) * 10 + 1);
+                cache.remove(&(key + 1));
+            }
+        }
+        drop(guard);
+        for (key, value) in cache.iter() {
+            cache.insert(key, value);
+        }
+        let writer = {
+            let cache = &cache;
+            move || {
+                for round in 0..STRESS_ROUNDS / 10 {
+                    let key = round % 300;
+                    cache.insert(key, key * 10);
+                    cache.remove(&((round * 7) % 300));
+                }
+            }
+        };
+        thread::scope(|scope| {
+            scope.spawn(writer);
+            for _ in 0..10 {
+                for (key, value) in cache.iter() {
+                    assert!(consistent(key, value), "{key} held {value}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn retain_removes_rejected_and_expired_entries_and_reports_why() {
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let cache = ShardedCacheBuilder::new(2_000)
+            .shards(4)
+            .removal_listener({
+                let heard = Arc::clone(&heard);
+                move |key: &u64, _: &u64, cause| heard.lock().push((*key, cause))
+            })
+            .build::<u64, u64>();
+        for key in 0..300_u64 {
+            cache.insert(key, key);
+        }
+        cache.insert_with_ttl(1_000, 1, HOUR);
+        cache.advance_clock(HOUR + MINUTE);
+        let mut tested = Vec::new();
+        cache.retain(|key, value| {
+            assert_eq!(key, value);
+            tested.push(*key);
+            key % 3 != 0
+        });
+        tested.sort_unstable();
+        assert_eq!(
+            tested,
+            (0..300).collect::<Vec<_>>(),
+            "expired entries are not offered"
+        );
+        assert_eq!(cache.len(), 200);
+        assert!((0..300).all(|key| cache.contains_key(&key) == (key % 3 != 0)));
+        let mut heard = heard.lock().clone();
+        heard.sort_unstable_by_key(|(key, _)| *key);
+        let mut expected: Vec<(u64, RemovalCause)> = (0..300)
+            .filter(|key| key % 3 == 0)
+            .map(|key| (key, RemovalCause::Explicit))
+            .collect();
+        expected.push((1_000, RemovalCause::Expired));
+        assert_eq!(heard, expected);
+        assert_eq!(cache.stats().expirations, 1);
+    }
+
+    #[test]
+    fn retain_tests_outside_every_lock_and_spares_entries_replaced_meanwhile() {
+        // The predicate may write to the cache. A key it replaces was
+        // tested by its old value, so the new one stays.
+        let cache = ShardedCacheBuilder::new(1_000)
+            .shards(2)
+            .build::<u64, u64>();
+        for key in 0..100_u64 {
+            cache.insert(key, key);
+        }
+        cache.retain(|key, _| {
+            cache.insert(*key, key + 1_000);
+            cache.insert(key + 5_000, *key);
+            false
+        });
+        for key in 0..100 {
+            assert_eq!(cache.get(&key), Some(key + 1_000), "replaced key {key}");
+        }
     }
 
     #[test]

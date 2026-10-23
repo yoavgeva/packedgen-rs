@@ -69,6 +69,8 @@ It offers:
 - per-entry and default times to live;
 - hit, miss, eviction, and expiration counts;
 - a removal listener told why each entry left;
+- `iter` over cloned entries, or borrowed ones through `pin()`, and
+  `retain`, whose predicate may write to the cache;
 - `peek`, `contains_key`, `clear`, and `maintain`, which drops removed
   values promptly after a burst of writes;
 - weighted limits and borrowed reads through `pin()`.
