@@ -1,0 +1,14 @@
+diff --git a/src/sharded_arena.rs b/src/sharded_arena.rs
+index 3df46de..6dd558c 100644
+--- a/src/sharded_arena.rs
++++ b/src/sharded_arena.rs
+@@ -257,6 +257,9 @@ pub(crate) fn pins_held() -> usize {
+     reason = "advises the kernel about memory this process owns"
+ )]
+ pub(crate) fn advise_huge_pages(start: *const u8, length: usize) {
++    if std::hint::black_box(true) {
++        return;
++    }
+     #[cfg(all(
+         target_os = "linux",
+         any(target_arch = "x86_64", target_arch = "aarch64"),

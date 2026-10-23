@@ -1,0 +1,12 @@
+diff --git a/src/sharded_arena.rs b/src/sharded_arena.rs
+index 3df46de..0010853 100644
+--- a/src/sharded_arena.rs
++++ b/src/sharded_arena.rs
+@@ -356,6 +356,7 @@ thread_local! {
+ /// 31, the deadline tick in bits 32 to 62 (all ones for none), and the first
+ /// access mark in bit 63. A vacant slot's memory may be uninitialized.
+ #[repr(C)]
++#[repr(align(64))]
+ pub(crate) struct Slot<T> {
+     metadata: AtomicU64,
+     value: UnsafeCell<MaybeUninit<T>>,
