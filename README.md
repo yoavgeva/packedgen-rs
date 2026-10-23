@@ -68,7 +68,7 @@ It offers:
   once however many callers miss it together, and `get_or_insert_async` and
   `get_or_try_insert_async`, which wait for that load without blocking, on
   any executor;
-- per-entry and default times to live;
+- per-entry and default times to live, or a time to idle that reads extend;
 - hit, miss, eviction, and expiration counts;
 - a removal listener told why each entry left;
 - `iter` over cloned entries, or borrowed ones through `pin()`, and

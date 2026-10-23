@@ -230,6 +230,7 @@ pub struct ShardedCacheBuilder<W = UnitWeighter, S = DefaultHashBuilder, L = NoL
     probation_bps: u16,
     shards: Option<usize>,
     time_to_live: Option<Duration>,
+    time_to_idle: Option<Duration>,
     record_stats: bool,
     weighter: W,
     hash_builder: S,
@@ -246,6 +247,7 @@ impl ShardedCacheBuilder {
             probation_bps: DEFAULT_PROBATION_BPS,
             shards: None,
             time_to_live: None,
+            time_to_idle: None,
             record_stats: false,
             weighter: UnitWeighter,
             hash_builder: DefaultHashBuilder::default(),
@@ -292,6 +294,22 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
         self
     }
 
+    /// Expires entries `time_to_idle` after they were last written or read.
+    ///
+    /// Reads that mark entries, such as [`ShardedCache::get`] and
+    /// [`ShardedCacheGuard::get`], move a live entry's deadline later, to
+    /// `time_to_idle` after the read; [`ShardedCache::peek`],
+    /// [`ShardedCache::contains_key`], and iteration do not. A read never
+    /// moves a deadline earlier, so an entry inserted with
+    /// [`ShardedCache::insert_with_ttl`] expires at the later of its own
+    /// deadline and `time_to_idle` after its last read. Deadlines are kept
+    /// in 100 ms ticks, as for [`Self::time_to_live`].
+    #[must_use]
+    pub fn time_to_idle(mut self, time_to_idle: Duration) -> Self {
+        self.time_to_idle = Some(time_to_idle);
+        self
+    }
+
     /// Counts hits and misses for [`ShardedCache::stats`]. Each counted read
     /// adds an uncontended atomic increment.
     #[must_use]
@@ -309,6 +327,7 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
             probation_bps: self.probation_bps,
             shards: self.shards,
             time_to_live: self.time_to_live,
+            time_to_idle: self.time_to_idle,
             record_stats: self.record_stats,
             weighter,
             hash_builder: self.hash_builder,
@@ -325,6 +344,7 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
             probation_bps: self.probation_bps,
             shards: self.shards,
             time_to_live: self.time_to_live,
+            time_to_idle: self.time_to_idle,
             record_stats: self.record_stats,
             weighter: self.weighter,
             hash_builder,
@@ -342,6 +362,7 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
             probation_bps: self.probation_bps,
             shards: self.shards,
             time_to_live: self.time_to_live,
+            time_to_idle: self.time_to_idle,
             record_stats: self.record_stats,
             weighter: self.weighter,
             hash_builder: self.hash_builder,
@@ -353,7 +374,9 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
     ///
     /// # Panics
     ///
-    /// Panics if one shard would need 2^32 or more table slots.
+    /// Panics if one shard would need 2^32 or more table slots, or if both
+    /// a time to live and a time to idle are set: an entry keeps one
+    /// deadline.
     #[must_use]
     pub fn build<K, V>(self) -> ShardedCache<K, V, W, S, L>
     where
@@ -362,6 +385,10 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
         S: BuildHasher,
         L: RemovalListener<K, V>,
     {
+        assert!(
+            self.time_to_live.is_none() || self.time_to_idle.is_none(),
+            "a cache expires entries after a time to live or a time to idle, not both"
+        );
         let max_entries = self.max_entries.max(1);
         let parallelism = std::thread::available_parallelism().map_or(1, usize::from);
         let shards = self
@@ -427,6 +454,7 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
                 .then(|| (0..STAT_STRIPES).map(|_| StatStripe::default()).collect()),
             started: Instant::now(),
             time_to_live: self.time_to_live,
+            time_to_idle: self.time_to_idle,
             capacity: max_entries,
             max_weight,
             #[cfg(test)]
@@ -480,6 +508,7 @@ pub struct ShardedCache<K, V, W = UnitWeighter, S = DefaultHashBuilder, L = NoLi
     stats: Option<Box<[StatStripe]>>,
     started: Instant,
     time_to_live: Option<Duration>,
+    time_to_idle: Option<Duration>,
     capacity: usize,
     max_weight: u64,
     #[cfg(test)]
@@ -1274,7 +1303,7 @@ where
         let entry = self.find_entry(pin, key, hash)?;
         // Entries without a deadline never read the clock.
         entry
-            .mark_accessed_if_live(|| self.now())
+            .mark_accessed_if_live(|| self.read_tick(entry))
             .then(|| &entry.value().1)
     }
 
@@ -1379,21 +1408,35 @@ where
     #[cold]
     #[inline(never)]
     fn now(&self) -> u64 {
-        u64::try_from(self.elapsed_nanos() / EXPIRY_TICK_NANOS)
-            .unwrap_or(u64::MAX)
-            .min(MAX_EXPIRY_TICK)
+        tick_at(self.elapsed_nanos())
+    }
+
+    /// The current tick for a marking read of `entry`, which has a
+    /// deadline. With a time to idle, it also moves the deadline of an
+    /// entry live now to the time to idle from now. Out of line, as
+    /// [`Self::now`].
+    #[cold]
+    #[inline(never)]
+    fn read_tick(&self, entry: Entry<'_, (K, V)>) -> u64 {
+        let elapsed = self.elapsed_nanos();
+        let now = tick_at(elapsed);
+        if let Some(idle) = self.time_to_idle {
+            entry.extend_deadline(deadline_at(elapsed, idle), now);
+        }
+        now
     }
 
     /// The first tick at which an entry stored now with `ttl` reads as
-    /// expired: rounding the deadline up keeps it readable for all of `ttl`.
+    /// expired.
     fn deadline(&self, ttl: Duration) -> u64 {
-        if ttl.is_zero() {
-            return 0;
-        }
-        let ticks = (self.elapsed_nanos() + ttl.as_nanos()).div_ceil(EXPIRY_TICK_NANOS);
-        u64::try_from(ticks)
-            .unwrap_or(u64::MAX)
-            .min(MAX_EXPIRY_TICK)
+        deadline_at(self.elapsed_nanos(), ttl)
+    }
+
+    /// How long a new entry lives without its own time to live: the
+    /// builder's time to live or time to idle, if either.
+    #[inline]
+    fn lifetime(&self) -> Option<Duration> {
+        self.time_to_live.or(self.time_to_idle)
     }
 
     /// Whether `entry` has expired, reading the clock at most once per
@@ -1405,7 +1448,8 @@ where
 
     /// Inserts or replaces the value for `key`, evicting from the key's shard
     /// while it is over its limits. The entry expires after the builder's
-    /// [`time_to_live`](ShardedCacheBuilder::time_to_live), if any.
+    /// [`time_to_live`](ShardedCacheBuilder::time_to_live) or
+    /// [`time_to_idle`](ShardedCacheBuilder::time_to_idle), if either.
     ///
     /// A value heavier than its shard's share of the weight limit, or than
     /// `u32::MAX >> 1`, is not cached; any previous value for `key` is then
@@ -1417,11 +1461,13 @@ where
     /// Only on a bug: a placement that fails after freeing one of the key's
     /// two buckets.
     pub fn insert(&self, key: K, value: V) -> bool {
-        self.insert_expiring(key, value, self.time_to_live)
+        self.insert_expiring(key, value, self.lifetime())
     }
 
     /// Like [`Self::insert`], with an entry that expires after `ttl` instead
-    /// of the builder's time to live. A zero `ttl` is never readable.
+    /// of the builder's time to live. A zero `ttl` is never readable. With a
+    /// time to idle, reads can extend the entry past `ttl`; see
+    /// [`ShardedCacheBuilder::time_to_idle`].
     ///
     /// # Panics
     ///
@@ -1482,7 +1528,7 @@ where
                 cached += usize::from(self.insert_pinned(
                     key,
                     value,
-                    self.time_to_live,
+                    self.lifetime(),
                     hash,
                     pin,
                     &mut removed,
@@ -2610,6 +2656,26 @@ fn empty_table(buckets: usize) -> Box<[Bucket]> {
     unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(table.cast(), buckets)) }
 }
 
+/// The tick `elapsed` nanoseconds after a cache was built; it saturates
+/// after about 6.8 years.
+fn tick_at(elapsed: u128) -> u64 {
+    u64::try_from(elapsed / EXPIRY_TICK_NANOS)
+        .unwrap_or(u64::MAX)
+        .min(MAX_EXPIRY_TICK)
+}
+
+/// The first tick at which an entry stored `elapsed` nanoseconds after its
+/// cache was built, with `ttl`, reads as expired: rounding the deadline up
+/// keeps it readable for all of `ttl`.
+fn deadline_at(elapsed: u128, ttl: Duration) -> u64 {
+    if ttl.is_zero() {
+        return 0;
+    }
+    u64::try_from((elapsed + ttl.as_nanos()).div_ceil(EXPIRY_TICK_NANOS))
+        .unwrap_or(u64::MAX)
+        .min(MAX_EXPIRY_TICK)
+}
+
 /// A slot tag: eight hash bits other than the shard and home-bucket bits,
 /// never zero.
 #[inline]
@@ -2681,6 +2747,11 @@ impl<'pin, T> Entry<'pin, T> {
     #[inline]
     fn take_accessed(self) -> bool {
         self.slot.take_accessed()
+    }
+
+    #[inline]
+    fn extend_deadline(self, deadline: u64, now: u64) {
+        self.slot.extend_deadline(deadline, now);
     }
 }
 
@@ -4065,6 +4136,58 @@ mod tests {
             assert_eq!(loads.load(Ordering::Relaxed), 1, "one load");
             assert!(cache.flights.iter().all(|lane| lane.0.lock().is_empty()));
         }
+    }
+
+    #[test]
+    fn reads_keep_an_entry_for_its_time_to_idle_and_peeks_do_not() {
+        let cache = ShardedCacheBuilder::new(100)
+            .time_to_idle(HOUR)
+            .build::<u64, u64>();
+        cache.insert(1, 10);
+        cache.insert(2, 20);
+        assert_eq!(cache.insert_many([(4, 40), (5, 50)]), 2);
+        cache.insert_with_ttl(3, 30, 3 * HOUR);
+        cache.advance_clock(59 * MINUTE);
+        assert_eq!(cache.get(&1), Some(10));
+        assert_eq!(cache.pin().get(&4), Some(&40));
+        assert_eq!(cache.get_or_insert_with(&5, || 0), 50);
+        assert_eq!(cache.get(&3), Some(30), "its own deadline is later");
+        assert!(cache.contains_key(&2) && cache.peek(&2) == Some(20));
+        assert_eq!(cache.iter().count(), 5);
+        cache.advance_clock(2 * MINUTE);
+        assert_eq!(cache.peek(&2), None, "unread for its time to idle");
+        for (key, value) in [(1, 10), (4, 40), (5, 50), (3, 30)] {
+            assert_eq!(
+                cache.peek(&key),
+                Some(value),
+                "read within its time to idle"
+            );
+        }
+        // A read moves a deadline later, never earlier: key 3 keeps its own
+        // until reads come within the time to idle of it.
+        cache.advance_clock(HOUR);
+        assert_eq!((cache.get(&1), cache.get(&4)), (None, None));
+        assert_eq!(cache.get(&3), Some(30));
+        cache.advance_clock(59 * MINUTE);
+        assert_eq!(cache.get(&3), Some(30));
+        cache.advance_clock(59 * MINUTE);
+        assert_eq!(cache.get(&3), Some(30), "the last read extended it");
+        cache.advance_clock(HOUR + MINUTE);
+        assert_eq!(cache.get(&3), None);
+        assert_eq!(
+            cache.stats().expirations,
+            0,
+            "expired entries stay until reached"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "a time to live or a time to idle")]
+    fn a_cache_expires_after_a_time_to_live_or_a_time_to_idle_not_both() {
+        let _ = ShardedCacheBuilder::new(100)
+            .time_to_live(HOUR)
+            .time_to_idle(HOUR)
+            .build::<u64, u64>();
     }
 
     #[test]

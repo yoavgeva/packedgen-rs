@@ -154,6 +154,18 @@ entry. Tables are sized once and never rebuilt.
     access marks. When a full bucket pair forces an eviction, an expired
     entry in the pair goes first.
   - Expired entries the policy has not reached still count in `len`.
+  - With the builder's `time_to_idle`, an insert sets the deadline that far
+    ahead, and a marking read of a live entry moves it to that far after
+    the read, never earlier. The move happens in the out-of-line clock call
+    that reads of entries with deadlines already make, so `get` keeps its
+    instructions (364 before, 365 after on aarch64) and caches without
+    deadlines never reach it. It is a compare-and-swap on the metadata
+    word, once per 100 ms tick per entry at most, that keeps access marks
+    set meanwhile. `peek`, `contains_key`, and iteration do not move it.
+  - An entry holds one deadline, so a cache takes a time to live or a time
+    to idle, not both; `build` panics if given both. An entry inserted with
+    its own time to live in a cache with a time to idle expires at the
+    later of that deadline and the time to idle after its last read.
 - **Statistics.** `stats()` reports evictions and expirations, which shard
   writers count under their locks. With `record_stats()`, it also reports hits
   and misses. Those are counted on 32 cache-line-padded stripes chosen by
@@ -222,6 +234,9 @@ entry. Tables are sized once and never rebuilt.
     (verified to fail with retirements four at a time);
   - failing and panicking loads handing the key to a waiter;
   - expired entries reading as missing, and leaving before read live keys;
+  - reads extending entries by the time to idle while peeks, membership
+    checks, and iteration do not, and an entry's own later deadline
+    surviving reads (fails without the extension);
   - statistics, every removal cause, `clear`, and `peek`;
   - iteration visiting each live entry once, without marking it, while the
     loop body and another thread write;
