@@ -67,7 +67,9 @@ It offers:
 - `get_or_insert_with` and `get_or_try_insert_with`, which load a missing key
   once however many callers miss it together, and `get_or_insert_async` and
   `get_or_try_insert_async`, which wait for that load without blocking, on
-  any executor;
+  any executor; `get_value_or_guard`, with a timeout, and
+  `get_value_or_guard_async` hand the caller a guard to insert through
+  instead;
 - per-entry and default times to live, or a time to idle that reads extend;
 - hit, miss, eviction, and expiration counts;
 - a removal listener told why each entry left;

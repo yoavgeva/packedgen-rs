@@ -145,6 +145,15 @@ entry. Tables are sized once and never rebuilt.
     flight, and a waiter's future dropped mid-wait clears its waker. The
     futures need no particular executor and are `Send` when the cache, the
     key, and the loader are.
+- **Placeholder guards.** `get_value_or_guard` and
+  `get_value_or_guard_async` return the value, or, when no load is in
+  progress, a `PlaceholderGuard` that lists a flight as the loaders do. The
+  caller inserts through `PlaceholderGuard::insert`, which inserts and
+  hands the value to the waiters; a guard dropped without inserting
+  abandons the flight, and a waiter takes it over. Loaders and guards
+  share flights, so each waits for the other. `get_value_or_guard` waits
+  up to its timeout and returns `Timeout` past it; a deadline already
+  passed returns before parking, so a zero timeout never waits.
 - **Expiry.** `insert_with_ttl` and the builder's `time_to_live` store a
   deadline in the entry's 31-bit expiry field, in 100 ms ticks since the
   cache was built.
@@ -281,6 +290,9 @@ entry. Tables are sized once and never rebuilt.
     restarting the time to live, reweighing, removing the old value when
     the new one is too heavy, and giving its slot back when it fails
     (verified to fail without the give-back);
+  - a placeholder guard inserting while another caller times out, a
+    dropped guard waking its asynchronous waiter and handing it a guard,
+    and a loader and a guard caller both waiting for a guard's insert;
   - `drain` yielding live entries once and reporting expired ones, and a
     dropped drain retiring the shard it emptied (verified to fail without
     the retirement on drop); `memory_used` counting the table, slots

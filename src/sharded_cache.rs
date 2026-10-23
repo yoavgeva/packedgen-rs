@@ -649,14 +649,98 @@ impl<K, V: Clone> Flight<K, V> {
     /// Blocks until the flight lands, and returns its value, or `None` if
     /// the load was abandoned.
     fn wait(&self) -> Option<V> {
+        match self.wait_until(None) {
+            Landed::Loaded(value) => Some(value),
+            Landed::Abandoned | Landed::TimedOut => None,
+        }
+    }
+
+    /// Blocks until the flight lands or `deadline` passes. A deadline
+    /// already passed returns before parking, so a zero timeout never
+    /// waits.
+    fn wait_until(&self, deadline: Option<Instant>) -> Landed<V> {
         let mut progress = self.progress.lock();
-        while matches!(progress.state, FlightState::Loading) {
-            self.landed.wait(&mut progress);
+        loop {
+            match &progress.state {
+                FlightState::Loaded(value) => return Landed::Loaded(value.clone()),
+                FlightState::Abandoned => return Landed::Abandoned,
+                FlightState::Loading => {}
+            }
+            match deadline {
+                None => self.landed.wait(&mut progress),
+                Some(deadline) if Instant::now() >= deadline => return Landed::TimedOut,
+                Some(deadline) => {
+                    self.landed.wait_until(&mut progress, deadline);
+                }
+            }
         }
-        match &progress.state {
-            FlightState::Loaded(value) => Some(value.clone()),
-            FlightState::Loading | FlightState::Abandoned => None,
-        }
+    }
+}
+
+/// How a wait for a flight ended.
+enum Landed<V> {
+    Loaded(V),
+    Abandoned,
+    TimedOut,
+}
+
+/// What [`ShardedCache::get_value_or_guard`] found.
+pub enum GuardResult<'cache, K, V, W = UnitWeighter, S = DefaultHashBuilder, L = NoListener> {
+    /// The key's live value, or the value another caller's load produced
+    /// while this one waited.
+    Value(V),
+    /// The key had no value and no load in progress: this caller loads it,
+    /// and inserts it through the guard while other callers wait.
+    Guard(PlaceholderGuard<'cache, K, V, W, S, L>),
+    /// Another caller was still loading the key when the timeout passed.
+    Timeout,
+}
+
+/// The right to load one missing key; see
+/// [`ShardedCache::get_value_or_guard`].
+///
+/// Other callers that miss the key, through `get_value_or_guard` or the
+/// `get_or_insert` methods, wait until the guard inserts or is dropped. A
+/// guard dropped without inserting abandons the load, and one waiter takes
+/// it over.
+pub struct PlaceholderGuard<'cache, K, V, W = UnitWeighter, S = DefaultHashBuilder, L = NoListener>
+{
+    cache: &'cache ShardedCache<K, V, W, S, L>,
+    landing: FlightLanding<'cache, K, V>,
+    key: K,
+}
+
+impl<K, V, W, S, L> PlaceholderGuard<'_, K, V, W, S, L>
+where
+    K: Hash + Eq,
+    W: Weighter<K, V>,
+    S: BuildHasher,
+    L: RemovalListener<K, V>,
+{
+    /// The key this guard loads.
+    #[must_use]
+    pub fn key(&self) -> &K {
+        &self.key
+    }
+
+    /// Inserts `value` for the key, as [`ShardedCache::insert`] would, and
+    /// hands it to the callers waiting. Returns whether it was cached.
+    ///
+    /// # Panics
+    ///
+    /// As for [`ShardedCache::insert`].
+    pub fn insert(self, value: V) -> bool
+    where
+        V: Clone,
+    {
+        let Self {
+            cache,
+            mut landing,
+            key,
+        } = self;
+        let cached = cache.insert(key, value.clone());
+        landing.loaded = Some(value);
+        cached
     }
 }
 
@@ -1421,6 +1505,108 @@ where
                     self.insert(key.to_owned(), value.clone());
                     landing.loaded = Some(value.clone());
                     return Ok(value);
+                }
+            }
+        }
+    }
+
+    /// Returns the value cached for `key`, or else a guard through which
+    /// this caller inserts it while other callers wait; see
+    /// [`PlaceholderGuard`].
+    ///
+    /// A caller that finds another's guard or load in progress waits for
+    /// it, up to `timeout`, and gets its value, or the guard if it was
+    /// abandoned. A `None` timeout waits as long as it takes; a zero timeout
+    /// never waits. A caller holding the key's guard that asks again
+    /// without a timeout deadlocks.
+    pub fn get_value_or_guard<Q>(
+        &self,
+        key: &Q,
+        timeout: Option<Duration>,
+    ) -> GuardResult<'_, K, V, W, S, L>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ToOwned<Owned = K> + ?Sized,
+        V: Clone,
+    {
+        let hash = self.hash(key);
+        let cached = self.lookup(&self.epochs.pin(), key, hash).cloned();
+        self.count(cached.is_some());
+        if let Some(value) = cached {
+            return GuardResult::Value(value);
+        }
+        // A timeout past the clock's range waits as long as it takes.
+        let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+        let lane = &self.flights[self.shard_index(hash)];
+        loop {
+            match self.join_or_lead(lane, key, hash) {
+                Missed::Found(value) => return GuardResult::Value(value),
+                Missed::Wait(flight) => match flight.wait_until(deadline) {
+                    Landed::Loaded(value) => return GuardResult::Value(value),
+                    Landed::Abandoned => {}
+                    Landed::TimedOut => return GuardResult::Timeout,
+                },
+                Missed::Lead(flight) => {
+                    return GuardResult::Guard(PlaceholderGuard {
+                        cache: self,
+                        landing: FlightLanding {
+                            lane,
+                            flight,
+                            loaded: None,
+                        },
+                        key: key.to_owned(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Returns the value cached for `key`, or else a guard through which
+    /// this caller inserts it, as [`Self::get_value_or_guard`] does
+    /// without a timeout, waiting without blocking the thread. The future
+    /// and the guard are `Send` when the cache and the key are.
+    ///
+    /// # Errors
+    ///
+    /// Returns the guard when this caller is to load the key.
+    pub async fn get_value_or_guard_async<Q>(
+        &self,
+        key: &Q,
+    ) -> Result<V, PlaceholderGuard<'_, K, V, W, S, L>>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ToOwned<Owned = K> + ?Sized,
+        V: Clone,
+    {
+        let hash = self.hash(key);
+        let cached = self.lookup(&self.epochs.pin(), key, hash).cloned();
+        self.count(cached.is_some());
+        if let Some(value) = cached {
+            return Ok(value);
+        }
+        let lane = &self.flights[self.shard_index(hash)];
+        loop {
+            match self.join_or_lead(lane, key, hash) {
+                Missed::Found(value) => return Ok(value),
+                Missed::Wait(flight) => {
+                    let wait = FlightWait {
+                        flight: &flight,
+                        waker: None,
+                    };
+                    if let Some(value) = wait.await {
+                        return Ok(value);
+                    }
+                }
+                Missed::Lead(flight) => {
+                    return Err(PlaceholderGuard {
+                        cache: self,
+                        landing: FlightLanding {
+                            lane,
+                            flight,
+                            loaded: None,
+                        },
+                        key: key.to_owned(),
+                    });
                 }
             }
         }
@@ -4538,6 +4724,99 @@ mod tests {
         assert!(flag.take(), "the failure wakes the waiter");
         assert_eq!(waiter.as_mut().poll(&mut context), Poll::Ready(Ok(40)));
         assert_eq!(cache.get(&4), Some(40));
+    }
+
+    #[test]
+    fn a_placeholder_guard_inserts_and_others_time_out_meanwhile() {
+        let cache = ShardedCache::<u64, u64>::new(100);
+        cache.insert(1, 10);
+        assert!(matches!(
+            cache.get_value_or_guard(&1, None),
+            GuardResult::Value(10)
+        ));
+        let GuardResult::Guard(guard) = cache.get_value_or_guard(&2, None) else {
+            panic!("a missing key hands its caller the guard");
+        };
+        assert_eq!(*guard.key(), 2);
+        // A zero timeout never waits: the guard is held on this thread.
+        assert!(matches!(
+            cache.get_value_or_guard(&2, Some(Duration::ZERO)),
+            GuardResult::Timeout
+        ));
+        assert!(guard.insert(20));
+        assert_eq!(cache.get(&2), Some(20));
+        assert!(matches!(
+            cache.get_value_or_guard(&2, Some(Duration::ZERO)),
+            GuardResult::Value(20)
+        ));
+        assert!(cache.flights.iter().all(|lane| lane.0.lock().is_empty()));
+    }
+
+    #[test]
+    fn a_dropped_placeholder_guard_hands_the_key_to_a_waiter() {
+        let cache = ShardedCache::<u64, u64>::new(100);
+        let flag = Arc::new(WakeFlag::default());
+        let waker = Waker::from(Arc::clone(&flag));
+        let mut context = Context::from_waker(&waker);
+        let GuardResult::Guard(guard) = cache.get_value_or_guard(&3, None) else {
+            panic!("a missing key hands its caller the guard");
+        };
+        let mut waiter = Box::pin(cache.get_value_or_guard_async(&3));
+        assert!(waiter.as_mut().poll(&mut context).is_pending(), "it waits");
+        drop(guard);
+        assert!(flag.take(), "abandoning the guard wakes the waiter");
+        let Poll::Ready(Err(next)) = waiter.as_mut().poll(&mut context) else {
+            panic!("the waiter takes the guard");
+        };
+        assert!(next.insert(30));
+        let mut hit = Box::pin(cache.get_value_or_guard_async(&3));
+        assert!(matches!(
+            hit.as_mut().poll(&mut context),
+            Poll::Ready(Ok(30))
+        ));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "parking_lot's futex wait fails Miri's variadic check")]
+    fn callers_wait_for_a_placeholder_guard_or_their_timeout() {
+        let cache = Arc::new(ShardedCache::<u64, u64>::new(100));
+        let GuardResult::Guard(guard) = cache.get_value_or_guard(&4, None) else {
+            panic!("a missing key hands its caller the guard");
+        };
+        let started = Instant::now();
+        assert!(matches!(
+            cache.get_value_or_guard(&4, Some(Duration::from_millis(30))),
+            GuardResult::Timeout
+        ));
+        assert!(started.elapsed() >= Duration::from_millis(30), "it waited");
+        let loader = {
+            let cache = Arc::clone(&cache);
+            thread::spawn(move || cache.get_or_insert_with(&4, || unreachable!("the guard loads")))
+        };
+        let waiter = {
+            let cache = Arc::clone(&cache);
+            thread::spawn(move || match cache.get_value_or_guard(&4, None) {
+                GuardResult::Value(value) => value,
+                _ => panic!("the guard's value"),
+            })
+        };
+        wait_for_waiters(&cache, 4, 2);
+        assert!(guard.insert(40));
+        assert_eq!(loader.join().expect("the loader completes"), 40);
+        assert_eq!(waiter.join().expect("the waiter completes"), 40);
+    }
+
+    #[test]
+    fn placeholder_guards_and_their_futures_are_send() {
+        fn assert_send<T: Send>(_: &T) {}
+        let cache = ShardedCache::<u64, String>::new(100);
+        let waiting = cache.get_value_or_guard_async(&1);
+        assert_send(&waiting);
+        let Err(guard) = block_on(waiting) else {
+            panic!("a missing key hands its caller the guard");
+        };
+        assert_send(&guard);
+        assert!(guard.insert("one".to_owned()));
     }
 
     #[test]
