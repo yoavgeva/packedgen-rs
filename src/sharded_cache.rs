@@ -3891,20 +3891,28 @@ mod tests {
         assert_eq!(cache.stats().hits + cache.stats().misses, 0);
     }
 
-    #[test]
-    fn iterating_while_writing_to_the_cache_neither_blocks_nor_tears() {
-        // Each shard is copied under its lock and visited after, so writes
-        // from the loop body never wait on the iteration.
+    /// Keys below 10,000 hold ten times the key; the iteration tests add keys
+    /// above it holding one more.
+    fn consistent(key: u64, value: u64) -> bool {
+        value == key * 10 || key >= 10_000 && value == key * 10 + 1
+    }
+
+    /// A two-shard cache of keys below 200, each holding ten times the key.
+    fn iteration_cache() -> ShardedCache<u64, u64> {
         let cache = ShardedCacheBuilder::new(1_000)
             .shards(2)
             .build::<u64, u64>();
         for key in 0..200_u64 {
             cache.insert(key, key * 10);
         }
-        // Keys below 10,000 hold ten times the key; the loop body adds keys
-        // above it, which the iteration may also reach.
-        let consistent =
-            |key: u64, value: u64| value == key * 10 || key >= 10_000 && value == key * 10 + 1;
+        cache
+    }
+
+    #[test]
+    fn iterating_while_the_loop_body_writes_neither_blocks_nor_tears() {
+        // Each shard is copied under its lock and visited after, so writes
+        // from the loop body never wait on the iteration.
+        let cache = iteration_cache();
         let guard = cache.pin();
         for (key, value) in guard.iter() {
             assert!(consistent(*key, *value), "{key} held {value}");
@@ -3917,6 +3925,12 @@ mod tests {
         for (key, value) in cache.iter() {
             cache.insert(key, value);
         }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "parking_lot's futex wait fails Miri's variadic check")]
+    fn iterating_while_another_thread_writes_yields_consistent_entries() {
+        let cache = iteration_cache();
         let writer = {
             let cache = &cache;
             move || {
