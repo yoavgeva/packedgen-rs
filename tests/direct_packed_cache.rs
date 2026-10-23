@@ -187,22 +187,27 @@ fn doorkeeper_rejects_one_off_pressure_and_admits_a_repeat() {
         );
     }
 
-    assert_eq!(
-        cache
-            .insert_if_absent_with_options(b"scan", vec![2], 1, None)
-            .unwrap(),
-        CacheAdmissionOutcome::Rejected
-    );
-    assert!(cache.peek(b"scan").is_none());
+    // The doorkeeper is approximate and admits some unseen keys on their first
+    // sighting. Offer fresh keys until its first rejection.
+    let scan = (0..16)
+        .map(|attempt| format!("scan {attempt}").into_bytes())
+        .find(|key| {
+            cache
+                .insert_if_absent_with_options(key, vec![2], 1, None)
+                .unwrap()
+                == CacheAdmissionOutcome::Rejected
+        })
+        .expect("the doorkeeper admitted 16 unseen keys");
+    assert!(cache.peek(&scan).is_none());
     assert_eq!(cache.len(), 2);
 
     assert_eq!(
         cache
-            .insert_if_absent_with_options(b"scan", vec![3], 1, None)
+            .insert_if_absent_with_options(&scan, vec![3], 1, None)
             .unwrap(),
         CacheAdmissionOutcome::Inserted
     );
-    assert!(cache.peek(b"scan").is_some());
+    assert!(cache.peek(&scan).is_some());
     assert_eq!(cache.len(), 2);
 }
 
