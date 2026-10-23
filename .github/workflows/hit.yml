@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   reads:
-    name: ${{ matrix.runner }} ${{ matrix.entries }}
+    name: ${{ matrix.runner }} ${{ matrix.entries }} ${{ matrix.repeat }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
     strategy:
@@ -17,6 +17,7 @@ jobs:
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
         entries: [50000, 1000000]
+        repeat: [1, 2]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -45,5 +46,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: reads-${{ matrix.runner }}-${{ matrix.entries }}
+          name: reads-${{ matrix.runner }}-${{ matrix.entries }}-${{ matrix.repeat }}
           path: reads.csv

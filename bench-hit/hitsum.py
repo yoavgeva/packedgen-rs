@@ -7,7 +7,7 @@ for path in sys.argv[1:]:
         if len(f) < 12:
             continue
         rows[(f[3], int(f[1]), int(f[7]), f[0])].append(float(f[11]))
-labels = [l for l in ('base', 'guard', 'thpoff', 'align64', 'quick') if any(k[3] == l for k in rows)]
+labels = [l for l in ('base', 'guard', 'parked', 'quick') if any(k[3] == l for k in rows)]
 order = ['resident-hit', 'read-miss', 'cold-fill', 'turnover', 'replace', 'delete-reinsert']
 print('| Workload | Entries | Threads | ' + ' | '.join(labels) + ' |')
 print('| --- | ---: | ---: |' + ' ---: |' * len(labels))
