@@ -137,6 +137,14 @@ entry. Tables are sized once and never rebuilt.
     joins the flight or sees the inserted value.
   - If the loader fails or panics, the flight is abandoned and one waiter
     loads again with its own loader.
+  - `get_or_insert_async` and `get_or_try_insert_async` share the flights.
+    An asynchronous waiter leaves its waker on the flight, under the lock
+    that guards the flight's state, so it cannot miss the landing; the
+    landing wakes those wakers after releasing the lock, as it notifies
+    blocking waiters. A leader's future dropped mid-load abandons the
+    flight, and a waiter's future dropped mid-wait clears its waker. The
+    futures need no particular executor and are `Send` when the cache, the
+    key, and the loader are.
 - **Expiry.** `insert_with_ttl` and the builder's `time_to_live` store a
   deadline in the entry's 31-bit expiry field, in 100 ms ticks since the
   cache was built.
@@ -146,6 +154,18 @@ entry. Tables are sized once and never rebuilt.
     access marks. When a full bucket pair forces an eviction, an expired
     entry in the pair goes first.
   - Expired entries the policy has not reached still count in `len`.
+  - With the builder's `time_to_idle`, an insert sets the deadline that far
+    ahead, and a marking read of a live entry moves it to that far after
+    the read, never earlier. The move happens in the out-of-line clock call
+    that reads of entries with deadlines already make, so `get` keeps its
+    instructions (364 before, 365 after on aarch64) and caches without
+    deadlines never reach it. It is a compare-and-swap on the metadata
+    word, once per 100 ms tick per entry at most, that keeps access marks
+    set meanwhile. `peek`, `contains_key`, and iteration do not move it.
+  - An entry holds one deadline, so a cache takes a time to live or a time
+    to idle, not both; `build` panics if given both. An entry inserted with
+    its own time to live in a cache with a time to idle expires at the
+    later of that deadline and the time to idle after its last read.
 - **Statistics.** `stats()` reports evictions and expirations, which shard
   writers count under their locks. With `record_stats()`, it also reports hits
   and misses. Those are counted on 32 cache-line-padded stripes chosen by
@@ -160,6 +180,38 @@ entry. Tables are sized once and never rebuilt.
 - **Clearing.** `clear` sweeps each shard under its lock. It retires every
   entry, resets the probation, main, and ghost state, and leaves the eviction
   and expiration counts in place.
+- **Iteration.** `iter` clones the live entries, and the guard's `iter`
+  borrows them, a shard at a time.
+  - Each shard's handles are copied under its lock and read after it is
+    released. A shard is seen as it was at one moment, each entry at most
+    once, and the loop body may write to the cache.
+  - Iterating is not reading: entries are neither marked nor counted.
+  - The cloning iterator refreshes its pin between shards, so a long
+    iteration holds back reclamation for one shard's copy at most.
+- **Retaining.** `retain` offers each live entry to a predicate outside
+  every lock, so the predicate may write to the cache.
+  - It removes a rejected entry only if it is still published, found again
+    under the shard lock by its handle. The caller's pin keeps that handle
+    from naming another entry meanwhile, so an entry replaced after it was
+    offered stays.
+  - Expired entries are removed without being offered, as `Expired`; the
+    rest as `Explicit`.
+- **Resizing.** `set_capacity` and `set_max_weight` change the limits at
+  run time.
+  - Tables are never rebuilt, so the builder's `max_capacity` reserves the
+    table, the slab region, the main queues' rings, and the shard count for
+    the largest capacity, about 8 bytes of table per reserved entry beyond
+    the limit. Without it, the reserve is the built capacity.
+  - `set_capacity` returns the limit it set: the request, raised to one
+    entry per shard or lowered to the reserve.
+  - Under a cache-wide resize lock, each shard takes its new shares under
+    its own lock and evicts down to them before the call returns, so the
+    listener hears `Size` for each. A shard whose entry share changes
+    starts its ghost and main filters afresh at the new size, keeping its
+    probation target within the new bounds.
+  - Shard limits became atomics read with relaxed loads under the shard
+    lock. `get` and `evict` compile to the same instructions; the insert
+    body to 1,229 against 1,234.
 - **Batched inserts.** `insert_many` inserts pairs in order, as single inserts
   would, and returns how many it cached. It takes one epoch pin per call
   instead of one per insert. Each chunk of 32 keys is hashed, and their home
@@ -189,13 +241,26 @@ entry. Tables are sized once and never rebuilt.
   - an 8-thread race of replacements, removals, loads, clears, and evictions
     that counts live values to prove each one is dropped exactly once;
   - eight racing callers loading a missing key once;
+  - asynchronous and blocking callers, under either kind of leader, loading
+    a missing key once; a dropped or failed asynchronous load waking its
+    waiter and handing it the key;
   - batched inserts leaving the cache as single inserts do, pinning once,
     prefetching each home bucket, letting their removed entries be
     reclaimed, and draining a reclamation backlog as single inserts do
     (verified to fail with retirements four at a time);
   - failing and panicking loads handing the key to a waiter;
   - expired entries reading as missing, and leaving before read live keys;
-  - statistics, every removal cause, `clear`, and `peek`.
+  - reads extending entries by the time to idle while peeks, membership
+    checks, and iteration do not, and an entry's own later deadline
+    surviving reads (fails without the extension);
+  - statistics, every removal cause, `clear`, and `peek`;
+  - iteration visiting each live entry once, without marking it, while the
+    loop body and another thread write;
+  - `retain` removing rejected and expired entries with their causes, and
+    sparing entries its predicate replaced;
+  - `set_capacity` evicting down at once and growing back within the
+    reserve, `set_max_weight` evicting down and refusing values heavier
+    than the new shares, and resizes racing four writing threads.
 - **Arena tests.** They cover:
   - aging of exactly three advances;
   - a pin blocking the second advance past its epoch;

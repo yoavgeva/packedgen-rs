@@ -845,6 +845,30 @@ impl<T> Slot<T> {
         true
     }
 
+    /// Moves the deadline of an entry live at tick `now` later, to
+    /// `deadline`. An entry without a deadline, with a later one, or
+    /// expired by `now` keeps its own; access marks set meanwhile stay.
+    pub(crate) fn extend_deadline(&self, deadline: u64, now: u64) {
+        let deadline = deadline.min(MAX_EXPIRY_TICK);
+        let mut current = self.metadata.load(Ordering::Relaxed);
+        loop {
+            let expiry = (current & EXPIRY_MASK) >> EXPIRY_SHIFT;
+            // The never-expiring encoding is above every deadline.
+            if expiry >= deadline || expiry <= now {
+                return;
+            }
+            match self.metadata.compare_exchange_weak(
+                current,
+                current & !EXPIRY_MASK | deadline << EXPIRY_SHIFT,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
     /// Whether the entry holds an access mark, without clearing it.
     #[cfg(test)]
     pub(crate) fn accessed(&self) -> bool {

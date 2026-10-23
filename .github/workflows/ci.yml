@@ -58,13 +58,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       # These steps build with target-cpu=native. Runners differ in CPU, and
       # restoring another CPU's artifacts can run instructions this one lacks
-      # (SIGILL), so the cache is keyed by CPU model.
-      - name: CPU model cache key
+      # (SIGILL). Runners naming the same CPU model can still expose different
+      # instruction sets, so the cache is keyed by the target features rustc
+      # enables here.
+      - name: Native target features cache key
         id: cpu
-        run: echo "model=$(grep -m1 'model name' /proc/cpuinfo | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+        run: echo "features=$(rustc --print cfg -C target-cpu=native | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
         with:
-          key: features-cpu-${{ steps.cpu.outputs.model }}
+          key: features-native-${{ steps.cpu.outputs.features }}
       - name: Root runtime tests with every feature
         env:
           RUSTFLAGS: -C target-cpu=native
@@ -79,12 +81,12 @@ jobs:
         with:
           components: clippy,rustfmt
       # Clippy below builds with target-cpu=native; see test-features.
-      - name: CPU model cache key
+      - name: Native target features cache key
         id: cpu
-        run: echo "model=$(grep -m1 'model name' /proc/cpuinfo | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+        run: echo "features=$(rustc --print cfg -C target-cpu=native | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
         with:
-          key: lint-cpu-${{ steps.cpu.outputs.model }}
+          key: lint-native-${{ steps.cpu.outputs.features }}
       - name: Formatting
         run: cargo fmt --all -- --check
       - name: Clippy
