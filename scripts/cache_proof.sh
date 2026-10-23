@@ -89,53 +89,54 @@ soak() {
     concurrent_reclamation_and_rebuild_soak -- --ignored --nocapture
 }
 
+# Runs one test under Miri by its exact name. A name that matches no test,
+# as after a rename, fails rather than passing with no test run.
+miri_exact() {
+  local flags="$1"
+  shift
+  local log
+  log="$(mktemp)"
+  MIRIFLAGS="$flags" cargo +nightly miri test "$@" -- --exact 2>&1 | tee "$log"
+  if ! grep -Eq 'test result: .*[^0-9]1 passed;' "$log"; then
+    printf 'no test ran under Miri for: %s\n' "$*" >&2
+    rm "$log"
+    return 1
+  fi
+  rm "$log"
+}
+
 miri_focused() {
+  local flags="${MIRIFLAGS:--Zmiri-permissive-provenance}"
   cargo +nightly miri setup
-  MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
-    cargo +nightly miri test --lib \
-    cache_arena::tests::stale_handle_cannot_read_reused_slot -- --exact
-  MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
-    cargo +nightly miri test --lib \
-    cache_arena::tests::partial_direct_reservation_releases_only_unused_slots -- --exact
-  MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
-    cargo +nightly miri test --lib \
-    cache_arena::tests::retired_value_drop_can_activate_first_mutation_on_the_same_arena -- --exact
-  MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
-    cargo +nightly miri test --lib \
-    generation_map::tests::mutable_only_guarded_insert_automatically_uses_route_hash_and_preserves_length -- --exact
-  MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
-    cargo +nightly miri test --lib \
-    cache::tests::direct_cloned_read_releases_reclamation_without_borrowing_the_cache -- --exact
-  MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
-    cargo +nightly miri test --lib \
-    cache::tests::direct_cloned_guard_keeps_no_arena_epoch_between_reads -- --exact
-  MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
-    cargo +nightly miri test --lib \
-    cache::tests::direct_shareable_guard_automatically_bounds_its_reader_epoch -- --exact
+  miri_exact "$flags" --lib cache_arena::tests::stale_handle_cannot_read_reused_slot
+  miri_exact "$flags" --lib \
+    cache_arena::tests::partial_direct_reservation_releases_only_unused_slots
+  miri_exact "$flags" --lib \
+    cache_arena::tests::retired_value_drop_can_activate_first_mutation_on_the_same_arena
+  miri_exact "$flags" --lib \
+    generation_map::tests::mutable_only_guarded_insert_automatically_uses_route_hash_and_preserves_length
+  miri_exact "$flags" --lib \
+    cache::tests::direct_cloned_read_releases_reclamation_without_borrowing_the_cache
+  miri_exact "$flags" --lib \
+    cache::tests::direct_cloned_guard_keeps_no_arena_epoch_between_reads
+  miri_exact "$flags" --lib \
+    cache::tests::direct_shareable_guard_automatically_bounds_its_reader_epoch
   # PtrHash's global Rayon pool retains worker threads through process exit and
   # currently trips Stacked Borrows inside Crossbeam. Tree Borrows validates
   # PackedGen's deferred-drop path; leak-ignore applies only to that global pool.
-  MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance} -Zmiri-tree-borrows -Zmiri-ignore-leaks" \
-    cargo +nightly miri test --lib \
-    generation_map::tests::deferred_generation_drop_waits_for_read_cache_and_explicit_reclaim -- --exact
-  MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
-    cargo +nightly miri test --test direct_packed_cache \
-    protected_value_survives_replacement_and_cache_drop -- --exact
-  MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
-    cargo +nightly miri test --test direct_packed_cache \
-    miri_conditional_block_and_boxed_reclaimers_coexist -- --exact
-  MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
-    cargo +nightly miri test --test direct_packed_cache \
-    miri_concurrent_replacement_and_reclamation_smoke -- --exact
-  MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
-    cargo +nightly miri test --test direct_packed_cache \
-    guarded_admission_batches_keep_public_accounting_and_rebuild_exact -- --exact
-  MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
-    cargo +nightly miri test --features prepared-keys --test direct_packed_cache \
-    prepared_replacement_pipeline_recycles_and_drops_values_exactly_once -- --exact
-  MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
-    cargo +nightly miri test --test direct_packed_cache \
-    unbounded_admission_batch_publishes_length_immediately -- --exact
+  miri_exact "$flags -Zmiri-tree-borrows -Zmiri-ignore-leaks" --lib \
+    generation_map::tests::deferred_generation_drop_waits_for_read_cache_and_explicit_reclaim
+  miri_exact "$flags" --test direct_packed_cache protected_value_survives_replacement
+  miri_exact "$flags" --test direct_packed_cache \
+    miri_conditional_block_and_boxed_reclaimers_coexist
+  miri_exact "$flags" --test direct_packed_cache \
+    miri_concurrent_replacement_and_reclamation_smoke
+  miri_exact "$flags" --test direct_packed_cache \
+    guarded_admission_batches_keep_public_accounting_and_rebuild_exact
+  miri_exact "$flags" --features prepared-keys --test direct_packed_cache \
+    prepared_replacement_pipeline_recycles_and_drops_values_exactly_once
+  miri_exact "$flags" --test direct_packed_cache \
+    unbounded_admission_batch_publishes_length_immediately
 }
 
 # ShardedCache and its arena. With PACKEDGEN_MIRI_PARTITION set to a
