@@ -2653,19 +2653,9 @@ impl<V> DirectArenaOwner<V> {
 )]
 impl<V> Drop for DirectArenaOwner<V> {
     fn drop(&mut self) {
-        debug_assert!(
-            self.mutators
-                .iter()
-                .all(|slot| !slot.0.load(Ordering::Relaxed))
-                && self.mutator_overflow.load(Ordering::Relaxed) == 0,
-            "direct arena owner outlives every mutator"
-        );
-        debug_assert!(
-            self.readers
-                .iter()
-                .all(|counter| counter.0.load(Ordering::Relaxed) == 0),
-            "direct arena owner outlives every reader"
-        );
+        // Readers and mutators may still be counted here: a pin forgotten
+        // with `mem::forget` never leaves. Its borrow has ended, so nothing
+        // reads through it, and every retired entry can be reclaimed.
         for epoch in 0..DIRECT_EPOCHS {
             self.drain_retired_epoch(epoch);
         }

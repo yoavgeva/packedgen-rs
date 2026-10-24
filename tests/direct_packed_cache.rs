@@ -176,6 +176,19 @@ fn a_forgotten_admission_batch_drops_only_the_values_it_admitted() {
 }
 
 #[test]
+fn a_forgotten_read_guard_leaves_the_cache_droppable() {
+    let cache = cache(u64::MAX, 8);
+    cache
+        .insert_discard_with_options(b"one", vec![1], 1, None)
+        .unwrap();
+    let guard = cache.pin();
+    assert!(guard.get_untracked(b"one").is_some());
+    // Its reader epoch stays entered, but nothing can read through it.
+    std::mem::forget(guard);
+    drop(cache);
+}
+
+#[test]
 fn admission_batch_preserves_conditional_insert_semantics() {
     let cache = cache(u64::MAX, 8);
     let mut guard = cache.pin();
