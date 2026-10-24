@@ -2047,16 +2047,19 @@ mod pop_tests {
                     map.insert(k, k);
                     expected.insert(k, k);
                 }
+                // Each pop-then-insert round costs the elastic map about 100 µs
+                // unoptimized, so Miri runs 300 rounds rather than 900.
+                let last_key = if cfg!(miri) { 400 } else { 1000 };
                 let mut next_key = 100;
                 while let Some((k, v)) = map.pop_first() {
                     assert_eq!(expected.remove(&k), Some(v));
-                    if next_key < 1000 {
+                    if next_key < last_key {
                         map.insert(next_key, next_key);
                         expected.insert(next_key, next_key);
                         next_key += 1;
                     }
                 }
-                assert_eq!(next_key, 1000);
+                assert_eq!(next_key, last_key);
                 assert!(expected.is_empty());
             }
         };
