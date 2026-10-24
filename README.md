@@ -49,7 +49,11 @@ from 15% behind to 31% ahead, and hits ran 7 to 9 times quick_cache's. With
 ahead on writes by 12 to 47%, and 50% behind on misses, whose tag words
 share cache lines with the handles; eight threads led on every workload, by
 4 to 109%. On a 4-vCPU x86_64 runner, four threads led on reads and turnover
-at 50,000 entries, and one thread trailed by 21 to 36% on writes. In
+at 50,000 entries, and one thread trailed by 21 to 36% on writes. There,
+updates of a full cache trailed by 20% on one thread and 15% on four at
+50,000 entries and were level at 1,000,000, and reads through the loader
+trailed by 10% on one thread and led by 17% on four, and by 18 and 52% at
+1,000,000. In
 process memory, before four-byte handles, 1,000,000 entries took 46 to 136
 bytes each, against 83 to 332 for quick_cache. Timing every operation at
 1,000,000 entries, its tail from p99.9 on was the shorter one in every cell:

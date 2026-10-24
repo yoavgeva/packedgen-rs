@@ -1094,6 +1094,10 @@ count, so they never wrote to a full cache. On macOS, five paired runs of
 | 50,000 | +11% (+5 to +19%) | +10% (−9 to +15%) |
 | 1,000,000 | +56% (+49 to +58%) | +58% (+50 to +89%) |
 
+On GitHub's 4-vCPU x86_64 runner (the bench workflow, three pairs), the
+same workload read −20% on one thread and −15% on four at 50,000 entries,
+and +3% and +2% at 1,000,000.
+
 ### Reading through the loader
 
 The probe's `read-through` workload issues turnover's reads, each through
@@ -1104,6 +1108,9 @@ paired runs of 4,000,000 operations against quick_cache:
 | ---: | ---: | ---: |
 | 50,000 | −3% (−6 to +2%) | +32% (+19 to +69%) |
 | 1,000,000 | +13% (+0 to +29%) | +61% (+51 to +67%) |
+
+On the x86_64 runner: −10% on one thread and +17% on four at 50,000
+entries, and +18% and +52% at 1,000,000.
 
 Against the commit before writes superseded loads, seven paired runs at
 50,000 entries moved by −1% on one thread and −2% at eight, within noise:
