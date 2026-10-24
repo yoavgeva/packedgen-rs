@@ -143,9 +143,12 @@ pub enum RemovalCause {
     /// Its time to live ran out. Expired entries leave when eviction, a
     /// replacement, or a removal reaches them.
     Expired,
-    /// Replaced by a later insert for the same key.
+    /// Replaced by a later insert for the same key, including one whose
+    /// value is too heavy to cache, which leaves the key absent.
     Replaced,
-    /// Removed by [`ShardedCache::remove`] or [`ShardedCache::clear`].
+    /// Removed by [`ShardedCache::remove`], [`ShardedCache::remove_if`],
+    /// [`ShardedCache::retain`], [`ShardedCache::drain`], or
+    /// [`ShardedCache::clear`].
     Explicit,
 }
 
@@ -360,7 +363,10 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
     }
 
     /// Counts hits and misses for [`ShardedCache::stats`]. Each counted read
-    /// adds an uncontended atomic increment.
+    /// adds an uncontended atomic increment. [`ShardedCache::get`],
+    /// [`ShardedCacheGuard::get`], and each call of the `get_or_insert` and
+    /// `get_value_or_guard` families count one read; [`ShardedCache::peek`],
+    /// [`ShardedCache::contains_key`], and iteration do not.
     #[must_use]
     pub fn record_stats(mut self) -> Self {
         self.record_stats = true;
@@ -1979,7 +1985,7 @@ where
             .ok()
             .filter(|weight| *weight <= MAX_WEIGHT && u64::from(*weight) <= shard.limits.weight())
         else {
-            self.remove(&key);
+            self.remove_as(&key, RemovalCause::Replaced);
             return false;
         };
         let expires_at = ttl.map_or(NEVER_EXPIRES, |ttl| self.deadline(ttl));
@@ -2120,11 +2126,26 @@ where
 
     /// Removes `key`, returning whether it held a live value. An expired
     /// entry is removed too, but reported absent.
+    pub fn remove<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.remove_as(key, RemovalCause::Explicit)
+    }
+
+    /// Removes `key` as [`Self::remove`] does, telling the listener `cause`
+    /// for a live value.
+    #[allow(
+        clippy::inline_always,
+        reason = "`remove`'s body, which should compile as it did before the cause became a parameter"
+    )]
     #[allow(
         unsafe_code,
         reason = "dereferences handles unpublished under the shard lock"
     )]
-    pub fn remove<Q>(&self, key: &Q) -> bool
+    #[inline(always)]
+    fn remove_as<Q>(&self, key: &Q, cause: RemovalCause) -> bool
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -2147,7 +2168,7 @@ where
                 writer.left(removed_entry.weight());
                 live = !self.expired(removed_entry, &mut None);
                 let cause = if live {
-                    RemovalCause::Explicit
+                    cause
                 } else {
                     writer.count_expiration();
                     RemovalCause::Expired
@@ -2230,7 +2251,7 @@ where
             .ok()
             .filter(|weight| *weight <= MAX_WEIGHT && u64::from(*weight) <= shard.limits.weight())
         else {
-            self.remove(&key);
+            self.remove_as(&key, RemovalCause::Replaced);
             return Err((key, value));
         };
         let expires_at = self
@@ -5321,6 +5342,30 @@ mod tests {
             })
             .build::<u64, u64>();
         (cache, heard)
+    }
+
+    #[test]
+    fn a_write_too_heavy_to_cache_reports_the_value_it_displaced_as_replaced() {
+        let heard: Heard = Arc::new(Mutex::new(Vec::new()));
+        let cache = ShardedCacheBuilder::new(16)
+            .max_weight(16)
+            .shards(1)
+            .weighter(|_: &u64, value: &u64| *value)
+            .removal_listener({
+                let heard = Arc::clone(&heard);
+                move |key: &u64, _: &u64, cause| heard.lock().push((*key, cause))
+            })
+            .build::<u64, u64>();
+        cache.insert(1, 1);
+        cache.insert(2, 2);
+        // Each new value outweighs the whole cache.
+        assert!(!cache.insert(1, 100));
+        assert_eq!(cache.replace(2, 100), Err((2, 100)));
+        assert_eq!(
+            *heard.lock(),
+            [(1, RemovalCause::Replaced), (2, RemovalCause::Replaced)]
+        );
+        assert!(cache.is_empty());
     }
 
     #[test]
