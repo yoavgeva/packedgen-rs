@@ -174,6 +174,10 @@ sanitizers() {
     concurrent_prepared_replacement_batches_recycle_without_lost_values -- --exact
   RUSTFLAGS="-Zsanitizer=address" RUSTDOCFLAGS="-Zsanitizer=address" \
     cargo +nightly test --target "$target" --lib -- sharded_cache::tests sharded_arena::tests
+  RUSTFLAGS="-Zsanitizer=address" RUSTDOCFLAGS="-Zsanitizer=address" \
+    cargo +nightly test --target "$target" --test sharded_cache_every_operation
+  RUSTFLAGS="-Zsanitizer=thread" RUSTDOCFLAGS="-Zsanitizer=thread" \
+    cargo +nightly test -Zbuild-std --target "$target" --test sharded_cache_every_operation
   RUSTFLAGS="-Zsanitizer=thread" RUSTDOCFLAGS="-Zsanitizer=thread" \
     cargo +nightly test -Zbuild-std --target "$target" --lib -- \
     sharded_cache::tests::racing sharded_cache::tests::concurrent \
