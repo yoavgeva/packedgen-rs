@@ -364,6 +364,19 @@ entry. Tables are sized once and never rebuilt.
   finds a reclamation beneath the reader in each (see "Parked pin
   announcements"). These models take minutes unoptimized, so they run with
   `--release`, as CI's model step does.
+- **Every operation at once.** `tests/sharded_cache_every_operation.rs`
+  runs every public operation from eight threads together: writes with
+  and without times to live, batches, replacements, removals, the three
+  loaders, placeholder guards, pinned and cloned reads, iteration,
+  `retain`, partial drains, clears, and resizes. Each value names its key,
+  and every read and the listener check it; afterwards the bounds hold,
+  the live values are the resident ones, and a clear leaves none. It
+  passed 20 seeds of 30 seconds in release, about 140 million operations
+  each, and runs under both sanitizers. A unit test arms keys' `Hash` and
+  `Eq`, the weigher, and values' `Clone` to panic now and then, some under
+  the shard lock, and finds the cache usable, within its limits, and right
+  about every key afterwards; another round-trips zero-sized and
+  128-byte-aligned entries.
 - **CI tools.** `scripts/cache_proof.sh` runs the module under Miri, ASan, and
   TSan. CI runs the tests on x86_64 Linux, Apple Silicon macOS, and x86_64
   Windows; on macOS and Windows, which lack `membarrier` and `madvise`, they
