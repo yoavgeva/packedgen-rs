@@ -47,8 +47,33 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: test
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.148
+          fallback: none
+      # The test jobs run tests and examples under nextest, every binary at
+      # once, and benches under cargo test; test-windows says why. The
+      # workspace's benches take about two minutes here, so they run in
+      # test-benches, with the doctests, which nextest doesn't run.
       - name: Tests
-        run: cargo test --workspace --all-targets
+        run: cargo nextest run --no-fail-fast --workspace --lib --bins --tests --examples
+
+  test-benches:
+    name: Stable benches in test mode and doctests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-benches
+      - name: Benches in test mode
+        run: cargo test --workspace --benches
+      # Their compile_fail examples are the only checks that PackedCache is
+      # Send and Sync only for values that are, and that a value read from
+      # a cache can't outlive it.
+      - name: Doctests
+        run: cargo test --workspace --doc
 
   test-features:
     name: Stable tests with every feature
@@ -67,10 +92,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: features-native-${{ steps.cpu.outputs.features }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.148
+          fallback: none
       - name: Root runtime tests with every feature
         env:
           RUSTFLAGS: -C target-cpu=native
-        run: cargo test -p packedgen --all-targets --all-features
+        run: cargo nextest run --no-fail-fast -p packedgen --lib --bins --tests --examples --all-features
+      - name: Root benches in test mode with every feature
+        env:
+          RUSTFLAGS: -C target-cpu=native
+        run: cargo test -p packedgen --benches --all-features
 
   lint:
     name: Lints, audit, and packaging
@@ -126,8 +159,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: macos-${{ matrix.key }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.148
+          fallback: none
       - name: PackedGen tests
-        run: cargo test --locked -p packedgen --all-targets --features "${{ matrix.features }}"
+        run: cargo nextest run --locked --no-fail-fast -p packedgen --lib --bins --tests --examples --features "${{ matrix.features }}"
+      - name: PackedGen benches in test mode
+        run: cargo test --locked -p packedgen --benches --features "${{ matrix.features }}"
 
   test-windows:
     name: Stable tests on Windows (${{ matrix.name }})

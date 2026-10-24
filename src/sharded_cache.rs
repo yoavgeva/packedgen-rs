@@ -2490,9 +2490,15 @@ where
             .reclaim_all(self.epochs.generation(), &self.slots);
     }
 
+    /// A multiply spreads every hash bit into the top bits that pick the
+    /// shard. Under some seeds the fast hasher's hashes of consecutive
+    /// integer keys share their top bits, which then took them all to one
+    /// shard. The constant differs from `home`'s, so a shard's keys still
+    /// spread over its buckets.
     fn shard_index(&self, hash: u64) -> usize {
+        let spread = hash.wrapping_mul(0xd6e8_feb8_6659_fd93);
         // `checked_shr` keeps the single-shard shift of 64 in range.
-        let shard = hash.checked_shr(self.shard_shift).unwrap_or(0);
+        let shard = spread.checked_shr(self.shard_shift).unwrap_or(0);
         usize::try_from(shard).expect("a shard index fits usize")
     }
 
@@ -4098,6 +4104,27 @@ mod tests {
         fn build_hasher(&self) -> IdentityHasher {
             IdentityHasher(0)
         }
+    }
+
+    #[test]
+    fn keys_whose_hashes_share_their_top_bits_spread_over_the_shards() {
+        // For about one process seed in a hundred, the fast hasher's hashes
+        // of consecutive integer keys differ only below their top bits, as
+        // identity hashes do. Shards picked by the top bits then took every
+        // key into one or two shards, which kept a quarter or half of the
+        // capacity.
+        let cache = ShardedCacheBuilder::new(1_000)
+            .shards(4)
+            .hasher(Identity)
+            .build::<u64, u64>();
+        for key in 0..1_000_u64 {
+            cache.insert(key, key);
+        }
+        assert!(cache.len() >= 900, "{} of 1,000 keys kept", cache.len());
+        let hits = (0..1_000_u64)
+            .filter(|key| cache.get(key) == Some(*key))
+            .count();
+        assert_eq!(hits, cache.len());
     }
 
     #[test]
