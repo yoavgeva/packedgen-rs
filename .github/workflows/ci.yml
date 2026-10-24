@@ -54,12 +54,12 @@ jobs:
       # The test jobs run tests and examples under nextest, every binary at
       # once, and benches under cargo test; test-windows says why. The
       # workspace's benches take about two minutes here, so they run in
-      # test-benches.
+      # test-benches, with the doctests, which nextest doesn't run.
       - name: Tests
         run: cargo nextest run --no-fail-fast --workspace --lib --bins --tests --examples
 
   test-benches:
-    name: Stable benches in test mode
+    name: Stable benches in test mode and doctests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -69,6 +69,11 @@ jobs:
           key: test-benches
       - name: Benches in test mode
         run: cargo test --workspace --benches
+      # Their compile_fail examples are the only checks that PackedCache is
+      # Send and Sync only for values that are, and that a value read from
+      # a cache can't outlive it.
+      - name: Doctests
+        run: cargo test --workspace --doc
 
   test-features:
     name: Stable tests with every feature
