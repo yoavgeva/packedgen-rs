@@ -1072,6 +1072,27 @@ the rest was spread over the policy, the table, and the insert itself.
 Those instructions are cheap, as the bound above shows: freeing at once
 gained 3 to 10%.
 
+### With `u64` keys and values
+
+The probe's 32-byte keys and `Arc` payloads cost both caches hashing and
+reference counts. With `u64` keys and values those costs fall away, and
+ShardedCache's fixed work per operation shows: the epoch pin, and on writes
+the new entry and the retirement of the old one, where quick_cache
+overwrites in place under its shard lock. A scratch benchmark, at 50,000
+entries, ran `get` hits on resident keys with room to spare, and upserts of
+the seeded keys into an exactly full cache; each figure is the range over
+three runs of the best of seven:
+
+| Workload | macOS 1T | macOS 8T | Linux 1T | Linux 8T |
+| --- | ---: | ---: | ---: | ---: |
+| Resident hit | −7 to −13% | +806 to +830% | −2 to +3% | +694 to +715% |
+| Upsert into a full cache | −56 to −60% | −1 to +6% | −53 to −54% | −15 to +31% |
+
+On one thread, upserts ran at 23 to 26 Mops/s against quick_cache's 50 to
+61. On macOS a pin is two read-modify-writes on shared counters, where
+Linux reuses a parked announcement (see "Parked pin announcements"), which
+leaves single-thread hits behind there and level on Linux.
+
 ### Batched inserts
 
 `bounded_cache_probe`'s `sharded-batch` backend writes through
