@@ -307,6 +307,15 @@ entry. Tables are sized once and never rebuilt.
   - a placeholder guard inserting while another caller times out, a
     dropped guard waking its asynchronous waiter and handing it a guard,
     and a loader and a guard caller both waiting for a guard's insert;
+  - writes superseding loads: an insert, removal, `insert_many`, clear,
+    or drain while a key loads keeps the load from caching over it, and
+    callers after the write load afresh; a writer that updates a source
+    and invalidates the key, racing loaders on every loading path, never
+    leaves an older version cached (the old code failed it in 4 runs of
+    5); superseded loads giving back their slots and dropping their
+    values (verified to fail without either); a load taking the shard
+    lock twice; and asynchronous waiters that give up during a long load
+    reusing their waker slots (1,000 slots before, three after);
   - `drain` yielding live entries once and reporting expired ones, and a
     dropped drain retiring the shard it emptied (verified to fail without
     the retirement on drop); `memory_used` counting the table, slots
