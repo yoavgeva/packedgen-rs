@@ -3986,6 +3986,15 @@ mod tests {
     }
 
     #[test]
+    fn an_arena_drops_cleanly_after_its_pins_are_forgotten() {
+        let arena = DirectValueArena::<u64>::new(1);
+        // Each stays counted: nothing ever leaves the epochs they entered.
+        std::mem::forget(arena.pin());
+        std::mem::forget(arena.mutation_pin());
+        drop(arena);
+    }
+
+    #[test]
     #[allow(
         unsafe_code,
         reason = "the test directly exercises quiescent batch reclamation"
