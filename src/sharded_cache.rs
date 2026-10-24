@@ -3756,11 +3756,20 @@ impl<K, V> Removed<(K, V)> {
         reason = "reads entries this operation unpublished while `pin` was held"
     )]
     fn notify(&self, listener: &impl RemovalListener<K, V>, pin: &EpochPin<'_>) {
-        for (handle, cause) in self.iter() {
+        // A loop per slice: with a listener that does nothing, the compiler
+        // proves each finite and drops it, as it did not one loop over the
+        // chain of both.
+        let tell = |&(handle, cause): &(Handle<(K, V)>, RemovalCause)| {
             // SAFETY: unpublished while `pin` was held, and `pin` still
             // blocks the reclamation of every entry retired since.
             let (key, value) = unsafe { entry(pin, handle) }.value();
             listener.on_removal(key, value, cause);
+        };
+        for removed in self.first[..self.len].iter().flatten() {
+            tell(removed);
+        }
+        for removed in &self.more {
+            tell(removed);
         }
     }
 }
