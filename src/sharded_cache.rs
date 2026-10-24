@@ -6063,6 +6063,99 @@ mod tests {
     }
 
     #[test]
+    fn panics_in_hash_eq_weigher_and_clone_leave_the_cache_whole() {
+        // Each kind of user code panics now and then, some of it under the
+        // shard lock: the cache may leak what the panicking operation held,
+        // but stays usable, within its limits, and right about every key.
+        thread_local! {
+            static ARMED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        }
+        fn tripped(kind: u64) -> bool {
+            ARMED.with(|armed| armed.get() == kind && armed.replace(0) == kind)
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        struct Key(u64);
+        impl Hash for Key {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                assert!(!tripped(1), "a panicking hash");
+                self.0.hash(state);
+            }
+        }
+        impl PartialEq for Key {
+            fn eq(&self, other: &Self) -> bool {
+                assert!(!tripped(2), "a panicking comparison");
+                self.0 == other.0
+            }
+        }
+        impl Eq for Key {}
+
+        struct Value(u64);
+        impl Clone for Value {
+            fn clone(&self) -> Self {
+                assert!(!tripped(3), "a panicking clone");
+                Self(self.0)
+            }
+        }
+
+        let cache = ShardedCacheBuilder::new(64)
+            .shards(2)
+            .weighter(|_key: &Key, value: &Value| {
+                assert!(!tripped(4), "a panicking weigher");
+                1 + value.0 % 2
+            })
+            .max_weight(100)
+            .build::<Key, Value>();
+        let rounds = if cfg!(miri) { 300 } else { 20_000 };
+        let mut random = 0x1234_5678_u64;
+        for round in 0..rounds {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            let key = Key(random % 200);
+            if round % 7 == 0 {
+                ARMED.with(|armed| armed.set(1 + (random >> 20) % 4));
+            }
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match random % 9 {
+                0..=3 => {
+                    cache.insert(key, Value(round));
+                }
+                4 => {
+                    cache
+                        .insert_many((0..3).map(|step| (Key((random + step) % 200), Value(round))));
+                }
+                5 => {
+                    cache.remove(&key);
+                }
+                6 => {
+                    let _ = cache.get(&key);
+                }
+                7 => {
+                    let _ = cache.get_or_insert_with(&key, || Value(round));
+                }
+                _ => {
+                    let _ = cache.replace(key, Value(round));
+                }
+            }));
+            ARMED.with(|armed| armed.set(0));
+        }
+        for key in 0..200 {
+            cache.insert(Key(key), Value(key));
+        }
+        assert!(cache.len() <= 64 && cache.weight() <= 100);
+        let mut found = 0;
+        for key in 0..200 {
+            if let Some(value) = cache.get(&Key(key)) {
+                assert_eq!(value.0, key);
+                found += 1;
+            }
+        }
+        assert_eq!(found, cache.len());
+        cache.clear();
+        assert!(cache.is_empty());
+    }
+
+    #[test]
     fn a_panicking_listener_still_drops_removed_values() {
         struct Counted(Arc<AtomicUsize>);
         impl Clone for Counted {
