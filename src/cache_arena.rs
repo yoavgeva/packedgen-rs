@@ -1102,6 +1102,11 @@ impl<V> Drop for DirectArenaMutationPin<'_, V> {
     }
 }
 
+/// Slots of entries. Dropping a block drops no value: an occupied slot may
+/// be claimed by a reservation that was forgotten before filling it, so
+/// values are dropped only by their owners. The cache's drop retires every
+/// indexed entry, the owner's drop reclaims every retired one, and guards
+/// drop unpublished ones; an entry leaked past all of them stays leaked.
 struct DirectArenaBlock<V> {
     state: UnsafeCell<DirectArenaBlockState>,
     entries: [UnsafeCell<MaybeUninit<DirectArenaEntry<V>>>; DIRECT_BLOCK_SIZE],
@@ -1254,23 +1259,6 @@ impl<V> DirectArenaBlock<V> {
         state.occupied[word] &= !mask;
         state.live -= 1;
         (was_full, state.live == 0)
-    }
-}
-
-#[allow(unsafe_code, reason = "drops exactly the slots still marked occupied")]
-impl<V> Drop for DirectArenaBlock<V> {
-    fn drop(&mut self) {
-        let occupied_words = self.state.get_mut().occupied;
-        for (word_index, mut occupied) in occupied_words.into_iter().enumerate() {
-            while occupied != 0 {
-                let bit = occupied.trailing_zeros() as usize;
-                occupied &= occupied - 1;
-                // SAFETY: occupied tracks every initialized live entry.
-                unsafe {
-                    ptr::drop_in_place(self.entry(word_index * u64::BITS as usize + bit));
-                }
-            }
-        }
     }
 }
 
@@ -4035,12 +4023,29 @@ mod tests {
             .map(|handle| handle.pointer::<PanicOnFirstDrop<'_>>())
             .collect::<Vec<_>>();
 
+        let requeued = DirectRetiredQueue(Mutex::new(Vec::new()));
+        let requeued_count = AtomicUsize::new(0);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // SAFETY: every pointer is a distinct initialized unpublished slot
             // from this exact arena, with no concurrent reader or owner.
-            unsafe { arena.owner.state.reclaim_entries(&pointers, None) };
+            unsafe {
+                arena
+                    .owner
+                    .state
+                    .reclaim_entries(&pointers, Some((&requeued, &requeued_count)));
+            }
         }));
         assert!(result.is_err());
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        // The two entries the panic left are queued again, not released.
+        assert_eq!(requeued_count.load(Ordering::Relaxed), 2);
+        let rest = collect_direct_arena_pointers::<PanicOnFirstDrop<'_>>(std::mem::take(
+            &mut *requeued.0.lock(),
+        ));
+        assert_eq!(rest, pointers[1..]);
+        // SAFETY: the requeued pointers are distinct initialized slots of this
+        // arena that nothing else reaches.
+        unsafe { arena.owner.state.reclaim_entries(&rest, None) };
         drop(arena);
         assert_eq!(drops.load(Ordering::Relaxed), 3);
     }
