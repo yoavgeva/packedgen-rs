@@ -69,7 +69,8 @@ It offers:
   `get_or_try_insert_async`, which wait for that load without blocking, on
   any executor; `get_value_or_guard`, with a timeout, and
   `get_value_or_guard_async` hand the caller a guard to insert through
-  instead;
+  instead; a write to a key while it loads supersedes the load, so a value
+  read from its source before an invalidation is never cached after it;
 - per-entry and default times to live, or a time to idle that reads extend;
 - hit, miss, eviction, and expiration counts;
 - a removal listener told why each entry left;

@@ -26,7 +26,7 @@ use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -651,7 +651,9 @@ impl<T> Deref for ShardView<'_, T> {
     }
 }
 
-/// One shard's loads in progress.
+/// One shard's loads in progress. Listed and unlisted only under the shard
+/// lock, which every write to the shard holds while it supersedes the loads
+/// of its key.
 #[repr(align(128))]
 struct FlightLane<K, V>(Mutex<Vec<Arc<Flight<K, V>>>>);
 
@@ -662,6 +664,10 @@ struct Flight<K, V> {
     progress: Mutex<FlightProgress<V>>,
     /// Blocking waiters wait on it; asynchronous ones leave their wakers.
     landed: Condvar,
+    /// Set under the shard lock by a write to the key while it loads, which
+    /// also unlists the flight: the load may have read its source before
+    /// the write, so its value goes to its callers but is not cached.
+    superseded: AtomicBool,
 }
 
 /// A flight's outcome so far, and the wakers of its asynchronous waiters.
@@ -692,6 +698,7 @@ impl<K, V: Clone> Flight<K, V> {
                 wakers: Vec::new(),
             }),
             landed: Condvar::new(),
+            superseded: AtomicBool::new(false),
         }
     }
 
@@ -751,7 +758,9 @@ pub enum GuardResult<'cache, K, V, W = UnitWeighter, S = DefaultHashBuilder, L =
 /// Other callers that miss the key, through `get_value_or_guard` or the
 /// `get_or_insert` methods, wait until the guard inserts or is dropped. A
 /// guard dropped without inserting abandons the load, and one waiter takes
-/// it over.
+/// it over. A write to the key meanwhile supersedes the guard: its insert
+/// then caches nothing, and callers that miss the key after the write load
+/// it again.
 pub struct PlaceholderGuard<'cache, K, V, W = UnitWeighter, S = DefaultHashBuilder, L = NoListener>
 {
     cache: &'cache ShardedCache<K, V, W, S, L>,
@@ -773,7 +782,10 @@ where
     }
 
     /// Inserts `value` for the key, as [`ShardedCache::insert`] would, and
-    /// hands it to the callers waiting. Returns whether it was cached.
+    /// hands it to the callers waiting. Returns whether it was cached: not
+    /// if a write to the key since the guard was handed out (an insert, a
+    /// removal, a clear, or a drain) superseded the load, as for
+    /// [`ShardedCache::get_or_try_insert_with`].
     ///
     /// # Panics
     ///
@@ -787,7 +799,7 @@ where
             mut landing,
             key,
         } = self;
-        let cached = cache.insert(key, value.clone());
+        let cached = cache.insert_loaded(&landing.flight, key, value.clone());
         landing.loaded = Some(value);
         cached
     }
@@ -838,6 +850,23 @@ impl<K, V> Drop for FlightWait<'_, K, V> {
     }
 }
 
+/// Where an inserted value comes from.
+enum Origin<'flight, K, V> {
+    /// A caller's write, expiring after this time to live if any.
+    Write(Option<Duration>),
+    /// A load's value, with the builder's time to live, cached unless a
+    /// write superseded the load.
+    Load(&'flight Flight<K, V>),
+}
+
+impl<K, V> Clone for Origin<'_, K, V> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<K, V> Copy for Origin<'_, K, V> {}
+
 /// What a caller that missed a key does next.
 enum Missed<K, V> {
     /// A load landed after the miss and inserted this value.
@@ -851,6 +880,7 @@ enum Missed<K, V> {
 /// Unlists a leader's flight when dropped and hands `loaded` to its waiters,
 /// or abandons the load if there is none, as when the loader fails or panics.
 struct FlightLanding<'lane, K, V> {
+    shard: &'lane Shard<(K, V)>,
     lane: &'lane FlightLane<K, V>,
     flight: Arc<Flight<K, V>>,
     loaded: Option<V>,
@@ -859,12 +889,16 @@ struct FlightLanding<'lane, K, V> {
 impl<K, V> Drop for FlightLanding<'_, K, V> {
     fn drop(&mut self) {
         {
+            // A write that superseded the flight, or the insert of its
+            // value, has unlisted it already.
+            let mut writer = self.shard.lock();
             let mut flights = self.lane.0.lock();
             if let Some(index) = flights
                 .iter()
                 .position(|flight| Arc::ptr_eq(flight, &self.flight))
             {
                 flights.swap_remove(index);
+                writer.unlisted();
             }
         }
         // Waiters join under the lane lock, so once the flight is unlisted
@@ -1027,6 +1061,11 @@ struct ShardLimits {
     weight: AtomicU64,
     /// The largest probation target the shard adapts to.
     probation_max: AtomicUsize,
+    /// The loads listed in the shard's flight lane. Every write reads it
+    /// under the shard lock, to supersede its key's load if one is listed,
+    /// so it sits on this line, which inserts read anyway and which
+    /// changes only as a resize or a load starts or ends.
+    loads: AtomicUsize,
 }
 
 impl ShardLimits {
@@ -1035,6 +1074,7 @@ impl ShardLimits {
             capacity: AtomicUsize::new(0),
             weight: AtomicU64::new(weight),
             probation_max: AtomicUsize::new(0),
+            loads: AtomicUsize::new(0),
         };
         limits.set_capacity(capacity);
         limits
@@ -1053,6 +1093,17 @@ impl ShardLimits {
     #[inline]
     fn probation_max(&self) -> usize {
         self.probation_max.load(Ordering::Relaxed)
+    }
+
+    /// Requires the shard lock.
+    #[inline]
+    fn loads(&self) -> usize {
+        self.loads.load(Ordering::Relaxed)
+    }
+
+    /// Requires the shard lock.
+    fn set_loads(&self, loads: usize) {
+        self.loads.store(loads, Ordering::Relaxed);
     }
 
     fn set_capacity(&self, capacity: usize) {
@@ -1153,6 +1204,22 @@ impl LockedShard<'_> {
         self.counts.len.load(Ordering::Relaxed)
     }
 
+    /// The loads listed in the shard's flight lane.
+    #[inline]
+    fn loads(&self) -> usize {
+        self.limits.loads()
+    }
+
+    /// Accounts for a load listed in the shard's flight lane.
+    fn listed(&mut self) {
+        self.limits.set_loads(self.loads() + 1);
+    }
+
+    /// Accounts for a load unlisted from the shard's flight lane.
+    fn unlisted(&mut self) {
+        self.limits.set_loads(self.loads() - 1);
+    }
+
     #[inline]
     fn weight(&self) -> u64 {
         self.counts.weight.load(Ordering::Relaxed)
@@ -1204,6 +1271,34 @@ impl LockedShard<'_> {
         } else {
             increment(&self.counts.evictions);
             RemovalCause::Size
+        }
+    }
+
+    /// Enrolls a key just placed at `record`: in the main area if the
+    /// filters remember it from a recent eviction, otherwise on probation.
+    #[allow(
+        clippy::inline_always,
+        reason = "part of the insert body, which inlines into each caller"
+    )]
+    #[inline(always)]
+    fn enroll<T>(&mut self, shard: ShardView<'_, T>, hash: u64, record: u32, handle: u32) {
+        if self.filters.admit(hash, shard.limits.probation_max()) {
+            // Remembered from a recent eviction: straight to main.
+            self.enter_main(shard, record);
+        } else {
+            if self.probation.len() >= self.filters.probation_record_limit() {
+                // An overflowing record's key joins the main area.
+                let overflow = self
+                    .probation
+                    .pop_front()
+                    .expect("probation is at its limit");
+                self.enter_main(shard, overflow.record);
+            }
+            self.probation.push_back(Probationary {
+                hash,
+                record,
+                handle,
+            });
         }
     }
 
@@ -1434,6 +1529,13 @@ where
     /// its own `load`. A `load` that reads this key through the cache
     /// deadlocks.
     ///
+    /// A write to the key while it loads (an insert, a removal, a clear, or
+    /// a drain) supersedes the load, which may have read its source before
+    /// the write: its value still goes to the callers sharing it, but is
+    /// not cached, and callers that miss the key afterwards load it again.
+    /// So removing a key after updating its source leaves no older value
+    /// cached.
+    ///
     /// # Errors
     ///
     /// Returns the error from this caller's `load`.
@@ -1468,14 +1570,10 @@ where
                     }
                 }
                 Missed::Lead(flight) => {
-                    let mut landing = FlightLanding {
-                        lane,
-                        flight,
-                        loaded: None,
-                    };
+                    let mut landing = self.landing(flight);
                     let load = load.take().expect("a caller leads at most one load");
                     let value = load()?;
-                    self.insert(key.to_owned(), value.clone());
+                    self.insert_loaded(&landing.flight, key.to_owned(), value.clone());
                     landing.loaded = Some(value.clone());
                     return Ok(value);
                 }
@@ -1504,7 +1602,9 @@ where
     /// loads, through this method or [`Self::get_or_try_insert_with`], wait
     /// for that load and share its value. If the load fails, or its future
     /// is dropped before it completes, one waiter loads again with its own
-    /// `load`. The future is `Send` when the cache, the key, and `load` are.
+    /// `load`. A write to the key while it loads supersedes the load, as for
+    /// [`Self::get_or_try_insert_with`]. The future is `Send` when the
+    /// cache, the key, and `load` are.
     ///
     /// # Errors
     ///
@@ -1545,14 +1645,10 @@ where
                 }
                 Missed::Lead(flight) => {
                     // Dropped with the future, the landing abandons the load.
-                    let mut landing = FlightLanding {
-                        lane,
-                        flight,
-                        loaded: None,
-                    };
+                    let mut landing = self.landing(flight);
                     let load = load.take().expect("a caller leads at most one load");
                     let value = load.await?;
-                    self.insert(key.to_owned(), value.clone());
+                    self.insert_loaded(&landing.flight, key.to_owned(), value.clone());
                     landing.loaded = Some(value.clone());
                     return Ok(value);
                 }
@@ -1599,11 +1695,7 @@ where
                 Missed::Lead(flight) => {
                     return GuardResult::Guard(PlaceholderGuard {
                         cache: self,
-                        landing: FlightLanding {
-                            lane,
-                            flight,
-                            loaded: None,
-                        },
+                        landing: self.landing(flight),
                         key: key.to_owned(),
                     });
                 }
@@ -1650,11 +1742,7 @@ where
                 Missed::Lead(flight) => {
                     return Err(PlaceholderGuard {
                         cache: self,
-                        landing: FlightLanding {
-                            lane,
-                            flight,
-                            loaded: None,
-                        },
+                        landing: self.landing(flight),
                         key: key.to_owned(),
                     });
                 }
@@ -1663,28 +1751,83 @@ where
     }
 
     /// Joins the flight loading `key`, or lists a new one for this caller to
-    /// lead, under `lane`'s lock.
+    /// lead. Under the shard lock, as writes supersede loads: a write to the
+    /// key either precedes the listing, and this caller finds its value or
+    /// loads after it, or supersedes the new load.
     fn join_or_lead<Q>(&self, lane: &FlightLane<K, V>, key: &Q, hash: u64) -> Missed<K, V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ToOwned<Owned = K> + ?Sized,
         V: Clone,
     {
-        let mut flights = lane.0.lock();
-        if let Some(flight) = flights
-            .iter()
-            .find(|flight| flight.hash == hash && flight.key.borrow() == key)
-        {
-            return Missed::Wait(Arc::clone(flight));
+        let shard = self.shard(hash);
+        let pin = self.epochs.pin();
+        let found = {
+            let mut writer = shard.lock();
+            let mut flights = lane.0.lock();
+            if let Some(flight) = flights
+                .iter()
+                .find(|flight| flight.hash == hash && flight.key.borrow() == key)
+            {
+                return Missed::Wait(Arc::clone(flight));
+            }
+            // A load that landed after this caller missed has inserted its
+            // value, and unlisted its flight under this lock.
+            if let Some(value) = self.lookup(&pin, key, hash) {
+                value
+            } else {
+                let flight = Arc::new(Flight::new(hash, key.to_owned()));
+                flights.push(Arc::clone(&flight));
+                writer.listed();
+                return Missed::Lead(flight);
+            }
+        };
+        // Cloned outside the locks, under the pin.
+        Missed::Found(found.clone())
+    }
+
+    /// The landing of `flight`, which this caller leads.
+    fn landing(&self, flight: Arc<Flight<K, V>>) -> FlightLanding<'_, K, V> {
+        let index = self.shard_index(flight.hash);
+        FlightLanding {
+            shard: &self.shards[index],
+            lane: &self.flights[index],
+            flight,
+            loaded: None,
         }
-        // A load that landed after this caller missed has inserted its
-        // value; flights unlist only after that.
-        if let Some(value) = self.lookup(&self.epochs.pin(), key, hash).cloned() {
-            return Missed::Found(value);
-        }
-        let flight = Arc::new(Flight::new(hash, key.to_owned()));
-        flights.push(Arc::clone(&flight));
-        Missed::Lead(flight)
+    }
+
+    /// Unlists the loads of `key` listed in its shard's lane, as a write to
+    /// the key does, superseding any still in progress: their values go to
+    /// their callers but are not cached. The insert of a load's own value
+    /// unlists it the same way. Requires the shard lock; it takes no guard,
+    /// so that writers need not keep theirs in memory to call it.
+    #[cold]
+    #[inline(never)]
+    fn supersede_loads<Q>(&self, hash: u64, key: &Q)
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        self.unlist_loads(self.shard_index(hash), |flight| {
+            flight.hash == hash && flight.key.borrow() == key
+        });
+    }
+
+    /// Unlists and supersedes the loads in shard `index`'s lane that
+    /// `picks` returns true for. Requires that shard's lock.
+    fn unlist_loads(&self, index: usize, mut picks: impl FnMut(&Flight<K, V>) -> bool) {
+        let mut flights = self.flights[index].0.lock();
+        let listed = flights.len();
+        flights.retain(|flight| {
+            let superseded = picks(flight);
+            if superseded {
+                flight.superseded.store(true, Ordering::Relaxed);
+            }
+            !superseded
+        });
+        let limits = &self.shards[index].limits;
+        limits.set_loads(limits.loads() - (listed - flights.len()));
     }
 
     /// Pins the cache for a run of borrowed reads.
@@ -1936,7 +2079,7 @@ where
                 cached += usize::from(self.insert_pinned(
                     key,
                     value,
-                    self.lifetime(),
+                    Origin::Write(self.lifetime()),
                     hash,
                     pin,
                     &mut removed,
@@ -1960,7 +2103,25 @@ where
         let hash = self.hash(&key);
         let pin = self.epochs.pin();
         let mut removed = Removed::new();
-        let inserted = self.insert_pinned(key, value, ttl, hash, &pin, &mut removed);
+        let inserted = self.insert_pinned(key, value, Origin::Write(ttl), hash, &pin, &mut removed);
+        self.after_write(&removed, pin);
+        inserted
+    }
+
+    /// Inserts the value `flight` loaded, as [`Self::insert`] would, unless
+    /// a write to the key superseded the load. Returns whether it was
+    /// cached.
+    fn insert_loaded(&self, flight: &Flight<K, V>, key: K, value: V) -> bool {
+        let pin = self.epochs.pin();
+        let mut removed = Removed::new();
+        let inserted = self.insert_pinned(
+            key,
+            value,
+            Origin::Load(flight),
+            flight.hash,
+            &pin,
+            &mut removed,
+        );
         self.after_write(&removed, pin);
         inserted
     }
@@ -1980,18 +2141,26 @@ where
         &self,
         key: K,
         value: V,
-        ttl: Option<Duration>,
+        origin: Origin<'_, K, V>,
         hash: u64,
         pin: &EpochPin<'_>,
         removed: &mut Removed<(K, V)>,
     ) -> bool {
+        let (ttl, landing) = match origin {
+            Origin::Write(ttl) => (ttl, None),
+            Origin::Load(flight) => (self.lifetime(), Some(flight)),
+        };
         let shard = self.shard(hash);
         let weight = self.weighter.weight(&key, &value);
         let Some(compact_weight) = u32::try_from(weight)
             .ok()
             .filter(|weight| *weight <= MAX_WEIGHT && u64::from(*weight) <= shard.limits.weight())
         else {
-            self.remove_as(&key, RemovalCause::Replaced);
+            // A load has no value it replaces: one written since it began
+            // superseded it.
+            if landing.is_none() {
+                self.remove_as(&key, RemovalCause::Replaced);
+            }
             return false;
         };
         let expires_at = ttl.map_or(NEVER_EXPIRES, |ttl| self.deadline(ttl));
@@ -2005,6 +2174,14 @@ where
         let key = &unsafe { entry(pin, handle) }.value().0;
         {
             let mut writer = shard.lock();
+            if !self.supersede_for_write(writer.loads(), hash, key, landing) {
+                drop(writer);
+                // SAFETY: the caller's own slot, filled above and never
+                // published.
+                unsafe { drop_value(slot) };
+                self.slots.give(&[slot]);
+                return false;
+            }
             if writer.over_limit(weight) {
                 shard.prefetch_eviction(&writer, hash);
             }
@@ -2066,26 +2243,34 @@ where
                     placed.unwrap_or_default()
                 };
                 writer.entered(weight);
-                let record = shard.record(index);
-                if writer.filters.admit(hash, shard.limits.probation_max()) {
-                    // Remembered from a recent eviction: straight to main.
-                    writer.enter_main(shard, record);
-                } else {
-                    if writer.probation.len() >= writer.filters.probation_record_limit() {
-                        // An overflowing record's key joins the main area.
-                        let overflow = writer
-                            .probation
-                            .pop_front()
-                            .expect("probation is at its limit");
-                        writer.enter_main(shard, overflow.record);
-                    }
-                    writer.probation.push_back(Probationary {
-                        record,
-                        hash,
-                        handle: handle.raw,
-                    });
-                }
+                writer.enroll(shard, hash, shard.record(index), handle.raw);
             }
+        }
+        true
+    }
+
+    /// Supersedes the loads of `key`, which a write is about to store under
+    /// the shard lock, given the `loads` the shard lists. Returns false if
+    /// the write lands `landing`'s load and a write superseded it first.
+    #[allow(
+        clippy::inline_always,
+        reason = "part of the insert body, which inlines into each caller"
+    )]
+    #[inline(always)]
+    fn supersede_for_write(
+        &self,
+        loads: usize,
+        hash: u64,
+        key: &K,
+        landing: Option<&Flight<K, V>>,
+    ) -> bool {
+        if let Some(flight) = landing {
+            if flight.superseded.load(Ordering::Relaxed) {
+                return false;
+            }
+            self.supersede_loads(hash, key);
+        } else if loads != 0 {
+            self.supersede_loads(hash, key);
         }
         true
     }
@@ -2159,6 +2344,9 @@ where
         let mut live = false;
         {
             let mut writer = shard.lock();
+            if writer.loads() != 0 {
+                self.supersede_loads(hash, key);
+            }
             let found = shard.find(hash, |handle| {
                 // SAFETY: published in this table while `pin` is held.
                 unsafe { entry(&pin, handle) }.value().0.borrow() == key
@@ -2352,6 +2540,9 @@ where
         let shard = self.view(index);
         let mut now = None;
         let mut writer = shard.lock();
+        if writer.loads() != 0 {
+            self.unlist_loads(index, |_| true);
+        }
         for bucket in shard.buckets {
             let meta = bucket.meta.load(Ordering::Relaxed);
             if bucket.tags.load(Ordering::Relaxed) == 0 && meta & !META_GENERATIONS == 0 {
@@ -4924,6 +5115,131 @@ mod tests {
         assert!(guard.insert(40));
         assert_eq!(loader.join().expect("the loader completes"), 40);
         assert_eq!(waiter.join().expect("the waiter completes"), 40);
+    }
+
+    #[test]
+    fn a_write_while_a_key_loads_keeps_the_load_from_caching_over_it() {
+        // A source updated and the key removed while its old value loads,
+        // as an invalidation does: the load is stale and must not land.
+        let cache = ShardedCache::<u64, u64>::new(100);
+        let GuardResult::Guard(stale) = cache.get_value_or_guard(&1, None) else {
+            panic!("a missing key hands its caller the guard");
+        };
+        assert!(!cache.remove(&1), "nothing was cached to remove");
+        let GuardResult::Guard(fresh) = cache.get_value_or_guard(&1, Some(Duration::ZERO)) else {
+            panic!("a caller after the removal loads again instead of waiting");
+        };
+        assert!(!stale.insert(10), "the load the removal superseded");
+        assert_eq!(cache.get(&1), None);
+        assert!(fresh.insert(11));
+        assert_eq!(cache.get(&1), Some(11));
+
+        // An insert while the key loads wins over the loaded value.
+        let GuardResult::Guard(stale) = cache.get_value_or_guard(&2, None) else {
+            panic!("a missing key hands its caller the guard");
+        };
+        assert!(cache.insert(2, 21));
+        assert!(!stale.insert(20));
+        assert_eq!(cache.get(&2), Some(21));
+
+        // Loaders get their value, but do not cache it over the write.
+        assert_eq!(
+            cache.get_or_insert_with(&3, || {
+                cache.remove(&3);
+                30
+            }),
+            30
+        );
+        assert_eq!(cache.get(&3), None);
+        assert_eq!(
+            block_on(cache.get_or_insert_async(&4, async {
+                cache.insert_many([(4, 41), (5, 51)]);
+                40
+            })),
+            40
+        );
+        assert_eq!(cache.get(&4), Some(41));
+
+        // Clearing or draining the cache supersedes every load.
+        let GuardResult::Guard(stale) = cache.get_value_or_guard(&6, None) else {
+            panic!("a missing key hands its caller the guard");
+        };
+        cache.clear();
+        assert!(!stale.insert(60));
+        let GuardResult::Guard(stale) = cache.get_value_or_guard(&7, None) else {
+            panic!("a missing key hands its caller the guard");
+        };
+        cache.drain().for_each(drop);
+        assert!(!stale.insert(70));
+        assert!(cache.is_empty());
+        assert!(cache.flights.iter().all(|lane| lane.0.lock().is_empty()));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "parking_lot's futex wait fails Miri's variadic check")]
+    fn loads_racing_invalidations_never_leave_a_stale_value_cached() {
+        // A writer updates a source, then invalidates the key by removing
+        // it or writing the new version through; loaders read the source on
+        // a miss. Once a version is invalidated, the key holds it or
+        // nothing: never a version loaded before it.
+        for write_through in [false, true] {
+            let cache = ShardedCache::<u64, u64>::new(64);
+            let source = Mutex::new(0_u64);
+            let done = AtomicBool::new(false);
+            thread::scope(|scope| {
+                scope.spawn(|| {
+                    // Stops the loaders even if an assertion fails.
+                    struct Done<'flag>(&'flag AtomicBool);
+                    impl Drop for Done<'_> {
+                        fn drop(&mut self) {
+                            self.0.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    let _done = Done(&done);
+                    for version in 1..=500 {
+                        *source.lock() = version;
+                        if write_through {
+                            cache.insert(0, version);
+                        } else {
+                            cache.remove(&0);
+                        }
+                        for _ in 0..20 {
+                            if let Some(cached) = cache.peek(&0) {
+                                assert_eq!(cached, version, "write-through {write_through}");
+                            }
+                            thread::yield_now();
+                        }
+                    }
+                });
+                for loader in 0..3 {
+                    let (cache, source, done) = (&cache, &source, &done);
+                    scope.spawn(move || {
+                        let load = || {
+                            let version = *source.lock();
+                            thread::yield_now();
+                            version
+                        };
+                        let mut round = 0_u64;
+                        while !done.load(Ordering::Relaxed) {
+                            round += 1;
+                            if loader == 0 {
+                                if let GuardResult::Guard(guard) =
+                                    cache.get_value_or_guard(&0, None)
+                                {
+                                    guard.insert(load());
+                                }
+                            } else if round.is_multiple_of(2) {
+                                cache.get_or_insert_with(&0, load);
+                            } else {
+                                block_on(cache.get_or_insert_async(&0, async { load() }));
+                            }
+                        }
+                    });
+                }
+            });
+            assert!(cache.flights.iter().all(|lane| lane.0.lock().is_empty()));
+            assert!(cache.shards.iter().all(|shard| shard.lock().loads() == 0));
+        }
     }
 
     #[test]

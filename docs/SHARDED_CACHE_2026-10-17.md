@@ -129,12 +129,22 @@ entry. Tables are sized once and never rebuilt.
 - **Loading once.** `get_or_insert_with` and `get_or_try_insert_with` take a
   borrowed key and a loader.
   - A caller that misses registers a flight, keyed by hash and key, in its
-    shard's lane and runs the loader outside every lock.
+    shard's lane under the shard lock, and runs the loader outside every
+    lock.
   - Callers that miss the same key while it loads wait on the flight and
     share its value.
-  - The leader inserts the value before unlisting the flight. A caller that
-    finds no flight looks the key up again under the lane lock, so it either
-    joins the flight or sees the inserted value.
+  - The leader's insert unlists the flight under the shard lock. A caller
+    that finds no flight looks the key up again under that lock, so it
+    either joins the flight or sees the inserted value.
+  - Writes supersede loads. An insert, removal, clear, or drain unlists the
+    flights of its keys under the shard lock and marks them superseded; the
+    leader's insert, under the same lock, then caches nothing, while its
+    callers still get the value. A loader may read its source before an
+    invalidation (update the source, then remove the key) and insert after
+    it; without this the old value would stay cached. Callers that miss
+    after the write list a new flight and load afresh. A count of listed
+    flights, on the shard's limits line that inserts read anyway, spares
+    writes the lane when nothing loads.
   - If the loader fails or panics, the flight is abandoned and one waiter
     loads again with its own loader.
   - `get_or_insert_async` and `get_or_try_insert_async` share the flights.
