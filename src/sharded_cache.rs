@@ -466,7 +466,6 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
                 .map(|index| {
                     Shard::new(
                         share(max_entries, shards, index),
-                        shard_reserve,
                         weight_share(max_weight, shards, index),
                         self.probation_bps,
                     )
@@ -547,6 +546,35 @@ fn default_shards(max_entries: usize, parallelism: usize) -> usize {
 /// borrows values instead. Limits apply per shard: each holds its share of
 /// the entry and weight limits, as in other sharded caches, so a cache can
 /// evict a little before it is full overall.
+///
+/// Keys and values must support concurrent sharing to share the cache:
+///
+/// ```compile_fail
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<packedgen::ShardedCache<u64, std::cell::Cell<u8>>>();
+/// ```
+///
+/// They must also support transfer between threads:
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<packedgen::ShardedCache<u64, std::rc::Rc<u8>>>();
+/// ```
+///
+/// Such a cache is both:
+///
+/// ```
+/// fn assert_send_sync<T: Send + Sync>() {}
+/// assert_send_sync::<packedgen::ShardedCache<u64, String>>();
+/// ```
+///
+/// A pin stays on the thread that took it:
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>(_: &T) {}
+/// let cache: packedgen::ShardedCache<u64, u64> = packedgen::ShardedCache::new(10);
+/// assert_send(&cache.pin());
+/// ```
 pub struct ShardedCache<K, V, W = UnitWeighter, S = DefaultHashBuilder, L = NoListener> {
     shards: Box<[Shard<(K, V)>]>,
     /// Every shard's buckets, `shard_buckets` per shard in shard order.
@@ -1257,6 +1285,7 @@ where
                 let capacity = share(capacity, shards, index);
                 if capacity != shard.limits.capacity() {
                     shard.limits.set_capacity(capacity);
+                    writer.main.grow(shard.limits.main_limit() + 1);
                     let target = writer
                         .filters
                         .probation_target()
@@ -2051,10 +2080,12 @@ where
         }
     }
 
-    /// Tells the listener what left, queues the unpublished entries for
-    /// reclamation, and drops the values of entries aged enough to reclaim.
-    /// Requires the pin taken before the entries were unpublished. Returns
-    /// whether enough retirements are pending to try advancing.
+    /// Queues the unpublished entries for reclamation, drops the values of
+    /// entries aged enough to reclaim, and then tells the listener what
+    /// left, so a panicking listener leaves nothing unqueued. Requires the
+    /// pin taken before the entries were unpublished, which keeps them until
+    /// the listener is done. Returns whether enough retirements are pending
+    /// to try advancing.
     #[allow(
         clippy::inline_always,
         reason = "with `insert_many` as a second caller of the insert body, it stayed out of line"
@@ -2064,7 +2095,6 @@ where
         if removed.len == 0 {
             return false;
         }
-        removed.notify(&self.listener, pin);
         let mut reclaimed = Reclaimed::new();
         let mut foreign = Reclaimed::new();
         let advance = self.retired.retire(
@@ -2075,6 +2105,7 @@ where
         );
         reclaimed.finish(&self.slots);
         foreign.finish(&self.slots);
+        removed.notify(&self.listener, pin);
         advance
     }
 
@@ -2544,6 +2575,9 @@ where
             };
             let raw = shard.bucket(slot).handles[slot % SLOTS].load(Ordering::Relaxed);
             if protected.is_some_and(|protected| protected.raw == raw) {
+                // The entry being written keeps its only record: it joins
+                // the main area, as the main area keeps it below.
+                writer.enter_main(shard, record);
                 continue;
             }
             // SAFETY: the shard lock keeps this published handle in the table.
@@ -2835,12 +2869,12 @@ impl<K, V, W, S, L> Drop for ShardedCache<K, V, W, S, L> {
 }
 
 impl<T> Shard<T> {
-    /// A shard holding `capacity` entries, whose main queue's ring has room
-    /// for `reserve`.
-    fn new(capacity: usize, reserve: usize, weight_limit: u64, probation_bps: u16) -> Self {
+    /// A shard holding `capacity` entries.
+    fn new(capacity: usize, weight_limit: u64, probation_bps: u16) -> Self {
         let limits = ShardLimits::new(capacity, weight_limit);
         let probation_target =
             (capacity * usize::from(probation_bps) / 10_000).clamp(1, limits.probation_max());
+        let main = MainQueue::with_capacity(limits.main_limit() + 1);
         Self {
             limits,
             writer: ShardLock {
@@ -2850,7 +2884,7 @@ impl<T> Shard<T> {
                 writer: Mutex::new(ShardWriter {
                     probation: VecDeque::new(),
                     filters: Filters::new(capacity, probation_target),
-                    main: MainQueue::with_capacity(reserve + reserve / 4 + 17),
+                    main,
                     hand: 0,
                 }),
                 expirations: AtomicU64::new(0),
@@ -3701,6 +3735,20 @@ impl MainQueue {
             cursor: 0,
             gap: 0,
         }
+    }
+
+    /// Widens the ring to `capacity` slots if it is narrower, keeping the
+    /// records, and the gap between them, in place past the head.
+    fn grow(&mut self, capacity: usize) {
+        if capacity <= self.records.len() {
+            return;
+        }
+        let mut records = vec![0; capacity].into_boxed_slice();
+        for (offset, record) in records[..self.span()].iter_mut().enumerate() {
+            *record = self.records[self.index(offset)];
+        }
+        self.records = records;
+        self.head = 0;
     }
 
     #[inline]
@@ -5350,6 +5398,70 @@ mod tests {
     }
 
     #[test]
+    fn a_replacement_that_evicts_leaves_its_key_evictable() {
+        // Probation holds the last five keys. Replacing the oldest of them
+        // with a heavier value evicts, and the eviction pops the replaced
+        // key's own record from probation.
+        let cache = ShardedCacheBuilder::new(64)
+            .max_weight(64)
+            .shards(1)
+            .weighter(|_: &u64, value: &u64| *value)
+            .build::<u64, u64>();
+        for key in 0..40 {
+            cache.insert(key, 1);
+        }
+        cache.insert(35, 30);
+        assert_eq!(cache.get(&35), Some(30));
+        // Clear the access mark that read set, as an eviction sweep would.
+        let _ = cache
+            .live_entry(&cache.epochs.pin(), &35, cache.hash(&35))
+            .map(|entry| (entry.take_accessed(), entry.take_accessed()));
+        // Keys read during probation join the main area and push it to
+        // evict: the cold keys already there leave, and so should key 35.
+        for key in 1_000..3_000 {
+            cache.insert(key, 1);
+            cache.get(&key);
+        }
+        let survivors: Vec<u64> = (0..40).filter(|key| cache.contains_key(key)).collect();
+        assert_eq!(survivors, Vec::<u64>::new(), "cold keys outlived the churn");
+    }
+
+    #[test]
+    fn a_panicking_listener_still_drops_removed_values() {
+        struct Counted(Arc<AtomicUsize>);
+        impl Clone for Counted {
+            fn clone(&self) -> Self {
+                Counted(Arc::clone(&self.0))
+            }
+        }
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        {
+            let cache = ShardedCacheBuilder::new(64)
+                .shards(1)
+                .removal_listener(|_: &u64, _: &Counted, _| panic!("listener"))
+                .build::<u64, Counted>();
+            for key in 0..64 {
+                cache.insert(key, Counted(Arc::clone(&dropped)));
+            }
+            // The 65th entry evicts one, and the listener panics on it.
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                cache.insert(1_000, Counted(Arc::clone(&dropped)))
+            }));
+            assert!(panicked.is_err());
+        }
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            65,
+            "every value dropped once"
+        );
+    }
+
+    #[test]
     fn drain_yields_live_entries_and_leaves_the_cache_empty() {
         let (cache, heard) = heard_cache(2_000);
         for key in 0..300_u64 {
@@ -5645,6 +5757,42 @@ mod tests {
             1,
             "maintain dropped every removed value"
         );
+    }
+
+    #[test]
+    fn a_capacity_reserve_costs_its_table_alone() {
+        let (built, reserve) = (100, 1_000);
+        let plain = ShardedCacheBuilder::new(built)
+            .shards(2)
+            .build::<u64, u64>();
+        let reserved = ShardedCacheBuilder::new(built)
+            .max_capacity(reserve)
+            .shards(2)
+            .build::<u64, u64>();
+        let (bare, roomy) = (plain.memory_used(), reserved.memory_used());
+        assert_eq!(
+            roomy.policy, bare.policy,
+            "the policy is sized for the capacity"
+        );
+        // About 8 bytes of table per reserved entry.
+        let (table, entries) = (roomy.table - bare.table, reserve - built);
+        assert!(
+            2 * table < 17 * entries,
+            "{table} bytes of table for {entries} reserved entries"
+        );
+        // Raised to the reserve, the cache fills its main area, whose queue
+        // grows with it.
+        reserved.set_capacity(reserve);
+        for key in 0..2 * reserve as u64 {
+            reserved.insert(key, key);
+            reserved.get(&key);
+        }
+        assert!(
+            reserved.len() > reserve * 9 / 10,
+            "{} entries",
+            reserved.len()
+        );
+        assert!(reserved.memory_used().policy > bare.policy);
     }
 
     #[test]
@@ -6378,7 +6526,7 @@ mod tests {
         // shard state a write touches moves to its core while it holds the
         // lock. Replacing needs the lock word and the counts; an insert that
         // evicts from probation needs the probation queue, then the filters.
-        let shard = Shard::<(u64, u64)>::new(64, 64, u64::MAX, DEFAULT_PROBATION_BPS);
+        let shard = Shard::<(u64, u64)>::new(64, u64::MAX, DEFAULT_PROBATION_BPS);
         let base = std::ptr::addr_of!(shard.writer) as usize;
         let line = |field: usize, size: usize| {
             let first = (field - base) / 64;
