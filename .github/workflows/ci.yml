@@ -129,6 +129,59 @@ jobs:
       - name: PackedGen tests
         run: cargo test --locked -p packedgen --all-targets --features "${{ matrix.features }}"
 
+  test-windows:
+    name: Stable tests on Windows (${{ matrix.name }})
+    # Windows has neither membarrier nor madvise, so this runs the portable
+    # fallbacks under Windows' scheduler, timers, and allocator.
+    runs-on: windows-latest
+    timeout-minutes: 30
+    # cargo test runs one test binary at a time, about nine minutes here.
+    # nextest runs every binary's tests at once, so the test legs take about
+    # as long as their slowest test, direct_cache_memory's three minutes.
+    # It runs each benchmark in its own process, though, and every Criterion
+    # process repeats its bench's setup (about 16 s for mixed_workloads), so
+    # the benches run under cargo test on a runner of their own.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default features
+            key: default
+            command: nextest run --no-fail-fast --workspace --lib --bins --tests --examples
+          - name: prepared keys and diagnostics
+            key: prepared
+            command: >-
+              nextest run --no-fail-fast -p packedgen --lib --bins --tests --examples
+              --features prepared-keys,prepared-batch-gate,cache-production-diagnostics
+          - name: benches in test mode
+            key: benches
+            command: test --workspace --benches
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Without debug info, the uncached build took 1m12s against 2m20s, as
+      # the linker skips writing PDBs for the ~90 test, example, and bench
+      # binaries. Panic messages keep their source locations.
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      # Tests read sources with include_str!; keep the LF endings the other
+      # runners check out.
+      - name: Check out with LF line endings
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-${{ matrix.key }}
+      - uses: taiki-e/install-action@v2
+        if: startsWith(matrix.command, 'nextest')
+        with:
+          tool: cargo-nextest@0.9.148
+          fallback: none
+      - name: Tests
+        run: cargo ${{ matrix.command }} --locked
+
   loom:
     name: Loom models
     runs-on: ubuntu-latest
