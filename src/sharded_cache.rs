@@ -265,7 +265,10 @@ pub struct ShardedCacheBuilder<W = UnitWeighter, S = DefaultHashBuilder, L = NoL
 }
 
 impl ShardedCacheBuilder {
-    /// Starts a cache holding at most `max_entries` entries.
+    /// Starts a cache holding at most `max_entries` entries. Its table is
+    /// allocated when the cache is built, about 8 bytes per entry, so a
+    /// limit no allocation can hold aborts the process as any failed
+    /// allocation does; there is no unbounded setting.
     #[must_use]
     pub fn new(max_entries: usize) -> Self {
         Self {
