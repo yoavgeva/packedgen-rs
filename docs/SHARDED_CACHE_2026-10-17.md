@@ -1094,6 +1094,23 @@ count, so they never wrote to a full cache. On macOS, five paired runs of
 | 50,000 | +11% (+5 to +19%) | +10% (−9 to +15%) |
 | 1,000,000 | +56% (+49 to +58%) | +58% (+50 to +89%) |
 
+### Reading through the loader
+
+The probe's `read-through` workload issues turnover's reads, each through
+`get_or_insert_with`, which loads and inserts a missed key. On macOS, five
+paired runs of 4,000,000 operations against quick_cache:
+
+| Entries | 1T | 8T |
+| ---: | ---: | ---: |
+| 50,000 | −3% (−6 to +2%) | +32% (+19 to +69%) |
+| 1,000,000 | +13% (+0 to +29%) | +61% (+51 to +67%) |
+
+Against the commit before writes superseded loads, seven paired runs at
+50,000 entries moved by −1% on one thread and −2% at eight, within noise:
+listing a load under the shard lock costs this mix nothing measurable.
+ShardedCache ran it at 59.8 Mops/s with eight threads, against 61.8 for
+turnover's plain reads and inserts.
+
 ### With `u64` keys and values
 
 The probe's 32-byte keys and `Arc` payloads cost both caches hashing and
