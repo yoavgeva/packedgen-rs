@@ -179,7 +179,8 @@ sanitizers() {
     sharded_cache::tests::racing sharded_cache::tests::concurrent \
     sharded_cache::tests::get_or_insert_with sharded_cache::tests::a_failed \
     sharded_cache::tests::a_thread_that_exits sharded_cache::tests::dropping_a_cache \
-    sharded_cache::tests::other_writers_drain
+    sharded_cache::tests::other_writers_drain sharded_cache::tests::loads_racing \
+    sharded_cache::tests::async_and_blocking sharded_cache::tests::callers_wait
 }
 
 memory_soak() {
