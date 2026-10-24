@@ -2135,16 +2135,12 @@ where
     }
 
     /// Removes `key` as [`Self::remove`] does, telling the listener `cause`
-    /// for a live value.
-    #[allow(
-        clippy::inline_always,
-        reason = "`remove`'s body, which should compile as it did before the cause became a parameter"
-    )]
+    /// for a live value. One body out of line, as `remove`'s was, which
+    /// `remove` and writes too heavy to cache share.
     #[allow(
         unsafe_code,
         reason = "dereferences handles unpublished under the shard lock"
     )]
-    #[inline(always)]
     fn remove_as<Q>(&self, key: &Q, cause: RemovalCause) -> bool
     where
         K: Borrow<Q>,
