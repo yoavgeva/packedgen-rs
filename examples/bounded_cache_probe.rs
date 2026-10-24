@@ -49,6 +49,9 @@ enum Workload {
     Turnover,
     Replace,
     DeleteReinsert,
+    /// Upserts of the seeded keys into an exactly full cache: replacements
+    /// of resident keys, and reinsertions of the few the seeding evicted.
+    Update,
 }
 
 impl Workload {
@@ -60,6 +63,7 @@ impl Workload {
             "turnover" => Self::Turnover,
             "replace" => Self::Replace,
             "delete-reinsert" => Self::DeleteReinsert,
+            "update" => Self::Update,
             _ => panic!("unknown workload: {value}"),
         }
     }
@@ -195,6 +199,7 @@ fn worker_trace(config: &Config, worker: usize) -> Vec<Operation> {
                 Workload::Turnover => (2 * config.entries + operation, Action::Insert),
                 Workload::Replace => (resident, Action::Replace),
                 Workload::DeleteReinsert => (resident, Action::DeleteReinsert),
+                Workload::Update => (resident, Action::Insert),
             };
             Operation {
                 key: key(id as u64),
@@ -679,6 +684,7 @@ fn validate_result(config: &Config, sample: &Sample, entries: usize, weight: u64
             assert_eq!(sample.inserts, config.operations as u64);
             assert_eq!(entries, config.entries);
         }
+        Workload::Update => assert_eq!(sample.writes, config.operations as u64),
         Workload::Turnover => {}
     }
 }
@@ -845,6 +851,7 @@ mod tests {
             Workload::Turnover,
             Workload::Replace,
             Workload::DeleteReinsert,
+            Workload::Update,
         ] {
             let config = config(workload);
             config.validate();
