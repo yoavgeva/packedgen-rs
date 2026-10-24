@@ -134,7 +134,7 @@ pub struct PackedKeyArena {
 }
 
 impl PackedKeyArena {
-    /// Creates an empty arena using one-MiB segments.
+    /// Creates an empty arena using 64-KiB segments.
     #[must_use]
     pub const fn new() -> Self {
         Self {
