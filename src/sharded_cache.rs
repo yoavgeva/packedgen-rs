@@ -215,13 +215,19 @@ pub struct ShardedCacheMemory {
     /// Each shard's policy state: its filters of evicted keys, its main
     /// queue's ring, and its probation queue.
     pub policy: usize,
+    /// Everything else: the epochs' reader counters, the queues of removed
+    /// entries awaiting reclamation, the shards' locks and counters, and the
+    /// lanes of loads in progress. The counters and queues take about 33 KB
+    /// whatever the capacity (41 KB on Linux, which adds announcement
+    /// lines), and each shard about half a kilobyte more.
+    pub bookkeeping: usize,
 }
 
 impl ShardedCacheMemory {
     /// The sum of the parts.
     #[must_use]
     pub fn total(&self) -> usize {
-        self.table + self.entries + self.policy
+        self.table + self.entries + self.policy + self.bookkeeping
     }
 }
 
@@ -2382,8 +2388,10 @@ where
     }
 
     /// Bytes the cache's own structures use: the table, the entry slots
-    /// handed out so far, and the shards' policy state. Memory the keys and
-    /// values own elsewhere is not counted. Takes each shard's lock in turn.
+    /// handed out so far, the shards' policy state, and the bookkeeping
+    /// around them. Memory the keys and values own elsewhere is not
+    /// counted. Takes each shard's lock, each retired queue's, and each load
+    /// lane's in turn.
     pub fn memory_used(&self) -> ShardedCacheMemory {
         let policy = self
             .shards
@@ -2395,10 +2403,21 @@ where
                     + writer.probation.capacity() * size_of::<Probationary>()
             })
             .sum();
+        let flights = self
+            .flights
+            .iter()
+            .map(|lane| lane.0.lock().capacity() * size_of::<Arc<Flight<K, V>>>())
+            .sum::<usize>();
         ShardedCacheMemory {
             table: self.table.len() * size_of::<Bucket>(),
             entries: self.slots.bytes_used(),
             policy,
+            bookkeeping: size_of_val(&*self.shards)
+                + self.epochs.bytes_used()
+                + self.retired.bytes_used()
+                + size_of_val(&*self.flights)
+                + flights
+                + self.stats.as_deref().map_or(0, size_of_val),
         }
     }
 
@@ -5583,7 +5602,11 @@ mod tests {
         assert_eq!(empty.table, cache.table.len() * size_of::<Bucket>());
         assert_eq!(empty.entries, 0, "no slot handed out yet");
         assert!(empty.policy > 0);
-        assert_eq!(empty.total(), empty.table + empty.entries + empty.policy);
+        assert!(empty.bookkeeping > 0);
+        assert_eq!(
+            empty.total(),
+            empty.table + empty.entries + empty.policy + empty.bookkeeping
+        );
         for key in 0..500_u64 {
             cache.insert(key, key);
         }
@@ -5853,6 +5876,20 @@ mod tests {
         assert_eq!(cache.shards.len(), 64);
         cache.insert(1, 1);
         assert_eq!(cache.get(&1), Some(1));
+    }
+
+    #[test]
+    fn memory_used_counts_what_every_cache_has_whatever_its_capacity() {
+        let cache = ShardedCacheBuilder::new(64).shards(1).build::<u64, u64>();
+        // Three epochs of 64 reader counters and 64 retired-slot queues,
+        // each counter and queue on its own 128-byte line.
+        let fixed = (3 * 64 + 64) * 128;
+        let memory = cache.memory_used();
+        assert!(
+            memory.total() >= fixed,
+            "{} bytes reported, {fixed} in counters and queues alone",
+            memory.total()
+        );
     }
 
     #[test]

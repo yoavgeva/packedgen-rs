@@ -77,8 +77,8 @@ It offers:
   `retain`, whose predicate may write to the cache;
 - `remove_if`, which decides and removes under one lock, and `replace`,
   which writes only a key that holds a live value;
-- `drain`, and `memory_used`, which reports the table, entry slots, and
-  policy state in bytes;
+- `drain`, and `memory_used`, which reports the table, entry slots,
+  policy state, and bookkeeping in bytes;
 - `peek`, `contains_key`, `clear`, and `maintain`, which drops removed
   values promptly after a burst of writes;
 - weighted limits, `set_capacity` and `set_max_weight` to resize at run
