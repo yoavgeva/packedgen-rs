@@ -678,6 +678,10 @@ struct FlightProgress<V> {
     /// By the index each waiter holds; a waiter dropped before the landing
     /// clears its own.
     wakers: Vec<Option<Waker>>,
+    /// Indices of cleared wakers, which later waiters reuse: waiters that
+    /// give up and retry during a long load take no more room than those
+    /// waiting at once.
+    vacant: Vec<usize>,
 }
 
 enum FlightState<V> {
@@ -696,6 +700,7 @@ impl<K, V: Clone> Flight<K, V> {
             progress: Mutex::new(FlightProgress {
                 state: FlightState::Loading,
                 wakers: Vec::new(),
+                vacant: Vec::new(),
             }),
             landed: Condvar::new(),
             superseded: AtomicBool::new(false),
@@ -831,8 +836,13 @@ impl<K, V: Clone> Future for FlightWait<'_, K, V> {
                 *left = Some(waker.clone());
             }
         } else {
-            progress.wakers.push(Some(waker.clone()));
-            let index = progress.wakers.len() - 1;
+            let index = if let Some(index) = progress.vacant.pop() {
+                progress.wakers[index] = Some(waker.clone());
+                index
+            } else {
+                progress.wakers.push(Some(waker.clone()));
+                progress.wakers.len() - 1
+            };
             drop(progress);
             self.waker = Some(index);
         }
@@ -842,10 +852,13 @@ impl<K, V: Clone> Future for FlightWait<'_, K, V> {
 
 impl<K, V> Drop for FlightWait<'_, K, V> {
     fn drop(&mut self) {
-        if let Some(index) = self.waker
-            && let Some(left) = self.flight.progress.lock().wakers.get_mut(index)
-        {
-            *left = None;
+        if let Some(index) = self.waker {
+            // The landing took the wakers if it came first.
+            let mut progress = self.flight.progress.lock();
+            if let Some(left) = progress.wakers.get_mut(index) {
+                *left = None;
+                progress.vacant.push(index);
+            }
         }
     }
 }
@@ -5012,6 +5025,40 @@ mod tests {
         assert_eq!(waiter.as_mut().poll(&mut context), Poll::Ready(30));
         assert_eq!(cache.get(&3), Some(30));
         assert!(cache.flights.iter().all(|lane| lane.0.lock().is_empty()));
+    }
+
+    #[test]
+    fn async_waiters_dropped_mid_load_free_their_waker_slots() {
+        // Waiters that give up and retry while one load runs, as under an
+        // executor's timeout, the oldest dropping first.
+        let cache = ShardedCache::<u64, u64>::new(100);
+        let flag = Arc::new(WakeFlag::default());
+        let waker = Waker::from(Arc::clone(&flag));
+        let mut context = Context::from_waker(&waker);
+        let mut leader = Box::pin(cache.get_or_insert_async(&5, std::future::pending()));
+        assert!(leader.as_mut().poll(&mut context).is_pending());
+        let mut waiting = VecDeque::new();
+        for _ in 0..1_000 {
+            let mut waiter = Box::pin(cache.get_or_insert_async(&5, async { 50 }));
+            assert!(waiter.as_mut().poll(&mut context).is_pending());
+            waiting.push_back(waiter);
+            if waiting.len() > 2 {
+                waiting.pop_front();
+            }
+        }
+        let lane = &cache.flights[cache.shard_index(cache.hash(&5))];
+        let wakers = lane.0.lock()[0].progress.lock().wakers.len();
+        assert!(
+            wakers <= 3,
+            "{wakers} waker slots for three waiters at most"
+        );
+        drop(leader);
+        for mut waiter in waiting {
+            assert!(matches!(
+                waiter.as_mut().poll(&mut context),
+                Poll::Ready(50)
+            ));
+        }
     }
 
     #[test]
