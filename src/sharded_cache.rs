@@ -265,7 +265,10 @@ pub struct ShardedCacheBuilder<W = UnitWeighter, S = DefaultHashBuilder, L = NoL
 }
 
 impl ShardedCacheBuilder {
-    /// Starts a cache holding at most `max_entries` entries.
+    /// Starts a cache holding at most `max_entries` entries. Its table is
+    /// allocated when the cache is built, about 8 bytes per entry, so a
+    /// limit no allocation can hold aborts the process as any failed
+    /// allocation does; there is no unbounded setting.
     #[must_use]
     pub fn new(max_entries: usize) -> Self {
         Self {
@@ -319,7 +322,13 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
     /// caches large enough to give each shard at least 256 entries.
     #[must_use]
     pub fn shards(mut self, shards: usize) -> Self {
-        self.shards = Some(shards.max(1).next_power_of_two());
+        // Above the largest power of two, `build` caps the count anyway.
+        self.shards = Some(
+            shards
+                .max(1)
+                .checked_next_power_of_two()
+                .unwrap_or(1 << (usize::BITS - 1)),
+        );
         self
     }
 
@@ -5793,6 +5802,16 @@ mod tests {
             reserved.len()
         );
         assert!(reserved.memory_used().policy > bare.policy);
+    }
+
+    #[test]
+    fn an_oversized_shard_count_is_capped_at_one_entry_per_shard() {
+        let cache = ShardedCacheBuilder::new(64)
+            .shards(usize::MAX)
+            .build::<u64, u64>();
+        assert_eq!(cache.shards.len(), 64);
+        cache.insert(1, 1);
+        assert_eq!(cache.get(&1), Some(1));
     }
 
     #[test]
