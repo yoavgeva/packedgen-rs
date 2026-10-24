@@ -219,7 +219,11 @@ entry. Tables are sized once and never rebuilt.
   iterator stops it once the shard it reached is emptied, and retires that
   shard's entries, so the listener hears each one.
 - **Memory.** `memory_used` reports the table, the entry slots handed out
-  so far, and each shard's filters, main-queue ring, and probation queue.
+  so far, each shard's filters, main-queue ring, and probation queue, and
+  the bookkeeping: reader counters, retired-slot queues, shard locks, and
+  load lanes, about 33 KB whatever the capacity plus half a kilobyte per
+  shard. Without it, a 1,000-entry cache reported 48 KB of its 103 KB of
+  resident memory; with it, 91 KB.
   Region slots never handed out are not counted, since a large region's
   untouched pages take no memory; memory keys and values own elsewhere is
   not counted either, as in quick_cache's `memory_used`.
