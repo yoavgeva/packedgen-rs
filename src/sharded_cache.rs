@@ -651,6 +651,38 @@ impl<T> Deref for ShardView<'_, T> {
     }
 }
 
+/// Prints the cache's counts and limits, not its entries, so a type holding
+/// a cache can derive `Debug` whatever its keys and values are.
+impl<K, V, W, S, L> std::fmt::Debug for ShardedCache<K, V, W, S, L> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let max_weight = self.max_weight.load(Ordering::Relaxed);
+        f.debug_struct("ShardedCache")
+            .field(
+                "len",
+                &self
+                    .shards
+                    .iter()
+                    .map(|shard| shard.writer.len.load(Ordering::Relaxed))
+                    .sum::<usize>(),
+            )
+            .field(
+                "weight",
+                &self
+                    .shards
+                    .iter()
+                    .map(|shard| shard.writer.weight.load(Ordering::Relaxed))
+                    .sum::<u64>(),
+            )
+            .field("capacity", &self.capacity.load(Ordering::Relaxed))
+            .field(
+                "max_weight",
+                &(max_weight != u64::MAX).then_some(max_weight),
+            )
+            .field("shards", &self.shards.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// One shard's loads in progress. Listed and unlisted only under the shard
 /// lock, which every write to the shard holds while it supersedes the loads
 /// of its key.
@@ -808,6 +840,26 @@ where
         let cached = cache.insert_loaded(&landing.flight, key, value.clone());
         landing.loaded = Some(value);
         cached
+    }
+}
+
+impl<K: std::fmt::Debug, V: std::fmt::Debug, W, S, L> std::fmt::Debug
+    for GuardResult<'_, K, V, W, S, L>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Value(value) => f.debug_tuple("Value").field(value).finish(),
+            Self::Guard(guard) => f.debug_tuple("Guard").field(guard).finish(),
+            Self::Timeout => f.write_str("Timeout"),
+        }
+    }
+}
+
+impl<K: std::fmt::Debug, V, W, S, L> std::fmt::Debug for PlaceholderGuard<'_, K, V, W, S, L> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlaceholderGuard")
+            .field("key", &self.key)
+            .finish_non_exhaustive()
     }
 }
 
@@ -3099,6 +3151,12 @@ where
     }
 }
 
+impl<K, V, W, S, L> std::fmt::Debug for ShardedCacheGuard<'_, K, V, W, S, L> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShardedCacheGuard").finish_non_exhaustive()
+    }
+}
+
 impl<K, V, W, S, L> Drop for ShardedCache<K, V, W, S, L> {
     #[allow(
         unsafe_code,
@@ -5350,6 +5408,40 @@ mod tests {
             assert!(cache.flights.iter().all(|lane| lane.0.lock().is_empty()));
             assert!(cache.shards.iter().all(|shard| shard.lock().loads() == 0));
         }
+    }
+
+    #[test]
+    fn caches_guards_and_results_print_for_debugging() {
+        // A struct holding a cache derives `Debug` whatever its entries are.
+        #[derive(Debug)]
+        #[allow(dead_code, reason = "printed, not read")]
+        struct State {
+            cache: ShardedCache<u64, std::cell::RefCell<()>>,
+        }
+        let cache = ShardedCacheBuilder::new(100).shards(1).build::<u64, u64>();
+        cache.insert(1, 10);
+        assert_eq!(
+            format!("{cache:?}"),
+            "ShardedCache { len: 1, weight: 1, capacity: 100, max_weight: None, shards: 1, .. }"
+        );
+        assert_eq!(format!("{:?}", cache.pin()), "ShardedCacheGuard { .. }");
+        assert_eq!(
+            format!("{:?}", cache.get_value_or_guard(&1, None)),
+            "Value(10)"
+        );
+        let GuardResult::Guard(guard) = cache.get_value_or_guard(&2, None) else {
+            panic!("a missing key hands its caller the guard");
+        };
+        assert_eq!(format!("{guard:?}"), "PlaceholderGuard { key: 2, .. }");
+        assert_eq!(
+            format!("{:?}", cache.get_value_or_guard(&2, Some(Duration::ZERO))),
+            "Timeout"
+        );
+        drop(guard);
+        let state = State {
+            cache: ShardedCache::new(10),
+        };
+        assert!(format!("{state:?}").starts_with("State { cache: ShardedCache {"));
     }
 
     #[test]
