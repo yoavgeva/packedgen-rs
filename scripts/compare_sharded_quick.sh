@@ -13,7 +13,7 @@ probe=${CARGO_TARGET_DIR:-target}/release/examples/bounded_cache_probe
 : > "$out"
 for pair in $(seq 1 "$pairs"); do
     for workers in $workers_list; do
-        for workload in resident-hit read-miss turnover cold-fill replace delete-reinsert update; do
+        for workload in resident-hit read-miss turnover cold-fill replace delete-reinsert update read-through; do
             case $workload in
                 resident-hit | read-miss) operations=${READ_OPS:-8000000} ;;
                 *) operations=${WRITE_OPS:-4000000} ;;

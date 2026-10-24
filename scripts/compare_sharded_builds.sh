@@ -13,7 +13,7 @@ out=${6:-target/compare-sharded-builds.csv}
 : > "$out"
 for pair in $(seq 1 "$pairs"); do
     for workers in $workers_list; do
-        for workload in resident-hit read-miss turnover cold-fill replace delete-reinsert update; do
+        for workload in resident-hit read-miss turnover cold-fill replace delete-reinsert update read-through; do
             case $workload in
                 resident-hit | read-miss) operations=${READ_OPS:-8000000} ;;
                 *) operations=${WRITE_OPS:-4000000} ;;
