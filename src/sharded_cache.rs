@@ -664,10 +664,11 @@ struct Flight<K, V> {
     progress: Mutex<FlightProgress<V>>,
     /// Blocking waiters wait on it; asynchronous ones leave their wakers.
     landed: Condvar,
-    /// Set under the shard lock by a write to the key while it loads, which
-    /// also unlists the flight: the load may have read its source before
-    /// the write, so its value goes to its callers but is not cached.
-    superseded: AtomicBool,
+    /// Set under the shard lock by the write that unlists the flight: the
+    /// insert of its value, or a write to the key while it loads, which
+    /// supersedes the load. The load may have read its source before that
+    /// write, so its value then goes to its callers but is not cached.
+    unlisted: AtomicBool,
 }
 
 /// A flight's outcome so far, and the wakers of its asynchronous waiters.
@@ -703,7 +704,7 @@ impl<K, V: Clone> Flight<K, V> {
                 vacant: Vec::new(),
             }),
             landed: Condvar::new(),
-            superseded: AtomicBool::new(false),
+            unlisted: AtomicBool::new(false),
         }
     }
 
@@ -901,9 +902,10 @@ struct FlightLanding<'lane, K, V> {
 
 impl<K, V> Drop for FlightLanding<'_, K, V> {
     fn drop(&mut self) {
-        {
-            // A write that superseded the flight, or the insert of its
-            // value, has unlisted it already.
+        // The insert of its value, or a write that superseded it, has
+        // unlisted the flight already, and with the release of the flag,
+        // every waiter that joined it is counted below.
+        if !self.flight.unlisted.load(Ordering::Acquire) {
             let mut writer = self.shard.lock();
             let mut flights = self.lane.0.lock();
             if let Some(index) = flights
@@ -1153,6 +1155,8 @@ struct ShardLock {
 impl ShardLock {
     #[inline]
     fn lock<'shard>(&'shard self, limits: &'shard ShardLimits) -> LockedShard<'shard> {
+        #[cfg(test)]
+        SHARD_LOCKS.with(|count| count.set(count.get() + 1));
         LockedShard {
             counts: self,
             limits,
@@ -1833,11 +1837,11 @@ where
         let mut flights = self.flights[index].0.lock();
         let listed = flights.len();
         flights.retain(|flight| {
-            let superseded = picks(flight);
-            if superseded {
-                flight.superseded.store(true, Ordering::Relaxed);
+            let picked = picks(flight);
+            if picked {
+                flight.unlisted.store(true, Ordering::Release);
             }
-            !superseded
+            !picked
         });
         let limits = &self.shards[index].limits;
         limits.set_loads(limits.loads() - (listed - flights.len()));
@@ -2278,7 +2282,8 @@ where
         landing: Option<&Flight<K, V>>,
     ) -> bool {
         if let Some(flight) = landing {
-            if flight.superseded.load(Ordering::Relaxed) {
+            // Unlisted before its own insert: a write superseded it.
+            if flight.unlisted.load(Ordering::Relaxed) {
                 return false;
             }
             self.supersede_loads(hash, key);
@@ -3530,6 +3535,8 @@ thread_local! {
     static WINDOW_EVICTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static RELOCATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static MAIN_RECORDS_EXAMINED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Shard locks this thread has taken.
+    static SHARD_LOCKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Runs once, when a search on this thread has missed in a key's home
     /// and is about to search its alternate.
     static BETWEEN_BUCKETS: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
@@ -5024,6 +5031,28 @@ mod tests {
         assert!(flag.take(), "abandoning the load wakes its waiter");
         assert_eq!(waiter.as_mut().poll(&mut context), Poll::Ready(30));
         assert_eq!(cache.get(&3), Some(30));
+        assert!(cache.flights.iter().all(|lane| lane.0.lock().is_empty()));
+    }
+
+    #[test]
+    fn a_load_takes_its_shard_lock_twice() {
+        // Once to list its flight, and once to insert its value, which
+        // unlists the flight; the landing then has nothing left to do.
+        let cache = ShardedCache::<u64, u64>::new(100);
+        let locks = || SHARD_LOCKS.with(std::cell::Cell::get);
+        let before = locks();
+        assert_eq!(cache.get_or_insert_with(&1, || 10), 10);
+        assert_eq!(locks() - before, 2);
+        let before = locks();
+        let GuardResult::Guard(guard) = cache.get_value_or_guard(&2, None) else {
+            panic!("a missing key hands its caller the guard");
+        };
+        assert!(guard.insert(20));
+        assert_eq!(locks() - before, 2);
+        // A failed load has no insert: its landing unlists the flight.
+        let before = locks();
+        assert_eq!(cache.get_or_try_insert_with(&3, || Err(())), Err(()));
+        assert_eq!(locks() - before, 2);
         assert!(cache.flights.iter().all(|lane| lane.0.lock().is_empty()));
     }
 
