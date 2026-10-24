@@ -6063,6 +6063,36 @@ mod tests {
     }
 
     #[test]
+    fn zero_sized_and_over_aligned_entries_round_trip() {
+        // Handles count eight-byte words from the region's base, so slots
+        // of any size and alignment must keep them exact.
+        #[repr(align(128))]
+        #[derive(Clone, Debug, PartialEq)]
+        struct Wide([u64; 3]);
+
+        let units: ShardedCache<(), ()> = ShardedCache::new(4);
+        assert!(units.insert((), ()));
+        assert_eq!(units.get(&()), Some(()));
+        assert!(units.remove(&()));
+        assert_eq!(units.get(&()), None);
+        let cache = ShardedCacheBuilder::new(512).shards(2).build::<u64, Wide>();
+        let keys = if cfg!(miri) { 300 } else { 2_000 };
+        for key in 0..keys {
+            cache.insert(key, Wide([key, key + 1, key + 2]));
+        }
+        let guard = cache.pin();
+        let mut found = 0;
+        for key in 0..keys {
+            if let Some(value) = guard.get(&key) {
+                assert_eq!(*value, Wide([key, key + 1, key + 2]));
+                assert_eq!(std::ptr::from_ref(value).addr() % 128, 0);
+                found += 1;
+            }
+        }
+        assert_eq!(found, cache.len());
+    }
+
+    #[test]
     fn panics_in_hash_eq_weigher_and_clone_leave_the_cache_whole() {
         // Each kind of user code panics now and then, some of it under the
         // shard lock: the cache may leak what the panicking operation held,
