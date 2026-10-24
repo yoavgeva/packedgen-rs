@@ -298,6 +298,11 @@ impl ShardedCacheBuilder {
 
 impl<W, S, L> ShardedCacheBuilder<W, S, L> {
     /// Also limits the summed weight of the entries; see [`Self::weighter`].
+    ///
+    /// Each shard holds an equal share of the limit, so a value heavier than
+    /// `max_weight` divided by the shard count is never cached: with 256
+    /// shards and a 1-GiB limit, one over 4 MiB. Fewer shards, set with
+    /// [`Self::shards`], let heavier values in.
     #[must_use]
     pub fn max_weight(mut self, max_weight: u64) -> Self {
         self.max_weight = Some(max_weight);
@@ -651,6 +656,38 @@ impl<T> Deref for ShardView<'_, T> {
     }
 }
 
+/// Prints the cache's counts and limits, not its entries, so a type holding
+/// a cache can derive `Debug` whatever its keys and values are.
+impl<K, V, W, S, L> std::fmt::Debug for ShardedCache<K, V, W, S, L> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let max_weight = self.max_weight.load(Ordering::Relaxed);
+        f.debug_struct("ShardedCache")
+            .field(
+                "len",
+                &self
+                    .shards
+                    .iter()
+                    .map(|shard| shard.writer.len.load(Ordering::Relaxed))
+                    .sum::<usize>(),
+            )
+            .field(
+                "weight",
+                &self
+                    .shards
+                    .iter()
+                    .map(|shard| shard.writer.weight.load(Ordering::Relaxed))
+                    .sum::<u64>(),
+            )
+            .field("capacity", &self.capacity.load(Ordering::Relaxed))
+            .field(
+                "max_weight",
+                &(max_weight != u64::MAX).then_some(max_weight),
+            )
+            .field("shards", &self.shards.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// One shard's loads in progress. Listed and unlisted only under the shard
 /// lock, which every write to the shard holds while it supersedes the loads
 /// of its key.
@@ -808,6 +845,26 @@ where
         let cached = cache.insert_loaded(&landing.flight, key, value.clone());
         landing.loaded = Some(value);
         cached
+    }
+}
+
+impl<K: std::fmt::Debug, V: std::fmt::Debug, W, S, L> std::fmt::Debug
+    for GuardResult<'_, K, V, W, S, L>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Value(value) => f.debug_tuple("Value").field(value).finish(),
+            Self::Guard(guard) => f.debug_tuple("Guard").field(guard).finish(),
+            Self::Timeout => f.write_str("Timeout"),
+        }
+    }
+}
+
+impl<K: std::fmt::Debug, V, W, S, L> std::fmt::Debug for PlaceholderGuard<'_, K, V, W, S, L> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlaceholderGuard")
+            .field("key", &self.key)
+            .finish_non_exhaustive()
     }
 }
 
@@ -3099,6 +3156,12 @@ where
     }
 }
 
+impl<K, V, W, S, L> std::fmt::Debug for ShardedCacheGuard<'_, K, V, W, S, L> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShardedCacheGuard").finish_non_exhaustive()
+    }
+}
+
 impl<K, V, W, S, L> Drop for ShardedCache<K, V, W, S, L> {
     #[allow(
         unsafe_code,
@@ -5353,6 +5416,84 @@ mod tests {
     }
 
     #[test]
+    fn caches_guards_and_results_print_for_debugging() {
+        // A struct holding a cache derives `Debug` whatever its entries are.
+        #[derive(Debug)]
+        #[allow(dead_code, reason = "printed, not read")]
+        struct State {
+            cache: ShardedCache<u64, std::cell::RefCell<()>>,
+        }
+        let cache = ShardedCacheBuilder::new(100).shards(1).build::<u64, u64>();
+        cache.insert(1, 10);
+        assert_eq!(
+            format!("{cache:?}"),
+            "ShardedCache { len: 1, weight: 1, capacity: 100, max_weight: None, shards: 1, .. }"
+        );
+        assert_eq!(format!("{:?}", cache.pin()), "ShardedCacheGuard { .. }");
+        assert_eq!(
+            format!("{:?}", cache.get_value_or_guard(&1, None)),
+            "Value(10)"
+        );
+        let GuardResult::Guard(guard) = cache.get_value_or_guard(&2, None) else {
+            panic!("a missing key hands its caller the guard");
+        };
+        assert_eq!(format!("{guard:?}"), "PlaceholderGuard { key: 2, .. }");
+        assert_eq!(
+            format!("{:?}", cache.get_value_or_guard(&2, Some(Duration::ZERO))),
+            "Timeout"
+        );
+        drop(guard);
+        let state = State {
+            cache: ShardedCache::new(10),
+        };
+        assert!(format!("{state:?}").starts_with("State { cache: ShardedCache {"));
+    }
+
+    #[test]
+    fn superseded_loads_give_back_their_slots_and_drop_their_values() {
+        static LIVE: AtomicUsize = AtomicUsize::new(0);
+
+        struct Tracked;
+
+        impl Tracked {
+            fn new() -> Self {
+                LIVE.fetch_add(1, Ordering::Relaxed);
+                Self
+            }
+        }
+
+        impl Clone for Tracked {
+            fn clone(&self) -> Self {
+                Self::new()
+            }
+        }
+
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                LIVE.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+
+        let cache = ShardedCache::<u64, Tracked>::new(64);
+        let rounds = if cfg!(miri) { 200 } else { 20_000 };
+        for round in 0..rounds {
+            let key = round % 8;
+            drop(cache.get_or_insert_with(&key, || {
+                cache.remove(&key);
+                Tracked::new()
+            }));
+        }
+        assert!(cache.is_empty(), "every load was superseded");
+        let entries = cache.memory_used().entries;
+        assert!(
+            entries < size_of::<Slot<(u64, Tracked)>>() * 4_096,
+            "{entries} bytes of slots for loads that cached nothing"
+        );
+        cache.maintain();
+        assert_eq!(LIVE.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn placeholder_guards_and_their_futures_are_send() {
         fn assert_send<T: Send>(_: &T) {}
         let cache = ShardedCache::<u64, String>::new(100);
@@ -6780,9 +6921,16 @@ mod tests {
             cache.insert(key, key);
             assert!(!in_probation(key), "remembered key {key} entered probation");
         }
-        // A key the ghost never saw starts in probation.
-        cache.insert(5_000, 5_000);
-        assert!(in_probation(5_000));
+        // Keys the ghost never saw start in probation, but for the rare one
+        // its words remember by chance: the filter's false positives, which
+        // failed a lone key here on 1 hash seed in 300.
+        let fresh = (5_000..5_020)
+            .filter(|&key| {
+                cache.insert(key, key);
+                in_probation(key)
+            })
+            .count();
+        assert!(fresh >= 17, "{fresh} of 20 fresh keys started in probation");
     }
 
     #[test]
