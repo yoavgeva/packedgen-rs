@@ -5417,50 +5417,64 @@ mod tests {
 
     #[test]
     fn set_capacity_evicts_at_once_and_grows_back_within_the_reserve() {
+        // At full size the scenario takes minutes under Miri, which runs the
+        // tenth-size one alone.
+        if !cfg!(miri) {
+            resize_scenario(1_000);
+        }
+        resize_scenario(100);
+    }
+
+    /// Builds a cache of `built` entries with room for four times as many,
+    /// shrinks it to a fifth, grows it past the reserve, and shrinks it to
+    /// one entry per shard.
+    fn resize_scenario(built: usize) {
+        let (reserve, shrunk) = (4 * built, built / 5);
+        let key = |count: usize| count as u64;
         let heard = Arc::new(Mutex::new(Vec::new()));
-        let cache = ShardedCacheBuilder::new(1_000)
-            .max_capacity(4_000)
+        let cache = ShardedCacheBuilder::new(built)
+            .max_capacity(reserve)
             .shards(4)
             .removal_listener({
                 let heard = Arc::clone(&heard);
                 move |_: &u64, _: &u64, cause| heard.lock().push(cause)
             })
             .build::<u64, u64>();
-        assert_eq!((cache.capacity(), cache.max_capacity()), (1_000, 4_000));
-        for key in 0..1_000_u64 {
+        assert_eq!((cache.capacity(), cache.max_capacity()), (built, reserve));
+        for key in 0..key(built) {
             cache.insert(key, key);
         }
         let full = cache.len();
         heard.lock().clear();
-        assert_eq!(cache.set_capacity(200), 200);
-        assert_eq!(cache.capacity(), 200);
+        assert_eq!(cache.set_capacity(shrunk), shrunk);
+        assert_eq!(cache.capacity(), shrunk);
         assert!(
-            cache.len() <= 200,
-            "{} entries in a cache of 200",
+            cache.len() <= shrunk,
+            "{} entries in a cache of {shrunk}",
             cache.len()
         );
         let evicted = heard.lock().clone();
         assert_eq!(evicted.len(), full - cache.len());
         assert!(evicted.iter().all(|cause| *cause == RemovalCause::Size));
-        for key in 1_000..1_400_u64 {
+        for key in key(built)..key(built + 2 * shrunk) {
             cache.insert(key, key);
         }
-        assert!(cache.len() <= 200);
-        assert_eq!(cache.set_capacity(10_000), 4_000, "capped at the reserve");
-        for key in 2_000..6_000_u64 {
+        assert!(cache.len() <= shrunk);
+        assert_eq!(
+            cache.set_capacity(10 * built),
+            reserve,
+            "capped at the reserve"
+        );
+        let grown = key(2 * built)..key(2 * built + reserve);
+        for key in grown.clone() {
             cache.insert(key, key);
         }
         assert!(
-            (2_000..=4_000).contains(&cache.len()),
-            "{} entries after growing to 4,000",
+            (reserve / 2..=reserve).contains(&cache.len()),
+            "{} entries after growing to {reserve}",
             cache.len()
         );
-        assert!(
-            (2_000..6_000)
-                .filter(|key| cache.get(key) == Some(*key))
-                .count()
-                >= 2_000
-        );
+        assert!(grown.filter(|key| cache.get(key) == Some(*key)).count() >= reserve / 2);
         assert_eq!(cache.set_capacity(1), 4, "one entry per shard");
         assert!(cache.len() <= 4);
     }
