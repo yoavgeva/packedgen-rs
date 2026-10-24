@@ -6916,9 +6916,16 @@ mod tests {
             cache.insert(key, key);
             assert!(!in_probation(key), "remembered key {key} entered probation");
         }
-        // A key the ghost never saw starts in probation.
-        cache.insert(5_000, 5_000);
-        assert!(in_probation(5_000));
+        // Keys the ghost never saw start in probation, but for the rare one
+        // its words remember by chance: the filter's false positives, which
+        // failed a lone key here on 1 hash seed in 300.
+        let fresh = (5_000..5_020)
+            .filter(|&key| {
+                cache.insert(key, key);
+                in_probation(key)
+            })
+            .count();
+        assert!(fresh >= 17, "{fresh} of 20 fresh keys started in probation");
     }
 
     #[test]
