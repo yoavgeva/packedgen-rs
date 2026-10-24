@@ -1023,10 +1023,13 @@ mod tests {
         const VALUES: usize = 4_096;
 
         let arena = Arc::new(CacheValueArena::new());
-        thread::scope(|scope| {
-            for worker in 0..THREADS {
+        // Joined rather than scoped: a scope waits for each closure, not for
+        // its thread's pool to drop, and under Miri those destructors then
+        // outlived the test.
+        let workers = (0..THREADS)
+            .map(|worker| {
                 let arena = Arc::clone(&arena);
-                scope.spawn(move || {
+                thread::spawn(move || {
                     for round in 0..ROUNDS {
                         let byte = u8::try_from(worker * ROUNDS + round).expect("test byte fits");
                         let pin = arena.pin();
@@ -1047,8 +1050,11 @@ mod tests {
                         drop(pin);
                         drop(arena.pin());
                     }
-                });
-            }
-        });
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().expect("a worker completes");
+        }
     }
 }
