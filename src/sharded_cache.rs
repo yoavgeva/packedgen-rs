@@ -2199,9 +2199,6 @@ where
                 self.slots.give(&[slot]);
                 return false;
             }
-            if writer.over_limit(weight) {
-                shard.prefetch_eviction(&writer, hash);
-            }
             let found = shard.find(hash, |current| {
                 // SAFETY: published in this table while `pin` is held.
                 unsafe { entry(pin, current) }.value().0 == *key
@@ -2230,6 +2227,9 @@ where
                     removed.push(victim, cause);
                 }
             } else {
+                if writer.over_limit(weight) {
+                    shard.prefetch_eviction(&writer, hash);
+                }
                 while writer.over_limit(weight) {
                     let Some((victim, cause)) = self.evict(shard, &mut writer, pin, None, &mut now)
                     else {
@@ -3159,10 +3159,13 @@ impl<T> ShardView<'_, T> {
     /// line, and the new key's home bucket and ghost line. Each was
     /// most likely last written on another core, and fetched together their
     /// misses overlap instead of following one another under the lock.
-    /// Lines the insert writes are fetched for writing. Writers call it only
-    /// for a full shard, so writes that evict nothing fetch nothing extra.
+    /// Lines the insert writes are fetched for writing. Inserts call it only
+    /// once a new key's lookup has missed in a full shard, so writes that
+    /// evict nothing, replacements included, fetch nothing extra.
     #[inline]
     fn prefetch_eviction(&self, writer: &ShardWriter, hash: u64) {
+        #[cfg(test)]
+        EVICTION_PREFETCHES.with(|count| count.set(count.get() + 1));
         if let Some(next) = writer.probation.front() {
             let slot = usize::try_from(next.record >> 8).expect("a slot fits usize");
             prefetch_write(self.buckets.as_ptr().wrapping_add(slot / SLOTS));
@@ -3537,6 +3540,8 @@ thread_local! {
     static MAIN_RECORDS_EXAMINED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Shard locks this thread has taken.
     static SHARD_LOCKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Eviction prefetches this thread has issued.
+    static EVICTION_PREFETCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Runs once, when a search on this thread has missed in a key's home
     /// and is about to search its alternate.
     static BETWEEN_BUCKETS: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
@@ -5054,6 +5059,26 @@ mod tests {
         assert_eq!(cache.get_or_try_insert_with(&3, || Err(())), Err(()));
         assert_eq!(locks() - before, 2);
         assert!(cache.flights.iter().all(|lane| lane.0.lock().is_empty()));
+    }
+
+    #[test]
+    fn writes_that_evict_nothing_prefetch_no_victim() {
+        let cache: ShardedCache<u64, u64> = ShardedCacheBuilder::new(64).shards(1).build();
+        let mut next = 0;
+        while cache.len() < 64 {
+            cache.insert(next, next);
+            next += 1;
+        }
+        let resident: Vec<u64> = (0..next).filter(|key| cache.peek(key).is_some()).collect();
+        let prefetches = || EVICTION_PREFETCHES.with(std::cell::Cell::get);
+        let before = prefetches();
+        for &key in &resident {
+            assert!(cache.insert(key, key + 1), "a replacement");
+        }
+        assert_eq!(prefetches(), before, "replacing a key evicts nothing");
+        assert!(cache.insert(next, next));
+        assert_eq!(prefetches(), before + 1, "a new key evicts");
+        assert_eq!(cache.len(), 64);
     }
 
     #[test]

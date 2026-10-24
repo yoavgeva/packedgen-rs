@@ -63,9 +63,9 @@ entry. Tables are sized once and never rebuilt.
     buckets. This happened on fewer than 0.1% of inserts into a full shard.
 - **Eviction.** Each shard uses an S3-FIFO-style policy:
   - New keys wait in a probationary FIFO. Its records hold the key's slot
-    record, its hash, and the handle it was published with. A writer that
-    takes a full shard's lock prefetches the next victim's bucket and entry
-    together.
+    record, its hash, and the handle it was published with. An insert
+    whose new key misses in a full shard prefetches the next victim's
+    bucket and entry together.
   - Each shard sizes its probation to the keys that return (see "Adaptive
     probation"). It starts at 0.25% of the shard and stays between one
     entry and a quarter of the shard.
@@ -841,6 +841,13 @@ These changes followed, each measured against the one before:
   full shard's lock now prefetches all of them, those it writes for writing.
   Eight-thread turnover: +4.6 to +5.4% on macOS and +3.6 to +4.5% on Linux;
   cold fill +1 to +7%, with every median positive and ranges crossing zero.
+- **Prefetching only for new keys.** The prefetch ran before the lookup, so
+  replacing a resident key in a full shard fetched a victim it would not
+  evict. It now runs once the lookup misses. Replacing resident `u64` keys
+  in a full cache on one thread, best of five on macOS: 40.2 to 42.6 ns
+  against 42.4 to 45.0 ns at 50,000 entries. The probe's write workloads,
+  whose replaces run below capacity, stayed within 3% at 50,000 and
+  1,000,000 entries.
 - **Stores instead of swaps.** Unpublishing a handle swapped it with an
   AcqRel read-modify-write. Under the shard lock a relaxed load and a
   release store do the same: writers change handles only under the lock,
