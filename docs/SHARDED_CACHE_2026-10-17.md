@@ -1081,6 +1081,19 @@ the rest was spread over the policy, the table, and the insert itself.
 Those instructions are cheap, as the bound above shows: freeing at once
 gained 3 to 10%.
 
+### Updates of a full cache
+
+The probe's `update` workload upserts the seeded keys into a cache of
+exactly their count: mostly replacements, and reinsertions of the few that
+seeding evicted. The other resident workloads run at four times their key
+count, so they never wrote to a full cache. On macOS, five paired runs of
+4,000,000 operations, median and range:
+
+| Entries | 1T | 8T |
+| ---: | ---: | ---: |
+| 50,000 | +11% (+5 to +19%) | +10% (−9 to +15%) |
+| 1,000,000 | +56% (+49 to +58%) | +58% (+50 to +89%) |
+
 ### With `u64` keys and values
 
 The probe's 32-byte keys and `Arc` payloads cost both caches hashing and

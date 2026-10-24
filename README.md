@@ -29,7 +29,10 @@ on a busy 16-core machine at 50,000 entries, it ran 2.3 to 3.2 times
 quick_cache's resident-hit throughput and 4.7 to 5.9 times its miss
 throughput, and it was 51 to 68% ahead on a 95%-read turnover mix, 37 to 44%
 ahead on deleting and reinserting keys, 5 to 22% ahead on replacing them,
-and 7 to 15% behind on inserting new keys into a full cache. On one thread,
+and 7 to 15% behind on inserting new keys into a full cache. Upserting
+resident keys into an exactly full cache, it was 10% ahead with eight
+threads and 11% ahead on one, and 56 to 58% ahead at 1,000,000 entries. On
+one thread,
 resident hits were level (−1 to −4%) and misses 79 to 87% faster; writes
 ranged from 11% ahead to 9% behind on Apple Silicon and trailed by 16 to 23%
 on Linux. Much of the single-thread write gap is epoch reclamation's
