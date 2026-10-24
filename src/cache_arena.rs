@@ -3636,8 +3636,14 @@ mod tests {
             arena.reclaim_retired();
             finished_tx.send(()).expect("test receiver remains live");
         });
+        // Miri's clock is virtual, and some of its interleavings spend more
+        // than two seconds of it here; it reports a true deadlock itself.
         finished_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
+            .recv_timeout(std::time::Duration::from_secs(if cfg!(miri) {
+                120
+            } else {
+                2
+            }))
             .expect("reentrant value destruction must not deadlock the collector gate");
         worker.join().expect("reclamation worker must not panic");
     }
