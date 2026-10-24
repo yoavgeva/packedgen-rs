@@ -298,6 +298,11 @@ impl ShardedCacheBuilder {
 
 impl<W, S, L> ShardedCacheBuilder<W, S, L> {
     /// Also limits the summed weight of the entries; see [`Self::weighter`].
+    ///
+    /// Each shard holds an equal share of the limit, so a value heavier than
+    /// `max_weight` divided by the shard count is never cached: with 256
+    /// shards and a 1-GiB limit, one over 4 MiB. Fewer shards, set with
+    /// [`Self::shards`], let heavier values in.
     #[must_use]
     pub fn max_weight(mut self, max_weight: u64) -> Self {
         self.max_weight = Some(max_weight);
