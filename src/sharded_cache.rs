@@ -5445,6 +5445,50 @@ mod tests {
     }
 
     #[test]
+    fn superseded_loads_give_back_their_slots_and_drop_their_values() {
+        static LIVE: AtomicUsize = AtomicUsize::new(0);
+
+        struct Tracked;
+
+        impl Tracked {
+            fn new() -> Self {
+                LIVE.fetch_add(1, Ordering::Relaxed);
+                Self
+            }
+        }
+
+        impl Clone for Tracked {
+            fn clone(&self) -> Self {
+                Self::new()
+            }
+        }
+
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                LIVE.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+
+        let cache = ShardedCache::<u64, Tracked>::new(64);
+        let rounds = if cfg!(miri) { 200 } else { 20_000 };
+        for round in 0..rounds {
+            let key = round % 8;
+            drop(cache.get_or_insert_with(&key, || {
+                cache.remove(&key);
+                Tracked::new()
+            }));
+        }
+        assert!(cache.is_empty(), "every load was superseded");
+        let entries = cache.memory_used().entries;
+        assert!(
+            entries < size_of::<Slot<(u64, Tracked)>>() * 4_096,
+            "{entries} bytes of slots for loads that cached nothing"
+        );
+        cache.maintain();
+        assert_eq!(LIVE.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn placeholder_guards_and_their_futures_are_send() {
         fn assert_send<T: Send>(_: &T) {}
         let cache = ShardedCache::<u64, String>::new(100);
