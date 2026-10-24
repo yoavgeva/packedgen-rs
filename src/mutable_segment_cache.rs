@@ -1553,6 +1553,9 @@ impl OnlineMutableSegmentCache {
     ///
     /// Reads and writes continue throughout construction. A reader guard that
     /// began before publication keeps its exact old base snapshot until drop.
+    /// Publication waits, yielding, until every guard from [`Self::pin`] or
+    /// [`Self::pin_writer_batch`] taken before it is dropped, so a thread
+    /// that holds one, or forgets one, never returns from this call.
     ///
     /// # Errors
     ///
