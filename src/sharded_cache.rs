@@ -1918,7 +1918,14 @@ where
         }
     }
 
-    /// Finds `key`'s live value and marks it read.
+    /// Finds `key`'s live value and marks it read. Always inlined: in a
+    /// program that also loads through the cache, the compiler kept it out
+    /// of line, and `get` called it.
+    #[allow(
+        clippy::inline_always,
+        reason = "out of line once loaders call it too, it left `get` a call"
+    )]
+    #[inline(always)]
     fn lookup<'pin, Q>(&self, pin: &'pin EpochPin<'_>, key: &Q, hash: u64) -> Option<&'pin V>
     where
         K: Borrow<Q> + 'pin,
@@ -1947,10 +1954,16 @@ where
         (!self.expired(entry, &mut None)).then_some(entry)
     }
 
+    /// The lookup every read shares; always inlined, as [`Self::lookup`].
     #[allow(
         unsafe_code,
         reason = "dereferences handles the table publishes under the caller's pin"
     )]
+    #[allow(
+        clippy::inline_always,
+        reason = "out of line once loaders call it too, it left `get` a call"
+    )]
+    #[inline(always)]
     fn find_entry<'pin, Q>(
         &self,
         pin: &'pin EpochPin<'_>,
