@@ -770,7 +770,12 @@ fn take_pooled(layout: Layout) -> Option<*mut CacheValueHeader> {
     if !CACHE_VALUE_POOL_ACTIVE.load(Ordering::Relaxed) {
         return None;
     }
-    CACHE_VALUE_POOL.with_borrow_mut(|pool| pool.take(layout))
+    // A thread-local destructor can allocate after this thread's pool is
+    // destroyed; it then allocates afresh, as `return_to_pool` frees.
+    CACHE_VALUE_POOL
+        .try_with(|pool| pool.try_borrow_mut().ok()?.take(layout))
+        .ok()
+        .flatten()
 }
 
 /// Transfers one quiescent allocation into its exact-layout local pool.
@@ -828,14 +833,17 @@ unsafe fn reclaim_cache_value(pointer: *mut CacheValueHeader, _collector: &Colle
 #[cfg(test)]
 mod tests {
     use std::alloc::{alloc, handle_alloc_error};
+    use std::cell::RefCell;
+    use std::panic::AssertUnwindSafe;
     use std::ptr;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
 
     use super::{
         CacheValueArena, CacheValueBatch, CacheValueHandle, CacheValuePool, LiveCacheValueHandle,
         MAX_POOLED_BYTES, ProtectedCacheValueHandle, RemovedCacheValueHandle, deallocate_batch,
-        value_layout,
+        reclaim_cache_value, value_layout,
     };
     use crate::NonMaxU64;
 
@@ -969,6 +977,44 @@ mod tests {
     #[test]
     #[allow(
         unsafe_code,
+        reason = "the destructor frees its unpublished value through the reclaim callback"
+    )]
+    fn a_thread_local_destructor_allocates_after_the_pool_is_gone() {
+        static PANICKED: AtomicBool = AtomicBool::new(false);
+        struct AllocateOnDrop(Arc<CacheValueArena>);
+        impl Drop for AllocateOnDrop {
+            fn drop(&mut self) {
+                let allocated = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    let handle = self.0.allocate(b"late", u64::MAX);
+                    // SAFETY: the value is unpublished, so nothing else
+                    // reaches it, and it is freed once.
+                    unsafe { reclaim_cache_value(handle.pointer().as_ptr(), &self.0.collector) };
+                }));
+                PANICKED.store(allocated.is_err(), Ordering::Relaxed);
+            }
+        }
+        thread_local! {
+            static LATE: RefCell<Option<AllocateOnDrop>> = const { RefCell::new(None) };
+        }
+        let arena = Arc::new(CacheValueArena::new());
+        thread::spawn(move || {
+            // Thread-local destructors run in reverse order of registration:
+            // registered first, this one runs after the pool's.
+            LATE.with(|late| *late.borrow_mut() = Some(AllocateOnDrop(Arc::clone(&arena))));
+            // Pooling a block registers this thread's pool and makes
+            // allocations look in pools.
+            let handle = arena.allocate(b"pooled", u64::MAX);
+            // SAFETY: as above, for this unpublished value.
+            unsafe { reclaim_cache_value(handle.pointer().as_ptr(), &arena.collector) };
+        })
+        .join()
+        .unwrap();
+        assert!(!PANICKED.load(Ordering::Relaxed), "allocating panicked");
+    }
+
+    #[test]
+    #[allow(
+        unsafe_code,
         reason = "workers retire unpublished values through their exact arena pin"
     )]
     fn concurrent_retirement_and_reuse_preserve_values() {
@@ -977,10 +1023,13 @@ mod tests {
         const VALUES: usize = 4_096;
 
         let arena = Arc::new(CacheValueArena::new());
-        thread::scope(|scope| {
-            for worker in 0..THREADS {
+        // Joined rather than scoped: a scope waits for each closure, not for
+        // its thread's pool to drop, and under Miri those destructors then
+        // outlived the test.
+        let workers = (0..THREADS)
+            .map(|worker| {
                 let arena = Arc::clone(&arena);
-                scope.spawn(move || {
+                thread::spawn(move || {
                     for round in 0..ROUNDS {
                         let byte = u8::try_from(worker * ROUNDS + round).expect("test byte fits");
                         let pin = arena.pin();
@@ -1001,8 +1050,11 @@ mod tests {
                         drop(pin);
                         drop(arena.pin());
                     }
-                });
-            }
-        });
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().expect("a worker completes");
+        }
     }
 }

@@ -27,20 +27,39 @@ at 100,000, against 78 to 210 for quick_cache 0.7.
 Against quick_cache, ShardedCache leads concurrent reads. With eight threads
 on a busy 16-core machine at 50,000 entries, it ran 2.3 to 3.2 times
 quick_cache's resident-hit throughput and 4.7 to 5.9 times its miss
-throughput, and it was 51 to 68% ahead on a 95%-read turnover mix, 37 to 44%
-ahead on deleting and reinserting keys, 5 to 22% ahead on replacing them,
-and 7 to 15% behind on inserting new keys into a full cache. On one thread,
-resident hits were level (−1 to −4%) and misses 79 to 87% faster; writes
-ranged from 11% ahead to 9% behind on Apple Silicon and trailed by 16 to 23%
-on Linux. Much of the single-thread write gap is epoch reclamation's
-bookkeeping: queuing, tagging, and later freeing each removed entry. With
-1,000,000 entries on Apple Silicon, one thread was level on hits (+2%),
+throughput. It was 51 to 68% ahead on a 95%-read turnover mix, 32% ahead
+reading through `get_or_insert_with`, 37 to 44% ahead on deleting and
+reinserting keys, 5 to 22% ahead on replacing them, 10% ahead on upserting
+resident keys into an exactly full cache, and 7 to 15% behind on inserting
+new keys into a full cache.
+
+On one thread, resident hits were level (−1 to −4%) and misses 79 to 87%
+faster; reads through the loader were level (−3%) and full-cache upserts
+11% ahead; other writes ranged from 11% ahead to 9% behind on Apple Silicon
+and trailed by 16 to 23% on Linux. Much of the single-thread write gap is
+epoch reclamation's bookkeeping: queuing, tagging, and later freeing each
+removed entry. These runs use 32-byte keys and 64-byte `Arc` payloads,
+which cost both caches hashing and reference counts. With `u64` keys and
+values, one thread's upserts into a full cache ran at 0.4 to 0.5 times
+quick_cache's throughput on macOS and Linux, as each writes a new entry and
+retires the old one where quick_cache overwrites in place; at eight threads
+those upserts ranged from 15% behind to 31% ahead, and hits ran 7 to 9 times
+quick_cache's.
+
+With 1,000,000 entries on Apple Silicon, one thread was level on hits (+2%),
 ahead on writes by 12 to 47%, and 50% behind on misses, whose tag words
 share cache lines with the handles; eight threads led on every workload, by
-4 to 109%. On a 4-vCPU x86_64 runner, four threads led on reads and turnover
-at 50,000 entries, and one thread trailed by 21 to 36% on writes. In
-process memory, before four-byte handles, 1,000,000 entries took 46 to 136
-bytes each, against 83 to 332 for quick_cache. Timing every operation at
+4 to 109%. Full-cache upserts led by 56 to 58%, and reads through the loader
+by 13% on one thread and 61% with eight.
+
+On a 4-vCPU x86_64 runner, four threads led on reads and turnover at 50,000
+entries, and one thread trailed by 21 to 36% on writes. There, full-cache
+upserts trailed by 20% on one thread and 15% on four at 50,000 entries and
+were level at 1,000,000; reads through the loader trailed by 10% on one
+thread and led by 17% on four, and led by 18 and 52% at 1,000,000.
+
+In process memory, before four-byte handles, 1,000,000 entries took 46 to
+136 bytes each, against 83 to 332 for quick_cache. Timing every operation at
 1,000,000 entries, its tail from p99.9 on was the shorter one in every cell:
 up to 16 times shorter at p99.999, and 3 to 17 times shorter from p99.9 at
 eight threads; on one thread its p99 was level or one 42 ns timer tick
@@ -69,7 +88,8 @@ It offers:
   `get_or_try_insert_async`, which wait for that load without blocking, on
   any executor; `get_value_or_guard`, with a timeout, and
   `get_value_or_guard_async` hand the caller a guard to insert through
-  instead;
+  instead; a write to a key while it loads supersedes the load, so a value
+  read from its source before an invalidation is never cached after it;
 - per-entry and default times to live, or a time to idle that reads extend;
 - hit, miss, eviction, and expiration counts;
 - a removal listener told why each entry left;
@@ -77,8 +97,8 @@ It offers:
   `retain`, whose predicate may write to the cache;
 - `remove_if`, which decides and removes under one lock, and `replace`,
   which writes only a key that holds a live value;
-- `drain`, and `memory_used`, which reports the table, entry slots, and
-  policy state in bytes;
+- `drain`, and `memory_used`, which reports the table, entry slots,
+  policy state, and bookkeeping in bytes;
 - `peek`, `contains_key`, `clear`, and `maintain`, which drops removed
   values promptly after a burst of writes;
 - weighted limits, `set_capacity` and `set_max_weight` to resize at run
@@ -120,11 +140,12 @@ assert_eq!(sessions.stats().misses, 1);
 ### Maturity
 
 `ShardedCache` is new. Unit tests, an 8-thread race that counts live values,
-Miri, and the address and thread sanitizers cover it (`scripts/cache_proof.sh`),
+a test running every operation from eight threads at once, Miri, and the
+address and thread sanitizers cover it (`scripts/cache_proof.sh`),
 and CI runs its tests on Linux, macOS, and Windows. It has no production
 deployments yet, and its API may change before 1.0.
-Its benchmarks so far ran on one 16-core Apple Silicon machine and on a Linux
-VM hosted there.
+Its benchmarks so far ran on one 16-core Apple Silicon machine, on a Linux
+VM hosted there, and on GitHub's x86_64 runners.
 
 ## Research components
 

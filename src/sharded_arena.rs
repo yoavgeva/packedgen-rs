@@ -282,6 +282,11 @@ pub(crate) struct Epochs {
 }
 
 impl Epochs {
+    /// Bytes of the reader counters and announcement lines.
+    pub(crate) fn bytes_used(&self) -> usize {
+        size_of_val(&*self.readers) + size_of_val(&*self.announcements)
+    }
+
     pub(crate) fn new() -> Self {
         let announcers = if announcements_supported() {
             ANNOUNCERS
@@ -977,6 +982,19 @@ struct QueueState<T> {
 unsafe impl<T: Send> Send for QueueState<T> {}
 
 impl<T> RetiredSlots<T> {
+    /// Bytes of the queues and of the buffers holding their retired slots;
+    /// takes each queue's lock in turn.
+    pub(crate) fn bytes_used(&self) -> usize {
+        size_of_val(&*self.queues)
+            + self
+                .queues
+                .iter()
+                .map(|queue| {
+                    queue.0.lock().slots.capacity() * size_of::<(usize, NonNull<Slot<T>>)>()
+                })
+                .sum::<usize>()
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             queues: (0..RETIRED_QUEUES)

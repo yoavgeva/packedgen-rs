@@ -174,12 +174,17 @@ sanitizers() {
     concurrent_prepared_replacement_batches_recycle_without_lost_values -- --exact
   RUSTFLAGS="-Zsanitizer=address" RUSTDOCFLAGS="-Zsanitizer=address" \
     cargo +nightly test --target "$target" --lib -- sharded_cache::tests sharded_arena::tests
+  RUSTFLAGS="-Zsanitizer=address" RUSTDOCFLAGS="-Zsanitizer=address" \
+    cargo +nightly test --target "$target" --test sharded_cache_every_operation
+  RUSTFLAGS="-Zsanitizer=thread" RUSTDOCFLAGS="-Zsanitizer=thread" \
+    cargo +nightly test -Zbuild-std --target "$target" --test sharded_cache_every_operation
   RUSTFLAGS="-Zsanitizer=thread" RUSTDOCFLAGS="-Zsanitizer=thread" \
     cargo +nightly test -Zbuild-std --target "$target" --lib -- \
     sharded_cache::tests::racing sharded_cache::tests::concurrent \
     sharded_cache::tests::get_or_insert_with sharded_cache::tests::a_failed \
     sharded_cache::tests::a_thread_that_exits sharded_cache::tests::dropping_a_cache \
-    sharded_cache::tests::other_writers_drain
+    sharded_cache::tests::other_writers_drain sharded_cache::tests::loads_racing \
+    sharded_cache::tests::async_and_blocking sharded_cache::tests::callers_wait
 }
 
 memory_soak() {
