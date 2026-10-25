@@ -1939,7 +1939,13 @@ where
             .then(|| &entry.value().1)
     }
 
-    /// Finds `key`'s live entry without marking it read.
+    /// Finds `key`'s live entry without marking it read; always inlined, as
+    /// [`Self::lookup`], for `peek` and `contains_key`.
+    #[allow(
+        clippy::inline_always,
+        reason = "out of line once loaders call the lookup too, it left `peek` a call"
+    )]
+    #[inline(always)]
     fn live_entry<'pin, Q>(
         &self,
         pin: &'pin EpochPin<'_>,
