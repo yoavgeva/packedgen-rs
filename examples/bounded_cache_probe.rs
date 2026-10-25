@@ -16,6 +16,7 @@
 
 #![allow(clippy::cast_precision_loss)]
 
+use std::convert::Infallible;
 use std::hint::black_box;
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -49,6 +50,12 @@ enum Workload {
     Turnover,
     Replace,
     DeleteReinsert,
+    /// Upserts of the seeded keys into an exactly full cache: replacements
+    /// of resident keys, and reinsertions of the few the seeding evicted.
+    Update,
+    /// Turnover's reads, each through the cache's loader, which loads and
+    /// inserts a missed key.
+    ReadThrough,
 }
 
 impl Workload {
@@ -60,6 +67,8 @@ impl Workload {
             "turnover" => Self::Turnover,
             "replace" => Self::Replace,
             "delete-reinsert" => Self::DeleteReinsert,
+            "update" => Self::Update,
+            "read-through" => Self::ReadThrough,
             _ => panic!("unknown workload: {value}"),
         }
     }
@@ -131,6 +140,8 @@ impl Config {
 #[derive(Clone, Copy, Debug)]
 enum Action {
     Read,
+    /// A read that loads a missed key through the cache's loader.
+    Load,
     Insert,
     Replace,
     DeleteReinsert,
@@ -181,20 +192,13 @@ fn worker_trace(config: &Config, worker: usize) -> Vec<Operation> {
                 Workload::ReadMiss => (config.entries + operation, Action::Read),
                 Workload::ColdFill => (config.entries + operation, Action::Insert),
                 Workload::Turnover if random % 100 < 95 => {
-                    // 80% of reads target a stable hot tenth; the rest cover a
-                    // working set twice the soft capacity. Policy remains visible.
-                    let id = if random.rotate_left(17) % 100 < 80 {
-                        usize::try_from(mix(random) % config.entries.div_ceil(10) as u64)
-                            .expect("hot id fits usize")
-                    } else {
-                        usize::try_from(mix(random) % (2 * config.entries) as u64)
-                            .expect("working-set id fits usize")
-                    };
-                    (id, Action::Read)
+                    (working_set_id(config, random), Action::Read)
                 }
+                Workload::ReadThrough => (working_set_id(config, random), Action::Load),
                 Workload::Turnover => (2 * config.entries + operation, Action::Insert),
                 Workload::Replace => (resident, Action::Replace),
                 Workload::DeleteReinsert => (resident, Action::DeleteReinsert),
+                Workload::Update => (resident, Action::Insert),
             };
             Operation {
                 key: key(id as u64),
@@ -203,6 +207,18 @@ fn worker_trace(config: &Config, worker: usize) -> Vec<Operation> {
             }
         })
         .collect()
+}
+
+/// A read's key: 80% of reads target a stable hot tenth; the rest cover a
+/// working set twice the soft capacity. Policy remains visible.
+fn working_set_id(config: &Config, random: u64) -> usize {
+    if random.rotate_left(17) % 100 < 80 {
+        usize::try_from(mix(random) % config.entries.div_ceil(10) as u64)
+            .expect("hot id fits usize")
+    } else {
+        usize::try_from(mix(random) % (2 * config.entries) as u64)
+            .expect("working-set id fits usize")
+    }
 }
 
 fn worker_range(total: usize, workers: usize, worker: usize) -> (usize, usize) {
@@ -306,7 +322,7 @@ impl<const OWNED: bool, const GUARDED: bool> DirectSession<'_, OWNED, GUARDED> {
 impl<const OWNED: bool, const GUARDED: bool> Session for DirectSession<'_, OWNED, GUARDED> {
     fn apply(&mut self, operation: &Operation, config: &Config, sample: &mut Sample) {
         match operation.action {
-            Action::Read => {
+            Action::Read | Action::Load => {
                 let hit = if OWNED {
                     let value = self.guard.get(&operation.key).cloned();
                     sample.observe(value.as_ref(), &operation.key);
@@ -316,7 +332,8 @@ impl<const OWNED: bool, const GUARDED: bool> Session for DirectSession<'_, OWNED
                     sample.observe(value, &operation.key);
                     value.is_some()
                 };
-                if !hit && config.workload == Workload::Turnover {
+                // The direct cache has no loader: a missed load inserts.
+                if !hit && matches!(config.workload, Workload::Turnover | Workload::ReadThrough) {
                     self.publish(operation, config, sample);
                 }
             }
@@ -347,6 +364,18 @@ impl Session for ShardedSession<'_> {
                         operation.key,
                         payload(&operation.key, config.value_bytes, operation.version),
                     );
+                    sample.writes += 1;
+                }
+            }
+            Action::Load => {
+                let mut loaded = false;
+                let value = self.0.get_or_insert_with(&operation.key, || {
+                    loaded = true;
+                    payload(&operation.key, config.value_bytes, operation.version)
+                });
+                sample.observe((!loaded).then_some(&value), &operation.key);
+                if loaded {
+                    assert_eq!(&value[..8], &operation.key[..8]);
                     sample.writes += 1;
                 }
             }
@@ -395,6 +424,19 @@ impl Session for ShardedBatchSession<'_> {
                         operation.key,
                         payload(&operation.key, config.value_bytes, operation.version),
                     ));
+                    sample.writes += 1;
+                }
+            }
+            Action::Load => {
+                self.flush();
+                let mut loaded = false;
+                let value = self.cache.get_or_insert_with(&operation.key, || {
+                    loaded = true;
+                    payload(&operation.key, config.value_bytes, operation.version)
+                });
+                sample.observe((!loaded).then_some(&value), &operation.key);
+                if loaded {
+                    assert_eq!(&value[..8], &operation.key[..8]);
                     sample.writes += 1;
                 }
             }
@@ -464,6 +506,22 @@ impl Session for QuickSession<'_> {
                         operation.key,
                         payload(&operation.key, config.value_bytes, operation.version),
                     );
+                    sample.writes += 1;
+                }
+            }
+            Action::Load => {
+                let mut loaded = false;
+                let Ok(value) = self.0.get_or_insert_with(&operation.key, || {
+                    loaded = true;
+                    Ok::<_, Infallible>(payload(
+                        &operation.key,
+                        config.value_bytes,
+                        operation.version,
+                    ))
+                });
+                sample.observe((!loaded).then_some(&value), &operation.key);
+                if loaded {
+                    assert_eq!(&value[..8], &operation.key[..8]);
                     sample.writes += 1;
                 }
             }
@@ -679,6 +737,15 @@ fn validate_result(config: &Config, sample: &Sample, entries: usize, weight: u64
             assert_eq!(sample.inserts, config.operations as u64);
             assert_eq!(entries, config.entries);
         }
+        Workload::Update => assert_eq!(sample.writes, config.operations as u64),
+        Workload::ReadThrough => {
+            assert_eq!(sample.reads, config.operations as u64);
+            assert_eq!(
+                sample.hits + sample.writes,
+                sample.reads,
+                "each read hits or loads"
+            );
+        }
         Workload::Turnover => {}
     }
 }
@@ -845,12 +912,16 @@ mod tests {
             Workload::Turnover,
             Workload::Replace,
             Workload::DeleteReinsert,
+            Workload::Update,
+            Workload::ReadThrough,
         ] {
             let config = config(workload);
             config.validate();
             let _ = direct_run::<true>(&config);
             let _ = direct_run::<false>(&config);
             let _ = quick_run(&config);
+            let _ = sharded_run(&config, false);
+            let _ = sharded_run(&config, true);
         }
     }
 

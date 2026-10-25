@@ -1553,6 +1553,9 @@ impl OnlineMutableSegmentCache {
     ///
     /// Reads and writes continue throughout construction. A reader guard that
     /// began before publication keeps its exact old base snapshot until drop.
+    /// Publication waits, yielding, until every guard from [`Self::pin`] or
+    /// [`Self::pin_writer_batch`] taken before it is dropped, so a thread
+    /// that holds one, or forgets one, never returns from this call.
     ///
     /// # Errors
     ///
@@ -3390,6 +3393,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "real-time expiry: Miri's clock runs with interpretation and outpaces the sleeps"
+    )]
     fn pinned_guard_uses_a_stable_expiration_snapshot() {
         let cache = MutableSegmentCache::try_from_entries(
             SegmentCacheConfig::with_relative_expiry(Duration::from_millis(1)),
@@ -4145,6 +4152,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "real-time expiry: Miri's clock runs with interpretation and outpaces the sleeps"
+    )]
     fn online_guards_and_compaction_do_not_restart_ttl() {
         let cache = OnlineMutableSegmentCache::try_from_entries(
             SegmentCacheConfig::with_relative_expiry(Duration::from_millis(1)),

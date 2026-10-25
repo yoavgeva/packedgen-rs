@@ -145,6 +145,37 @@ fn admission_batch_enforces_limits_when_it_leaves_scope() {
 }
 
 #[test]
+fn a_forgotten_admission_batch_drops_only_the_values_it_admitted() {
+    // The batch holds arena slots it has claimed but not yet filled. A value
+    // with no bytes counts the drops of filled and unfilled slots alike.
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    struct Counted;
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let cache = DirectPackedCache::try_new(
+        CacheConfig::new(u64::MAX)
+            .with_max_entries(64)
+            .with_overlay_capacity(64),
+    )
+    .unwrap();
+    let mut guard = cache.pin();
+    let mut batch = guard.admission_batch();
+    assert_eq!(
+        batch
+            .insert_if_absent_with_options(b"one", Counted, 1, None)
+            .unwrap(),
+        CacheAdmissionOutcome::Inserted
+    );
+    std::mem::forget(batch);
+    drop(guard);
+    drop(cache);
+    assert_eq!(DROPS.load(Ordering::Relaxed), 1);
+}
+
+#[test]
 fn admission_batch_preserves_conditional_insert_semantics() {
     let cache = cache(u64::MAX, 8);
     let mut guard = cache.pin();

@@ -121,3 +121,9 @@ pub type AtomicPackedGenMap = LockFreeAtomicU64GenerationMap;
 /// Prepared exact handle for explicitly identified hot atomic keys.
 #[cfg(feature = "prepared-keys")]
 pub type PreparedKey = AtomicPreparedKey;
+
+/// Compiles and runs the README's example as a doctest, so it cannot drift
+/// from the API.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
