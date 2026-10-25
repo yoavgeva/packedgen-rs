@@ -643,6 +643,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "Miri fails compare_exchange_weak spuriously by design; the bound measures contention"
+    )]
     fn hot_key_cas_failures_are_bounded() {
         const THREADS: usize = 8;
         const OPERATIONS: usize = 50_000;

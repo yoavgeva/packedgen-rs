@@ -63,9 +63,9 @@ entry. Tables are sized once and never rebuilt.
     buckets. This happened on fewer than 0.1% of inserts into a full shard.
 - **Eviction.** Each shard uses an S3-FIFO-style policy:
   - New keys wait in a probationary FIFO. Its records hold the key's slot
-    record, its hash, and the handle it was published with. A writer that
-    takes a full shard's lock prefetches the next victim's bucket and entry
-    together.
+    record, its hash, and the handle it was published with. An insert
+    whose new key misses in a full shard prefetches the next victim's
+    bucket and entry together.
   - Each shard sizes its probation to the keys that return (see "Adaptive
     probation"). It starts at 0.25% of the shard and stays between one
     entry and a quarter of the shard.
@@ -129,12 +129,22 @@ entry. Tables are sized once and never rebuilt.
 - **Loading once.** `get_or_insert_with` and `get_or_try_insert_with` take a
   borrowed key and a loader.
   - A caller that misses registers a flight, keyed by hash and key, in its
-    shard's lane and runs the loader outside every lock.
+    shard's lane under the shard lock, and runs the loader outside every
+    lock.
   - Callers that miss the same key while it loads wait on the flight and
     share its value.
-  - The leader inserts the value before unlisting the flight. A caller that
-    finds no flight looks the key up again under the lane lock, so it either
-    joins the flight or sees the inserted value.
+  - The leader's insert unlists the flight under the shard lock. A caller
+    that finds no flight looks the key up again under that lock, so it
+    either joins the flight or sees the inserted value.
+  - Writes supersede loads. An insert, removal, clear, or drain unlists the
+    flights of its keys under the shard lock and marks them superseded; the
+    leader's insert, under the same lock, then caches nothing, while its
+    callers still get the value. A loader may read its source before an
+    invalidation (update the source, then remove the key) and insert after
+    it; without this the old value would stay cached. Callers that miss
+    after the write list a new flight and load afresh. A count of listed
+    flights, on the shard's limits line that inserts read anyway, spares
+    writes the lane when nothing loads.
   - If the loader fails or panics, the flight is abandoned and one waiter
     loads again with its own loader.
   - `get_or_insert_async` and `get_or_try_insert_async` share the flights.
@@ -219,7 +229,11 @@ entry. Tables are sized once and never rebuilt.
   iterator stops it once the shard it reached is emptied, and retires that
   shard's entries, so the listener hears each one.
 - **Memory.** `memory_used` reports the table, the entry slots handed out
-  so far, and each shard's filters, main-queue ring, and probation queue.
+  so far, each shard's filters, main-queue ring, and probation queue, and
+  the bookkeeping: reader counters, retired-slot queues, shard locks, and
+  load lanes, about 33 KB whatever the capacity plus half a kilobyte per
+  shard. Without it, a 1,000-entry cache reported 48 KB of its 103 KB of
+  resident memory; with it, 91 KB.
   Region slots never handed out are not counted, since a large region's
   untouched pages take no memory; memory keys and values own elsewhere is
   not counted either, as in quick_cache's `memory_used`.
@@ -293,6 +307,15 @@ entry. Tables are sized once and never rebuilt.
   - a placeholder guard inserting while another caller times out, a
     dropped guard waking its asynchronous waiter and handing it a guard,
     and a loader and a guard caller both waiting for a guard's insert;
+  - writes superseding loads: an insert, removal, `insert_many`, clear,
+    or drain while a key loads keeps the load from caching over it, and
+    callers after the write load afresh; a writer that updates a source
+    and invalidates the key, racing loaders on every loading path, never
+    leaves an older version cached (the old code failed it in 4 runs of
+    5); superseded loads giving back their slots and dropping their
+    values (verified to fail without either); a load taking the shard
+    lock twice; and asynchronous waiters that give up during a long load
+    reusing their waker slots (1,000 slots before, three after);
   - `drain` yielding live entries once and reporting expired ones, and a
     dropped drain retiring the shard it emptied (verified to fail without
     the retirement on drop); `memory_used` counting the table, slots
@@ -341,6 +364,19 @@ entry. Tables are sized once and never rebuilt.
   finds a reclamation beneath the reader in each (see "Parked pin
   announcements"). These models take minutes unoptimized, so they run with
   `--release`, as CI's model step does.
+- **Every operation at once.** `tests/sharded_cache_every_operation.rs`
+  runs every public operation from eight threads together: writes with
+  and without times to live, batches, replacements, removals, the three
+  loaders, placeholder guards, pinned and cloned reads, iteration,
+  `retain`, partial drains, clears, and resizes. Each value names its key,
+  and every read and the listener check it; afterwards the bounds hold,
+  the live values are the resident ones, and a clear leaves none. It
+  passed 20 seeds of 30 seconds in release, about 140 million operations
+  each, and runs under both sanitizers. A unit test arms keys' `Hash` and
+  `Eq`, the weigher, and values' `Clone` to panic now and then, some under
+  the shard lock, and finds the cache usable, within its limits, and right
+  about every key afterwards; another round-trips zero-sized and
+  128-byte-aligned entries.
 - **CI tools.** `scripts/cache_proof.sh` runs the module under Miri, ASan, and
   TSan. CI runs the tests on x86_64 Linux, Apple Silicon macOS, and x86_64
   Windows; on macOS and Windows, which lack `membarrier` and `madvise`, they
@@ -827,6 +863,13 @@ These changes followed, each measured against the one before:
   full shard's lock now prefetches all of them, those it writes for writing.
   Eight-thread turnover: +4.6 to +5.4% on macOS and +3.6 to +4.5% on Linux;
   cold fill +1 to +7%, with every median positive and ranges crossing zero.
+- **Prefetching only for new keys.** The prefetch ran before the lookup, so
+  replacing a resident key in a full shard fetched a victim it would not
+  evict. It now runs once the lookup misses. Replacing resident `u64` keys
+  in a full cache on one thread, best of five on macOS: 40.2 to 42.6 ns
+  against 42.4 to 45.0 ns at 50,000 entries. The probe's write workloads,
+  whose replaces run below capacity, stayed within 3% at 50,000 and
+  1,000,000 entries.
 - **Stores instead of swaps.** Unpublishing a handle swapped it with an
   AcqRel read-modify-write. Under the shard lock a relaxed load and a
   release store do the same: writers change handles only under the lock,
@@ -1050,6 +1093,64 @@ difference, spread over about a hundred source lines with none above 16;
 the rest was spread over the policy, the table, and the insert itself.
 Those instructions are cheap, as the bound above shows: freeing at once
 gained 3 to 10%.
+
+### Updates of a full cache
+
+The probe's `update` workload upserts the seeded keys into a cache of
+exactly their count: mostly replacements, and reinsertions of the few that
+seeding evicted. The other resident workloads run at four times their key
+count, so they never wrote to a full cache. On macOS, five paired runs of
+4,000,000 operations, median and range:
+
+| Entries | 1T | 8T |
+| ---: | ---: | ---: |
+| 50,000 | +11% (+5 to +19%) | +10% (−9 to +15%) |
+| 1,000,000 | +56% (+49 to +58%) | +58% (+50 to +89%) |
+
+On GitHub's 4-vCPU x86_64 runner (the bench workflow, three pairs), the
+same workload read −20% on one thread and −15% on four at 50,000 entries,
+and +3% and +2% at 1,000,000.
+
+### Reading through the loader
+
+The probe's `read-through` workload issues turnover's reads, each through
+`get_or_insert_with`, which loads and inserts a missed key. On macOS, five
+paired runs of 4,000,000 operations against quick_cache:
+
+| Entries | 1T | 8T |
+| ---: | ---: | ---: |
+| 50,000 | −3% (−6 to +2%) | +32% (+19 to +69%) |
+| 1,000,000 | +13% (+0 to +29%) | +61% (+51 to +67%) |
+
+On the x86_64 runner: −10% on one thread and +17% on four at 50,000
+entries, and +18% and +52% at 1,000,000.
+
+Against the commit before writes superseded loads, seven paired runs at
+50,000 entries moved by −1% on one thread and −2% at eight, within noise:
+listing a load under the shard lock costs this mix nothing measurable.
+ShardedCache ran it at 59.8 Mops/s with eight threads, against 61.8 for
+turnover's plain reads and inserts.
+
+### With `u64` keys and values
+
+The probe's 32-byte keys and `Arc` payloads cost both caches hashing and
+reference counts. With `u64` keys and values those costs fall away, and
+ShardedCache's fixed work per operation shows: the epoch pin, and on writes
+the new entry and the retirement of the old one, where quick_cache
+overwrites in place under its shard lock. A scratch benchmark, at 50,000
+entries, ran `get` hits on resident keys with room to spare, and upserts of
+the seeded keys into an exactly full cache; each figure is the range over
+three runs of the best of seven:
+
+| Workload | macOS 1T | macOS 8T | Linux 1T | Linux 8T |
+| --- | ---: | ---: | ---: | ---: |
+| Resident hit | −7 to −13% | +806 to +830% | −2 to +3% | +694 to +715% |
+| Upsert into a full cache | −56 to −60% | −1 to +6% | −53 to −54% | −15 to +31% |
+
+On one thread, upserts ran at 23 to 26 Mops/s against quick_cache's 50 to
+61. On macOS a pin is two read-modify-writes on shared counters, where
+Linux reuses a parked announcement (see "Parked pin announcements"), which
+leaves single-thread hits behind there and level on Linux.
 
 ### Batched inserts
 
