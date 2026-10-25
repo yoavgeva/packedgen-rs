@@ -40,7 +40,7 @@ and trailed by 16 to 23% on Linux. Much of the single-thread write gap is
 epoch reclamation's bookkeeping: queuing, tagging, and later freeing each
 removed entry. These runs use 32-byte keys and 64-byte `Arc` payloads,
 which cost both caches hashing and reference counts. With `u64` keys and
-values, one thread's upserts into a full cache ran at 0.4 to 0.5 times
+values, one thread's upserts into a full cache ran at 0.47 to 0.49 times
 quick_cache's throughput on macOS and Linux, as each writes a new entry and
 retires the old one where quick_cache overwrites in place; at eight threads
 those upserts ranged from 15% behind to 31% ahead, and hits ran 7 to 9 times
