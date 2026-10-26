@@ -8,9 +8,9 @@ use loom::sync::{Arc, Mutex};
 use loom::thread;
 
 use direct_epoch_protocol::{
-    ANNOUNCED, Announced, EPOCHS, EVICTED, EVICTING, announce_afresh, classify_announcement,
-    enter_epoch, epoch_slot, eviction_outcome, leave_announcement, leave_epoch, next_epoch_token,
-    plan_epoch_advance, reclaim_at, reuse_announcement,
+    ANNOUNCED, ANNOUNCED_PIN, Announced, EPOCHS, EVICTED, EVICTING, announce_afresh,
+    classify_announcement, enter_epoch, epoch_slot, eviction_outcome, leave_announcement,
+    leave_epoch, next_epoch_token, plan_epoch_advance, reclaim_at, reuse_announcement,
 };
 
 const ABSENT: usize = 0;
@@ -887,4 +887,131 @@ fn evicting_without_the_heavy_fence_can_reclaim_under_a_reused_announcement() {
     // Negative control: the heavy fence orders the eviction mark before the
     // advance reads the announcement again.
     model_announced_reclamation(ANNOUNCED, 1, true, false);
+}
+
+const BIASED: usize = 0;
+const REVOKING: usize = 1;
+const REVOKED: usize = 2;
+
+/// A retired lane, as `RetiredQueue` in `sharded_arena`: its thread retires
+/// into `ring` without `lock` while `bias` is `BIASED`, pinned through
+/// `word`, and a drainer revokes the bias under `lock` before taking the
+/// ring. `barrier` models the light and heavy fences as in `AnnouncedModel`:
+/// the thread holds it from its pin's store to its load of `bias`, and the
+/// heavy fence takes it, so it falls before the store or after the load. A
+/// barrier between them only adds ordering.
+struct LaneModel {
+    word: AtomicUsize,
+    bias: AtomicUsize,
+    ring: loom::cell::UnsafeCell<usize>,
+    lock: Mutex<()>,
+    barrier: Mutex<()>,
+    light_fence: bool,
+    heavy_fence: bool,
+}
+
+#[allow(unsafe_code, reason = "the ring models a lane's unsynchronized state")]
+impl LaneModel {
+    fn new(light_fence: bool, heavy_fence: bool) -> Self {
+        Self {
+            word: AtomicUsize::new(ANNOUNCED),
+            bias: AtomicUsize::new(BIASED),
+            ring: loom::cell::UnsafeCell::new(0),
+            lock: Mutex::new(()),
+            barrier: Mutex::new(()),
+            light_fence,
+            heavy_fence,
+        }
+    }
+
+    /// One write by the lane's thread: pin, retire into the ring, unpin.
+    fn write(&self) {
+        let barrier = self.light_fence.then(|| self.barrier.lock().unwrap());
+        self.word
+            .store(ANNOUNCED_PIN | ANNOUNCED, Ordering::Relaxed);
+        let biased = self.bias.load(Ordering::Relaxed) == BIASED;
+        drop(barrier);
+        if biased {
+            // SAFETY: the model checks that nothing else touches the ring.
+            self.ring.with_mut(|ring| unsafe { *ring += 1 });
+        } else {
+            let _lock = self.lock.lock().unwrap();
+            self.bias.store(BIASED, Ordering::Relaxed);
+            // SAFETY: as above.
+            self.ring.with_mut(|ring| unsafe { *ring += 1 });
+        }
+        self.word.store(ANNOUNCED, Ordering::Release);
+    }
+
+    /// One drain by another thread: revoke under the lock, then take the
+    /// ring, unless the lane's thread is pinned.
+    fn drain(&self) {
+        let _lock = self.lock.lock().unwrap();
+        if self.bias.load(Ordering::Relaxed) != REVOKED {
+            self.bias.store(REVOKING, Ordering::Relaxed);
+            if self.heavy_fence {
+                drop(self.barrier.lock().unwrap());
+            }
+            if self.word.load(Ordering::Acquire) >= ANNOUNCED_PIN {
+                return;
+            }
+            self.bias.store(REVOKED, Ordering::Relaxed);
+        }
+        // SAFETY: as in `write`.
+        self.ring.with_mut(|ring| unsafe { *ring = 0 });
+    }
+}
+
+/// The lane's thread writes `writes` times while the main thread drains
+/// `drains` times; any access to the ring not ordered after the other's
+/// fails the model.
+fn model_lane(writes: usize, drains: usize, light_fence: bool, heavy_fence: bool) {
+    model_bounded(move || {
+        let lane = Arc::new(LaneModel::new(light_fence, heavy_fence));
+        let owner = {
+            let lane = Arc::clone(&lane);
+            thread::spawn(move || {
+                for _ in 0..writes {
+                    lane.write();
+                }
+            })
+        };
+        for _ in 0..drains {
+            lane.drain();
+        }
+        owner.join().unwrap();
+    });
+}
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "minutes unoptimized; CI runs it with --release"
+)]
+fn a_lanes_thread_and_its_drainers_never_reach_it_at_once() {
+    model_lane(3, 3, true, true);
+}
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "minutes unoptimized; CI runs it with --release"
+)]
+#[should_panic(expected = "Causality violation")]
+fn draining_without_the_heavy_fence_can_race_the_lanes_thread() {
+    // Negative control: the heavy fence orders the revocation before the
+    // drainer reads the announcement.
+    model_lane(1, 1, true, false);
+}
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "minutes unoptimized; CI runs it with --release"
+)]
+#[should_panic(expected = "Causality violation")]
+fn retiring_without_the_light_fence_can_race_a_drainer() {
+    // Negative control: the pin's fence orders its announcement before the
+    // thread reads the bias.
+    model_lane(1, 1, false, true);
 }

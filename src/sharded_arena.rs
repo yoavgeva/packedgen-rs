@@ -25,7 +25,7 @@
 
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::cell::{Cell, RefCell, UnsafeCell};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::ptr::{self, NonNull};
@@ -37,8 +37,8 @@ use parking_lot::Mutex;
 use crate::cache_arena::{assigned_thread_shards, claimed_thread_shards, direct_arena_thread};
 pub(crate) use crate::direct_epoch_protocol::reclaim_at;
 use crate::direct_epoch_protocol::{
-    Announced, EPOCHS, EVICTED, EVICTING, announce_afresh, classify_announcement, enter_epoch,
-    epoch_slot, eviction_outcome, leave_announcement, leave_epoch, plan_epoch_advance,
+    ANNOUNCED_PIN, Announced, EPOCHS, EVICTED, EVICTING, announce_afresh, classify_announcement,
+    enter_epoch, epoch_slot, eviction_outcome, leave_announcement, leave_epoch, plan_epoch_advance,
     reuse_announcement,
 };
 
@@ -276,7 +276,9 @@ pub(crate) struct Epochs {
     /// unsupported.
     announcements: Box<[Announcement]>,
     /// Serializes advances; a writer that finds it held skips advancing.
-    advancing: Mutex<()>,
+    /// Holds the announcer slots the last blocked advance would have
+    /// evicted.
+    advancing: Mutex<u64>,
     /// Retirements reported since the generation last advanced.
     pending: PendingCount,
 }
@@ -304,9 +306,31 @@ impl Epochs {
                     evicted: AtomicUsize::new(0),
                 })
                 .collect(),
-            advancing: Mutex::new(()),
+            advancing: Mutex::new(0),
             pending: PendingCount(AtomicUsize::new(0)),
         }
+    }
+
+    /// Announcer slots this cache's epochs announce through.
+    pub(crate) fn announcers(&self) -> usize {
+        self.announcements.len()
+    }
+
+    /// Whether the thread holding announcer `slot` is pinned through it,
+    /// read after a [`heavy_fence`]: an unpinned word was stored with
+    /// release by the unpin that ended the thread's last access.
+    fn announcement_pinned(&self, slot: usize) -> bool {
+        self.announcements[slot].word.load(Ordering::Acquire) >= ANNOUNCED_PIN
+    }
+
+    /// Whether announcer `slot`'s announcement is parked and evicted, read
+    /// after a sequentially consistent fence: the slot's thread then pins
+    /// next by announcing afresh, with such a fence of its own, before it
+    /// can reach its lane without the lock.
+    fn announcement_evicted(&self, slot: usize) -> bool {
+        let announcement = &self.announcements[slot];
+        announcement.word.load(Ordering::Acquire) < ANNOUNCED_PIN
+            && announcement.evicted.load(Ordering::Relaxed) == EVICTED
     }
 
     /// Reports `count` retirements; returns whether enough are pending
@@ -486,7 +510,13 @@ impl Epochs {
     /// advance retires; returns whether it advanced. Skips when another
     /// thread is advancing.
     pub(crate) fn try_advance(&self) -> bool {
-        let Some(_advancing) = self.advancing.try_lock() else {
+        // Every write whose report finds enough retirements pending tries,
+        // until an advance resets the count: one already under way turns
+        // the rest away with a load, not a read-modify-write each.
+        if self.advancing.is_locked() {
+            return false;
+        }
+        let Some(mut last_evictions) = self.advancing.try_lock() else {
             return false;
         };
         let generation = self.generation.load(Ordering::SeqCst);
@@ -540,6 +570,16 @@ impl Epochs {
             self.pending.0.store(advance_after() / 2, Ordering::Relaxed);
             return false;
         };
+        // An active thread's parked announcement moves on to the current
+        // epoch at its next pin, while an idle thread's stays: evict only
+        // those that blocked the previous try too. Evicting interrupts
+        // every running thread, and evicting each one as it parked between
+        // writes cost eight-thread writes on the Linux VM a third.
+        let previous = std::mem::replace(&mut *last_evictions, evicting);
+        if evicting & !previous != 0 {
+            self.pending.0.store(advance_after() / 2, Ordering::Relaxed);
+            return false;
+        }
         if evicting != 0 && !self.evict(evicting, generation) {
             self.pending.0.store(advance_after() / 2, Ordering::Relaxed);
             return false;
@@ -796,6 +836,10 @@ thread_local! {
     pub(crate) static PREFETCHED: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
     /// Times this thread searched its slot stacks for a store's.
     pub(crate) static STACK_SEARCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Times this thread borrowed its slot stacks' `RefCell`.
+    pub(crate) static STACK_BORROWS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Times this thread locked its own retired queue to retire.
+    pub(crate) static RETIRE_LOCKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// One entry's storage: atomic metadata, then the value.
@@ -959,6 +1003,25 @@ pub(crate) unsafe fn drop_value<T>(slot: NonNull<Slot<T>>) {
 /// lines.
 const RETIRED_QUEUES: usize = READER_SHARDS;
 
+/// The announcer slot this thread pins through, if it holds one.
+fn announcer_slot() -> Option<usize> {
+    let slot = ANNOUNCER.try_with(Cell::get).ok()? & ANNOUNCER_SLOT;
+    (slot < ANNOUNCERS).then_some(slot)
+}
+
+/// The announcer slot this thread pins through, if it holds one.
+#[cfg(test)]
+pub(crate) fn announced_slot() -> Option<usize> {
+    announcer_slot()
+}
+
+/// Where this thread retires, as `RetiredSlots::queued` counts: its lane
+/// if it holds an announcer slot, else its queue.
+#[cfg(test)]
+pub(crate) fn retiring_index() -> usize {
+    announced_slot().map_or_else(retired_queue_index, |slot| RETIRED_QUEUES + slot)
+}
+
 /// The retired queue this thread uses in every cache.
 #[inline]
 pub(crate) fn retired_queue_index() -> usize {
@@ -968,25 +1031,201 @@ pub(crate) fn retired_queue_index() -> usize {
 /// own retirements, so a queue whose thread stopped writing still drains.
 const FOREIGN_DRAIN_EVERY: u32 = 16;
 
-/// A cache's unpublished slots awaiting reclamation, in one queue per thread
-/// index.
+/// A cache's unpublished slots awaiting reclamation: one lane per announcer
+/// slot, for writers pinned through an announcement, and one queue per
+/// thread index for the rest.
+///
+/// A lane's thread retires into it without its lock (see `RetiredQueue`);
+/// on x86 a lock's two read-modify-writes are full barriers, and taking
+/// them per write cost single-thread writes up to a third of their speed.
 pub(crate) struct RetiredSlots<T> {
     queues: Box<[RetiredQueue<T>]>,
+    /// By announcer slot; empty where announcements are unsupported.
+    lanes: Box<[RetiredQueue<T>]>,
 }
 
+/// A retired queue, or a lane.
+///
+/// A lane belongs to whichever thread holds its announcer slot, which is
+/// pinned through that slot whenever it retires. While `bias` is `BIASED`,
+/// that thread reaches the state without the lock. Others, to drain the
+/// lane, take the lock and revoke the bias: they store `REVOKING` and a
+/// fence, and proceed only if the thread cannot be past its load of `bias`
+/// unless it saw the store, storing `REVOKED`. The thread's pin stored the
+/// announcement and fenced before it loads `bias`, so either the drainer
+/// finds the pin or the thread finds the bias revoked and takes the lock,
+/// where it restores the bias. A lane stays `REVOKED` until then, so later
+/// drains need no fence.
+///
+/// - Foreign drains revoke only a lane whose announcement an advance has
+///   evicted while parked: the thread's next pin announces afresh, with a
+///   sequentially consistent fence, which theirs pairs with.
+/// - `maintain` revokes any lane whose thread is unpinned, with a
+///   [`heavy_fence`] against the [`light_fence`] of a reused announcement.
+///   In foreign drains that barrier, which interrupts every running thread,
+///   cost eight-thread writes on the Linux VM a quarter to a third of
+///   their speed.
 #[repr(align(128))]
-struct RetiredQueue<T>(Mutex<QueueState<T>>);
+struct RetiredQueue<T> {
+    state: Mutex<QueueState<T>>,
+    bias: AtomicUsize,
+    /// The newest slot's due generation, or `NO_RETIRED`: drainers find
+    /// idle lanes by it without the lock.
+    newest_due: AtomicUsize,
+    /// The ring's capacity, for memory accounting without the lock.
+    capacity: AtomicUsize,
+    /// The next queue or lane a foreign drain from here visits.
+    next_foreign: AtomicUsize,
+}
+
+const BIASED: usize = 0;
+const REVOKING: usize = 1;
+const REVOKED: usize = 2;
+const NO_RETIRED: usize = usize::MAX;
 
 struct QueueState<T> {
     /// Unpublished slots with the first generation at which each may be
     /// reclaimed, oldest first.
-    slots: VecDeque<(usize, NonNull<Slot<T>>)>,
+    slots: RetiredRing<T>,
     /// Slots retired here since this queue last reported to its epochs.
     unreported: usize,
     /// Retirements left before this queue's thread drains another queue.
     until_foreign_drain: u32,
-    /// The next queue a foreign drain visits.
-    next_foreign: usize,
+}
+
+impl<T> RetiredQueue<T> {
+    fn new(next_foreign: usize) -> Self {
+        Self {
+            state: Mutex::new(QueueState {
+                slots: RetiredRing::new(),
+                unreported: 0,
+                until_foreign_drain: FOREIGN_DRAIN_EVERY,
+            }),
+            bias: AtomicUsize::new(BIASED),
+            newest_due: AtomicUsize::new(NO_RETIRED),
+            capacity: AtomicUsize::new(0),
+            next_foreign: AtomicUsize::new(next_foreign),
+        }
+    }
+
+    /// Publishes what drainers and memory accounting read without the lock.
+    #[inline]
+    fn publish(&self, state: &QueueState<T>) {
+        self.newest_due.store(
+            state.slots.back().map_or(NO_RETIRED, |(due, _)| due),
+            Ordering::Relaxed,
+        );
+        let capacity = state.slots.capacity();
+        if self.capacity.load(Ordering::Relaxed) != capacity {
+            self.capacity.store(capacity, Ordering::Relaxed);
+        }
+    }
+
+    /// Takes a lane from its thread, under its lock, if an advance evicted
+    /// the slot's parked announcement: returns whether the thread is
+    /// excluded until it next takes the lock.
+    fn revoke_evicted(&self, epochs: &Epochs, slot: usize) -> bool {
+        if self.bias.load(Ordering::Relaxed) == REVOKED {
+            return true;
+        }
+        self.bias.store(REVOKING, Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+        if !epochs.announcement_evicted(slot) {
+            return false;
+        }
+        self.bias.store(REVOKED, Ordering::Relaxed);
+        true
+    }
+
+    /// Takes a lane from its thread, under its lock, unless the thread is
+    /// pinned: returns whether the thread is excluded until it next takes
+    /// the lock.
+    fn revoke(&self, epochs: &Epochs, slot: usize) -> bool {
+        if self.bias.load(Ordering::Relaxed) == REVOKED {
+            return true;
+        }
+        self.bias.store(REVOKING, Ordering::Relaxed);
+        if !heavy_fence() || epochs.announcement_pinned(slot) {
+            return false;
+        }
+        self.bias.store(REVOKED, Ordering::Relaxed);
+        true
+    }
+}
+
+/// A queue's retired slots, oldest first, each with its due generation. Its
+/// capacity is a power of two, so positions wrap with a mask: `VecDeque`
+/// wraps them with a compare, and every write pushes one slot and pops one.
+struct RetiredRing<T> {
+    buffer: Box<[(usize, NonNull<Slot<T>>)]>,
+    /// The oldest slot's position, counting every slot ever popped.
+    head: usize,
+    len: usize,
+}
+
+impl<T> RetiredRing<T> {
+    fn new() -> Self {
+        Self {
+            buffer: Box::new([]),
+            head: 0,
+            len: 0,
+        }
+    }
+
+    #[cfg(test)]
+    const fn len(&self) -> usize {
+        self.len
+    }
+
+    const fn capacity(&self) -> usize {
+        self.buffer.len()
+    }
+
+    #[inline]
+    fn at(&self, position: usize) -> (usize, NonNull<Slot<T>>) {
+        self.buffer[position & (self.buffer.len() - 1)]
+    }
+
+    #[inline]
+    fn push_back(&mut self, retired: (usize, NonNull<Slot<T>>)) {
+        if self.len == self.buffer.len() {
+            self.grow();
+        }
+        let mask = self.buffer.len() - 1;
+        self.buffer[self.head.wrapping_add(self.len) & mask] = retired;
+        self.len += 1;
+    }
+
+    #[inline]
+    fn front(&self) -> Option<(usize, NonNull<Slot<T>>)> {
+        (self.len != 0).then(|| self.at(self.head))
+    }
+
+    #[inline]
+    fn back(&self) -> Option<(usize, NonNull<Slot<T>>)> {
+        (self.len != 0).then(|| self.at(self.head.wrapping_add(self.len - 1)))
+    }
+
+    #[inline]
+    fn pop_front(&mut self) -> Option<(usize, NonNull<Slot<T>>)> {
+        let oldest = self.front()?;
+        self.head = self.head.wrapping_add(1);
+        self.len -= 1;
+        Some(oldest)
+    }
+
+    /// Doubles the capacity, at least to 16, keeping the order.
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self) {
+        let capacity = (self.buffer.len() * 2).max(16);
+        let mut buffer = vec![(0, NonNull::dangling()); capacity].into_boxed_slice();
+        for (index, entry) in buffer.iter_mut().take(self.len).enumerate() {
+            *entry = self.at(self.head.wrapping_add(index));
+        }
+        self.buffer = buffer;
+        self.head = 0;
+    }
 }
 
 // SAFETY: queues only name slots of their cache's store, which outlives them,
@@ -999,26 +1238,25 @@ impl<T> RetiredSlots<T> {
     /// takes each queue's lock in turn.
     pub(crate) fn bytes_used(&self) -> usize {
         size_of_val(&*self.queues)
+            + size_of_val(&*self.lanes)
             + self
                 .queues
                 .iter()
+                .chain(&*self.lanes)
                 .map(|queue| {
-                    queue.0.lock().slots.capacity() * size_of::<(usize, NonNull<Slot<T>>)>()
+                    queue.capacity.load(Ordering::Relaxed) * size_of::<(usize, NonNull<Slot<T>>)>()
                 })
                 .sum::<usize>()
     }
 
-    pub(crate) fn new() -> Self {
+    /// Queues for every thread index, and lanes for `announcers` slots.
+    pub(crate) fn new(announcers: usize) -> Self {
         Self {
             queues: (0..RETIRED_QUEUES)
-                .map(|index| {
-                    RetiredQueue(Mutex::new(QueueState {
-                        slots: VecDeque::new(),
-                        unreported: 0,
-                        until_foreign_drain: FOREIGN_DRAIN_EVERY,
-                        next_foreign: index + 1,
-                    }))
-                })
+                .map(|index| RetiredQueue::new(index + 1))
+                .collect(),
+            lanes: (0..announcers)
+                .map(|slot| RetiredQueue::new(RETIRED_QUEUES + slot + 1))
                 .collect(),
         }
     }
@@ -1031,6 +1269,9 @@ impl<T> RetiredSlots<T> {
     /// thread has stopped retiring. Reads the generation that tags the slots
     /// here, while the caller still holds `pin`. Returns whether enough
     /// retirements are pending across the cache to try advancing.
+    #[allow(clippy::inline_always, reason = "every write retires")]
+    #[allow(unsafe_code, reason = "a lane's thread reaches it without the lock")]
+    #[inline(always)]
     pub(crate) fn retire(
         &self,
         pin: &EpochPin<'_>,
@@ -1039,98 +1280,194 @@ impl<T> RetiredSlots<T> {
         store: &SlotStore<T>,
     ) -> bool {
         let epochs = pin.epochs;
-        // A pin through the shared counters names the thread's index, as
-        // its queue does; an announced pin names its slot instead.
-        let own = if ANNOUNCEABLE {
-            retired_queue_index()
-        } else {
-            pin.reader
-        };
-        debug_assert_eq!(own, retired_queue_index());
         let generation = epochs.generation();
         let due = reclaim_at(generation);
-        let mut queue = self.queues[own].0.lock();
+        let (queue, own, lane) = if ANNOUNCEABLE
+            && let Some(slot) = pin.reader.checked_sub(ANNOUNCED_READER)
+            && let Some(lane) = self.lanes.get(slot)
+        {
+            (lane, RETIRED_QUEUES + slot, true)
+        } else {
+            // A pin through the shared counters names the thread's index,
+            // as its queue does.
+            let own = if ANNOUNCEABLE {
+                retired_queue_index()
+            } else {
+                pin.reader
+            };
+            debug_assert_eq!(own, retired_queue_index());
+            (&self.queues[own], own, false)
+        };
+        let mut locked = None;
+        // The pin's light fence came before this load.
+        let state = if lane && queue.bias.load(Ordering::Relaxed) == BIASED {
+            // SAFETY: the pin through this lane's announcer slot keeps
+            // drainers out until the pin ends (see `RetiredQueue`), and only
+            // this thread holds the slot.
+            unsafe { &mut *queue.state.data_ptr() }
+        } else {
+            #[cfg(test)]
+            RETIRE_LOCKS.with(|count| count.set(count.get() + 1));
+            let state = &mut **locked.insert(queue.state.lock());
+            if lane {
+                // No drainer holds the lane: take the bias back.
+                queue.bias.store(BIASED, Ordering::Relaxed);
+            }
+            state
+        };
+        let (advance, foreign) =
+            Self::queue_slots(state, epochs, generation, due, slots, reclaimed, queue);
+        queue.publish(state);
+        drop(locked);
+        if let Some(next) = foreign {
+            self.drain_foreign(epochs, own, next, generation, store);
+        }
+        advance
+    }
+
+    /// Queues `slots` in `state`, `queue`'s, and moves aged slots into
+    /// `reclaimed`, as `retire` does. Returns whether to try advancing, and
+    /// the queue or lane a foreign drain visits now, if any.
+    #[allow(clippy::inline_always, reason = "every write retires")]
+    #[allow(clippy::too_many_arguments, reason = "the parts of one retirement")]
+    #[inline(always)]
+    fn queue_slots(
+        state: &mut QueueState<T>,
+        epochs: &Epochs,
+        generation: usize,
+        due: usize,
+        slots: impl Iterator<Item = NonNull<Slot<T>>>,
+        reclaimed: &mut Reclaimed<T>,
+        queue: &RetiredQueue<T>,
+    ) -> (bool, Option<usize>) {
         let mut retired = 0;
         for slot in slots {
-            queue.slots.push_back((due, slot));
+            state.slots.push_back((due, slot));
             retired += 1;
         }
         if retired == 0 {
-            return false;
+            return (false, None);
         }
         // Reclaim as many slots as this write retired, so values are dropped
         // as steadily as writes allocate them, which allocators' per-thread
         // caches absorb. Slots due since an earlier advance are a backlog,
         // and each write drains as many more of it, within one batch.
-        Self::take_aged(&mut queue, generation, reclaimed, retired);
-        if queue
-            .slots
-            .front()
-            .is_some_and(|&(due, _)| due < generation)
-        {
-            Self::take_aged(&mut queue, generation, reclaimed, retired);
+        Self::take_aged(state, generation, reclaimed, retired);
+        if state.slots.front().is_some_and(|(due, _)| due < generation) {
+            Self::take_aged(state, generation, reclaimed, retired);
         }
         // The next write reclaims the front slot, a few advances after this
         // thread last touched it: start loading the lines its drop reads.
-        if let Some(&(_, next)) = queue.slots.front() {
+        if let Some((_, next)) = state.slots.front() {
             let first = next.as_ptr().cast::<u8>();
             prefetch(first);
             prefetch(first.wrapping_add(size_of::<Slot<T>>() - 1));
         }
-        queue.unreported += retired;
-        queue.until_foreign_drain = queue.until_foreign_drain.saturating_sub(1);
-        let foreign_queue = (queue.until_foreign_drain == 0).then(|| {
-            queue.until_foreign_drain = FOREIGN_DRAIN_EVERY;
-            let next = queue.next_foreign;
-            queue.next_foreign = next.wrapping_add(1);
+        state.unreported += retired;
+        state.until_foreign_drain = state.until_foreign_drain.saturating_sub(1);
+        let foreign = (state.until_foreign_drain == 0).then(|| {
+            state.until_foreign_drain = FOREIGN_DRAIN_EVERY;
+            let next = queue.next_foreign.load(Ordering::Relaxed);
+            queue
+                .next_foreign
+                .store(next.wrapping_add(1), Ordering::Relaxed);
             next
         });
-        let advance = if queue.unreported >= REPORT_EVERY {
-            epochs.note_retired(std::mem::take(&mut queue.unreported))
+        let advance = if state.unreported >= REPORT_EVERY {
+            epochs.note_retired(std::mem::take(&mut state.unreported))
         } else {
             false
         };
-        drop(queue);
-        if let Some(next) = foreign_queue {
-            self.drain_foreign(own, next, generation, store);
-        }
-        advance
+        (advance, foreign)
     }
 
-    /// Reclaims a batch from the queue `next` names, if its thread has
-    /// stopped retiring; a write in sixteen calls it. Out of line, the batch
-    /// it sets up costs the others nothing.
+    /// `retire` for writes that removed more than one entry, out of line.
+    #[inline(never)]
+    pub(crate) fn retire_many(
+        &self,
+        pin: &EpochPin<'_>,
+        slots: impl Iterator<Item = NonNull<Slot<T>>>,
+        reclaimed: &mut Reclaimed<T>,
+        store: &SlotStore<T>,
+    ) -> bool {
+        self.retire(pin, slots, reclaimed, store)
+    }
+
+    /// Reclaims a batch from the queue or lane `next` names, if its thread
+    /// has stopped retiring; a write in sixteen calls it. Out of line, the
+    /// batch it sets up costs the others nothing.
     #[cold]
     #[inline(never)]
-    fn drain_foreign(&self, own: usize, next: usize, generation: usize, store: &SlotStore<T>) {
-        let index = next & (RETIRED_QUEUES - 1);
-        if index != own
-            && let Some(mut queue) = self.queues[index].0.try_lock()
-            // Only a queue whose newest slot is aged: its thread has retired
-            // nothing for three advances, so it is not draining the queue.
-            && queue.slots.back().is_some_and(|&(due, _)| due <= generation)
+    fn drain_foreign(
+        &self,
+        epochs: &Epochs,
+        own: usize,
+        next: usize,
+        generation: usize,
+        store: &SlotStore<T>,
+    ) {
+        let index = next % (RETIRED_QUEUES + self.lanes.len());
+        if index == own {
+            return;
+        }
+        let (queue, lane) = match index.checked_sub(RETIRED_QUEUES) {
+            Some(slot) => (&self.lanes[slot], Some(slot)),
+            None => (&self.queues[index], None),
+        };
+        // Only one whose newest slot is aged: its thread has retired nothing
+        // for three advances, so it is not draining it.
+        if queue.newest_due.load(Ordering::Relaxed) > generation {
+            return;
+        }
+        let Some(mut state) = queue.state.try_lock() else {
+            return;
+        };
+        if state.slots.back().is_none_or(|(due, _)| due > generation)
+            || lane.is_some_and(|slot| !queue.revoke_evicted(epochs, slot))
         {
-            let mut foreign = Reclaimed::new();
-            Self::take_aged(&mut queue, generation, &mut foreign, RECLAIM_BATCH);
-            drop(queue);
-            // Return to this queue until it is drained.
-            self.queues[own].0.lock().next_foreign = next;
-            foreign.finish(store);
+            return;
+        }
+        let mut foreign = Reclaimed::new();
+        Self::take_aged(&mut state, generation, &mut foreign, RECLAIM_BATCH);
+        queue.publish(&state);
+        drop(state);
+        // Return to it until it is drained.
+        self.owned(own).next_foreign.store(next, Ordering::Relaxed);
+        foreign.finish(store);
+    }
+
+    /// The queue or lane `index` names, as `drain_foreign` counts them.
+    fn owned(&self, index: usize) -> &RetiredQueue<T> {
+        match index.checked_sub(RETIRED_QUEUES) {
+            Some(slot) => &self.lanes[slot],
+            None => &self.queues[index],
         }
     }
 
     /// Reclaims every slot aged by `generation`, a batch at a time, dropping
-    /// values outside the queue locks.
-    pub(crate) fn reclaim_all(&self, generation: usize, store: &SlotStore<T>) {
-        for queue in &self.queues {
+    /// values outside the queue locks. Another thread's lane is left while
+    /// that thread is pinned; this thread's own lane it reaches as its
+    /// thread, under the lock.
+    pub(crate) fn reclaim_all(&self, epochs: &Epochs, generation: usize, store: &SlotStore<T>) {
+        let own = announcer_slot();
+        let lanes = self
+            .lanes
+            .iter()
+            .enumerate()
+            .map(|(slot, lane)| (lane, Some(slot)));
+        for (queue, lane) in self.queues.iter().map(|queue| (queue, None)).chain(lanes) {
             loop {
                 let mut reclaimed = Reclaimed::new();
-                Self::take_aged(
-                    &mut queue.0.lock(),
-                    generation,
-                    &mut reclaimed,
-                    RECLAIM_BATCH,
-                );
+                {
+                    let mut state = queue.state.lock();
+                    if lane.is_some() && lane == own {
+                        queue.bias.store(BIASED, Ordering::Relaxed);
+                    } else if lane.is_some_and(|slot| !queue.revoke(epochs, slot)) {
+                        break;
+                    }
+                    Self::take_aged(&mut state, generation, &mut reclaimed, RECLAIM_BATCH);
+                    queue.publish(&state);
+                }
                 let full = reclaimed.is_full();
                 reclaimed.finish(store);
                 if !full {
@@ -1152,7 +1489,7 @@ impl<T> RetiredSlots<T> {
         let end = (reclaimed.len + limit).min(RECLAIM_BATCH);
         while reclaimed.len < end {
             match queue.slots.front() {
-                Some(&(due, slot)) if due <= generation => {
+                Some((due, slot)) if due <= generation => {
                     queue.slots.pop_front();
                     reclaimed.slots[reclaimed.len] = slot;
                     reclaimed.len += 1;
@@ -1171,8 +1508,8 @@ impl<T> Drop for RetiredSlots<T> {
     /// it, and its store frees the slots' memory only after this.
     #[allow(unsafe_code, reason = "drops retired values no pin reaches")]
     fn drop(&mut self) {
-        for queue in &mut self.queues {
-            while let Some((_, slot)) = queue.0.get_mut().slots.pop_front() {
+        for queue in self.queues.iter_mut().chain(self.lanes.iter_mut()) {
+            while let Some((_, slot)) = queue.state.get_mut().slots.pop_front() {
                 // SAFETY: retired slots hold initialized values, and nothing
                 // can reach them once their cache is gone.
                 unsafe { drop_value(slot) };
@@ -1576,7 +1913,58 @@ thread_local! {
 /// stayed out of line once the insert body had two copies.
 #[inline]
 fn thread_stores() -> Option<NonNull<RefCell<ThreadStores>>> {
+    #[cfg(test)]
+    STACK_BORROWS.with(|count| count.set(count.get() + 1));
     THREAD_STORES.try_with(|stores| NonNull::from(stores)).ok()
+}
+
+/// The vacant region slots of the first store this thread takes a slot
+/// from. Most threads write to one cache, whose writes reach this stack in
+/// a constant-initialized thread-local, without `THREAD_STORES`' `RefCell`
+/// and search; other stores' stacks stay there. Once its store drops, the
+/// next store to take a slot claims it.
+///
+/// Only this thread reaches it, and each access ends before running
+/// anything that could reach it again: no allocation, no user code.
+struct FirstStack {
+    /// The store's id, or 0 while unclaimed.
+    store: u64,
+    depot: Option<Weak<Depot>>,
+    len: usize,
+    slots: [NonNull<u8>; THREAD_LIMIT],
+}
+
+impl Drop for FirstStack {
+    fn drop(&mut self) {
+        if let Some(depot) = self.depot.take().and_then(|depot| depot.upgrade()) {
+            depot
+                .state
+                .lock()
+                .vacant
+                .extend_from_slice(&self.slots[..self.len]);
+        }
+    }
+}
+
+thread_local! {
+    static FIRST_STACK: UnsafeCell<FirstStack> = const {
+        UnsafeCell::new(FirstStack {
+            store: 0,
+            depot: None,
+            len: 0,
+            slots: [NonNull::dangling(); THREAD_LIMIT],
+        })
+    };
+}
+
+/// This thread's first stack, or `None` while thread-local storage is
+/// unavailable, as during thread exit.
+#[inline]
+fn first_stack() -> Option<NonNull<FirstStack>> {
+    FIRST_STACK
+        .try_with(|stack| NonNull::new(stack.get()))
+        .ok()
+        .flatten()
 }
 
 impl<T> SlotStore<T> {
@@ -1691,8 +2079,8 @@ impl<T> SlotStore<T> {
         Some(with(&mut stores.0[index].slots))
     }
 
-    /// A vacant slot the caller now owns, with its handle. A thread's first
-    /// stack is usually its only one, so `take` checks it before searching.
+    /// A vacant slot the caller now owns, with its handle, from this
+    /// thread's first stack when it is this store's.
     #[allow(unsafe_code, reason = "reads this thread's own thread-local")]
     #[allow(
         clippy::inline_always,
@@ -1700,23 +2088,27 @@ impl<T> SlotStore<T> {
     )]
     #[inline(always)]
     pub(crate) fn take(&self) -> (NonNull<Slot<T>>, u32) {
-        if let Some(stores) = thread_stores()
-            // SAFETY: a thread-local lives at a fixed address until its
-            // thread exits, past this call on this thread.
-            && let Ok(mut stores) = unsafe { stores.as_ref() }.try_borrow_mut()
-            && let Some(stack) = stores.0.first_mut()
-            && stack.store == self.id
-            && let Some(slot) = stack.slots.pop()
-        {
-            return (slot.cast(), self.region_handle(slot));
+        if let Some(mut stack) = first_stack() {
+            // SAFETY: this thread's own first stack, which nothing else on
+            // the thread references while this runs.
+            let stack = unsafe { stack.as_mut() };
+            if stack.store == self.id && stack.len != 0 {
+                stack.len -= 1;
+                let slot = stack.slots[stack.len];
+                return (slot.cast(), self.region_handle(slot));
+            }
         }
         self.take_cold()
     }
 
-    /// `take` from a stack found by search, refilled if empty.
+    /// `take` from the first stack once claimed or refilled, else from a
+    /// stack found by search, refilled if empty.
     #[cold]
     #[inline(never)]
     fn take_cold(&self) -> (NonNull<Slot<T>>, u32) {
+        if let Some(slot) = self.take_from_first() {
+            return (slot.cast(), self.region_handle(slot));
+        }
         if let Some(Some(slot)) = self.with_stack(|stack| {
             if stack.is_empty() {
                 self.refill(stack);
@@ -1726,6 +2118,70 @@ impl<T> SlotStore<T> {
             return (slot.cast(), self.region_handle(slot));
         }
         self.take_unbatched()
+    }
+
+    /// Takes a slot from this thread's first stack, claiming it if it is
+    /// unclaimed or its store has dropped, and refilling it if empty.
+    /// Returns `None` if another live store holds it, the region is used
+    /// up, or thread-local storage is gone.
+    #[allow(unsafe_code, reason = "reads this thread's own thread-local")]
+    fn take_from_first(&self) -> Option<NonNull<u8>> {
+        let mut stack = first_stack()?;
+        let mut previous = None;
+        let slot = {
+            // SAFETY: as in `take`; the depot's lock runs no user code.
+            let stack = unsafe { stack.as_mut() };
+            if stack.store != self.id {
+                if stack
+                    .depot
+                    .as_ref()
+                    .is_some_and(|depot| depot.strong_count() != 0)
+                {
+                    return None;
+                }
+                // A dropped store's slots are gone with its region.
+                stack.store = self.id;
+                stack.len = 0;
+                previous = stack.depot.replace(Arc::downgrade(&self.depot));
+            }
+            if stack.len == 0 {
+                stack.len = self.refill_into(&mut stack.slots[..THREAD_BATCH]);
+            }
+            stack.len.checked_sub(1).map(|top| {
+                stack.len = top;
+                stack.slots[top]
+            })
+        };
+        // Outside the stack's access: the last reference to a dropped
+        // depot frees it.
+        drop(previous);
+        slot
+    }
+
+    /// Fills `slots` from the start with vacant region slots, from the
+    /// depot or else from the region's untouched rest, as `refill` does;
+    /// returns how many. None once the region is used up.
+    fn refill_into(&self, slots: &mut [NonNull<u8>]) -> usize {
+        let depot = &*self.depot;
+        let mut state = depot.state.lock();
+        if !state.vacant.is_empty() {
+            let keep = state.vacant.len().saturating_sub(slots.len());
+            let mut count = 0;
+            for (target, slot) in slots.iter_mut().zip(state.vacant.drain(keep..)) {
+                *target = slot;
+                count += 1;
+            }
+            return count;
+        }
+        let first = state.fresh;
+        let end = (first + slots.len()).min(depot.region_slots);
+        state.fresh = end;
+        drop(state);
+        // Last first, so pops walk the region in address order.
+        for (target, index) in slots.iter_mut().zip((first..end).rev()) {
+            *target = depot.region_slot(index);
+        }
+        end - first
     }
 
     /// A slot straight from the depot: the region is used up, or
@@ -1776,37 +2232,85 @@ impl<T> SlotStore<T> {
         (state.fresh + state.overflow.len() * OVERFLOW_CHUNK_SLOTS) * depot.slot.size()
     }
 
-    /// Gives back one vacant slot, as `give` does, to the thread's first
-    /// stack when it is this store's and has room.
+    /// Gives back one vacant slot: a region slot to this thread's stack,
+    /// which overflows into the depot, and an overflow slot to its chunk.
     #[allow(unsafe_code, reason = "reads this thread's own thread-local")]
     #[allow(clippy::inline_always, reason = "every write's reclamation")]
     #[inline(always)]
     pub(crate) fn give_one(&self, slot: NonNull<Slot<T>>) {
         if self.depot.in_region(slot.cast())
-            && let Some(stores) = thread_stores()
-            // SAFETY: a thread-local lives at a fixed address until its
-            // thread exits, past this call on this thread.
-            && let Ok(mut stores) = unsafe { stores.as_ref() }.try_borrow_mut()
-            && let Some(stack) = stores.0.first_mut()
-            && stack.store == self.id
-            && stack.slots.len() < THREAD_LIMIT
+            && let Some(mut stack) = first_stack()
         {
-            stack.slots.push(slot.cast());
-            return;
+            // SAFETY: as in `take`.
+            let stack = unsafe { stack.as_mut() };
+            if stack.store == self.id && stack.len < THREAD_LIMIT {
+                stack.slots[stack.len] = slot.cast();
+                stack.len += 1;
+                return;
+            }
         }
         self.give_cold(slot);
     }
 
+    /// `give_one` for an overflow slot, a full first stack, or a store
+    /// whose stack is listed.
+    #[allow(unsafe_code, reason = "reads this thread's own thread-local")]
     #[cold]
     #[inline(never)]
     fn give_cold(&self, slot: NonNull<Slot<T>>) {
-        self.give(&[slot]);
+        let depot = &*self.depot;
+        if !depot.in_region(slot.cast()) {
+            depot.give_overflow(&mut depot.state.lock(), slot.cast());
+            return;
+        }
+        if !self.push_first_spilling(slot) {
+            self.give_listed(&[slot]);
+        }
+    }
+
+    /// Pushes `slot` on this thread's first stack if it is this store's,
+    /// first moving the stack's newest batch to the depot when it is full.
+    /// Returns false if the stack is another store's or thread-local
+    /// storage is gone.
+    #[allow(unsafe_code, reason = "reads this thread's own thread-local")]
+    fn push_first_spilling(&self, slot: NonNull<Slot<T>>) -> bool {
+        let Some(mut stack) = first_stack() else {
+            return false;
+        };
+        let mut spilled = [NonNull::dangling(); THREAD_BATCH];
+        let spill = {
+            // SAFETY: as in `take`.
+            let stack = unsafe { stack.as_mut() };
+            if stack.store != self.id {
+                return false;
+            }
+            let spill = stack.len == THREAD_LIMIT;
+            if spill {
+                stack.len -= THREAD_BATCH;
+                spilled.copy_from_slice(&stack.slots[stack.len..][..THREAD_BATCH]);
+            }
+            stack.slots[stack.len] = slot.cast();
+            stack.len += 1;
+            spill
+        };
+        // Outside the stack's access: extending the depot may allocate.
+        if spill {
+            self.depot.state.lock().vacant.extend_from_slice(&spilled);
+        }
+        true
     }
 
     /// Gives back vacant slots: region slots to this thread's stack, which
     /// overflows into the depot, and overflow slots to their chunks.
-    #[inline]
     pub(crate) fn give(&self, slots: &[NonNull<Slot<T>>]) {
+        for &slot in slots {
+            self.give_one(slot);
+        }
+    }
+
+    /// `give` for a store whose stack this thread lists in
+    /// `THREAD_STORES`.
+    fn give_listed(&self, slots: &[NonNull<Slot<T>>]) {
         let depot = &*self.depot;
         let mut overflow = false;
         let stacked = self.with_stack(|stack| {
@@ -1896,6 +2400,7 @@ impl<T> Reclaimed<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::mpsc;
     use std::thread;
 
@@ -1905,13 +2410,18 @@ mod tests {
     impl<T> RetiredSlots<T> {
         /// Slots waiting in one queue.
         pub(crate) fn queued(&self, queue: usize) -> usize {
-            self.queues[queue].0.lock().slots.len()
+            self.owned(queue).state.lock().slots.len()
+        }
+
+        /// Slots waiting in one lane. Requires its thread to be idle.
+        pub(crate) fn lane_queued(&self, lane: usize) -> usize {
+            self.queued(RETIRED_QUEUES + lane)
         }
 
         /// The address of the slot one queue reclaims next.
         fn front(&self, queue: usize) -> Option<usize> {
-            let queue = self.queues[queue].0.lock();
-            queue.slots.front().map(|&(_, slot)| slot.as_ptr() as usize)
+            let queue = self.owned(queue).state.lock();
+            queue.slots.front().map(|(_, slot)| slot.as_ptr() as usize)
         }
     }
 
@@ -1972,6 +2482,47 @@ mod tests {
         );
         store.give(&slots);
         store.give(&[extra]);
+    }
+
+    #[test]
+    fn a_threads_first_stack_passes_to_a_live_store_once_its_store_drops() {
+        thread::spawn(|| {
+            let first = SlotStore::<u64>::new(64);
+            let (slot, _) = first.take();
+            first.give(&[slot]);
+            drop(first);
+            let second = SlotStore::<u64>::new(64);
+            let (slot, _) = second.take();
+            let before = STACK_BORROWS.with(std::cell::Cell::get);
+            for _ in 0..100 {
+                second.give(&[slot]);
+                assert_eq!(second.take().0, slot, "the stack is last in, first out");
+            }
+            assert_eq!(
+                STACK_BORROWS.with(std::cell::Cell::get),
+                before,
+                "the second store's slots went through the list of stacks"
+            );
+            second.give(&[slot]);
+        })
+        .join()
+        .expect("the thread finishes");
+    }
+
+    #[test]
+    fn a_threads_vacant_slots_return_to_the_depot_when_it_exits() {
+        let store = Arc::new(SlotStore::<u64>::new(256));
+        let writer = Arc::clone(&store);
+        // Joined, not scoped: a scope can end before the thread's
+        // thread-locals are destroyed.
+        thread::spawn(move || {
+            let slots: Vec<_> = (0..40).map(|_| writer.take().0).collect();
+            writer.give(&slots);
+        })
+        .join()
+        .expect("the thread finishes");
+        // Two batches of 32 left the depot; all 64 came back.
+        assert_eq!(store.depot_len(), 64);
     }
 
     #[test]
@@ -2060,7 +2611,7 @@ mod tests {
         let epochs = Epochs::new();
         // Declared first so it drops last: retired values live in its region.
         let store = SlotStore::new(4_096);
-        let retired = RetiredSlots::new();
+        let retired = RetiredSlots::new(epochs.announcers());
         assert_eq!(retire_filled(&epochs, &retired, &store, 64), 0);
         for _ in 0..3 {
             assert!(epochs.try_advance());
@@ -2095,7 +2646,7 @@ mod tests {
         let epochs = Epochs::new();
         // Declared first so it drops last: retired values live in its region.
         let store = SlotStore::new(4_096);
-        let retired = RetiredSlots::new();
+        let retired = RetiredSlots::new(epochs.announcers());
         assert_eq!(retire_filled(&epochs, &retired, &store, 4), 0);
         for _ in 0..3 {
             assert!(epochs.try_advance());
@@ -2103,7 +2654,7 @@ mod tests {
         PREFETCHED.with(|lines| lines.borrow_mut().clear());
         assert_eq!(retire_filled(&epochs, &retired, &store, 1), 1);
         let next = retired
-            .front(retired_queue_index())
+            .front(retiring_index())
             .expect("three aged slots remain");
         assert!(
             PREFETCHED.with(|lines| lines.borrow().contains(&next)),
@@ -2116,7 +2667,7 @@ mod tests {
         let epochs = Epochs::new();
         // Declared first so it drops last: retired values live in its region.
         let store = SlotStore::new(4_096);
-        let retired = RetiredSlots::new();
+        let retired = RetiredSlots::new(epochs.announcers());
         let (to_other, other_requests) = mpsc::channel::<usize>();
         let (to_main, other_retired) = mpsc::channel();
         thread::scope(|scope| {
@@ -2124,7 +2675,7 @@ mod tests {
                 for count in other_requests {
                     retire_filled(&epochs, &retired, &store, count);
                     to_main
-                        .send(retired_queue_index())
+                        .send(retiring_index())
                         .expect("the test thread listens");
                 }
             });
@@ -2133,7 +2684,7 @@ mod tests {
                 other_retired.recv().expect("the other thread retires")
             };
             let other = retire_on_other(64);
-            if other == retired_queue_index() {
+            if other == retiring_index() {
                 // Thread indices 64 apart share a queue; nothing to compare.
                 return;
             }
@@ -2169,6 +2720,50 @@ mod tests {
             assert_eq!(retired.queued(other), 0, "the idle queue was not drained");
             drop(to_other);
         });
+    }
+
+    #[test]
+    fn retired_rings_keep_slots_oldest_first_as_they_grow_and_wrap() {
+        let slot = |index: usize| {
+            NonNull::new(std::ptr::without_provenance_mut::<Slot<u64>>(
+                (index + 1) * 64,
+            ))
+            .expect("nonzero")
+        };
+        let mut ring = RetiredRing::<u64>::new();
+        let mut model = VecDeque::new();
+        let mut next = 0;
+        // Pushes outrun pops, then pops outrun pushes, so the ring both
+        // grows with its oldest slot mid-buffer and wraps without growing.
+        for (pushes, pops) in [
+            (5, 2),
+            (40, 30),
+            (3, 0),
+            (100, 7),
+            (0, 60),
+            (17, 20),
+            (64, 64),
+        ] {
+            for _ in 0..pushes {
+                ring.push_back((next, slot(next)));
+                model.push_back((next, slot(next)));
+                next += 1;
+            }
+            assert_eq!(ring.back(), model.back().copied());
+            for _ in 0..pops {
+                assert_eq!(ring.front(), model.front().copied());
+                assert_eq!(ring.pop_front(), model.pop_front());
+            }
+            assert_eq!(ring.len(), model.len());
+            assert!(ring.capacity().is_power_of_two() || ring.capacity() == 0);
+        }
+        while let Some(oldest) = model.pop_front() {
+            assert_eq!(ring.pop_front(), Some(oldest));
+        }
+        assert_eq!(
+            (ring.pop_front(), ring.front(), ring.back()),
+            (None, None, None)
+        );
     }
 
     #[test]
