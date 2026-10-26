@@ -964,6 +964,65 @@ const RETIRED_QUEUES: usize = READER_SHARDS;
 pub(crate) fn retired_queue_index() -> usize {
     direct_arena_thread() & (RETIRED_QUEUES - 1)
 }
+pub(crate) struct BoundLane {
+    ring: [(usize, *mut u8); 4096],
+    head: usize,
+    tail: usize,
+    free: [*mut u8; 512],
+    free_len: usize,
+    unreported: usize,
+}
+
+thread_local! {
+    pub(crate) static BOUND_LANE: UnsafeCell<BoundLane> = const {
+        UnsafeCell::new(BoundLane {
+            ring: [(0, ptr::null_mut()); 4096],
+            head: 0,
+            tail: 0,
+            free: [ptr::null_mut(); 512],
+            free_len: 0,
+            unreported: 0,
+        })
+    };
+}
+
+impl<T> RetiredSlots<T> {
+    #[allow(unsafe_code, clippy::inline_always)]
+    #[inline(always)]
+    pub(crate) fn bound_retire(&self, pin: &EpochPin<'_>, slot: NonNull<Slot<T>>, store: &SlotStore<T>) -> bool {
+        let epochs = pin.epochs;
+        let generation = epochs.generation();
+        let due = reclaim_at(generation);
+        BOUND_LANE.with(|lane| {
+            let lane = unsafe { &mut *lane.get() };
+            assert!(lane.tail - lane.head < 4096);
+            lane.ring[lane.tail & 4095] = (due, slot.as_ptr().cast());
+            lane.tail += 1;
+            let (front_due, front) = lane.ring[lane.head & 4095];
+            if front_due <= generation {
+                lane.head += 1;
+                let front = unsafe { NonNull::new_unchecked(front.cast::<Slot<T>>()) };
+                unsafe { drop_value(front) };
+                if lane.free_len < 512 {
+                    lane.free[lane.free_len] = front.as_ptr().cast();
+                    lane.free_len += 1;
+                } else {
+                    store.give_one(front);
+                }
+            }
+            let next = lane.ring[lane.head & 4095].1;
+            prefetch(next);
+            lane.unreported += 1;
+            if lane.unreported >= REPORT_EVERY {
+                lane.unreported = 0;
+                epochs.note_retired(REPORT_EVERY)
+            } else {
+                false
+            }
+        })
+    }
+}
+
 /// A thread drains another thread's aged slots once per this many of its
 /// own retirements, so a queue whose thread stopped writing still drains.
 const FOREIGN_DRAIN_EVERY: u32 = 16;
@@ -1700,6 +1759,19 @@ impl<T> SlotStore<T> {
     )]
     #[inline(always)]
     pub(crate) fn take(&self) -> (NonNull<Slot<T>>, u32) {
+        let bound = BOUND_LANE.with(|lane| {
+            let lane = unsafe { &mut *lane.get() };
+            if lane.free_len > 0 {
+                lane.free_len -= 1;
+                Some(lane.free[lane.free_len])
+            } else {
+                None
+            }
+        });
+        if let Some(slot) = bound {
+            let slot = unsafe { NonNull::new_unchecked(slot) };
+            return (slot.cast(), self.region_handle(slot));
+        }
         if let Some(stores) = thread_stores()
             // SAFETY: a thread-local lives at a fixed address until its
             // thread exits, past this call on this thread.
