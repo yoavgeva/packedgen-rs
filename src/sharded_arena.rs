@@ -25,7 +25,7 @@
 
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::cell::{Cell, RefCell, UnsafeCell};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::ptr::{self, NonNull};
@@ -796,6 +796,8 @@ thread_local! {
     pub(crate) static PREFETCHED: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
     /// Times this thread searched its slot stacks for a store's.
     pub(crate) static STACK_SEARCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Times this thread borrowed its slot stacks' `RefCell`.
+    pub(crate) static STACK_BORROWS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// One entry's storage: atomic metadata, then the value.
@@ -980,13 +982,88 @@ struct RetiredQueue<T>(Mutex<QueueState<T>>);
 struct QueueState<T> {
     /// Unpublished slots with the first generation at which each may be
     /// reclaimed, oldest first.
-    slots: VecDeque<(usize, NonNull<Slot<T>>)>,
+    slots: RetiredRing<T>,
     /// Slots retired here since this queue last reported to its epochs.
     unreported: usize,
     /// Retirements left before this queue's thread drains another queue.
     until_foreign_drain: u32,
     /// The next queue a foreign drain visits.
     next_foreign: usize,
+}
+
+/// A queue's retired slots, oldest first, each with its due generation. Its
+/// capacity is a power of two, so positions wrap with a mask: `VecDeque`
+/// wraps them with a compare, and every write pushes one slot and pops one.
+struct RetiredRing<T> {
+    buffer: Box<[(usize, NonNull<Slot<T>>)]>,
+    /// The oldest slot's position, counting every slot ever popped.
+    head: usize,
+    len: usize,
+}
+
+impl<T> RetiredRing<T> {
+    fn new() -> Self {
+        Self {
+            buffer: Box::new([]),
+            head: 0,
+            len: 0,
+        }
+    }
+
+    #[cfg(test)]
+    const fn len(&self) -> usize {
+        self.len
+    }
+
+    const fn capacity(&self) -> usize {
+        self.buffer.len()
+    }
+
+    #[inline]
+    fn at(&self, position: usize) -> (usize, NonNull<Slot<T>>) {
+        self.buffer[position & (self.buffer.len() - 1)]
+    }
+
+    #[inline]
+    fn push_back(&mut self, retired: (usize, NonNull<Slot<T>>)) {
+        if self.len == self.buffer.len() {
+            self.grow();
+        }
+        let mask = self.buffer.len() - 1;
+        self.buffer[self.head.wrapping_add(self.len) & mask] = retired;
+        self.len += 1;
+    }
+
+    #[inline]
+    fn front(&self) -> Option<(usize, NonNull<Slot<T>>)> {
+        (self.len != 0).then(|| self.at(self.head))
+    }
+
+    #[inline]
+    fn back(&self) -> Option<(usize, NonNull<Slot<T>>)> {
+        (self.len != 0).then(|| self.at(self.head.wrapping_add(self.len - 1)))
+    }
+
+    #[inline]
+    fn pop_front(&mut self) -> Option<(usize, NonNull<Slot<T>>)> {
+        let oldest = self.front()?;
+        self.head = self.head.wrapping_add(1);
+        self.len -= 1;
+        Some(oldest)
+    }
+
+    /// Doubles the capacity, at least to 16, keeping the order.
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self) {
+        let capacity = (self.buffer.len() * 2).max(16);
+        let mut buffer = vec![(0, NonNull::dangling()); capacity].into_boxed_slice();
+        for (index, entry) in buffer.iter_mut().take(self.len).enumerate() {
+            *entry = self.at(self.head.wrapping_add(index));
+        }
+        self.buffer = buffer;
+        self.head = 0;
+    }
 }
 
 // SAFETY: queues only name slots of their cache's store, which outlives them,
@@ -1013,7 +1090,7 @@ impl<T> RetiredSlots<T> {
             queues: (0..RETIRED_QUEUES)
                 .map(|index| {
                     RetiredQueue(Mutex::new(QueueState {
-                        slots: VecDeque::new(),
+                        slots: RetiredRing::new(),
                         unreported: 0,
                         until_foreign_drain: FOREIGN_DRAIN_EVERY,
                         next_foreign: index + 1,
@@ -1031,6 +1108,8 @@ impl<T> RetiredSlots<T> {
     /// thread has stopped retiring. Reads the generation that tags the slots
     /// here, while the caller still holds `pin`. Returns whether enough
     /// retirements are pending across the cache to try advancing.
+    #[allow(clippy::inline_always, reason = "every write retires")]
+    #[inline(always)]
     pub(crate) fn retire(
         &self,
         pin: &EpochPin<'_>,
@@ -1063,16 +1142,12 @@ impl<T> RetiredSlots<T> {
         // caches absorb. Slots due since an earlier advance are a backlog,
         // and each write drains as many more of it, within one batch.
         Self::take_aged(&mut queue, generation, reclaimed, retired);
-        if queue
-            .slots
-            .front()
-            .is_some_and(|&(due, _)| due < generation)
-        {
+        if queue.slots.front().is_some_and(|(due, _)| due < generation) {
             Self::take_aged(&mut queue, generation, reclaimed, retired);
         }
         // The next write reclaims the front slot, a few advances after this
         // thread last touched it: start loading the lines its drop reads.
-        if let Some(&(_, next)) = queue.slots.front() {
+        if let Some((_, next)) = queue.slots.front() {
             let first = next.as_ptr().cast::<u8>();
             prefetch(first);
             prefetch(first.wrapping_add(size_of::<Slot<T>>() - 1));
@@ -1097,6 +1172,18 @@ impl<T> RetiredSlots<T> {
         advance
     }
 
+    /// `retire` for writes that removed more than one entry, out of line.
+    #[inline(never)]
+    pub(crate) fn retire_many(
+        &self,
+        pin: &EpochPin<'_>,
+        slots: impl Iterator<Item = NonNull<Slot<T>>>,
+        reclaimed: &mut Reclaimed<T>,
+        store: &SlotStore<T>,
+    ) -> bool {
+        self.retire(pin, slots, reclaimed, store)
+    }
+
     /// Reclaims a batch from the queue `next` names, if its thread has
     /// stopped retiring; a write in sixteen calls it. Out of line, the batch
     /// it sets up costs the others nothing.
@@ -1108,7 +1195,7 @@ impl<T> RetiredSlots<T> {
             && let Some(mut queue) = self.queues[index].0.try_lock()
             // Only a queue whose newest slot is aged: its thread has retired
             // nothing for three advances, so it is not draining the queue.
-            && queue.slots.back().is_some_and(|&(due, _)| due <= generation)
+            && queue.slots.back().is_some_and(|(due, _)| due <= generation)
         {
             let mut foreign = Reclaimed::new();
             Self::take_aged(&mut queue, generation, &mut foreign, RECLAIM_BATCH);
@@ -1152,7 +1239,7 @@ impl<T> RetiredSlots<T> {
         let end = (reclaimed.len + limit).min(RECLAIM_BATCH);
         while reclaimed.len < end {
             match queue.slots.front() {
-                Some(&(due, slot)) if due <= generation => {
+                Some((due, slot)) if due <= generation => {
                     queue.slots.pop_front();
                     reclaimed.slots[reclaimed.len] = slot;
                     reclaimed.len += 1;
@@ -1576,7 +1663,58 @@ thread_local! {
 /// stayed out of line once the insert body had two copies.
 #[inline]
 fn thread_stores() -> Option<NonNull<RefCell<ThreadStores>>> {
+    #[cfg(test)]
+    STACK_BORROWS.with(|count| count.set(count.get() + 1));
     THREAD_STORES.try_with(|stores| NonNull::from(stores)).ok()
+}
+
+/// The vacant region slots of the first store this thread takes a slot
+/// from. Most threads write to one cache, whose writes reach this stack in
+/// a constant-initialized thread-local, without `THREAD_STORES`' `RefCell`
+/// and search; other stores' stacks stay there. Once its store drops, the
+/// next store to take a slot claims it.
+///
+/// Only this thread reaches it, and each access ends before running
+/// anything that could reach it again: no allocation, no user code.
+struct FirstStack {
+    /// The store's id, or 0 while unclaimed.
+    store: u64,
+    depot: Option<Weak<Depot>>,
+    len: usize,
+    slots: [NonNull<u8>; THREAD_LIMIT],
+}
+
+impl Drop for FirstStack {
+    fn drop(&mut self) {
+        if let Some(depot) = self.depot.take().and_then(|depot| depot.upgrade()) {
+            depot
+                .state
+                .lock()
+                .vacant
+                .extend_from_slice(&self.slots[..self.len]);
+        }
+    }
+}
+
+thread_local! {
+    static FIRST_STACK: UnsafeCell<FirstStack> = const {
+        UnsafeCell::new(FirstStack {
+            store: 0,
+            depot: None,
+            len: 0,
+            slots: [NonNull::dangling(); THREAD_LIMIT],
+        })
+    };
+}
+
+/// This thread's first stack, or `None` while thread-local storage is
+/// unavailable, as during thread exit.
+#[inline]
+fn first_stack() -> Option<NonNull<FirstStack>> {
+    FIRST_STACK
+        .try_with(|stack| NonNull::new(stack.get()))
+        .ok()
+        .flatten()
 }
 
 impl<T> SlotStore<T> {
@@ -1691,8 +1829,8 @@ impl<T> SlotStore<T> {
         Some(with(&mut stores.0[index].slots))
     }
 
-    /// A vacant slot the caller now owns, with its handle. A thread's first
-    /// stack is usually its only one, so `take` checks it before searching.
+    /// A vacant slot the caller now owns, with its handle, from this
+    /// thread's first stack when it is this store's.
     #[allow(unsafe_code, reason = "reads this thread's own thread-local")]
     #[allow(
         clippy::inline_always,
@@ -1700,23 +1838,27 @@ impl<T> SlotStore<T> {
     )]
     #[inline(always)]
     pub(crate) fn take(&self) -> (NonNull<Slot<T>>, u32) {
-        if let Some(stores) = thread_stores()
-            // SAFETY: a thread-local lives at a fixed address until its
-            // thread exits, past this call on this thread.
-            && let Ok(mut stores) = unsafe { stores.as_ref() }.try_borrow_mut()
-            && let Some(stack) = stores.0.first_mut()
-            && stack.store == self.id
-            && let Some(slot) = stack.slots.pop()
-        {
-            return (slot.cast(), self.region_handle(slot));
+        if let Some(mut stack) = first_stack() {
+            // SAFETY: this thread's own first stack, which nothing else on
+            // the thread references while this runs.
+            let stack = unsafe { stack.as_mut() };
+            if stack.store == self.id && stack.len != 0 {
+                stack.len -= 1;
+                let slot = stack.slots[stack.len];
+                return (slot.cast(), self.region_handle(slot));
+            }
         }
         self.take_cold()
     }
 
-    /// `take` from a stack found by search, refilled if empty.
+    /// `take` from the first stack once claimed or refilled, else from a
+    /// stack found by search, refilled if empty.
     #[cold]
     #[inline(never)]
     fn take_cold(&self) -> (NonNull<Slot<T>>, u32) {
+        if let Some(slot) = self.take_from_first() {
+            return (slot.cast(), self.region_handle(slot));
+        }
         if let Some(Some(slot)) = self.with_stack(|stack| {
             if stack.is_empty() {
                 self.refill(stack);
@@ -1726,6 +1868,70 @@ impl<T> SlotStore<T> {
             return (slot.cast(), self.region_handle(slot));
         }
         self.take_unbatched()
+    }
+
+    /// Takes a slot from this thread's first stack, claiming it if it is
+    /// unclaimed or its store has dropped, and refilling it if empty.
+    /// Returns `None` if another live store holds it, the region is used
+    /// up, or thread-local storage is gone.
+    #[allow(unsafe_code, reason = "reads this thread's own thread-local")]
+    fn take_from_first(&self) -> Option<NonNull<u8>> {
+        let mut stack = first_stack()?;
+        let mut previous = None;
+        let slot = {
+            // SAFETY: as in `take`; the depot's lock runs no user code.
+            let stack = unsafe { stack.as_mut() };
+            if stack.store != self.id {
+                if stack
+                    .depot
+                    .as_ref()
+                    .is_some_and(|depot| depot.strong_count() != 0)
+                {
+                    return None;
+                }
+                // A dropped store's slots are gone with its region.
+                stack.store = self.id;
+                stack.len = 0;
+                previous = stack.depot.replace(Arc::downgrade(&self.depot));
+            }
+            if stack.len == 0 {
+                stack.len = self.refill_into(&mut stack.slots[..THREAD_BATCH]);
+            }
+            stack.len.checked_sub(1).map(|top| {
+                stack.len = top;
+                stack.slots[top]
+            })
+        };
+        // Outside the stack's access: the last reference to a dropped
+        // depot frees it.
+        drop(previous);
+        slot
+    }
+
+    /// Fills `slots` from the start with vacant region slots, from the
+    /// depot or else from the region's untouched rest, as `refill` does;
+    /// returns how many. None once the region is used up.
+    fn refill_into(&self, slots: &mut [NonNull<u8>]) -> usize {
+        let depot = &*self.depot;
+        let mut state = depot.state.lock();
+        if !state.vacant.is_empty() {
+            let keep = state.vacant.len().saturating_sub(slots.len());
+            let mut count = 0;
+            for (target, slot) in slots.iter_mut().zip(state.vacant.drain(keep..)) {
+                *target = slot;
+                count += 1;
+            }
+            return count;
+        }
+        let first = state.fresh;
+        let end = (first + slots.len()).min(depot.region_slots);
+        state.fresh = end;
+        drop(state);
+        // Last first, so pops walk the region in address order.
+        for (target, index) in slots.iter_mut().zip((first..end).rev()) {
+            *target = depot.region_slot(index);
+        }
+        end - first
     }
 
     /// A slot straight from the depot: the region is used up, or
@@ -1776,37 +1982,85 @@ impl<T> SlotStore<T> {
         (state.fresh + state.overflow.len() * OVERFLOW_CHUNK_SLOTS) * depot.slot.size()
     }
 
-    /// Gives back one vacant slot, as `give` does, to the thread's first
-    /// stack when it is this store's and has room.
+    /// Gives back one vacant slot: a region slot to this thread's stack,
+    /// which overflows into the depot, and an overflow slot to its chunk.
     #[allow(unsafe_code, reason = "reads this thread's own thread-local")]
     #[allow(clippy::inline_always, reason = "every write's reclamation")]
     #[inline(always)]
     pub(crate) fn give_one(&self, slot: NonNull<Slot<T>>) {
         if self.depot.in_region(slot.cast())
-            && let Some(stores) = thread_stores()
-            // SAFETY: a thread-local lives at a fixed address until its
-            // thread exits, past this call on this thread.
-            && let Ok(mut stores) = unsafe { stores.as_ref() }.try_borrow_mut()
-            && let Some(stack) = stores.0.first_mut()
-            && stack.store == self.id
-            && stack.slots.len() < THREAD_LIMIT
+            && let Some(mut stack) = first_stack()
         {
-            stack.slots.push(slot.cast());
-            return;
+            // SAFETY: as in `take`.
+            let stack = unsafe { stack.as_mut() };
+            if stack.store == self.id && stack.len < THREAD_LIMIT {
+                stack.slots[stack.len] = slot.cast();
+                stack.len += 1;
+                return;
+            }
         }
         self.give_cold(slot);
     }
 
+    /// `give_one` for an overflow slot, a full first stack, or a store
+    /// whose stack is listed.
+    #[allow(unsafe_code, reason = "reads this thread's own thread-local")]
     #[cold]
     #[inline(never)]
     fn give_cold(&self, slot: NonNull<Slot<T>>) {
-        self.give(&[slot]);
+        let depot = &*self.depot;
+        if !depot.in_region(slot.cast()) {
+            depot.give_overflow(&mut depot.state.lock(), slot.cast());
+            return;
+        }
+        if !self.push_first_spilling(slot) {
+            self.give_listed(&[slot]);
+        }
+    }
+
+    /// Pushes `slot` on this thread's first stack if it is this store's,
+    /// first moving the stack's newest batch to the depot when it is full.
+    /// Returns false if the stack is another store's or thread-local
+    /// storage is gone.
+    #[allow(unsafe_code, reason = "reads this thread's own thread-local")]
+    fn push_first_spilling(&self, slot: NonNull<Slot<T>>) -> bool {
+        let Some(mut stack) = first_stack() else {
+            return false;
+        };
+        let mut spilled = [NonNull::dangling(); THREAD_BATCH];
+        let spill = {
+            // SAFETY: as in `take`.
+            let stack = unsafe { stack.as_mut() };
+            if stack.store != self.id {
+                return false;
+            }
+            let spill = stack.len == THREAD_LIMIT;
+            if spill {
+                stack.len -= THREAD_BATCH;
+                spilled.copy_from_slice(&stack.slots[stack.len..][..THREAD_BATCH]);
+            }
+            stack.slots[stack.len] = slot.cast();
+            stack.len += 1;
+            spill
+        };
+        // Outside the stack's access: extending the depot may allocate.
+        if spill {
+            self.depot.state.lock().vacant.extend_from_slice(&spilled);
+        }
+        true
     }
 
     /// Gives back vacant slots: region slots to this thread's stack, which
     /// overflows into the depot, and overflow slots to their chunks.
-    #[inline]
     pub(crate) fn give(&self, slots: &[NonNull<Slot<T>>]) {
+        for &slot in slots {
+            self.give_one(slot);
+        }
+    }
+
+    /// `give` for a store whose stack this thread lists in
+    /// `THREAD_STORES`.
+    fn give_listed(&self, slots: &[NonNull<Slot<T>>]) {
         let depot = &*self.depot;
         let mut overflow = false;
         let stacked = self.with_stack(|stack| {
@@ -1896,6 +2150,7 @@ impl<T> Reclaimed<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::mpsc;
     use std::thread;
 
@@ -1911,7 +2166,7 @@ mod tests {
         /// The address of the slot one queue reclaims next.
         fn front(&self, queue: usize) -> Option<usize> {
             let queue = self.queues[queue].0.lock();
-            queue.slots.front().map(|&(_, slot)| slot.as_ptr() as usize)
+            queue.slots.front().map(|(_, slot)| slot.as_ptr() as usize)
         }
     }
 
@@ -1972,6 +2227,47 @@ mod tests {
         );
         store.give(&slots);
         store.give(&[extra]);
+    }
+
+    #[test]
+    fn a_threads_first_stack_passes_to_a_live_store_once_its_store_drops() {
+        thread::spawn(|| {
+            let first = SlotStore::<u64>::new(64);
+            let (slot, _) = first.take();
+            first.give(&[slot]);
+            drop(first);
+            let second = SlotStore::<u64>::new(64);
+            let (slot, _) = second.take();
+            let before = STACK_BORROWS.with(std::cell::Cell::get);
+            for _ in 0..100 {
+                second.give(&[slot]);
+                assert_eq!(second.take().0, slot, "the stack is last in, first out");
+            }
+            assert_eq!(
+                STACK_BORROWS.with(std::cell::Cell::get),
+                before,
+                "the second store's slots went through the list of stacks"
+            );
+            second.give(&[slot]);
+        })
+        .join()
+        .expect("the thread finishes");
+    }
+
+    #[test]
+    fn a_threads_vacant_slots_return_to_the_depot_when_it_exits() {
+        let store = Arc::new(SlotStore::<u64>::new(256));
+        let writer = Arc::clone(&store);
+        // Joined, not scoped: a scope can end before the thread's
+        // thread-locals are destroyed.
+        thread::spawn(move || {
+            let slots: Vec<_> = (0..40).map(|_| writer.take().0).collect();
+            writer.give(&slots);
+        })
+        .join()
+        .expect("the thread finishes");
+        // Two batches of 32 left the depot; all 64 came back.
+        assert_eq!(store.depot_len(), 64);
     }
 
     #[test]
@@ -2169,6 +2465,50 @@ mod tests {
             assert_eq!(retired.queued(other), 0, "the idle queue was not drained");
             drop(to_other);
         });
+    }
+
+    #[test]
+    fn retired_rings_keep_slots_oldest_first_as_they_grow_and_wrap() {
+        let slot = |index: usize| {
+            NonNull::new(std::ptr::without_provenance_mut::<Slot<u64>>(
+                (index + 1) * 64,
+            ))
+            .expect("nonzero")
+        };
+        let mut ring = RetiredRing::<u64>::new();
+        let mut model = VecDeque::new();
+        let mut next = 0;
+        // Pushes outrun pops, then pops outrun pushes, so the ring both
+        // grows with its oldest slot mid-buffer and wraps without growing.
+        for (pushes, pops) in [
+            (5, 2),
+            (40, 30),
+            (3, 0),
+            (100, 7),
+            (0, 60),
+            (17, 20),
+            (64, 64),
+        ] {
+            for _ in 0..pushes {
+                ring.push_back((next, slot(next)));
+                model.push_back((next, slot(next)));
+                next += 1;
+            }
+            assert_eq!(ring.back(), model.back().copied());
+            for _ in 0..pops {
+                assert_eq!(ring.front(), model.front().copied());
+                assert_eq!(ring.pop_front(), model.pop_front());
+            }
+            assert_eq!(ring.len(), model.len());
+            assert!(ring.capacity().is_power_of_two() || ring.capacity() == 0);
+        }
+        while let Some(oldest) = model.pop_front() {
+            assert_eq!(ring.pop_front(), Some(oldest));
+        }
+        assert_eq!(
+            (ring.pop_front(), ring.front(), ring.back()),
+            (None, None, None)
+        );
     }
 
     #[test]
