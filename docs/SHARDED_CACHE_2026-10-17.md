@@ -1001,6 +1001,27 @@ unit, and four-thread writes 3 to 8%; one-thread replace read −6% and
 +27% in pairs from −17 to +61%, its usual spread there, and one-thread
 turnover −1% and −4%; reads moved within 3%.
 
+Three more steps followed:
+
+- The first store a thread takes a slot from keeps the thread's vacant
+  slots in a constant-initialized thread-local array, which `take` and
+  `give` reach without `THREAD_STORES`' `RefCell` and search. Other
+  stores stay listed there, and the next store to take a slot claims the
+  array once its store drops; a thread's exit returns its slots.
+- Retired queues hold their slots in a ring whose capacity is a power of
+  two, so positions wrap with a mask.
+- `retire` inlines into writes that removed one entry, and keeps an
+  out-of-line copy for the rest.
+
+A single-thread upsert of a `u64` then ran 542 instructions instead of
+599, the ring saving only 6 of them, and on macOS ran 6% faster (+2 to
++7% over six pairs). The probe's cells moved within noise in both codegen
+settings, except one-thread delete and reinsert: −4% in the default build
+and −1% with one codegen unit. On the Linux VM, writes moved within noise
+at one and eight threads. On an x86_64 runner (an EPYC 9V74), against the
+parent commit over five pairs, one-thread writes moved by −4 to +5% and
+four-thread writes gained 3 to 14%.
+
 ## Throughput against quick_cache 0.7
 
 Measured with `bounded_cache_probe` at the end of the changes described
@@ -1801,6 +1822,36 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
   4-vCPU runners (Intel Xeon 8573C, Neoverse N2), while advances come due
   after 32 to 512 retirements, a few microseconds of writes. Parking the
   announcement confines the barrier to threads that stopped pinning.
+- **Retiring without the retired queue's lock.** On x86 a lock's acquire
+  and release are full barriers, and a bound that retired into a
+  thread-local ring without the lock, unsound for idle and multi-cache
+  threads, ran one-thread replace 35 to 40% faster on an EPYC 7763 runner,
+  update 35 to 37%, delete and reinsert 21 to 25%, and cold fill 13 to
+  15%, and four threads' writes 6 to 11%. On an M4 Max it ran `u64`
+  upserts 11 to 17% faster, and 7% with an uncontended lock kept.
+  - A sound form gave each announcer slot a lane, which its thread
+    retired into without the lock while pinned through the slot. Other
+    threads drained a lane only after revoking it under its lock, and a
+    Loom model with negative controls checked both revocations: one with
+    `membarrier` against a pin's light fence, and one that waited for an
+    advance to evict the parked announcement, whose thread then pins with
+    a sequentially consistent fence.
+  - On the same EPYC 7763, against the constant thread-local stack and
+    ring above, one-thread writes moved by −2 to +2% and four-thread
+    replace and update fell 5 to 8%. On the Linux VM eight-thread writes
+    fell 8 to 14%.
+  - Shorter pins let six times as many advances succeed at eight threads,
+    and after each one every writer's next pin announced afresh, with a
+    full fence, and reloaded the generation: 630,000 to 680,000 fresh
+    announcements per run against 90,000 to 120,000. First, revoking with
+    `membarrier`, evicting writers parked between writes, and every
+    pending write trying the advance lock had cost eight threads a third;
+    each was fixed and counted, and the advance rate remained. Pacing
+    advances by the threads that have used the cache would also slow a
+    lone writer's reclamation, as an idle main thread counts.
+  - The lock was not what the bound's one-thread gain measured; its other
+    shortcuts (no foreign drains, no backlog draining, no store identity
+    checks) were not measured apart.
 - **RCpc acquire loads on Linux, as a bound.** Rust's default aarch64
   Linux target compiles acquire loads to `ldar`, which waits for earlier
   release stores, where Apple's targets use `ldapr`; on the Linux VM, `get`'s
