@@ -6532,16 +6532,26 @@ mod tests {
         let mut guard = map.read_guard();
         assert_eq!(guard.get_protected(&key), map.get(&key));
 
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let old_generation = map.inner.current.load_full();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let rebuilding = Arc::clone(&map);
         let join = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
             let result = rebuilding.rebuild(128);
             done_tx.send(result).unwrap();
         });
-        started_rx.recv().unwrap();
-        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        // Once the rebuild redirects writers, it waits for this guard's
+        // read batch. A wall-clock wait instead let this test write before
+        // the redirect under Miri, whose clock advances with interpretation.
+        while Arc::ptr_eq(&old_generation, &map.inner.current.load_full()) {
+            std::thread::yield_now();
+        }
+        for _ in 0..64 {
+            std::thread::yield_now();
+        }
+        assert!(
+            done_rx.try_recv().is_err(),
+            "the rebuild cut over under an open read batch"
+        );
         let inserted_key = 1_001_u64.to_le_bytes();
         let inserted_value = NonMaxU64::new(1_002).unwrap();
         assert_eq!(
@@ -6552,10 +6562,12 @@ mod tests {
         let removed_value = NonMaxU64::new(9).unwrap();
         assert_eq!(guard.remove(&removed_key), Some(removed_value));
         guard.refresh();
-        done_rx
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap()
-            .unwrap();
+        let done = if cfg!(miri) {
+            done_rx.recv().unwrap()
+        } else {
+            done_rx.recv_timeout(Duration::from_secs(10)).unwrap()
+        };
+        done.unwrap();
         join.join().unwrap();
 
         assert_eq!(guard.get_protected(&key), map.get(&key));
