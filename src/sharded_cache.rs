@@ -40,7 +40,7 @@ use crate::sharded_arena::{
     prefetch_write,
 };
 #[cfg(test)]
-use crate::sharded_arena::{PREFETCHED, STACK_BORROWS, STACK_SEARCHES};
+use crate::sharded_arena::{PREFETCHED, RETIRE_LOCKS, STACK_BORROWS, STACK_SEARCHES};
 
 const SLOTS: usize = 10;
 /// Slots whose tags fill a bucket's tag word; the rest are in its meta word.
@@ -483,6 +483,7 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
             .div_ceil(SLOTS_PER_ENTRY_DENOMINATOR)
             .max(SLOTS * 2);
         let shard_buckets = shard_slots.div_ceil(SLOTS);
+        let epochs = Epochs::new();
         assert!(
             u32::try_from(shard_buckets * SLOTS).is_ok(),
             "a shard holds fewer than 2^32 slots"
@@ -500,8 +501,8 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
             table: empty_table(shards * shard_buckets),
             shard_buckets,
             shard_shift: u64::BITS - shards.trailing_zeros(),
-            epochs: Epochs::new(),
-            retired: RetiredSlots::new(),
+            retired: RetiredSlots::new(epochs.announcers()),
+            epochs,
             slots: SlotStore::new(
                 reserve
                     .saturating_add(REGION_SPARE)
@@ -2855,10 +2856,10 @@ where
     pub fn maintain(&self) {
         // Three advances age every entry removed before this call.
         for _ in 0..3 {
-            self.epochs.try_advance();
+            self.epochs.advance_evicting();
         }
         self.retired
-            .reclaim_all(self.epochs.generation(), &self.slots);
+            .reclaim_all(&self.epochs, self.epochs.generation(), &self.slots);
     }
 
     /// A multiply spreads every hash bit into the top bits that pick the
@@ -7064,9 +7065,7 @@ mod tests {
                     cache.insert(key, key);
                 }
             }
-            cache
-                .retired
-                .queued(crate::sharded_arena::retired_queue_index())
+            cache.retired.queued(crate::sharded_arena::retiring_index())
         };
         let (single, batched) = (queued(false), queued(true));
         assert!(
@@ -7090,9 +7089,7 @@ mod tests {
                     cache.insert(key, key);
                 }
             }
-            let backlog = cache
-                .retired
-                .queued(crate::sharded_arena::retired_queue_index());
+            let backlog = cache.retired.queued(crate::sharded_arena::retiring_index());
             let keys = 5_000..20_000;
             if batched {
                 cache.insert_many(keys.map(|key| (key, key)));
@@ -7101,9 +7098,7 @@ mod tests {
                     cache.insert(key, key);
                 }
             }
-            let left = cache
-                .retired
-                .queued(crate::sharded_arena::retired_queue_index());
+            let left = cache.retired.queued(crate::sharded_arena::retiring_index());
             (backlog, left)
         };
         let ((backlog, single), (_, batched)) = (queued(false), queued(true));
@@ -7444,21 +7439,155 @@ mod tests {
     }
 
     #[test]
+    fn announced_writes_retire_without_a_lock() {
+        thread::spawn(|| {
+            let cache: ShardedCache<u64, u64> = ShardedCacheBuilder::new(64).shards(1).build();
+            for key in 0..32 {
+                cache.insert(key, key);
+            }
+            if crate::sharded_arena::announced_slot().is_none() {
+                // Every announcer slot is held: this thread pins through
+                // the shared counters, whose queues lock.
+                return;
+            }
+            let locks = || RETIRE_LOCKS.with(std::cell::Cell::get);
+            let before = locks();
+            for round in 1..=8 {
+                for key in 0..32 {
+                    cache.insert(key, key + round);
+                }
+            }
+            assert_eq!(
+                locks(),
+                before,
+                "an announced write locked its retired queue"
+            );
+        })
+        .join()
+        .expect("the writer finishes");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "parking_lot's futex wait fails Miri's variadic check")]
+    fn other_writers_drain_the_lane_of_an_idle_live_thread() {
+        let cache = Arc::new(ShardedCacheBuilder::new(256).shards(4).build::<u64, u64>());
+        let (release, parked) = std::sync::mpsc::channel::<()>();
+        let (report, reported) = std::sync::mpsc::channel();
+        let writer = {
+            let cache = Arc::clone(&cache);
+            thread::spawn(move || {
+                for key in 0..5_000 {
+                    cache.insert(key, key);
+                }
+                report
+                    .send(crate::sharded_arena::announced_slot())
+                    .expect("the main thread listens");
+                // Alive and unpinned, retiring nothing.
+                let _ = parked.recv();
+            })
+        };
+        if let Some(lane) = reported.recv().expect("the writer reports its slot") {
+            assert!(
+                cache.retired.lane_queued(lane) > 0,
+                "the idle thread left retirements"
+            );
+            for key in 10_000..10_000 + 40_000 * CHURN_SCALE {
+                cache.insert(key, key);
+            }
+            assert_eq!(
+                cache.retired.lane_queued(lane),
+                0,
+                "the idle thread's lane was not drained"
+            );
+        }
+        drop(release);
+        writer.join().expect("the writer exits");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "parking_lot's futex wait fails Miri's variadic check")]
+    fn a_pinned_threads_lane_is_drained_only_after_it_unpins() {
+        let cache = Arc::new(ShardedCacheBuilder::new(256).shards(4).build::<u64, u64>());
+        let (to_writer, from_main) = std::sync::mpsc::channel::<()>();
+        let (to_main, from_writer) = std::sync::mpsc::channel();
+        let writer = {
+            let cache = Arc::clone(&cache);
+            thread::spawn(move || {
+                for key in 0..5_000 {
+                    cache.insert(key, key);
+                }
+                let step = |slot| {
+                    to_main.send(slot).expect("the main thread listens");
+                    from_main.recv().is_ok()
+                };
+                if !step(crate::sharded_arena::announced_slot()) {
+                    return;
+                }
+                let guard = cache.pin();
+                step(None);
+                drop(guard);
+                step(None);
+            })
+        };
+        let step = || {
+            to_writer.send(()).expect("the writer listens");
+            from_writer.recv().expect("the writer answers")
+        };
+        let Some(lane) = from_writer.recv().expect("the writer reports its slot") else {
+            drop(to_writer);
+            writer.join().expect("the writer exits");
+            return;
+        };
+        // Age everything the writer retired, then let it pin.
+        for _ in 0..4 {
+            assert!(cache.epochs.advance_evicting(), "nothing else is pinned");
+        }
+        step();
+        let queued = cache.retired.lane_queued(lane);
+        assert!(queued > 0, "the writer left retirements");
+        // Every lane and queue is visited once per 128 foreign drains, one
+        // per 16 of this thread's retirements.
+        for key in 10_000..10_000 + 4 * 128 * 16 {
+            cache.insert(key, key);
+        }
+        assert_eq!(
+            cache.retired.lane_queued(lane),
+            queued,
+            "a drainer took slots from a pinned thread's lane"
+        );
+        step();
+        for key in 20_000..20_000 + 40_000 * CHURN_SCALE {
+            cache.insert(key, key);
+        }
+        assert_eq!(
+            cache.retired.lane_queued(lane),
+            0,
+            "the unpinned thread's lane was not drained"
+        );
+        drop(to_writer);
+        writer.join().expect("the writer exits");
+    }
+
+    #[test]
     #[cfg_attr(miri, ignore = "parking_lot's futex wait fails Miri's variadic check")]
     fn other_writers_drain_the_retired_queue_of_an_idle_thread() {
         let cache = Arc::new(ShardedCacheBuilder::new(256).shards(4).build::<u64, u64>());
+        // Claim this thread's announcer slot first: one the idle thread frees
+        // when it exits would pass its lane to this thread, as the lane of a
+        // slot belongs to whichever thread holds the slot.
+        drop(cache.pin());
         let idle_queue = {
             let cache = Arc::clone(&cache);
             thread::spawn(move || {
                 for key in 0..5_000 {
                     cache.insert(key, key);
                 }
-                crate::sharded_arena::retired_queue_index()
+                crate::sharded_arena::retiring_index()
             })
             .join()
             .expect("the idle thread's writes complete")
         };
-        if idle_queue == crate::sharded_arena::retired_queue_index() {
+        if idle_queue == crate::sharded_arena::retiring_index() {
             // Thread indices 64 apart share a queue; nothing to compare.
             return;
         }
