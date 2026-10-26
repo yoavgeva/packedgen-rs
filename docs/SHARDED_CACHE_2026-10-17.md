@@ -966,6 +966,16 @@ for about 267 ns: 60 to find the key, 141 to evict, 77 to place, and 60 for
 the ghost and the probation queue, each including about 10 ns of timer
 overhead.
 
+Most writes remove one entry: the value a replacement displaces, or one
+eviction. Retirement once passed every write's removed entries to the
+retired queue as a chain over an array of options and a vector, and the
+queue's `retire` kept its loops over that chain. A write that removes one
+entry now passes a one-slot iterator, for which the compiler folds those
+loops away. Single-thread upserts of `u64`s into a full cache ran 7 to 13%
+faster on macOS and 5 to 14% on the Linux VM; `bounded_cache_probe` moved
+replace by +6% and update and turnover by +3% on one thread, and eight
+threads within noise.
+
 ## Throughput against quick_cache 0.7
 
 Measured with `bounded_cache_probe` at the end of the changes described
@@ -1145,12 +1155,16 @@ three runs of the best of seven:
 | Workload | macOS 1T | macOS 8T | Linux 1T | Linux 8T |
 | --- | ---: | ---: | ---: | ---: |
 | Resident hit | −7 to −13% | +806 to +830% | −2 to +3% | +694 to +715% |
-| Upsert into a full cache | −56 to −60% | −1 to +6% | −53 to −54% | −15 to +31% |
+| Upsert into a full cache | −52 to −53% | +3 to +32% | −51 to −52% | +4 to +56% |
 
-On one thread, upserts ran at 23 to 26 Mops/s against quick_cache's 50 to
-61. On macOS a pin is two read-modify-writes on shared counters, where
-Linux reuses a parked announcement (see "Parked pin announcements"), which
-leaves single-thread hits behind there and level on Linux.
+On one thread, upserts ran at 26 to 28 Mops/s against quick_cache's 56 to
+59 on macOS. The upsert row was measured after writes that remove one entry
+stopped looping over the removed entries (see "Write path"), in three runs
+on macOS and four on the Linux VM; before, one thread ran at 23 to 26
+Mops/s, 56 to 60% behind on macOS and 53 to 54% on Linux. On macOS a pin
+is two read-modify-writes on shared counters, where Linux reuses a parked
+announcement (see "Parked pin announcements"), which leaves single-thread
+hits behind there and level on Linux.
 
 ### Batched inserts
 
@@ -1572,7 +1586,15 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
   "Slab storage against boxed entries" for the comparison.
 - **Retired queues per shard, under the shard lock.** Retiring needed no
   extra lock. But every thread writing a shard moved its queue's cache lines
-  between cores, and eight-thread replace fell 45%.
+  between cores, and eight-thread replace fell 45%. Measured again with the
+  current design, single-thread upserts of `u64`s into a full cache ran 37%
+  faster on macOS, while `bounded_cache_probe`'s eight-thread replace and
+  update fell 21 to 23% and its one-thread writes moved by −4 to +2%.
+- **Tagging retirements from the writer's pin.** While a writer holds its
+  pin, the generation can advance at most once, so a tag one advance past
+  any generation it reads is never early, and an acquire load could replace
+  the sequentially consistent one that follows the unpublication.
+  Single-thread upserts of `u64`s moved within noise on macOS.
 - **Per-thread lanes within each shard's queue.** Each thread kept 64 lanes,
   one per shard, too many to stay cached: a lane's first loads missed on
   most visits.
