@@ -976,6 +976,31 @@ faster on macOS and 5 to 14% on the Linux VM; `bounded_cache_probe` moved
 replace by +6% and update and turnover by +3% on one thread, and eight
 threads within noise.
 
+The steps around those loops cost more than the loops did. Cachegrind put
+a single-thread upsert of a `u64` at 666 instructions against
+quick_cache's 196, about half of them in retiring the old entry,
+reclaiming an aged one, and moving slots through the thread's stack,
+spread over out-of-line calls and loops sized for any number of slots:
+
+- Taking a slot and giving one back each searched the thread's list of
+  slot stacks. Both now check its first stack, usually its only one.
+- Reclaiming one slot drops its value and gives the slot back inline.
+- A foreign drain, one write in sixteen, sets up its batch inside its own
+  out-of-line function, so other writes pass no second batch around.
+- Writes unpin inline, where dropping the pin stayed a call.
+- `reclaim_at` adds four: three advances pass every epoch slot once and
+  step over one skipped token.
+
+Upserts then ran 599 instructions, and the probe's writes 72 to 74 fewer,
+4 to 5%. On macOS, `u64` upserts ran 5 to 8% faster in both codegen
+settings, single-thread cold fill 6%, and turnover 3.5%; other probe
+cells, reads, and eight-thread writes moved within noise. On an x86_64
+runner (EPYC 7763), against the parent commit over five pairs, one-thread
+cold fill ran 4% faster in the default build and 10% with one codegen
+unit, and four-thread writes 3 to 8%; one-thread replace read −6% and
++27% in pairs from −17 to +61%, its usual spread there, and one-thread
+turnover −1% and −4%; reads moved within 3%.
+
 ## Throughput against quick_cache 0.7
 
 Measured with `bounded_cache_probe` at the end of the changes described
@@ -1091,16 +1116,17 @@ per operation, with setup removed. At 50,000 entries on one Linux thread:
 
 | Per operation | Cold fill | Replace | Delete and reinsert |
 | --- | ---: | ---: | ---: |
-| ShardedCache instructions | 1,805 | 1,410 | 2,045 |
-| quick_cache instructions | 1,217 | 963 | 1,349 |
-| ShardedCache L1 data misses | 15.2 | 11.8 | 17.6 |
-| quick_cache L1 data misses | 12.8 | 10.4 | 13.9 |
+| ShardedCache instructions | 1,709 | 1,292 | 1,961 |
+| quick_cache instructions | 1,233 | 965 | 1,364 |
+| ShardedCache L1 data misses | 14.8 | 12.2 | 17.9 |
+| quick_cache L1 data misses | 12.2 | 10.4 | 13.6 |
 
 Allocator work was identical for the two caches, and ShardedCache hashed
 once per insert where quick_cache hashed twice. Retiring and reclaiming
-removed entries took 370 to 410 instructions per write, 60 to 80% of the
-difference, spread over about a hundred source lines with none above 16;
-the rest was spread over the policy, the table, and the insert itself.
+removed entries, dropping the old value included, took 255 to 295
+instructions per write, half to three quarters of the difference; an
+earlier build took 370 to 410, before the trims under "Write path". The
+rest was spread over the policy, the table, and the insert itself.
 Those instructions are cheap, as the bound above shows: freeing at once
 gained 3 to 10%.
 
@@ -1155,13 +1181,16 @@ three runs of the best of seven:
 | Workload | macOS 1T | macOS 8T | Linux 1T | Linux 8T |
 | --- | ---: | ---: | ---: | ---: |
 | Resident hit | −7 to −13% | +806 to +830% | −2 to +3% | +694 to +715% |
-| Upsert into a full cache | −52 to −53% | +3 to +32% | −51 to −52% | +4 to +56% |
+| Upsert into a full cache | −46 to −49% | +18 to +24% | −41 to −46% | +25 to +29% |
 
-On one thread, upserts ran at 26 to 28 Mops/s against quick_cache's 56 to
-59 on macOS. The upsert row was measured after writes that remove one entry
-stopped looping over the removed entries (see "Write path"), in three runs
-on macOS and four on the Linux VM; before, one thread ran at 23 to 26
-Mops/s, 56 to 60% behind on macOS and 53 to 54% on Linux. On macOS a pin
+On one thread, upserts ran at 31 to 32 Mops/s against quick_cache's 59 to
+61 on macOS, and at 28 to 29 against 49 to 52 on the Linux VM. The upsert
+row was measured after the write path's fixed costs were trimmed (see
+"Write path"), in three runs on macOS and four on the Linux VM. Before
+that, one thread ran at 26 to 28 Mops/s, 52 to 53% behind on macOS and 51
+to 52% on Linux; and before writes that remove one entry stopped looping
+over the removed entries, at 23 to 26 Mops/s, 56 to 60% behind on macOS
+and 53 to 54% on Linux. On macOS a pin
 is two read-modify-writes on shared counters, where Linux reuses a parked
 announcement (see "Parked pin announcements"), which leaves single-thread
 hits behind there and level on Linux.
@@ -1594,7 +1623,12 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
   pin, the generation can advance at most once, so a tag one advance past
   any generation it reads is never early, and an acquire load could replace
   the sequentially consistent one that follows the unpublication.
-  Single-thread upserts of `u64`s moved within noise on macOS.
+  Single-thread upserts of `u64`s moved within noise on macOS. On the Linux
+  VM, task-clock samples gathered on that load, a load-acquire that waits
+  for the write's earlier release stores. A relaxed load tagged one advance
+  later read medians of −1.5%, −0.1%, and +0.1% for one-thread cold fill,
+  replace, and turnover over five pairs each, and +8% for delete and
+  reinsert in pairs from −3 to +21%: within that VM's noise.
 - **Per-thread lanes within each shard's queue.** Each thread kept 64 lanes,
   one per shard, too many to stay cached: a lane's first loads missed on
   most visits.
@@ -1767,6 +1801,13 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
   4-vCPU runners (Intel Xeon 8573C, Neoverse N2), while advances come due
   after 32 to 512 retirements, a few microseconds of writes. Parking the
   announcement confines the barrier to threads that stopped pinning.
+- **RCpc acquire loads on Linux, as a bound.** Rust's default aarch64
+  Linux target compiles acquire loads to `ldar`, which waits for earlier
+  release stores, where Apple's targets use `ldapr`; on the Linux VM, `get`'s
+  samples in turnover gathered on its acquire loads of the bucket. Built
+  with `-C target-feature=+rcpc`, both caches' one-thread hits, turnover,
+  and writes moved by −7 to +5%, medians of five pairs, within the VM's
+  noise, and ShardedCache gained no more than quick_cache.
 - **Announcements on macOS, with fences.** Without `membarrier`, a reuse
   needs a sequentially consistent fence in place of the compiler fence. On
   an M4 Max that read hits 12 to 24% slower than the counters' read-modify-
