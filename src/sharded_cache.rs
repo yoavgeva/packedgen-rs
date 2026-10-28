@@ -2174,6 +2174,7 @@ where
                     value,
                     Origin::Write(self.lifetime()),
                     hash,
+                    self.shard(hash),
                     pin,
                     &mut removed,
                 ));
@@ -2194,9 +2195,19 @@ where
 
     fn insert_expiring(&self, key: K, value: V, ttl: Option<Duration>) -> bool {
         let hash = self.hash(&key);
+        let shard = self.shard(hash);
+        shard.prefetch_for_insert(hash);
         let pin = self.epochs.pin();
         let mut removed = Removed::new();
-        let inserted = self.insert_pinned(key, value, Origin::Write(ttl), hash, &pin, &mut removed);
+        let inserted = self.insert_pinned(
+            key,
+            value,
+            Origin::Write(ttl),
+            hash,
+            shard,
+            &pin,
+            &mut removed,
+        );
         self.after_write(&removed, pin);
         inserted
     }
@@ -2212,6 +2223,7 @@ where
             value,
             Origin::Load(flight),
             flight.hash,
+            self.shard(flight.hash),
             &pin,
             &mut removed,
         );
@@ -2219,8 +2231,13 @@ where
         inserted
     }
 
-    /// Inserts under `pin`, pushing what the insert unpublished to `removed`
-    /// for the caller to retire while still pinned.
+    /// Inserts under `pin` into `shard`, `hash`'s, pushing what the insert
+    /// unpublished to `removed` for the caller to retire while still pinned.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "callers find the shard before pinning: after the pin's fence it was found again, \
+                  14 more instructions per insert"
+    )]
     #[allow(
         clippy::inline_always,
         reason = "`insert`'s body; out of line, the key and value passed through memory"
@@ -2236,6 +2253,7 @@ where
         value: V,
         origin: Origin<'_, K, V>,
         hash: u64,
+        shard: ShardView<'_, (K, V)>,
         pin: &EpochPin<'_>,
         removed: &mut Removed<(K, V)>,
     ) -> bool {
@@ -2243,7 +2261,6 @@ where
             Origin::Write(ttl) => (ttl, None),
             Origin::Load(flight) => (self.lifetime(), Some(flight)),
         };
-        let shard = self.shard(hash);
         let weight = self.weighter.weight(&key, &value);
         let Some(compact_weight) = u32::try_from(weight)
             .ok()
@@ -3246,6 +3263,21 @@ impl<T> Shard<T> {
 }
 
 impl<T> ShardView<'_, T> {
+    /// Starts loading the lines every insert of `hash` reads under the shard
+    /// lock: the shard's limits, its lock word with the counts and the
+    /// probation queue, the filters and the main queue on the next line, and
+    /// the key's home bucket. An insert calls it before it pins and fills its
+    /// slot, so these misses overlap that work rather than waiting behind
+    /// the lock's acquire, which no later load passes.
+    #[inline]
+    fn prefetch_for_insert(&self, hash: u64) {
+        prefetch(std::ptr::from_ref(&self.state.limits));
+        let lock = std::ptr::from_ref(&self.state.writer).cast::<u8>();
+        prefetch_write(lock);
+        prefetch(lock.wrapping_add(64));
+        prefetch(self.buckets.as_ptr().wrapping_add(self.home(hash)));
+    }
+
     /// Starts loading the lines an insert of `hash` that evicts the next
     /// probationary victim touches: the victim's bucket, entry, and ghost
     /// line, and the new key's home bucket and ghost line. Each was
@@ -7025,6 +7057,27 @@ mod tests {
         assert_eq!(weighted.insert_many([(1, 1), (2, 2), (1, 1_000)]), 2);
         assert_eq!(weighted.peek(&1), None);
         assert_eq!(weighted.peek(&2), Some(2));
+    }
+
+    #[test]
+    fn an_insert_prefetches_its_shards_lines_and_home_bucket_first() {
+        // The lines a write's shard lock and lookup wait on, fetched before
+        // it pins and fills its slot, load alongside that work.
+        let cache = ShardedCacheBuilder::new(1_000).build::<u64, u64>();
+        let hash = cache.hash(&7_u64);
+        let shard = cache.shard(hash);
+        let lock = std::ptr::from_ref(&shard.state.writer) as usize;
+        let lines = vec![
+            std::ptr::from_ref(&shard.state.limits) as usize,
+            lock,
+            lock + 64,
+            std::ptr::from_ref(&shard.buckets[shard.home(hash)]) as usize,
+        ];
+        PREFETCHED.with(|prefetched| prefetched.borrow_mut().clear());
+        assert!(cache.insert(7, 7));
+        let prefetched = PREFETCHED.with(std::cell::RefCell::take);
+        assert_eq!(prefetched, lines, "an empty cache prefetches nothing else");
+        assert_eq!(cache.get(&7), Some(7));
     }
 
     #[test]
