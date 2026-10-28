@@ -1050,6 +1050,27 @@ then ran cold fill 4% behind, replace 28% ahead, and delete and reinsert
 3% ahead, from 17%, 16%, and 23% behind in the table below; eight threads
 led by 0 to 44%.
 
+An insert then first touched its shard under the lock: the limits, the lock
+word with the counts and the probation queue, the filters and the main
+queue on the next line, and the key's home bucket, each likely written by
+another core or evicted since the shard's last write. No load passes the
+lock's acquire, so these misses waited for it. An insert now prefetches the
+four lines once it has hashed, before it pins and fills its slot, and finds
+its shard once, before the pin: found again after the pin's compiler fence,
+the shard cost 14 more instructions. The prefetch adds 19 instructions to a
+cold-fill insert on aarch64. A remove runs only its pin between finding the
+shard and locking it, and does not prefetch; reads do not either (see
+"Prefetching the home bucket before pinning").
+
+Against the parent on the Linux VM, five pairs in both codegen settings,
+eight threads ran cold fill 11 and 13% faster, update 7 and 11%, turnover 7
+and 6%, and replace 3 and 13%, and delete and reinsert 1 and 4% slower; one
+thread moved by −3 to +5%. On three AMD x86_64 runners, two EPYC 7763s and
+a 9V45, five pairs each in both settings, replace ran 1 to 7% faster on one
+thread and on four, update −1 to +5%, one-thread cold fill −2 to +6% and
+four-thread cold fill level, and four-thread delete and reinsert −2 to 0%;
+reads moved within 3%.
+
 ## Throughput against quick_cache 0.7
 
 Measured with `bounded_cache_probe` at the end of the changes described
@@ -1286,34 +1307,46 @@ moved by −4 to +12%, every range but one crossing zero.
 ### On x86_64
 
 `.github/workflows/bench.yml` runs the same comparison on GitHub's x86_64
-runners when a branch under `bench/` is pushed. The last run, on an AMD EPYC
-9V45 with 4 vCPUs and the changes above, read as follows; each figure is
+runners when a branch under `bench/` is pushed. Runners differ by more than
+most changes, so only pairs within one run compare. A run on an AMD EPYC
+7763 with 4 vCPUs, with every change above, read as follows; each figure is
 the median of three pairs, and positive means `ShardedCache` is faster:
 
 | Workload | 50,000, 1T | 50,000, 4T | 1,000,000, 1T | 1,000,000, 4T |
 | --- | ---: | ---: | ---: | ---: |
-| Resident hit | +13% | +11% | +4% | −8% |
-| Read miss | +18% | +63% | −54% | −21% |
-| Turnover (95% reads) | −2% | +31% | +15% | +42% |
-| Cold fill | −21% | +4% | +48% | +86% |
-| Replace | −36% | −18% | −5% | −8% |
-| Delete and reinsert | −32% | +9% | −9% | +26% |
+| Resident hit | −2% | +29% | −18% | +8% |
+| Read miss | +10% | +50% | −62% | −21% |
+| Turnover (95% reads) | +5% | +39% | +6% | +48% |
+| Cold fill | −11% | +22% | +42% | +75% |
+| Replace | +12% | +1% | +38% | +6% |
+| Update | +10% | −3% | +43% | +12% |
+| Delete and reinsert | −10% | +25% | +6% | +22% |
 
-The previous run, on an EPYC 9V74 before those changes, read −1%, +33%,
-−13%, and +5% for resident hits, +28%, +58%, −61%, and −32% for misses, and
-−20 to −23% for single-thread writes at 50,000 entries. Runners differ by
-more than the changes: single-thread replace at 50,000 entries trailed by
-15% on an EPYC 7763 and by 36 to 46% on EPYC 9V45 runners, with nearly the
-same code.
+A second 7763 run read within 10 points of it at 50,000 entries. On an EPYC
+9V45, one thread ran cold fill 15% behind, delete and reinsert 21%, and
+replace 3%. Before the single-thread work under "Write path", one thread
+trailed on every write at 50,000 entries on a 9V45, by 21 to 36%.
 
-On x86 every
-read-modify-write is a full barrier, and a ShardedCache replace makes seven,
-where quick_cache's makes three: the writer's pin and unpin, its retired
-queue's lock and unlock, and the shard lock and the old value's count,
-which both share. As upper bounds, skipping the writer's pin moved
-single-thread writes by −2 to +4%, and a retired-queue lock that unlocks
-with a store by 0 to +1%, delete and reinsert by +14% within −2 to +34%
-(see "Rejected and reverted").
+On Intel runners the single-thread gap reverses. Profiled before the
+insert prefetch on a Xeon Platinum 8370C, six pairs, `ShardedCache` ran cold
+fill 63% ahead and delete and reinsert 20%: quick_cache's samples gathered
+on its table's misses and its lock, and its cold fill ran 3.9 million
+operations a second there, against 7.4 to 9.5 million on AMD runners. On
+AMD the gap is instructions. Cachegrind counted 1,595 per cold-fill
+operation for `ShardedCache` against quick_cache's 1,180, while
+`ShardedCache` stalled less: sampled on an EPYC 9V74, no instruction of its
+writes took more than 4.2% of their time. About 220 of those instructions,
+after the shard lock, retire the evicted entry, reclaim an aged one, and
+unpin; the rest spread over the admission check against the ghost, the
+pin, the slot stack, and the eviction prefetches.
+
+On x86 every read-modify-write is a full barrier. On Linux, where a pin
+announces itself with stores, a `ShardedCache` write makes five, where
+quick_cache's makes three: its retired queue's lock and unlock, and the
+shard lock's two and the old value's count, which both share. As upper
+bounds, skipping the writer's pin moved single-thread writes by −2 to +4%,
+and a retired-queue lock that unlocks with a store by 0 to +1%, delete and
+reinsert by +14% within −2 to +34% (see "Rejected and reverted").
 
 ### On mokabench
 
@@ -1362,7 +1395,9 @@ handles, and advances over the reader shards in use, in brackets:
 
 The x86_64 runs were on an AMD EPYC 7763, the previous one on an EPYC
 9V74, and the macOS host carried more other load this time, which weighs
-on sixteen clients most.
+on sixteen clients most. With the write-path changes since, three x86_64
+runs on EPYC 7763s read +1 to +4% at one client, +22 to +24% at two, and
++35 to +38% at four.
 
 - ShardedCache's mean one-client hit ratio was 38.97%, against 37.99% for
   quick_cache; earlier, moka 0.12's sync cache read 37.87%. On the six S3
