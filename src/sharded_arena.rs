@@ -1142,9 +1142,6 @@ impl<T> RetiredSlots<T> {
         // caches absorb. Slots due since an earlier advance are a backlog,
         // and each write drains as many more of it, within one batch.
         Self::take_aged(&mut queue, generation, reclaimed, retired);
-        if queue.slots.front().is_some_and(|(due, _)| due < generation) {
-            Self::take_aged(&mut queue, generation, reclaimed, retired);
-        }
         // The next write reclaims the front slot, a few advances after this
         // thread last touched it: start loading the lines its drop reads.
         if let Some((_, next)) = queue.slots.front() {
