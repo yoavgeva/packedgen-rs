@@ -4,9 +4,9 @@
 set -u
 entries=${3:-50000}
 out=${4:-target/compare-sharded-quick.csv}
+mkdir -p target
 : > "$out"
 [ "$entries" = 50000 ] || exit 0
-mkdir -p target
 sudo apt-get update -qq > /dev/null 2>&1
 sudo apt-get install -y -qq valgrind binutils > /dev/null 2>&1
 sudo apt-get install -y -qq linux-tools-common "linux-tools-$(uname -r)" > /dev/null 2>&1 \
