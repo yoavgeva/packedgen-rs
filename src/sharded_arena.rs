@@ -2099,7 +2099,7 @@ pub(crate) struct Reclaimed<T> {
 }
 
 /// Aged slots one batch holds. A write reclaims about as many as it retires,
-/// one or two, so batches stay small enough to hand on by value cheaply.
+/// one or two.
 pub(crate) const RECLAIM_BATCH: usize = 4;
 
 impl<T> Reclaimed<T> {
@@ -2114,31 +2114,37 @@ impl<T> Reclaimed<T> {
         self.len == RECLAIM_BATCH
     }
 
-    /// Drops each value and gives the vacant slots to this thread's stack.
-    /// If a value panics while dropping, the batch's slots leak, with the
-    /// values after it.
+    /// Drops each value and gives the vacant slots to this thread's stack,
+    /// leaving the batch empty. If a value panics while dropping, the
+    /// batch's slots leak, with the values after it.
+    ///
+    /// It borrows the batch. Taking it by value, and handing it on by value
+    /// to `finish_many`, made single-thread writes a third slower on the
+    /// Linux VM and on an `x86_64` runner, with the same instructions and
+    /// simulated cache misses: the core stalled.
     #[allow(unsafe_code, reason = "drops values of slots no pin reaches")]
     #[allow(clippy::inline_always, reason = "every write's reclamation")]
     #[inline(always)]
-    pub(crate) fn finish(self, store: &SlotStore<T>) {
-        if self.len == 0 {
+    pub(crate) fn finish(&mut self, store: &SlotStore<T>) {
+        let len = std::mem::take(&mut self.len);
+        if len == 0 {
             return;
         }
         // A write usually reclaims one slot, without the loops.
-        if self.len == 1 {
+        if len == 1 {
             // SAFETY: an aged retired slot holds an initialized value that no
-            // pin reaches and that only this batch owns.
+            // pin reaches and that only this batch owned.
             unsafe { drop_value(self.slots[0]) };
             store.give_one(self.slots[0]);
             return;
         }
-        self.finish_many(store);
+        self.finish_many(len, store);
     }
 
     #[allow(unsafe_code, reason = "drops values of slots no pin reaches")]
     #[inline(never)]
-    fn finish_many(self, store: &SlotStore<T>) {
-        let slots = &self.slots[..self.len];
+    fn finish_many(&self, len: usize, store: &SlotStore<T>) {
+        let slots = &self.slots[..len];
         for slot in slots {
             // SAFETY: an aged retired slot holds an initialized value that no
             // pin reaches and that only this batch owns.
@@ -2513,8 +2519,31 @@ mod tests {
 
     #[test]
     fn a_writes_reclamation_batch_fits_a_cache_line() {
-        // Every write sets up one and hands it on by value.
         assert!(std::mem::size_of::<Reclaimed<u64>>() <= 64);
+    }
+
+    #[test]
+    #[allow(unsafe_code, reason = "fills slots taken from the test's store")]
+    fn a_finished_batch_drops_its_values_once() {
+        let drops = Arc::new(());
+        // Declared first so it drops last: the values live in its region.
+        let store = SlotStore::<Arc<()>>::new(64);
+        for count in [1, 2, RECLAIM_BATCH] {
+            let mut batch = Reclaimed::new();
+            for _ in 0..count {
+                let (slot, _) = store.take();
+                // SAFETY: `take` handed the vacant slot to this test alone.
+                unsafe { fill(slot, Arc::clone(&drops), 1, NEVER_EXPIRES) };
+                batch.slots[batch.len] = slot;
+                batch.len += 1;
+            }
+            batch.finish(&store);
+            assert_eq!(Arc::strong_count(&drops), 1, "{count} values dropped");
+            // Finished, the batch holds nothing: finishing again drops
+            // nothing twice.
+            batch.finish(&store);
+            assert_eq!(Arc::strong_count(&drops), 1);
+        }
     }
 
     #[test]
