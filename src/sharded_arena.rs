@@ -1166,9 +1166,7 @@ impl<T> RetiredSlots<T> {
             false
         };
         drop(queue);
-        if let Some(next) = foreign_queue {
-            self.drain_foreign(own, next, generation, store);
-        }
+        let _ = (foreign_queue, store);
         advance
     }
 
