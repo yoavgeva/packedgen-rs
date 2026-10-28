@@ -2194,6 +2194,7 @@ where
 
     fn insert_expiring(&self, key: K, value: V, ttl: Option<Duration>) -> bool {
         let hash = self.hash(&key);
+        self.shard(hash).prefetch_write_path(hash);
         let pin = self.epochs.pin();
         let mut removed = Removed::new();
         let inserted = self.insert_pinned(key, value, Origin::Write(ttl), hash, &pin, &mut removed);
@@ -3246,6 +3247,15 @@ impl<T> Shard<T> {
 }
 
 impl<T> ShardView<'_, T> {
+    #[inline]
+    fn prefetch_write_path(&self, hash: u64) {
+        prefetch(std::ptr::from_ref(&self.state.limits));
+        let lock = std::ptr::from_ref(&self.state.writer).cast::<u8>();
+        prefetch_write(lock);
+        prefetch(lock.wrapping_add(64));
+        prefetch(self.buckets.as_ptr().wrapping_add(self.home(hash)));
+    }
+
     /// Starts loading the lines an insert of `hash` that evicts the next
     /// probationary victim touches: the victim's bucket, entry, and ghost
     /// line, and the new key's home bucket and ghost line. Each was
