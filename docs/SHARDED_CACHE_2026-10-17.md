@@ -1022,6 +1022,34 @@ at one and eight threads. On an x86_64 runner (an EPYC 9V74), against the
 parent commit over five pairs, one-thread writes moved by −4 to +5% and
 four-thread writes gained 3 to 14%.
 
+The largest single-thread write cost was none of these steps. The
+reclamation batch's `finish` took the batch by value and handed it on by
+value to its out-of-line `finish_many`, which runs only for batches of two
+or more. Every write paid for it: on the Linux VM single-thread writes ran
+a third slower than with the batch borrowed, with the same instructions
+and simulated cache misses (1,235 and 1,210 instructions per replace,
+identical D1 and LL misses), so the core stalled; task-clock samples
+gathered on glibc `malloc`'s first load of its thread cache.
+
+A bound that skipped the batch, among other shortcuts (see "Retiring
+without the retired queue's lock"), still ran one-thread writes 19 to 48%
+faster on the Linux VM and 21 to 39% on a Xeon 8370C runner. Bisected back
+towards the full write path on the Linux VM, its free list, where it
+dropped values, the queue lock, the ring's size and placement, the
+prefetches, and the codegen units each left the gain; reclaiming through
+the batch removed it, the same batch read in place kept it, and `finish`
+borrowing the batch restored it. `finish` now borrows and empties it.
+
+Against the parent on the Linux VM, one-thread writes ran 18 to 41%
+faster (replace 34%, update 41%, delete and reinsert 32%, cold fill 18%)
+and eight-thread writes 11 to 13%; reads moved within noise. On an M4 Max
+every cell moved within noise, `u64` upserts by 1%, and `u64` upserts on
+the Linux VM, which allocate nothing, did not move either: the stall came
+with glibc's allocator. Against quick_cache on the Linux VM, one thread
+then ran cold fill 4% behind, replace 28% ahead, and delete and reinsert
+3% ahead, from 17%, 16%, and 23% behind in the table below; eight threads
+led by 0 to 44%.
+
 ## Throughput against quick_cache 0.7
 
 Measured with `bounded_cache_probe` at the end of the changes described
@@ -1849,9 +1877,8 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
     each was fixed and counted, and the advance rate remained. Pacing
     advances by the threads that have used the cache would also slow a
     lone writer's reclamation, as an idle main thread counts.
-  - The lock was not what the bound's one-thread gain measured; its other
-    shortcuts (no foreign drains, no backlog draining, no store identity
-    checks) were not measured apart.
+  - The lock was not what the bound's one-thread gain measured: bisected,
+    it was the reclamation batch's by-value `finish` (see "Write path").
 - **RCpc acquire loads on Linux, as a bound.** Rust's default aarch64
   Linux target compiles acquire loads to `ldar`, which waits for earlier
   release stores, where Apple's targets use `ldapr`; on the Linux VM, `get`'s
