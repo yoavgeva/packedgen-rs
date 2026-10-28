@@ -2395,6 +2395,13 @@ where
         if removed.len == 0 {
             return false;
         }
+        if removed.len == 1
+            && let Some((handle, _)) = removed.first[0]
+        {
+            let advance = self.retired.bound_retire(pin, handle.slot, &self.slots);
+            removed.notify(&self.listener, pin);
+            return advance;
+        }
         let mut reclaimed = Reclaimed::new();
         // Most writes remove one entry. Retiring it through a one-slot
         // iterator lets the compiler fold away `retire`'s loops, which the
