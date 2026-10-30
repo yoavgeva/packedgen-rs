@@ -1808,6 +1808,32 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
   shard's previous insert, whose lines another core may still hold. A floor
   of 64 entries made eight-thread cold fill 4.5% faster and single-thread
   cold fill 16% slower; floors of 4 and 16 moved eight threads by 1 to 2%.
+- **A longer ghost for P3.** moka led mokabench's P3 at 20,000 entries by
+  2.9 points. Many of P3's keys return after half to all of a shard's
+  capacity, past the ghost's half-shard window. Measured in `hit_ratio_sim`
+  over the 18 cells above and mokabench's 16 (27 cells in all):
+  - Remembering a whole shard and sending those keys to the main area
+    lifted P3 by 0.4 to 4.6 points across five sizes. But DS1 at 4,000,000
+    entries lost 10.7 and S3 at 400,000 lost 4.2: keys that return once at
+    that distance filled the main area. Static windows of 62.5% and 75%
+    cost DS1 2.0 and 5.2.
+  - Requiring two returns in a window of twice the shard gained nothing on
+    P3, whose far keys return once and then stay hot.
+  - Admitting far keys only while the main sweep found them read as often
+    as other main entries, with 16 ghost generations so growth kept its
+    window, summed +4.88 over the 18 cells and +1.63 over mokabench's. DS1
+    at 4,000,000 still lost 2.5, and the comparison settled wherever it
+    began: started denying, it kept P3 at 20,000 to +0.4 of its +1.8.
+    Comparing far keys with near ones instead summed −3.9 and −3.1.
+  - Set dueling, with leader shards that always or never admit, summed +1.8
+    to +2.9 and +0.4 to +1.0, but DS1 at 1,000,000 and 4,000,000 lost 0.6
+    to 2.0. Their policies differ by about 1% in misses, too little for the
+    leaders' miss counts to pick from.
+
+  Any longer window doubles the ghost's 2 bytes per entry and needs a flag
+  bit in each entry's metadata. In the same simulator, W-TinyLFU won both P3
+  (11.61% at 20,000) and DS1 (45.32% at 4,000,000) by counting every read.
+  Reads here set at most two access marks, lock-free, and record no more.
 - **A spin lock for the retired queues.** Its uncontended unlock is a
   store, where the mutex's is a read-modify-write, a full barrier on x86.
   On x86, single-thread writes moved by 0 to +1%, delete and reinsert by
