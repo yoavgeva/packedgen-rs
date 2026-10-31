@@ -52,11 +52,13 @@ share cache lines with the handles; eight threads led on every workload, by
 4 to 109%. Full-cache upserts led by 56 to 58%, and reads through the loader
 by 13% on one thread and 61% with eight.
 
-On a 4-vCPU x86_64 runner, four threads led on reads and turnover at 50,000
-entries, and one thread trailed by 21 to 36% on writes. There, full-cache
-upserts trailed by 20% on one thread and 15% on four at 50,000 entries and
-were level at 1,000,000; reads through the loader trailed by 10% on one
-thread and led by 17% on four, and led by 18 and 52% at 1,000,000.
+On a 4-vCPU AMD EPYC 7763 runner at 50,000 entries, four threads led by 22
+to 50% on every workload but replace and update, which were level; one
+thread led on replace, update, and misses by 10 to 12%, and trailed on cold
+fill and on delete and reinsert by 10 to 11%, running more instructions
+where quick_cache stalled more. At 1,000,000 entries one thread led on
+writes by 6 to 43% and trailed on hits by 18% and misses by 62%. On an
+Intel Xeon runner, one thread led cold fill by 63%.
 
 In process memory, before four-byte handles, 1,000,000 entries took 46 to
 136 bytes each, against 83 to 332 for quick_cache. Timing every operation at
@@ -73,9 +75,10 @@ On [mokabench](https://github.com/moka-rs/mokabench), moka's trace-replay
 load generator, over 16 cells of six ARC traces, ShardedCache's throughput
 against quick_cache had a geometric mean of −1% at one client, +22% at
 eight, and +51% at sixteen on Apple Silicon; −5% at one client to +35% at
-sixteen on Linux; and −5% at one client to +21% at four on a 4-vCPU x86_64
-runner. It lost mostly where reads miss and most operations insert and
-evict: by up to 30% at one client, and on Linux by up to 29% with more.
+sixteen on Linux; and, with the latest write changes, +1 to +4% at one
+client to +35 to +38% at four on 4-vCPU x86_64 runners. It lost mostly
+where reads miss and most operations insert and evict: by up to 30% at one
+client, and on Linux by up to 29% with more.
 moka's sync cache ran 2.4 to 22 times slower.
 
 Design, correctness evidence, tables, and rejected alternatives are in
