@@ -34,13 +34,13 @@ use hashbrown::DefaultHashBuilder;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use crate::cache_arena::direct_arena_thread;
-#[cfg(test)]
-use crate::sharded_arena::PREFETCHED;
 use crate::sharded_arena::{
     EpochPin, Epochs, MAX_EXPIRY_TICK, MAX_WEIGHT, OVERFLOW_HANDLE, RECLAIM_BATCH, Reclaimed,
     RetiredSlots, Slot, SlotDecoder, SlotStore, advise_huge_pages, drop_value, fill, prefetch,
     prefetch_write,
 };
+#[cfg(test)]
+use crate::sharded_arena::{PREFETCHED, STACK_SEARCHES};
 
 const SLOTS: usize = 10;
 /// Slots whose tags fill a bucket's tag word; the rest are in its meta word.
@@ -2374,7 +2374,7 @@ where
     /// retirements are pending.
     fn after_write(&self, removed: &Removed<(K, V)>, pin: EpochPin<'_>) {
         let advance = self.retire_removed(removed, &pin);
-        drop(pin);
+        pin.unpin();
         if advance {
             self.epochs.try_advance();
         }
@@ -2396,7 +2396,6 @@ where
             return false;
         }
         let mut reclaimed = Reclaimed::new();
-        let mut foreign = Reclaimed::new();
         // Most writes remove one entry. Retiring it through a one-slot
         // iterator lets the compiler fold away `retire`'s loops, which the
         // chain over every removed entry kept: single-thread upserts of
@@ -2404,7 +2403,7 @@ where
         let advance = if removed.len == 1 {
             let slot = removed.first[0].map(|(handle, _)| handle.slot);
             self.retired
-                .retire(pin, slot.into_iter(), &mut reclaimed, &mut foreign)
+                .retire(pin, slot.into_iter(), &mut reclaimed, &self.slots)
         } else {
             #[cfg(test)]
             LOOPED_RETIREMENTS.with(|count| count.set(count.get() + 1));
@@ -2412,11 +2411,10 @@ where
                 pin,
                 removed.iter().map(|(handle, _)| handle.slot),
                 &mut reclaimed,
-                &mut foreign,
+                &self.slots,
             )
         };
         reclaimed.finish(&self.slots);
-        foreign.finish(&self.slots);
         removed.notify(&self.listener, pin);
         advance
     }
@@ -5204,6 +5202,33 @@ mod tests {
         assert_eq!(looped(), before, "one removed entry went through the loop");
         cache.clear();
         assert_eq!(looped(), before + 1, "a clear's many entries take the loop");
+    }
+
+    #[test]
+    fn writes_reach_the_threads_slot_stack_without_searching() {
+        // A thread of its own, whose first slot stack is this cache's.
+        thread::spawn(|| {
+            let cache: ShardedCache<u64, u64> = ShardedCacheBuilder::new(64).shards(1).build();
+            let searches = || STACK_SEARCHES.with(std::cell::Cell::get);
+            for key in 0..32 {
+                cache.insert(key, key);
+            }
+            let before = searches();
+            for round in 1..=8 {
+                for key in 0..32 {
+                    assert!(cache.insert(key, key + round), "a replacement");
+                }
+            }
+            // Only refilling an empty stack searches, once per batch of
+            // slots; taking a slot and giving one back do not.
+            assert!(
+                searches() - before <= 256 / 16,
+                "{} searches in 256 writes",
+                searches() - before
+            );
+        })
+        .join()
+        .expect("the writer finishes");
     }
 
     #[test]

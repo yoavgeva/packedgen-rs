@@ -36,17 +36,16 @@ pub(crate) const AGING_ADVANCES: usize = 3;
 /// reclaimed: `AGING_ADVANCES` advances later. The advance that reuses the
 /// tag's epoch slot found that slot and the next quiescent. Saturates, never
 /// reclaiming, past the last representable token.
+///
+/// As many advances as there are epoch slots pass every slot once, so they
+/// step over exactly one skipped token and add one more than their count.
+/// Every write computes this, which a loop over the advances made a
+/// three-step chain of branches.
 #[allow(dead_code, reason = "each including crate uses a different subset")]
 #[inline]
 pub(crate) fn reclaim_at(tag: usize) -> usize {
-    let mut aged = tag;
-    for _ in 0..AGING_ADVANCES {
-        let Some(next) = next_epoch_token(aged) else {
-            return usize::MAX;
-        };
-        aged = next;
-    }
-    aged
+    const _: () = assert!(AGING_ADVANCES == EPOCHS);
+    tag.saturating_add(AGING_ADVANCES + 1)
 }
 
 #[inline]
