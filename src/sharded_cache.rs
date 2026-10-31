@@ -14,8 +14,11 @@
 //! S3-FIFO style: new keys wait in a small probationary FIFO and leave unless
 //! read; keys the ghost filter remembers go straight to the main area, a
 //! CLOCK queue in the order keys entered it. Each shard sizes its probation
-//! to the keys it sees return. Expired entries leave first wherever eviction
-//! meets them.
+//! to the keys it sees return, and counts its keys' misses and the main
+//! area's reads in a frequency sketch: a key counted more often than the
+//! main area's recent victims joins it from probation, and a remembered key
+//! counted too rarely waits in probation. Expired entries leave first
+//! wherever eviction meets them.
 
 use std::borrow::Borrow;
 use std::collections::VecDeque;
@@ -2402,8 +2405,9 @@ where
                     removed.push(victim, cause);
                 }
             } else {
+                let counters = shard.state.sketch.counters(hash);
                 if writer.over_limit(weight) {
-                    shard.prefetch_eviction(&writer, hash);
+                    shard.prefetch_eviction(&writer, hash, counters);
                 }
                 while writer.over_limit(weight) {
                     let Some((victim, cause)) = self.evict(shard, &mut writer, pin, None, &mut now)
@@ -2435,7 +2439,7 @@ where
                     placed.unwrap_or_default()
                 };
                 writer.entered(weight);
-                let count = shard.state.sketch.increment(hash);
+                let count = shard.state.sketch.count(counters);
                 // Remembered from a recent eviction and missed often enough,
                 // it skips probation.
                 let main = writer.filters.admit(hash, shard.limits.probation_max())
@@ -3414,15 +3418,15 @@ impl<T> ShardView<'_, T> {
     /// Starts loading the lines an insert of `hash` that evicts the next
     /// probationary victim touches: the victim's bucket, entry, and ghost
     /// line, and the new key's home bucket, ghost line, and sketch line,
-    /// which it counts in. (The victim's sketch line, counted in when it
-    /// arrived a few inserts ago, is most likely cached.) Each was
+    /// which it counts in. (The victim's count travels in its probation
+    /// record.) Each was
     /// most likely last written on another core, and fetched together their
     /// misses overlap instead of following one another under the lock.
     /// Lines the insert writes are fetched for writing. Inserts call it only
     /// once a new key's lookup has missed in a full shard, so writes that
     /// evict nothing, replacements included, fetch nothing extra.
     #[inline]
-    fn prefetch_eviction(&self, writer: &ShardWriter, hash: u64) {
+    fn prefetch_eviction(&self, writer: &ShardWriter, hash: u64, counters: [SketchCounter; 2]) {
         #[cfg(test)]
         EVICTION_PREFETCHES.with(|count| count.set(count.get() + 1));
         if let Some(next) = writer.probation.front() {
@@ -3437,7 +3441,7 @@ impl<T> ShardView<'_, T> {
         }
         prefetch_write(self.buckets.as_ptr().wrapping_add(self.home(hash)));
         prefetch(writer.filters.ghost_line(hash));
-        prefetch_write(std::ptr::from_ref(self.state.sketch.line(hash)));
+        prefetch_write(std::ptr::from_ref(&self.state.sketch.lines[counters[0].0]));
     }
 
     #[inline]
@@ -3805,6 +3809,10 @@ thread_local! {
     /// Keys this thread looked up in a frequency sketch without counting
     /// them.
     static SKETCH_ESTIMATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Hashes this thread spread to place a key in a frequency sketch.
+    static SKETCH_PLACEMENTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Sketch words this thread loaded to read or raise a key's counters.
+    static SKETCH_LOADS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Retirements this thread queued through the loop over any number of
     /// removed entries.
     static LOOPED_RETIREMENTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -4276,6 +4284,8 @@ impl FrequencySketch {
     /// filters do not use, spread by one multiply.
     #[inline]
     fn mixed(hash: u64) -> u64 {
+        #[cfg(test)]
+        SKETCH_PLACEMENTS.with(|count| count.set(count.get() + 1));
         hash.rotate_left(32).wrapping_mul(0xa076_1d64_78bd_642f)
     }
 
@@ -4286,7 +4296,7 @@ impl FrequencySketch {
     }
 
     /// The line holding `hash`'s counters.
-    #[inline]
+    #[cfg(test)]
     fn line(&self, hash: u64) -> &SketchLine {
         &self.lines[self.line_index(Self::mixed(hash))]
     }
@@ -4315,8 +4325,14 @@ impl FrequencySketch {
 
     #[inline]
     fn counter(&self, counter: SketchCounter) -> u8 {
-        u8::try_from((self.word(counter).load(Ordering::Relaxed) >> counter.2) & 15)
-            .expect("a counter fits u8")
+        u8::try_from((self.load(counter) >> counter.2) & 15).expect("a counter fits u8")
+    }
+
+    #[inline]
+    fn load(&self, counter: SketchCounter) -> u64 {
+        #[cfg(test)]
+        SKETCH_LOADS.with(|count| count.set(count.get() + 1));
+        self.word(counter).load(Ordering::Relaxed)
     }
 
     /// How often the sketch counts `hash`: the smaller of its counters.
@@ -4328,27 +4344,37 @@ impl FrequencySketch {
         self.counter(first).min(self.counter(second))
     }
 
-    /// Counts `hash` once more, raising only its smaller counters, so that a
-    /// key sharing a counter with a more frequent one leaves it alone.
-    /// Returns its count. Requires the shard lock.
+    /// Counts `hash` once more; see [`Self::count`].
     #[inline]
     fn increment(&self, hash: u64) -> u8 {
-        let counters = self.counters(hash);
-        let values = counters.map(|counter| self.counter(counter));
-        let least = values[0].min(values[1]);
+        self.count(self.counters(hash))
+    }
+
+    /// Counts the key at `counters` once more, raising only its smaller
+    /// counters, so that a key sharing a counter with a more frequent one
+    /// leaves it alone. Returns its count. Requires the shard lock.
+    ///
+    /// The counters lie in different words, so each word is loaded once and
+    /// stored once, whether or not its counter rises: which counter is the
+    /// smaller follows no pattern a branch predictor learns.
+    #[inline]
+    fn count(&self, [first, second]: [SketchCounter; 2]) -> u8 {
+        let (first_word, second_word) = (self.load(first), self.load(second));
+        let (first_value, second_value) =
+            ((first_word >> first.2) & 15, (second_word >> second.2) & 15);
+        let least = first_value.min(second_value);
         if least == 15 {
-            return least;
+            return 15;
         }
-        for (counter, value) in counters.into_iter().zip(values) {
-            if value == least {
-                let word = self.word(counter);
-                word.store(
-                    word.load(Ordering::Relaxed) + (1 << counter.2),
-                    Ordering::Relaxed,
-                );
-            }
-        }
-        least + 1
+        self.word(first).store(
+            first_word + (u64::from(first_value == least) << first.2),
+            Ordering::Relaxed,
+        );
+        self.word(second).store(
+            second_word + (u64::from(second_value == least) << second.2),
+            Ordering::Relaxed,
+        );
+        u8::try_from(least + 1).expect("a count fits u8")
     }
 
     /// Ages the sketch as its shard's evictions reach `evictions`: every
@@ -7739,9 +7765,10 @@ mod tests {
     }
 
     #[test]
-    fn an_insert_evicting_from_probation_looks_up_no_count() {
+    fn an_insert_evicting_from_probation_places_its_key_once_and_looks_up_no_count() {
         // It counts its own key in, and the evicted key's count arrived
-        // with it.
+        // with it. One placement gives both the sketch line it prefetches
+        // and the counters it raises.
         let cache = ShardedCacheBuilder::new(256).shards(1).build::<u64, u64>();
         for key in 0..1_000 {
             cache.insert(key, key);
@@ -7761,8 +7788,24 @@ mod tests {
             key += 1;
         }
         SKETCH_ESTIMATES.with(|count| count.set(0));
+        SKETCH_PLACEMENTS.with(|count| count.set(0));
         cache.insert(5_000, 5_000);
         assert_eq!(SKETCH_ESTIMATES.with(std::cell::Cell::get), 0);
+        assert_eq!(SKETCH_PLACEMENTS.with(std::cell::Cell::get), 1);
+    }
+
+    #[test]
+    fn an_increment_loads_each_of_its_two_words_once() {
+        // Relaxed atomic loads are never merged: reading each counter and
+        // then its word again to raise it loaded four times.
+        let sketch = FrequencySketch::new(1_024);
+        let hash = BuildHasherDefault::<DefaultHasher>::default().hash_one(7_u64);
+        for count in 1..=3 {
+            SKETCH_LOADS.with(|loads| loads.set(0));
+            assert_eq!(sketch.increment(hash), count);
+            assert_eq!(SKETCH_LOADS.with(std::cell::Cell::get), 2);
+        }
+        assert_eq!(sketch.estimate(hash), 3);
     }
 
     #[test]
