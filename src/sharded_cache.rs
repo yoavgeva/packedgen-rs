@@ -40,7 +40,7 @@ use crate::sharded_arena::{
     prefetch_write,
 };
 #[cfg(test)]
-use crate::sharded_arena::{PREFETCHED, STACK_SEARCHES};
+use crate::sharded_arena::{PREFETCHED, STACK_BORROWS, STACK_SEARCHES};
 
 const SLOTS: usize = 10;
 /// Slots whose tags fill a bucket's tag word; the rest are in its meta word.
@@ -2407,7 +2407,7 @@ where
         } else {
             #[cfg(test)]
             LOOPED_RETIREMENTS.with(|count| count.set(count.get() + 1));
-            self.retired.retire(
+            self.retired.retire_many(
                 pin,
                 removed.iter().map(|(handle, _)| handle.slot),
                 &mut reclaimed,
@@ -5225,6 +5225,27 @@ mod tests {
                 searches() - before <= 256 / 16,
                 "{} searches in 256 writes",
                 searches() - before
+            );
+        })
+        .join()
+        .expect("the writer finishes");
+    }
+
+    #[test]
+    fn a_single_cache_threads_writes_skip_the_shared_stack_list() {
+        thread::spawn(|| {
+            let cache: ShardedCache<u64, u64> = ShardedCacheBuilder::new(64).shards(1).build();
+            let borrows = || STACK_BORROWS.with(std::cell::Cell::get);
+            let before = borrows();
+            for round in 0..=8 {
+                for key in 0..32 {
+                    cache.insert(key, key + round);
+                }
+            }
+            assert_eq!(
+                borrows(),
+                before,
+                "a write borrowed the list of slot stacks"
             );
         })
         .join()
