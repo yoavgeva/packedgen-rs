@@ -122,6 +122,9 @@ const FREQUENCY_MARGIN: u8 = 2;
 /// counts it this often, or at least as often as the keys the main area
 /// evicts.
 const REMEMBERED_ADMISSION: u8 = 3;
+/// Read keys a main-area eviction's sweep leaves to count at the next; one
+/// more counts the oldest at once.
+const PENDING_HARVESTS: usize = 4;
 /// Deadlines are 100 ms ticks since the cache was built, kept in the entry's
 /// 31-bit expiry field: about 6.8 years of range.
 const EXPIRY_TICK_NANOS: u128 = 100_000_000;
@@ -1265,6 +1268,21 @@ struct ShardWriter {
     /// a moving average of the last sixteen or so, times sixteen. Beside
     /// the hand, on a line inserts read only for keys counted often.
     victim_counts: u32,
+    /// Counts a main-area eviction leaves for the next, on the same line.
+    pending: PendingCounts,
+}
+
+/// The sketch counts a main-area eviction leaves for the next: its victim's,
+/// which the victims' average takes, and the read keys its sweep passed,
+/// each counted once more. Their lines lie anywhere in the sketch, which in
+/// a large cache means memory; each was prefetched when it was left, so it
+/// loads between the two evictions rather than under the lock.
+#[derive(Default)]
+struct PendingCounts {
+    /// The last main-area victim's hash, or zero for none.
+    victim: u64,
+    harvested: [u64; PENDING_HARVESTS],
+    harvested_len: u8,
 }
 
 /// A probationary key: its slot record, the low half of its hash, which is
@@ -1348,6 +1366,48 @@ impl ShardWriter {
 }
 
 impl LockedShard<'_> {
+    /// Takes the counts the last main-area eviction left, whose lines it
+    /// prefetched.
+    #[inline]
+    fn settle_counts(&mut self) {
+        let victim = std::mem::take(&mut self.pending.victim);
+        if victim != 0 {
+            let count = self.sketch.estimate(victim);
+            self.count_victim(count);
+        }
+        let harvested = std::mem::take(&mut self.pending.harvested_len);
+        for index in 0..usize::from(harvested) {
+            self.sketch.increment(self.pending.harvested[index]);
+        }
+    }
+
+    /// Leaves a read key the main sweep passed to be counted at the next
+    /// main-area eviction, and starts loading its sketch line. With the
+    /// queue full, the oldest, whose line has had longest, is counted now.
+    #[inline]
+    fn harvest(&mut self, hash: u64) {
+        prefetch_write(self.sketch.line_of(hash));
+        let pending = &mut self.writer.pending;
+        if usize::from(pending.harvested_len) == PENDING_HARVESTS {
+            let oldest = pending.harvested[0];
+            pending.harvested.copy_within(1.., 0);
+            pending.harvested[PENDING_HARVESTS - 1] = hash;
+            self.sketch.increment(oldest);
+        } else {
+            pending.harvested[usize::from(pending.harvested_len)] = hash;
+            pending.harvested_len += 1;
+        }
+    }
+
+    /// Leaves the main area's victim, `hash`, for the next main-area
+    /// eviction to fold into the victims' average, and starts loading its
+    /// sketch line.
+    #[inline]
+    fn leave_victim(&mut self, hash: u64) {
+        prefetch(self.sketch.line_of(hash));
+        self.pending.victim = hash;
+    }
+
     #[inline]
     fn len(&self) -> usize {
         self.counts.len.load(Ordering::Relaxed)
@@ -2788,6 +2848,7 @@ where
         writer.probation.clear();
         writer.main.clear();
         writer.filters.clear();
+        writer.pending = PendingCounts::default();
         shard.state.sketch.clear();
     }
 
@@ -3034,7 +3095,7 @@ where
             // SAFETY: the shard lock keeps this published handle in the table.
             let entry = unsafe { entry(pin, shard.handle(raw)) };
             if !self.expired(entry, now) && entry.take_accessed() {
-                shard.state.sketch.increment(self.hash(&entry.value().0));
+                writer.harvest(self.hash(&entry.value().0));
                 writer.main.pop_front();
                 writer.main.push_back(record);
                 continue;
@@ -3101,13 +3162,14 @@ where
             }
             return Some((removed, writer.evicted(entry.weight(), expired)));
         }
+        writer.settle_counts();
         if let Some((slot, raw)) = self.main_victim(shard, writer, pin, protected, now) {
             writer.main.pop_front();
             // SAFETY: the shard lock keeps this published handle in the table.
             let entry = unsafe { entry(pin, shard.handle(raw)) };
             let expired = self.expired(entry, now);
             let hash = self.hash(&entry.value().0);
-            writer.count_victim(shard.state.sketch.estimate(hash));
+            writer.leave_victim(hash);
             let removed = shard.clear(slot);
             if !expired {
                 writer.filters.remember_main(hash);
@@ -3386,6 +3448,7 @@ impl<T> Shard<T> {
                     main,
                     hand: 0,
                     victim_counts: 0,
+                    pending: PendingCounts::default(),
                 }),
                 expirations: AtomicU64::new(0),
             },
@@ -4299,6 +4362,14 @@ impl FrequencySketch {
     #[cfg(test)]
     fn line(&self, hash: u64) -> &SketchLine {
         &self.lines[self.line_index(Self::mixed(hash))]
+    }
+
+    /// The address of the line holding `hash`'s counters, to prefetch.
+    #[inline]
+    fn line_of(&self, hash: u64) -> *const SketchLine {
+        self.lines
+            .as_ptr()
+            .wrapping_add(self.line_index(Self::mixed(hash)))
     }
 
     /// `hash`'s two counters, in different words of its line.
@@ -7243,16 +7314,17 @@ mod tests {
         // ghost's current generation seems to remember (one fill in 400)
         // grows the probation target and skips probation, so the insert
         // would evict from the main area; a relocated front key (one in 750)
-        // leaves a stale record, which eviction skips. Later keys restore
-        // both.
+        // leaves a stale record, which eviction skips; and a front key whose
+        // counters other keys share may count above the main area's victims
+        // and join them. Later keys restore all three.
         let mut key = 1_000;
         while {
             let writer = shard.lock();
             writer.probation.len() <= writer.filters.probation_target()
-                || writer
-                    .probation
-                    .front()
-                    .is_none_or(|front| shard.live_record(front.record).is_none())
+                || writer.probation.front().is_none_or(|front| {
+                    shard.live_record(front.record).is_none()
+                        || writer.outcounts_victims(front.count)
+                })
         } {
             cache.insert(key, key);
             key += 1;
@@ -7773,16 +7845,17 @@ mod tests {
         for key in 0..1_000 {
             cache.insert(key, key);
         }
-        // Until the next insert must evict a live probation front.
+        // Until the next insert must evict a live probation front, one the
+        // sketch does not count above the main area's victims.
         let shard = cache.view(0);
         let mut key = 1_000;
         while {
             let writer = shard.lock();
             writer.probation.len() <= writer.filters.probation_target()
-                || writer
-                    .probation
-                    .front()
-                    .is_none_or(|front| shard.live_record(front.record).is_none())
+                || writer.probation.front().is_none_or(|front| {
+                    shard.live_record(front.record).is_none()
+                        || writer.outcounts_victims(front.count)
+                })
         } {
             cache.insert(key, key);
             key += 1;
@@ -7792,6 +7865,76 @@ mod tests {
         cache.insert(5_000, 5_000);
         assert_eq!(SKETCH_ESTIMATES.with(std::cell::Cell::get), 0);
         assert_eq!(SKETCH_PLACEMENTS.with(std::cell::Cell::get), 1);
+    }
+
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "reads the main area's front key through its published handle"
+    )]
+    fn main_area_evictions_leave_their_sketch_counts_for_the_next() {
+        // An insert after every probationary key was read moves them to the
+        // main area and evicts from it.
+        let cache = ShardedCacheBuilder::new(256).shards(1).build::<u64, u64>();
+        let shard = cache.view(0);
+        let line = |hash: u64| std::ptr::from_ref(shard.state.sketch.line(hash)) as usize;
+        let mut next = 0_u64;
+        let mut insert_evicting_from_main = || {
+            for key in next.saturating_sub(512)..next {
+                let probationary = shard
+                    .lock()
+                    .probation
+                    .iter()
+                    .any(|probationary| probationary.hash == ghost_half(cache.hash(&key)));
+                if probationary {
+                    let _ = cache.get(&key);
+                }
+            }
+            cache.insert(next, next);
+            next += 1;
+        };
+        for _ in 0..400 {
+            insert_evicting_from_main();
+        }
+        // Read the main area's front key: the next sweep passes it.
+        let front = {
+            let mut writer = shard.lock();
+            let raw = loop {
+                let record = writer.main.front().expect("the main area holds keys");
+                if let Some(slot) = shard.live_record(record) {
+                    break shard.bucket(slot).handles[slot % SLOTS].load(Ordering::Relaxed);
+                }
+                writer.main.pop_front();
+            };
+            let pin = cache.epochs.pin();
+            // SAFETY: published in the shard, whose lock is held, under `pin`.
+            unsafe { entry(&pin, shard.handle(raw)) }.value().0
+        };
+        assert_eq!(cache.get(&front), Some(front));
+        let read = cache.hash(&front);
+        let count = shard.state.sketch.estimate(read);
+        PREFETCHED.with(|prefetched| prefetched.borrow_mut().clear());
+        insert_evicting_from_main();
+        let prefetched = PREFETCHED.with(std::cell::RefCell::take);
+        let (victim, averaged) = {
+            let writer = shard.lock();
+            (writer.pending.victim, writer.victim_counts)
+        };
+        assert_eq!(shard.state.sketch.estimate(read), count, "counted at once");
+        assert!(
+            prefetched.contains(&line(read)),
+            "its line was not prefetched"
+        );
+        assert_ne!(victim, 0, "the victim's count was taken at once");
+        assert!(
+            prefetched.contains(&line(victim)),
+            "the victim's line was not prefetched"
+        );
+        // The next main-area eviction takes both.
+        insert_evicting_from_main();
+        assert_eq!(shard.state.sketch.estimate(read), count + 1);
+        let expected = averaged - averaged / 16 + u32::from(shard.state.sketch.estimate(victim));
+        assert_eq!(shard.lock().victim_counts, expected);
     }
 
     #[test]
