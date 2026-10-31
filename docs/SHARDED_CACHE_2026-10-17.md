@@ -63,17 +63,23 @@ entry. Tables are sized once and never rebuilt.
     buckets. This happened on fewer than 0.1% of inserts into a full shard.
 - **Eviction.** Each shard uses an S3-FIFO-style policy:
   - New keys wait in a probationary FIFO. Its records hold the key's slot
-    record, its hash, and the handle it was published with. An insert
-    whose new key misses in a full shard prefetches the next victim's
-    bucket and entry together.
+    record, half its hash, the handle it was published with, and its
+    frequency count. An insert whose new key misses in a full shard
+    prefetches the next victim's bucket and entry together.
   - Each shard sizes its probation to the keys that return (see "Adaptive
     probation"). It starts at 0.25% of the shard and stays between one
     entry and a quarter of the shard.
-  - An unread probationary key leaves first and goes into a ghost filter. The
-    ghost has eight generations of a sixteenth of the shard and remembers
-    seven sixteenths to half of it. A key's words in every generation fill
-    one 64-byte line.
-  - A key the ghost remembers is admitted straight to the main area.
+  - Each shard counts its keys' misses in a frequency sketch of four-bit
+    counters, 4 bytes per entry, aged by halving (see "Frequency
+    admission"). Writers alone update it; reads write nothing.
+  - An unread probationary key leaves first and goes into a ghost filter,
+    unless the sketch counts it more often than the keys the main area
+    has been evicting; then it joins the main area. The ghost has eight
+    generations of a sixteenth of the shard and remembers seven sixteenths
+    to half of it. A key's words in every generation fill one 64-byte line.
+  - A missed key that the ghost remembers and the sketch counts at least
+    three times, or as often as the main area's recent victims, is
+    admitted straight to the main area.
   - The main area is a CLOCK queue in the order keys entered it: on leaving
     probation after being read, on overflowing probation's record cap, or on
     a ghost hit. A read key loses one of its two access marks and goes to the
@@ -390,17 +396,18 @@ rounding of the boxed entries is not included.
 
 | Entries | Key | Value | ShardedCache | DirectPackedCache | quick_cache |
 | ---: | --- | --- | ---: | ---: | ---: |
-| 100,000 | 8 B | `u64` | 42.9 | 46.7 | 118.0 |
-| 100,000 | 32 B | `[u8; 64]` | 127.0 | 128.4 | 306.7 |
-| 1,000,000 | 8 B | `u64` | 39.7 | 44.2 | 94.4 |
-| 1,000,000 | 32 B | `u64` | 63.8 | 69.0 | 144.7 |
-| 1,000,000 | 32 B | `[u8; 64]` | 120.1 | 125.1 | 245.4 |
+| 100,000 | 8 B | `u64` | 47.0 | 46.8 | 118.0 |
+| 100,000 | 32 B | `[u8; 64]` | 131.1 | 128.4 | 306.7 |
+| 1,000,000 | 8 B | `u64` | 43.7 | 44.2 | 94.4 |
+| 1,000,000 | 32 B | `u64` | 67.8 | 69.0 | 144.7 |
+| 1,000,000 | 32 B | `[u8; 64]` | 124.1 | 125.1 | 245.4 |
 
-Overhead beyond the key and value is 23.7 to 24.1 bytes per entry at
-1,000,000 entries, and 26.9 to 31.0 at 100,000, where the slab region's
+Overhead beyond the key and value is 27.7 to 28.1 bytes per entry at
+1,000,000 entries, and 31.0 to 35.1 at 100,000, where the slab region's
 spare slots, which a single-threaded fill never touches, add 1 to 4.6 on a
-16-thread machine (see "The slab region"). Before four-byte handles it was
-29.1 to 33.3 at both sizes. On a 16-thread machine, a 100,000-entry cache has 256 shards, and
+16-thread machine (see "The slab region"). The frequency sketch accounts
+for 4.0 to 4.1 of it; before the sketch it was 23.7 to 24.1 and 26.9 to
+31.0, and before four-byte handles 29.1 to 33.3 at both sizes. On a 16-thread machine, a 100,000-entry cache has 256 shards, and
 their fixed state adds about 1.4 bytes per entry; at 1,000,000 entries it
 adds about 0.5:
 
@@ -409,6 +416,7 @@ adds about 0.5:
 | Table at 80% load | 8.0 |
 | Entry metadata | 8 |
 | Main queue, with its slack | about 4 to 5 |
+| Frequency sketch | 4 |
 | Ghost filter | about 2 |
 | Main filter | about 0.25 |
 | Probation records, 16 bytes each | about 0.05 at the starting share |
@@ -1322,7 +1330,10 @@ the median of three pairs, and positive means `ShardedCache` is faster:
 | Update | +10% | −3% | +43% | +12% |
 | Delete and reinsert | −10% | +25% | +6% | +22% |
 
-A second 7763 run read within 10 points of it at 50,000 entries. On an EPYC
+A second 7763 run read within 10 points of it at 50,000 entries. The
+frequency sketch since (see "Frequency admission") put one thread 16 to
+17% behind on cold fill and 15 to 16% on delete and reinsert in two 7763
+runs, with four threads 14 to 17% ahead on both. On an EPYC
 9V45, one thread ran cold fill 15% behind, delete and reinsert 21%, and
 replace 3%. Before the single-thread work under "Write path", one thread
 trailed on every write at 50,000 entries on a 9V45, by 21 to 36%.
@@ -1397,10 +1408,14 @@ The x86_64 runs were on an AMD EPYC 7763, the previous one on an EPYC
 9V74, and the macOS host carried more other load this time, which weighs
 on sixteen clients most. With the write-path changes since, three x86_64
 runs on EPYC 7763s read +1 to +4% at one client, +22 to +24% at two, and
-+35 to +38% at four.
++35 to +38% at four, and with the frequency sketch, three more read −5 to
+−7%, +10 to +11%, and +22 to +24%.
 
 - ShardedCache's mean one-client hit ratio was 38.97%, against 37.99% for
-  quick_cache; earlier, moka 0.12's sync cache read 37.87%. On the six S3
+  quick_cache; earlier, moka 0.12's sync cache read 37.87%. With the
+  frequency sketch it reads 39.40%, and moka leads 4 of the 16 cells, by
+  0.24 to 0.60 points: OLTP at 256 entries, P3 at 20,000, S3 at 800,000,
+  and DS1 at 4,000,000 (see "Frequency admission"). On the six S3
   and DS1 cells both replay, mokabench's ratios agreed with
   `hit_ratio_sim`'s to 0.02 points for both caches (see "Hit ratio").
 - moka's sync cache ran at 2.4 to 22 times less throughput than
@@ -1488,7 +1503,8 @@ The mean one-client hit ratio rose from 37.75% to 38.97% (38.95% on
 x86_64), against 37.99% for quick_cache and 37.87% for moka. moka leads in
 5 of the 16 cells, by 2.9 points on P3 at 20,000 entries and by under a
 point in the others: OLTP at 256 entries, DS1 at 4,000,000, and S3 at
-400,000 and 800,000.
+400,000 and 800,000. With the frequency sketch the mean reads 39.40%, and
+moka leads 4 cells, by 0.60 points at most (see "On mokabench").
 
 Requested bytes per entry beyond the key and value, measured as in
 "Memory", with moka 0.12.16's sync cache read after `run_pending_tasks`:
@@ -1503,7 +1519,9 @@ Requested bytes per entry beyond the key and value, measured as in
 | 1,000,000 | 32 B, `[u8; 64]` | 29.1 | 24.1 | 149.4 | 227.5 |
 
 The first version's figures leave out the allocator's rounding of its
-boxed entries.
+boxed entries. The frequency sketch since adds 4.0 to 4.1 bytes per entry
+to "Now", which leaves it at 17 to 35% of quick_cache's overhead and 12
+to 15% of moka's (see "Memory").
 
 ## Tail latency against quick_cache 0.7
 
@@ -1554,34 +1572,35 @@ entries per shard, the sweep averaged 3.3 records per main-area eviction;
 
 The ARC paper traces were replayed through `hit_ratio_sim`; the traces are
 cited, not committed. Values are read hit percentages at the default
-configuration. "Fixed 2%" is ShardedCache before probation adapted.
+configuration. "No sketch" is ShardedCache before frequency admission.
 
-| Cell | ShardedCache | Fixed 2% | quick_cache | quick_cache sharded |
+| Cell | ShardedCache | No sketch | quick_cache | quick_cache sharded |
 | --- | ---: | ---: | ---: | ---: |
-| OLTP 1,000 | 39.76 | 36.20 | 35.15 | 36.13 |
-| OLTP 5,000 | 54.73 | 53.13 | 54.29 | 53.24 |
-| OLTP 15,000 | 65.36 | 64.35 | 64.83 | 64.55 |
-| P3 8,192 | 4.53 | 4.26 | 3.64 | 3.75 |
-| P3 32,768 | 13.42 | 13.09 | 12.94 | 13.11 |
-| P3 131,072 | 48.69 | 48.39 | 48.61 | 48.73 |
-| S1 65,536 | 6.16 | 6.06 | 6.17 | 6.23 |
-| S1 262,144 | 24.00 | 23.66 | 23.77 | 23.94 |
-| S1 524,288 | 43.06 | 42.53 | 41.99 | 42.73 |
-| P8 8,192 | 10.11 | 10.09 | 10.40 | 10.37 |
-| P8 32,768 | 31.98 | 31.73 | 32.41 | 32.31 |
-| P8 131,072 | 70.28 | 70.17 | 70.01 | 70.11 |
-| S3 100,000 | 12.55 | 12.28 | 12.67 | 12.83 |
-| S3 400,000 | 42.35 | 41.76 | 41.75 | 42.27 |
-| S3 800,000 | 69.45 | 68.70 | 66.99 | 68.34 |
-| DS1 1,000,000 | 15.25 | 14.94 | 14.86 | 14.86 |
-| DS1 4,000,000 | 45.08 | 44.74 | 44.80 | 44.75 |
-| DS1 8,000,000 | 70.26 | 68.06 | 69.22 | 69.31 |
+| OLTP 1,000 | 40.13 | 39.94 | 35.15 | 36.11 |
+| OLTP 5,000 | 55.08 | 54.78 | 54.29 | 53.27 |
+| OLTP 15,000 | 65.41 | 65.41 | 64.83 | 64.57 |
+| P3 8,192 | 4.79 | 4.46 | 3.64 | 3.76 |
+| P3 32,768 | 18.02 | 13.26 | 12.94 | 13.11 |
+| P3 131,072 | 48.43 | 48.76 | 48.61 | 48.70 |
+| S1 65,536 | 6.32 | 6.20 | 6.17 | 6.22 |
+| S1 262,144 | 24.34 | 24.02 | 23.77 | 23.96 |
+| S1 524,288 | 43.19 | 43.08 | 41.99 | 42.74 |
+| P8 8,192 | 11.02 | 10.27 | 10.40 | 10.36 |
+| P8 32,768 | 32.64 | 32.09 | 32.41 | 32.31 |
+| P8 131,072 | 70.43 | 70.34 | 70.01 | 70.12 |
+| S3 100,000 | 12.93 | 12.64 | 12.67 | 12.84 |
+| S3 400,000 | 42.81 | 42.40 | 41.75 | 42.27 |
+| S3 800,000 | 69.99 | 69.48 | 66.99 | 68.32 |
+| DS1 1,000,000 | 15.26 | 15.28 | 14.86 | 14.86 |
+| DS1 4,000,000 | 45.16 | 45.09 | 44.80 | 44.75 |
+| DS1 8,000,000 | 71.51 | 70.17 | 69.22 | 69.31 |
 
-Summed over the 18 cells, ShardedCache reads 667.03, against 654.51 for
-single-shard quick_cache and 657.58 for its sharded cache. It is ahead of the
-sharded cache in 13 cells, by up to 3.63 points (OLTP at 1,000 entries), and
-at most 0.33 behind (P8 at 32,768). The default hasher is seeded per process,
-so sums vary by about 0.1 between runs.
+Summed over the 18 cells, ShardedCache reads 677.47, against 667.66
+without the sketch, 654.51 for single-shard quick_cache, and 657.58 for its
+sharded cache. It is ahead of the sharded cache in 17 cells, by up to 4.91
+points (P3 at 32,768 entries), and 0.26 behind on P3 at 131,072. The
+default hasher is seeded per process, so sums vary by about 0.1 between
+runs.
 
 The insertion-order main queue closed most of the earlier gap. A CLOCK over
 the table's own slots sweeps in hash order and loses recency: before the
@@ -1599,7 +1618,8 @@ changes per share were:
 | DS1 at 8,000,000 | +1.84 | +1.31 | −1.45 | −3.87 | −8.06 | −12.48 |
 | All 18 cells | +1.04 | +0.15 | −2.33 | −7.07 | −22.99 | −53.31 |
 
-Picking each cell's best fixed share would have reached 667.77. So each
+Picking each cell's best fixed share would have reached 667.77, against
+667.03 for the adaptive share before the sketch. So each
 shard adapts its own share, ARC-style, from the keys that return soon after
 leaving a queue:
 
@@ -1646,6 +1666,93 @@ points. A loop of 1.25 times the capacity read 59.8% and 58.1%, +0.5 and +0.1
 over fixed probation, against 61.1% and 63.4% for quick_cache's sharded
 cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
 
+### Frequency admission
+
+The ghost remembers a key for half a shard of evictions, and reads leave
+no count, so a key that returned after a longer gap, or that was read
+often before it left, entered probation as new (see "A longer ghost for
+P3"). Each shard keeps a frequency sketch, as TinyLFU does, which only
+writers update, under the shard lock:
+
+- Four-bit counters, eight per entry of the shard's capacity, in 64-byte
+  lines: 4 bytes per entry. A key has two counters, in two words of one
+  line, and its count is the smaller. An increment raises only the
+  counters at that minimum.
+- Every insert of a new key adds one. Reads write nothing, but the main
+  area's sweep adds one for each access mark it consumes, so a key read in
+  the main area is counted when the sweep passes it.
+- Every 16th eviction halves the counters of the next word in turn, so
+  each counter halves once per eight evictions per entry of capacity.
+
+Two admissions read the counts:
+
+- A probationary key leaving unread joins the main area instead, if its
+  count is above 2 and more than 2 above the average count of the keys
+  the main area has been evicting, rounded up. The average moves a
+  sixteenth of the way to each main-area victim's count.
+- A missed key the ghost remembers skips probation only if counted at
+  least 3 times or at least as often as that average. Before, every
+  remembered key did.
+
+A probation record carries its key's count from its insert, so an
+eviction from probation reads no sketch line. Records keep half the key's
+hash, all the ghost reads, and stay 16 bytes. An insert that evicts
+prefetches the new key's sketch line with the victim's lines.
+
+A main-area eviction leaves the counts it would take for the next one:
+its victim's, for the average, and those of up to four read keys its
+sweep passed. It prefetches their lines, which lie anywhere in the sketch
+and in a large cache come from memory, so they load in between rather
+than under the lock. A count loads each of its two words once and stores
+both without branching, since which counter is the smaller follows no
+pattern; relaxed atomic loads are never merged, and reading each counter
+and then its word again had loaded four times.
+
+Over the 18 cells the sketch adds 9.80 points, and 6.89 over mokabench's
+16. Most of it is P3, +4.77 at 32,768 entries and +2.27 at 20,000, and DS1
+at 8,000,000, +1.33; P3 loses 0.33 at 131,072 and 0.27 at 160,000.
+
+Variants, as summed changes over the 18 cells and mokabench's 16 against
+no sketch:
+
+- Comparing a key leaving probation with the main area's next victim,
+  looked up in the sketch, and admitting every remembered key: +5.48 and
+  +2.22. The threshold for remembered keys raised that to +8.36 and +5.78,
+  and the victims' average in place of the lookup, with remembered keys
+  admitted at the average, to +9.55 and +6.77, without the victim's sketch
+  line under the lock.
+- Without the sweep's counts: +8.11 and +5.44; counting one consumed mark
+  in four: +8.31 and +5.57.
+- Two and three bytes per entry, with four and six counters: +4.92 and
+  +3.37, and +7.74 and +5.33.
+- One counter per key: +6.45 and +4.45. Both counters in one word, one
+  load and one store: +9.10 and +6.56.
+- Counting replacements too: within 0.02.
+- Leaving uncounted the keys that arrive while their shard has room, as
+  reinserts after removals do: 0.41 and 0.58 lower than counting them,
+  most of it in large caches' first fill (DS1 at 8,000,000 entries, 0.45).
+
+The cost falls on inserts of new keys, which count, and on evictions,
+which age the sketch. Against the build without it, on two EPYC 7763
+runners and a 9V45, five pairs each in both codegen settings, one thread
+ran cold fill 2 to 6% slower, reads through the loader 4 to 7%, turnover 1
+to 9%, and delete and reinsert 2 to 11%; four threads ran cold fill 1 to
+6% slower and delete and reinsert 2 to 7%; replace, update, and reads
+moved within noise. Cachegrind on the Linux VM counted 62 more
+instructions per cold-fill insert. On mokabench, against quick_cache on
+EPYC 7763 runners, three runs read 0.93 to 0.95x at one client, 1.10 to
+1.11x at two, and 1.22 to 1.24x at four, where three without the sketch
+read 1.01 to 1.04x, 1.22 to 1.24x, and 1.35 to 1.38x. The largest caches
+lost most: at one client DS1 at 8,000,000 entries went from 1.19x to 0.98x
+and S3 at 800,000 from 1.36x to 1.15x.
+
+The sketch as first built cost one-thread cold fill 10 to 13.5% on 7763s
+and mokabench 12 to 14%. Counting with one load per word sped cold fill
+up by 6 to 8% in five of six runs and settings on three AMD runner
+models, and leaving the main area's counts for the next eviction moved
+one-client mokabench a further 2%, most on DS1 at 4,000,000 and 8,000,000
+entries and S1 at 800,000.
+
 ## Rejected and reverted
 
 - **Linear probing over buckets.** Its overflow counts were correct, but fill
@@ -1682,7 +1789,11 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
   fell 11%.
 - **Prefetching all of an insert's lines for writing.** The ghost word and
   probation tail go unused when replacing, and taking them exclusive cost
-  eight-thread replace 6%.
+  eight-thread replace 6%. Prefetching the sketch line for writing before
+  the pin, for every insert, did the same on three EPYC 7763 runners:
+  four-thread replace lost 4 to 12% and update 1 to 4%, while delete and
+  reinsert, whose reinserts evict nothing and so fetch no sketch line
+  early, moved by −3 to +2%.
 - **Freeing up to four entries per write.** See the trade-off under "Write
   path".
 - **A CLOCK over the table's slots as the main policy.** Hash order cost 3.4
@@ -1834,6 +1945,27 @@ cache; the dedicated shadows had lifted it to 60.7% and 60.3%.
   bit in each entry's metadata. In the same simulator, W-TinyLFU won both P3
   (11.61% at 20,000) and DS1 (45.32% at 4,000,000) by counting every read.
   Reads here set at most two access marks, lock-free, and record no more.
+  The frequency sketch since counts the marks the main sweep consumes, and
+  lifted P3 at 20,000 to 11.15% without a longer ghost (see "Frequency
+  admission").
+- **Evicting the main area's least-counted entry.** Taking the lowest
+  count among the main sweep's next four unread entries, over the first
+  sketch, summed 11.20 points lower over the 18 cells and 10.89 over
+  mokabench's 16, 2.07 of it on DS1 at 8,000,000 entries: counts recorded
+  only at misses and sweeps rank recency poorly.
+- **A ghost of half the bits, to pay for the sketch.** Sixteen-bit ghost
+  words, over the first sketch: 10.23 points lower over the 18 cells and
+  8.78 over mokabench's 16. Its false positives sent DS1 at 1,000,000
+  entries 2.27 lower and S3 at 100,000 1.67 lower.
+- **Huge pages for the sketch and the ghost.** As a bound before pooling
+  them, each shard's sketch and filter lines took their own 2 MB-aligned,
+  advised region. On two EPYC 7763 runners, one-client mokabench moved
+  −1.6% against the sketch without them, and DS1 at 8,000,000 entries −6%:
+  their misses are not the TLB's.
+- **W-TinyLFU in place of S3-FIFO.** The simulator's W-TinyLFU model,
+  which counts every read, summed 30.1 points below ShardedCache without
+  the sketch over the 18 cells and 30.7 over mokabench's 16. The sketch
+  helps as an admission test beside the queues, not as the policy.
 - **A spin lock for the retired queues.** Its uncontended unlock is a
   store, where the mutex's is a read-modify-write, a full barrier on x86.
   On x86, single-thread writes moved by 0 to +1%, delete and reinsert by

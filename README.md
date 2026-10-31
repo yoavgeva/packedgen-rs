@@ -3,7 +3,7 @@
 PackedGen's main component is `ShardedCache`, a bounded concurrent cache for
 any `K: Hash + Eq`. Reads are lock-free, per-shard tables are sized once and
 never rebuilt, and eviction follows S3-FIFO. Its overhead beyond the key and
-value is about 24 requested bytes per entry at 1,000,000 entries.
+value is about 28 requested bytes per entry at 1,000,000 entries.
 
 The repository also holds research data structures: packed generational
 maps, lock-free and lock-based concurrent maps, the byte-keyed
@@ -21,7 +21,7 @@ Writers take per-shard locks; readers take none. The shards share one table
 of 64-byte buckets, each with ten tag bytes and ten four-byte handles to
 epoch-reclaimed entries in one slab region per cache, and every key lives in
 one of two buckets. Overhead beyond the key and value is
-23.7 to 24.1 requested bytes per entry at 1,000,000 entries and 26.9 to 31.0
+27.7 to 28.1 requested bytes per entry at 1,000,000 entries and 31.0 to 35.1
 at 100,000, against 78 to 210 for quick_cache 0.7.
 
 Against quick_cache, ShardedCache leads concurrent reads. With eight threads
@@ -52,13 +52,16 @@ share cache lines with the handles; eight threads led on every workload, by
 4 to 109%. Full-cache upserts led by 56 to 58%, and reads through the loader
 by 13% on one thread and 61% with eight.
 
-On a 4-vCPU AMD EPYC 7763 runner at 50,000 entries, four threads led by 22
-to 50% on every workload but replace and update, which were level; one
-thread led on replace, update, and misses by 10 to 12%, and trailed on cold
-fill and on delete and reinsert by 10 to 11%, running more instructions
-where quick_cache stalled more. At 1,000,000 entries one thread led on
-writes by 6 to 43% and trailed on hits by 18% and misses by 62%. On an
-Intel Xeon runner, one thread led cold fill by 63%.
+In two runs on 4-vCPU AMD EPYC 7763 runners at 50,000 entries, four
+threads led by 14 to 51% on every workload but replace and update, which
+were level; one thread led on replace, update, and misses by 8 to 15%, and
+trailed on cold fill and on delete and reinsert by 15 to 17%, running more
+instructions where quick_cache stalled more; before the frequency sketch
+those two trailed by 10 to 11%. At 1,000,000 entries one thread led on
+cold fill, replace, update, and reads through the loader by 23 to 62%,
+was level on delete and reinsert, and trailed on hits by 17 to 18% and
+misses by 46 to 52%. On an Intel Xeon runner, before the sketch, one
+thread led cold fill by 63%.
 
 In process memory, before four-byte handles, 1,000,000 entries took 46 to
 136 bytes each, against 83 to 332 for quick_cache. Timing every operation at
@@ -67,16 +70,24 @@ up to 16 times shorter at p99.999, and 3 to 17 times shorter from p99.9 at
 eight threads; on one thread its p99 was level or one 42 ns timer tick
 behind.
 
-Each shard sizes its probationary queue to the keys it sees return. On the
-ARC paper traces, its summed hit rate over 18 cells was 12.5 points above
-single-shard quick_cache and 9.5 above quick_cache's sharded cache.
+Each shard sizes its probationary queue to the keys it sees return, and
+admits by a frequency sketch of its misses and the main area's reads,
+which adds 4 bytes per entry. On the ARC paper traces, its summed hit rate
+over 18 cells was 23.0 points above single-shard quick_cache and 19.9
+above quick_cache's sharded cache, 9.8 of them from the sketch; over
+mokabench's 16 cells at one client its mean was 39.4%, against 38.0% for
+quick_cache and 37.9% for moka. The sketch costs one thread's inserts of
+new keys 2 to 11% on x86_64 runners; the Apple Silicon and Linux
+throughput figures above predate it.
 
 On [mokabench](https://github.com/moka-rs/mokabench), moka's trace-replay
 load generator, over 16 cells of six ARC traces, ShardedCache's throughput
 against quick_cache had a geometric mean of −1% at one client, +22% at
 eight, and +51% at sixteen on Apple Silicon; −5% at one client to +35% at
-sixteen on Linux; and, with the latest write changes, +1 to +4% at one
-client to +35 to +38% at four on 4-vCPU x86_64 runners. It lost mostly
+sixteen on Linux; and on 4-vCPU EPYC 7763 runners, +1 to +4% at one
+client to +35 to +38% at four before the frequency sketch, and −5 to −7%
+to +22 to +24% with it, or −1 to 0% to +30 to +32% on other x86_64
+runners. It lost mostly
 where reads miss and most operations insert and evict: by up to 30% at one
 client, and on Linux by up to 29% with more.
 moka's sync cache ran 2.4 to 22 times slower.
