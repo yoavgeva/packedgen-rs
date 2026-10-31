@@ -2205,7 +2205,8 @@ where
     /// Inserts each pair in order, as [`Self::insert`] would one at a time,
     /// and returns how many values were cached. A batch takes one epoch pin,
     /// refreshed between chunks of inserts, instead of one per insert, and
-    /// starts loading every key's home bucket before inserting the chunk.
+    /// starts loading every key's home bucket and frequency count before
+    /// inserting the chunk.
     ///
     /// # Panics
     ///
@@ -2238,6 +2239,7 @@ where
             for &(hash, ..) in &chunk {
                 let shard = self.shard(hash);
                 prefetch(&raw const shard.buckets[shard.home(hash)]);
+                prefetch_write(std::ptr::from_ref(shard.state.sketch.line(hash)));
             }
             // The first chunk hashes before pinning, as an insert does. A
             // pin held past two advances would hold back every removal
@@ -3399,9 +3401,10 @@ impl<T> ShardView<'_, T> {
     /// Starts loading the lines every insert of `hash` reads under the shard
     /// lock: the shard's limits, its lock word with the counts and the
     /// probation queue, the filters and the main queue on the next line, and
-    /// the key's home bucket. An insert calls it before it pins and fills its
-    /// slot, so these misses overlap that work rather than waiting behind
-    /// the lock's acquire, which no later load passes.
+    /// the key's home bucket, and the sketch line a new key is counted in.
+    /// An insert calls it before it pins and fills its slot, so these misses
+    /// overlap that work rather than waiting behind the lock's acquire,
+    /// which no later load passes.
     #[inline]
     fn prefetch_for_insert(&self, hash: u64) {
         prefetch(std::ptr::from_ref(&self.state.limits));
@@ -3409,13 +3412,13 @@ impl<T> ShardView<'_, T> {
         prefetch_write(lock);
         prefetch(lock.wrapping_add(64));
         prefetch(self.buckets.as_ptr().wrapping_add(self.home(hash)));
+        prefetch_write(std::ptr::from_ref(self.state.sketch.line(hash)));
     }
 
     /// Starts loading the lines an insert of `hash` that evicts the next
     /// probationary victim touches: the victim's bucket, entry, and ghost
-    /// line, and the new key's home bucket, ghost line, and sketch line,
-    /// which it counts in. (The victim's sketch line, counted in when it
-    /// arrived a few inserts ago, is most likely cached.) Each was
+    /// line, and the new key's home bucket and ghost line. (The new key's
+    /// sketch line was fetched before the insert pinned.) Each was
     /// most likely last written on another core, and fetched together their
     /// misses overlap instead of following one another under the lock.
     /// Lines the insert writes are fetched for writing. Inserts call it only
@@ -3437,7 +3440,6 @@ impl<T> ShardView<'_, T> {
         }
         prefetch_write(self.buckets.as_ptr().wrapping_add(self.home(hash)));
         prefetch(writer.filters.ghost_line(hash));
-        prefetch_write(std::ptr::from_ref(self.state.sketch.line(hash)));
     }
 
     #[inline]
@@ -7347,9 +7349,11 @@ mod tests {
     }
 
     #[test]
-    fn an_insert_prefetches_its_shards_lines_and_home_bucket_first() {
+    fn an_insert_prefetches_its_shards_lines_home_bucket_and_sketch_line_first() {
         // The lines a write's shard lock and lookup wait on, fetched before
-        // it pins and fills its slot, load alongside that work.
+        // it pins and fills its slot, load alongside that work. So does the
+        // sketch line a new key is counted in, which inserts into a shard
+        // with room, reinserts after a removal among them, never fetched.
         let cache = ShardedCacheBuilder::new(1_000).build::<u64, u64>();
         let hash = cache.hash(&7_u64);
         let shard = cache.shard(hash);
@@ -7359,6 +7363,7 @@ mod tests {
             lock,
             lock + 64,
             std::ptr::from_ref(&shard.buckets[shard.home(hash)]) as usize,
+            std::ptr::from_ref(shard.state.sketch.line(hash)) as usize,
         ];
         PREFETCHED.with(|prefetched| prefetched.borrow_mut().clear());
         assert!(cache.insert(7, 7));
@@ -7368,15 +7373,19 @@ mod tests {
     }
 
     #[test]
-    fn insert_many_pins_once_and_prefetches_each_home_bucket_first() {
+    fn insert_many_pins_once_and_prefetches_each_home_bucket_and_sketch_line_first() {
         // A pin per insert holds back the loads after it; a batch takes one
-        // and starts loading every key's home bucket before inserting.
+        // and starts loading every key's home bucket, and the sketch line a
+        // new key is counted in, before inserting.
         let cache = ShardedCacheBuilder::new(1_000).build::<u64, u64>();
         let homes: Vec<usize> = (0..64_u64)
-            .map(|key| {
+            .flat_map(|key| {
                 let hash = cache.hash(&key);
                 let shard = cache.shard(hash);
-                std::ptr::from_ref(&shard.buckets[shard.home(hash)]) as usize
+                [
+                    std::ptr::from_ref(&shard.buckets[shard.home(hash)]) as usize,
+                    std::ptr::from_ref(shard.state.sketch.line(hash)) as usize,
+                ]
             })
             .collect();
         let pins = crate::sharded_arena::pins_taken();
