@@ -3906,6 +3906,23 @@ const fn overflow(meta: u64) -> u64 {
     meta >> OVERFLOW_SHIFT & OVERFLOW_MAX
 }
 
+
+/// EXPERIMENT ONLY: a zeroed boxed slice in its own huge-page-aligned region.
+#[allow(unsafe_code)]
+fn huge_zeroed<T>(len: usize) -> Box<[T]> {
+    let bytes = len * size_of::<T>();
+    if bytes < (1 << 18) {
+        let layout = std::alloc::Layout::array::<T>(len.max(1)).unwrap();
+        let p = unsafe { std::alloc::alloc_zeroed(layout) };
+        return unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(p.cast(), len)) };
+    }
+    let size = bytes.next_multiple_of(2 << 20);
+    let layout = std::alloc::Layout::from_size_align(size, 2 << 20).unwrap();
+    let p = unsafe { std::alloc::alloc_zeroed(layout) };
+    advise_huge_pages(p, size);
+    unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(p.cast(), len)) }
+}
+
 /// A table of `buckets` empty buckets. Zeroed memory is an empty table, so
 /// a large one comes straight from the kernel, untouched until written,
 /// and is advised for huge pages before its first write.
@@ -4161,9 +4178,7 @@ impl Filters {
         let main_words = generation.div_ceil(KEYS_PER_FILTER_WORD).max(1);
         let main_lines = main_words.div_ceil(GHOST_GENERATIONS);
         Self {
-            lines: (0..ghost_lines + main_lines)
-                .map(|_| FilterLine([0; GHOST_GENERATIONS]))
-                .collect(),
+            lines: huge_zeroed(ghost_lines + main_lines),
             main_words: u32::try_from(main_words).expect("a shard's main filter fits u32 words"),
             ghost_remembered: 0,
             main_remembered: 0,
@@ -4337,9 +4352,7 @@ impl FrequencySketch {
         let lines =
             (capacity.max(1) * SKETCH_COUNTERS_PER_ENTRY).div_ceil(SKETCH_COUNTERS_PER_LINE);
         Self {
-            lines: (0..lines)
-                .map(|_| SketchLine(std::array::from_fn(|_| AtomicU64::new(0))))
-                .collect(),
+            lines: huge_zeroed(lines),
         }
     }
 
