@@ -308,7 +308,12 @@ type Cache<S> = ShardedCache<u64, Versioned, ByWeight, S, Listener>;
     unsafe_code,
     reason = "reads entries the table publishes under the check's pin"
 )]
-fn check_tables<S: BuildHasher>(cache: &Cache<S>) {
+fn check_tables<V, W, S, L>(cache: &ShardedCache<u64, V, W, S, L>)
+where
+    W: Weighter<u64, V>,
+    S: BuildHasher,
+    L: RemovalListener<u64, V>,
+{
     let pin = cache.epochs.pin();
     for index in 0..cache.shards.len() {
         let shard = cache.view(index);
@@ -891,6 +896,10 @@ fn run_seeds<S: BuildHasher + Clone>(first: u64, hasher: &S, relocates: bool, fi
     for seed in first..first + SEEDS {
         run(seed, hasher, STEPS, &mut exercised);
     }
+    if cfg!(miri) {
+        // Too few steps to reach every path; the checks still ran.
+        return;
+    }
     let Exercised {
         evictions,
         expirations,
@@ -939,4 +948,412 @@ fn random_operations_on_clustered_keys_match_the_model() {
 fn random_operations_on_one_bucket_pair_match_the_model() {
     // Every key shares both buckets, so none can move to make room.
     run_seeds(2_000, &Colliding, false, true);
+}
+
+/// Values the owned-key runs built or cloned and have not dropped, across
+/// their threads.
+static OWNED_ALIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// A value of an owned-key run: its key, a version no other write reuses,
+/// and its weight.
+#[derive(Debug)]
+struct Owned {
+    key: u64,
+    version: u64,
+    weight: u64,
+}
+
+impl Owned {
+    fn new(key: u64, version: u64, weight: u64) -> Self {
+        OWNED_ALIVE.fetch_add(1, Ordering::Relaxed);
+        Self {
+            key,
+            version,
+            weight,
+        }
+    }
+}
+
+impl Clone for Owned {
+    fn clone(&self) -> Self {
+        Self::new(self.key, self.version, self.weight)
+    }
+}
+
+impl Drop for Owned {
+    fn drop(&mut self) {
+        OWNED_ALIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct OwnedWeight;
+
+impl Weighter<u64, Owned> for OwnedWeight {
+    fn weight(&self, _key: &u64, value: &Owned) -> u64 {
+        value.weight
+    }
+}
+
+type Removals = Arc<Mutex<Vec<(u64, u64, RemovalCause)>>>;
+
+struct OwnedListener(Removals);
+
+impl RemovalListener<u64, Owned> for OwnedListener {
+    fn on_removal(&self, key: &u64, value: &Owned, cause: RemovalCause) {
+        assert_eq!(*key, value.key, "a removal names another key's value");
+        self.0.lock().push((*key, value.version, cause));
+    }
+}
+
+type OwnedCache<S> = ShardedCache<u64, Owned, OwnedWeight, S, OwnedListener>;
+
+/// What an owner knows of its key: the version it wrote last, if it may be
+/// cached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Latest {
+    Absent,
+    /// A write the cache confirmed caching.
+    Cached(u64),
+    /// A load whose value may not have been cached: a clear from another
+    /// thread can supersede it.
+    Maybe(u64),
+}
+
+impl Latest {
+    fn version(self) -> Option<u64> {
+        match self {
+            Self::Absent => None,
+            Self::Cached(version) | Self::Maybe(version) => Some(version),
+        }
+    }
+}
+
+/// What one owner thread saw.
+#[derive(Default)]
+struct Owner {
+    latest: HashMap<u64, Latest>,
+    /// Versions the cache confirmed caching.
+    cached: Vec<(u64, u64)>,
+    /// Confirmed versions the owner then found missing: something else
+    /// removed them, and the listener must have heard it.
+    missing: Vec<(u64, u64)>,
+}
+
+impl Owner {
+    /// Checks a read of `key` that found `found`, and notes a confirmed
+    /// version gone missing.
+    fn read(&mut self, key: u64, found: Option<&Owned>) {
+        let latest = self.latest.get(&key).copied().unwrap_or(Latest::Absent);
+        match (latest, found) {
+            (_, Some(value)) => {
+                assert_eq!(value.key, key, "{key} read another key's value");
+                assert_eq!(
+                    Some(value.version),
+                    latest.version(),
+                    "{key} read a version its owner did not write last"
+                );
+            }
+            (Latest::Cached(version), None) => {
+                self.missing.push((key, version));
+                self.latest.insert(key, Latest::Absent);
+            }
+            (Latest::Maybe(_), None) => {
+                self.latest.insert(key, Latest::Absent);
+            }
+            (Latest::Absent, None) => {}
+        }
+    }
+
+    /// Notes that the cache confirmed caching `version` of `key`.
+    fn cached(&mut self, key: u64, version: u64) {
+        self.cached.push((key, version));
+        self.latest.insert(key, Latest::Cached(version));
+    }
+}
+
+const OWNED_KEYS: u64 = 200;
+const OWNED_THREADS: u64 = 4;
+const OWNED_ROUNDS: u64 = if cfg!(miri) { 150 } else { 30_000 };
+
+/// One owner thread's operations on its keys, with the shared ones every
+/// thread may run: clears, partial drains, `retain` of its own keys,
+/// iteration, and resizes.
+#[allow(clippy::too_many_lines, reason = "one match arm per operation")]
+fn own_keys<S: BuildHasher>(cache: &OwnedCache<S>, thread: u64, seed: u64) -> Owner {
+    let mut rng = Rng::new(seed * 64 + thread);
+    let mut owner = Owner::default();
+    let first = thread * OWNED_KEYS;
+    let mut counter = 0;
+    let mut version = || {
+        counter += 1;
+        thread << 40 | counter
+    };
+    let fits = |key: u64, weight: u64| weight <= cache.shard(cache.hash(&key)).limits.weight();
+    for _ in 0..OWNED_ROUNDS {
+        let key = first + rng.below(OWNED_KEYS);
+        let weight = if rng.below(50) == 0 {
+            u64::MAX >> 1
+        } else {
+            1 + rng.below(2)
+        };
+        match rng.below(100) {
+            0..30 => {
+                let written = version();
+                if cache.insert(key, Owned::new(key, written, weight)) {
+                    owner.cached(key, written);
+                } else {
+                    assert!(!fits(key, weight), "{key} refused at weight {weight}");
+                    owner.latest.insert(key, Latest::Absent);
+                }
+            }
+            30..50 => owner.read(key, cache.get(&key).as_ref()),
+            50..55 => owner.read(key, cache.peek(&key).as_ref()),
+            55..62 => {
+                let latest = owner.latest.get(&key).copied().unwrap_or(Latest::Absent);
+                let live = cache.remove(&key);
+                match (latest, live) {
+                    (Latest::Absent, true) => {
+                        panic!("removed {key}, which its owner had not cached")
+                    }
+                    (Latest::Cached(version), false) => owner.missing.push((key, version)),
+                    _ => {}
+                }
+                owner.latest.insert(key, Latest::Absent);
+            }
+            62..66 => {
+                let offered = Cell::new(None);
+                let removed = cache.remove_if(&key, |value| {
+                    offered.set(Some(value.version));
+                    value.version % 2 == 0
+                });
+                let latest = owner.latest.get(&key).copied().unwrap_or(Latest::Absent);
+                if let Some(version) = offered.get() {
+                    assert_eq!(Some(version), latest.version(), "{key} offered stale");
+                } else {
+                    if let Latest::Cached(version) = latest {
+                        owner.missing.push((key, version));
+                    }
+                    owner.latest.insert(key, Latest::Absent);
+                }
+                if removed {
+                    owner.latest.insert(key, Latest::Absent);
+                }
+            }
+            66..71 => {
+                let written = version();
+                let latest = owner.latest.get(&key).copied().unwrap_or(Latest::Absent);
+                match cache.replace(key, Owned::new(key, written, weight)) {
+                    Ok(()) => {
+                        assert_ne!(latest, Latest::Absent, "replaced {key}, which was absent");
+                        owner.cached(key, written);
+                    }
+                    Err((_, value)) => {
+                        assert_eq!(value.version, written);
+                        if let (Latest::Cached(version), true) = (latest, fits(key, weight)) {
+                            owner.missing.push((key, version));
+                        }
+                        owner.latest.insert(key, Latest::Absent);
+                    }
+                }
+            }
+            71..78 => {
+                let written = version();
+                let latest = owner.latest.get(&key).copied().unwrap_or(Latest::Absent);
+                let got = cache.get_or_insert_with(&key, || Owned::new(key, written, 1));
+                if got.version == written {
+                    if let Latest::Cached(version) = latest {
+                        owner.missing.push((key, version));
+                    }
+                    owner.latest.insert(key, Latest::Maybe(written));
+                } else {
+                    owner.read(key, Some(&got));
+                }
+            }
+            78..84 => {
+                let written = version();
+                let latest = owner.latest.get(&key).copied().unwrap_or(Latest::Absent);
+                match cache.get_value_or_guard(&key, Some(Duration::ZERO)) {
+                    GuardResult::Value(value) => owner.read(key, Some(&value)),
+                    GuardResult::Guard(guard) => {
+                        if let Latest::Cached(version) = latest {
+                            owner.missing.push((key, version));
+                        }
+                        if guard.insert(Owned::new(key, written, weight)) {
+                            owner.cached(key, written);
+                        } else {
+                            owner.latest.insert(key, Latest::Absent);
+                        }
+                    }
+                    GuardResult::Timeout => panic!("{key} loads only on its owner's thread"),
+                }
+            }
+            84..88 => {
+                let guard = cache.pin();
+                owner.read(key, guard.get(&key));
+            }
+            88..92 => {
+                let mut batch = Vec::new();
+                let mut drawn = HashSet::new();
+                for _ in 0..=rng.below(16) {
+                    let key = first + rng.below(OWNED_KEYS);
+                    if drawn.insert(key) {
+                        batch.push((key, version()));
+                    }
+                }
+                let entries = batch
+                    .iter()
+                    .map(|(key, written)| (*key, Owned::new(*key, *written, 1)));
+                assert_eq!(cache.insert_many(entries), batch.len());
+                for (key, written) in batch {
+                    owner.cached(key, written);
+                }
+            }
+            92..94 => {
+                // Iteration sees the owner's keys at their latest versions.
+                let entries: Vec<(u64, Owned)> = cache.iter().collect();
+                for (seen_key, value) in &entries {
+                    assert_eq!(*seen_key, value.key);
+                }
+                for (seen_key, value) in entries {
+                    if seen_key / OWNED_KEYS == thread {
+                        owner.read(seen_key, Some(&value));
+                    }
+                }
+            }
+            94..96 => {
+                // Removes this thread's keys of versions divisible by three.
+                let mut rejected = Vec::new();
+                cache.retain(|seen_key, value| {
+                    let own = seen_key / OWNED_KEYS == thread;
+                    let reject = own && value.version % 3 == 0;
+                    if own {
+                        rejected.push((*seen_key, value.version, reject));
+                    }
+                    !reject
+                });
+                for (seen_key, seen, reject) in rejected {
+                    let latest = owner
+                        .latest
+                        .get(&seen_key)
+                        .copied()
+                        .unwrap_or(Latest::Absent);
+                    assert_eq!(Some(seen), latest.version(), "{seen_key} offered stale");
+                    if reject {
+                        owner.latest.insert(seen_key, Latest::Absent);
+                    }
+                }
+            }
+            96 => {
+                if rng.below(20) == 0 {
+                    cache.clear();
+                } else {
+                    let taken = usize::try_from(rng.below(4)).expect("fits");
+                    for (seen_key, value) in cache.drain().take(taken) {
+                        assert_eq!(seen_key, value.key);
+                    }
+                }
+            }
+            97 => {
+                let reserve = cache.max_capacity() as u64;
+                let capacity = reserve / 2 + rng.below(reserve / 2 + 1);
+                cache.set_capacity(usize::try_from(capacity).expect("fits"));
+            }
+            _ => cache.maintain(),
+        }
+    }
+    owner
+}
+
+/// Runs `OWNED_THREADS` owners on one cache, then checks every removal the
+/// listener heard against the versions the owners wrote, and that every
+/// version the cache confirmed caching left once or is resident.
+fn run_owned<S: BuildHasher + Clone + Send + Sync>(seed: u64, hasher: &S) {
+    let mut rng = Rng::new(seed);
+    let total = OWNED_THREADS * OWNED_KEYS;
+    let capacity = usize::try_from(total * rng.pick(&[1, 2, 3]) / 2).expect("fits");
+    let shards = rng.pick(&[2_usize, 4, 16]);
+    let removals = Removals::default();
+    let alive = OWNED_ALIVE.load(Ordering::Relaxed);
+    {
+        let cache: OwnedCache<S> = ShardedCacheBuilder::new(capacity)
+            .max_capacity(capacity)
+            .shards(shards)
+            .max_weight(2 * capacity as u64)
+            .hasher(hasher.clone())
+            .weighter(OwnedWeight)
+            .removal_listener(OwnedListener(Arc::clone(&removals)))
+            .build();
+        let owners: Vec<Owner> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..OWNED_THREADS)
+                .map(|thread| {
+                    let cache = &cache;
+                    scope.spawn(move || own_keys(cache, thread, seed))
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("an owner completes"))
+                .collect()
+        });
+        check_tables(&cache);
+        let heard = std::mem::take(&mut *removals.lock());
+        let mut left = HashMap::new();
+        for (key, version, cause) in heard {
+            assert_eq!(
+                version >> 40,
+                key / OWNED_KEYS,
+                "{key} v{version} not its owner's"
+            );
+            assert!(
+                left.insert(version, (key, cause)).is_none(),
+                "{key} v{version} left twice"
+            );
+        }
+        let mut resident = 0;
+        for (thread, owner) in owners.iter().enumerate() {
+            for (key, version) in &owner.missing {
+                let (_, cause) = left
+                    .get(version)
+                    .unwrap_or_else(|| panic!("{key} v{version} went missing unheard"));
+                assert_ne!(*cause, RemovalCause::Replaced, "{key} v{version} replaced");
+            }
+            for key in thread as u64 * OWNED_KEYS..(thread as u64 + 1) * OWNED_KEYS {
+                let latest = owner.latest.get(&key).copied().unwrap_or(Latest::Absent);
+                if let Some(value) = cache.peek(&key) {
+                    resident += 1;
+                    assert_eq!(Some(value.version), latest.version(), "{key} holds stale");
+                    assert!(
+                        !left.contains_key(&value.version),
+                        "{key} heard leaving, resident"
+                    );
+                }
+            }
+            for (key, version) in &owner.cached {
+                let stayed = cache
+                    .peek(key)
+                    .is_some_and(|value| value.version == *version);
+                assert!(
+                    stayed || left.contains_key(version),
+                    "{key} v{version} vanished unheard"
+                );
+            }
+        }
+        assert_eq!(cache.len(), resident);
+    }
+    assert_eq!(
+        OWNED_ALIVE.load(Ordering::Relaxed),
+        alive,
+        "seed {seed}: values leaked or dropped twice"
+    );
+}
+
+const OWNED_SEEDS: u64 = if cfg!(miri) { 1 } else { 12 };
+
+#[test]
+#[cfg_attr(miri, ignore = "parking_lot's futex wait fails Miri's variadic check")]
+fn owners_racing_every_operation_read_only_their_latest_versions() {
+    for seed in 0..OWNED_SEEDS {
+        run_owned(seed, &hashbrown::DefaultHashBuilder::default());
+        run_owned(100 + seed, &Clustered);
+    }
 }
