@@ -17,10 +17,9 @@ jobs:
       matrix:
         include:
           - { variant: baseline, cfg: "", tests: all }
-          - { variant: baseline, cfg: "", tests: alone }
-          - { variant: shared, cfg: "--cfg packedgen_exp_shared", tests: all }
-          - { variant: fresh, cfg: "--cfg packedgen_exp_fresh", tests: all }
-          - { variant: retire-fence, cfg: "--cfg packedgen_exp_retire_fence", tests: all }
+          - { variant: acq-gen, cfg: "--cfg packedgen_exp_acq_gen", tests: all }
+          - { variant: rmw-words, cfg: "--cfg packedgen_exp_rmw_words", tests: all }
+          - { variant: acq-gen-rmw-words, cfg: "--cfg packedgen_exp_acq_gen --cfg packedgen_exp_rmw_words", tests: all }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -28,6 +27,7 @@ jobs:
           components: rust-src
       - name: Runs
         env:
+          TSAN_OPTIONS: history_size=7
           RUSTFLAGS: -Zsanitizer=thread --cfg packedgen_sanitize_thread ${{ matrix.cfg }}
           RUSTDOCFLAGS: -Zsanitizer=thread --cfg packedgen_sanitize_thread ${{ matrix.cfg }}
         run: |
@@ -38,8 +38,11 @@ jobs:
             tests="sharded_cache::model_check::owners_racing"
           fi
           for run in 1 2 3; do
-            cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu --lib -- $tests > run.log 2>&1 || true
-            races=$(grep -c 'WARNING: ThreadSanitizer' run.log || true)
-            echo "run $run: $races races; $(grep 'test result' run.log)"
-            grep -A12 'WARNING: ThreadSanitizer' run.log | grep -E 'Write|Read|#[3-9] ' | sed 's/(packedgen-[^)]*)//' | head -24
+            cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu --lib -- $tests > run$run.log 2>&1 || true
+            races=$(grep -c 'WARNING: ThreadSanitizer' run$run.log || true)
+            echo "run $run: $races races; $(grep 'test result' run$run.log)"
           done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tsan-${{ matrix.variant }}
+          path: run*.log

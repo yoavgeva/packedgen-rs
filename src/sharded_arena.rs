@@ -166,6 +166,29 @@ const REUSE_STORE: Ordering = if cfg!(packedgen_sanitize_thread) {
 /// Whether this build can announce pins: on Linux, where `membarrier`
 /// decides at run time, and in tests and Miri elsewhere. Other builds
 /// compile the shared counters alone, as before announcements.
+/// Experiment: generation loads of announced pins.
+const GEN_ORDER: Ordering = if cfg!(packedgen_exp_acq_gen) { Ordering::Acquire } else { Ordering::Relaxed };
+
+/// Experiment: announcement words written by read-modify-writes.
+#[inline]
+fn word_store(word: &AtomicUsize, value: usize, order: Ordering) {
+    if cfg!(packedgen_exp_rmw_words) {
+        word.swap(value, Ordering::AcqRel);
+    } else {
+        word.store(value, order);
+    }
+}
+
+/// Experiment: announcement words read by read-modify-writes.
+#[inline]
+fn word_load(word: &AtomicUsize) -> usize {
+    if cfg!(packedgen_exp_rmw_words) {
+        word.fetch_add(0, Ordering::AcqRel)
+    } else {
+        word.load(Ordering::Acquire)
+    }
+}
+
 const ANNOUNCEABLE: bool = !cfg!(packedgen_exp_shared) && (ASYMMETRIC || cfg!(any(test, miri)));
 
 /// Whether this process announces pins: where `membarrier` registers, and
@@ -423,10 +446,10 @@ impl Epochs {
     fn announce(&self, announcement: &Announcement) -> usize {
         reuse_announcement(
             announcement.word.load(Ordering::Relaxed),
-            |word| announcement.word.store(word, REUSE_STORE),
+            |word| word_store(&announcement.word, word, REUSE_STORE),
             light_fence,
             || if cfg!(packedgen_exp_fresh) { 1 } else { announcement.evicted.load(Ordering::Relaxed) },
-            || self.generation.load(Ordering::Relaxed),
+            || self.generation.load(GEN_ORDER),
         )
         .unwrap_or_else(
             #[cold]
@@ -440,12 +463,12 @@ impl Epochs {
         #[cfg(test)]
         ORDERED_PINS.set(ORDERED_PINS.get() + 1);
         announce_afresh(
-            || self.generation.load(Ordering::Relaxed),
+            || self.generation.load(GEN_ORDER),
             // Release: an advance that reads the new epoch takes the thread
             // to have left its old one, so its reads under that one must
             // happen before; a relaxed store would not carry the release
             // of the unpin before it.
-            |word| announcement.word.store(word, Ordering::Release),
+            |word| word_store(&announcement.word, word, Ordering::Release),
             || fence(Ordering::SeqCst),
             || announcement.evicted.load(Ordering::Relaxed),
             || announcement.evicted.store(0, Ordering::Relaxed),
@@ -480,7 +503,7 @@ impl Epochs {
             && let Some(announcement) = self.announcements.get(reader ^ ANNOUNCED_READER)
         {
             let word = leave_announcement(announcement.word.load(Ordering::Relaxed));
-            announcement.word.store(word, Ordering::Release);
+            word_store(&announcement.word, word, Ordering::Release);
             ANNOUNCER.set(ANNOUNCER.get() - ANNOUNCER_PIN);
             return;
         }
@@ -539,7 +562,7 @@ impl Epochs {
                 remaining &= remaining - 1;
                 let announcement = &self.announcements[slot];
                 match classify_announcement(
-                    announcement.word.load(Ordering::Acquire),
+                    word_load(&announcement.word),
                     || announcement.evicted.load(Ordering::Relaxed),
                     epoch,
                 ) {
@@ -591,7 +614,7 @@ impl Epochs {
             let slot = remaining.trailing_zeros() as usize;
             remaining &= remaining - 1;
             let announcement = &self.announcements[slot];
-            match eviction_outcome(announcement.word.load(Ordering::Acquire), current) {
+            match eviction_outcome(word_load(&announcement.word), current) {
                 // A pin marked it active before the barrier.
                 None => return false,
                 Some(true) => announcement.evicted.store(EVICTED, Ordering::Relaxed),
