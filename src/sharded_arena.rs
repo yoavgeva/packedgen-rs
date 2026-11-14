@@ -166,7 +166,7 @@ const REUSE_STORE: Ordering = if cfg!(packedgen_sanitize_thread) {
 /// Whether this build can announce pins: on Linux, where `membarrier`
 /// decides at run time, and in tests and Miri elsewhere. Other builds
 /// compile the shared counters alone, as before announcements.
-const ANNOUNCEABLE: bool = ASYMMETRIC || cfg!(any(test, miri));
+const ANNOUNCEABLE: bool = !cfg!(packedgen_exp_shared) && (ASYMMETRIC || cfg!(any(test, miri)));
 
 /// Whether this process announces pins: where `membarrier` registers, and
 /// in tests and Miri elsewhere, with sequentially consistent fences on both
@@ -425,7 +425,7 @@ impl Epochs {
             announcement.word.load(Ordering::Relaxed),
             |word| announcement.word.store(word, REUSE_STORE),
             light_fence,
-            || announcement.evicted.load(Ordering::Relaxed),
+            || if cfg!(packedgen_exp_fresh) { 1 } else { announcement.evicted.load(Ordering::Relaxed) },
             || self.generation.load(Ordering::Relaxed),
         )
         .unwrap_or_else(
@@ -1141,6 +1141,8 @@ impl<T> RetiredSlots<T> {
             pin.reader
         };
         debug_assert_eq!(own, retired_queue_index());
+        #[cfg(packedgen_exp_retire_fence)]
+        fence(Ordering::SeqCst);
         let generation = epochs.generation();
         let due = reclaim_at(generation);
         let mut queue = self.queues[own].0.lock();

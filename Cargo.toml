@@ -105,7 +105,7 @@ unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "warn"
 # Set by scripts/cache_proof.sh for thread-sanitized builds.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(packedgen_sanitize_thread)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(packedgen_sanitize_thread)", "cfg(packedgen_exp_shared)", "cfg(packedgen_exp_retire_fence)", "cfg(packedgen_exp_fresh)"] }
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
