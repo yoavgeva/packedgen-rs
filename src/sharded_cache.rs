@@ -3781,6 +3781,10 @@ impl<T> ShardView<'_, T> {
         current.add_overflow(1);
         let tag = current.tag(slot % SLOTS);
         let moved_to = self.place_in(alternate, tag, raw, true)?;
+        #[cfg(test)]
+        if let Some(between) = BETWEEN_RELOCATION_STEPS.take() {
+            between();
+        }
         let moved = self.clear(slot);
         debug_assert_eq!(moved.raw, raw);
         Some(moved_to)
@@ -3896,6 +3900,10 @@ thread_local! {
     /// Runs once, when a search on this thread has missed in a key's home
     /// and is about to search its alternate.
     static BETWEEN_BUCKETS: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::Cell::new(None) };
+    /// Runs once, when a write on this thread has published a moving key
+    /// in its alternate and has yet to clear it from its home.
+    static BETWEEN_RELOCATION_STEPS: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -5071,6 +5079,60 @@ mod tests {
             .chain(&at_alternate)
             .chain(&in_other)
         {
+            assert_eq!(cache.get(key), Some(*key));
+        }
+    }
+
+    #[test]
+    fn readers_find_a_key_midway_through_its_move() {
+        // A move that cleared the key at home before publishing it in its
+        // alternate left a reader between the two steps finding it in
+        // neither bucket.
+        let cache = Arc::new(
+            ShardedCacheBuilder::new(64)
+                .shards(1)
+                .hasher(Identity)
+                .build::<u64, u64>(),
+        );
+        let shard = cache.view(0);
+        let mut unused = (1..).map(|index: u64| index.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let mut keys = |count: usize, wanted: &dyn Fn((usize, usize)) -> bool| -> Vec<u64> {
+            unused
+                .by_ref()
+                .filter(|&key| wanted(shard.candidates(key)))
+                .take(count)
+                .collect()
+        };
+        // Bucket 0 holds keys whose alternate, bucket 2, has room, and
+        // bucket 1 keys at home; the arriving key's buckets are 0 and 1.
+        let movable = keys(SLOTS, &|buckets| buckets == (0, 2));
+        let settled = keys(SLOTS, &|(home, alternate)| home == 1 && alternate != 0);
+        let arriving = keys(1, &|buckets| buckets == (0, 1))[0];
+        for &key in movable.iter().chain(&settled) {
+            cache.insert(key, key);
+        }
+        assert!(shard.buckets[0].empty_slot().is_none());
+        assert!(shard.buckets[1].empty_slot().is_none());
+        // The first key in bucket 0 moves to bucket 2.
+        let moving = movable[0];
+        let reader = Arc::clone(&cache);
+        let found = Arc::new(Mutex::new(None));
+        let midway = Arc::clone(&found);
+        BETWEEN_RELOCATION_STEPS.set(Some(Box::new(move || {
+            *midway.lock() = Some(reader.get(&moving));
+        })));
+        cache.insert(arriving, arriving);
+        assert!(
+            BETWEEN_RELOCATION_STEPS.take().is_none(),
+            "the insert moved a key"
+        );
+        assert_eq!(
+            *found.lock(),
+            Some(Some(moving)),
+            "a reader missed the moving key"
+        );
+        assert!(shard.buckets[2].is_displaced(0));
+        for key in movable.iter().chain(&settled).chain([&arriving]) {
             assert_eq!(cache.get(key), Some(*key));
         }
     }
