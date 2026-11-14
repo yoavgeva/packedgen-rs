@@ -358,9 +358,12 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
     }
 
     /// Sets the shard count, rounded up to a power of two and capped so each
-    /// shard holds at least one entry. By default it is four per available
-    /// thread, fewer for small caches, and up to sixteen per thread for
-    /// caches large enough to give each shard at least 256 entries.
+    /// shard of the [`max_capacity`](Self::max_capacity) holds at least one
+    /// entry; an entry limit below the count is raised to it. By default it
+    /// is four per available thread, fewer for small caches, and up to
+    /// sixteen per thread for caches large enough to give each shard at
+    /// least 256 entries, sized for the `max_capacity` but no more than the
+    /// entry limit.
     #[must_use]
     pub fn shards(mut self, shards: usize) -> Self {
         // Above the largest power of two, `build` caps the count anyway.
@@ -489,9 +492,11 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
         // Tables, the region, and the shard count are sized for the reserve.
         let reserve = self.max_capacity.unwrap_or(0).max(max_entries);
         let parallelism = std::thread::available_parallelism().map_or(1, usize::from);
+        // The default count, sized for the reserve, keeps the entry limit:
+        // each shard holds at least one entry.
         let shards = self
             .shards
-            .unwrap_or_else(|| default_shards(reserve, parallelism));
+            .unwrap_or_else(|| default_shards(reserve, parallelism).min(1 << max_entries.ilog2()));
         // Every shard holds an entry: a shard with none would admit one.
         let most = 1 << reserve.ilog2();
         // Main-queue records hold a slot in 24 bits.
@@ -7128,6 +7133,25 @@ mod tests {
             reserved.len()
         );
         assert!(reserved.memory_used().policy > bare.policy);
+    }
+
+    #[test]
+    fn a_reserve_keeps_the_entry_limit_the_cache_was_built_with() {
+        // Shards counted for the reserve alone raised a ten-entry limit to
+        // one entry per shard: at least 16, and 256 on sixteen threads.
+        let cache = ShardedCacheBuilder::new(10)
+            .max_capacity(1_000_000)
+            .build::<u64, u64>();
+        assert_eq!(cache.capacity(), 10);
+        for key in 0..1_000 {
+            cache.insert(key, key);
+        }
+        assert!(
+            cache.len() <= 10,
+            "{} entries in a cache of 10",
+            cache.len()
+        );
+        assert_eq!(cache.set_capacity(1_000_000), 1_000_000);
     }
 
     #[test]

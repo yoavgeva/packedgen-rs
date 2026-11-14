@@ -250,7 +250,9 @@ entry. Tables are sized once and never rebuilt.
     the largest capacity, about 8 bytes of table per reserved entry beyond
     the limit; the region and the sketches are zeroed memory, untouched
     until the capacity grows into them. Without it, the reserve is the
-    built capacity.
+    built capacity. The default shard count stays within the entry limit:
+    counted for the reserve alone, it raised a ten-entry limit with a
+    reserve of a million to 256, one entry per shard.
   - `set_capacity` returns the limit it set: the request, raised to one
     entry per shard or lowered to the reserve.
   - Under a cache-wide resize lock, each shard takes its new shares under
