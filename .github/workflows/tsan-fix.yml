@@ -1,0 +1,40 @@
+name: TSan fix check
+
+on:
+  push:
+    branches: ['bench/tsan-fix']
+
+permissions:
+  contents: read
+
+jobs:
+  tsan:
+    name: TSan ${{ matrix.job }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        job: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - name: Runs
+        env:
+          RUSTFLAGS: -Zsanitizer=thread
+          RUSTDOCFLAGS: -Zsanitizer=thread
+          TSAN_OPTIONS: history_size=7
+        run: |
+          lscpu | grep -E 'Model name|^CPU\(s\)'
+          tests="sharded_cache::tests::racing sharded_cache::tests::concurrent sharded_cache::tests::get_or_insert_with sharded_cache::tests::a_failed sharded_cache::tests::a_thread_that_exits sharded_cache::tests::dropping_a_cache sharded_cache::tests::other_writers_drain sharded_cache::tests::loads_racing sharded_cache::tests::async_and_blocking sharded_cache::tests::callers_wait sharded_cache::model_check::owners_racing"
+          for run in 1 2 3; do
+            cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu --lib -- $tests > run$run.log 2>&1 || true
+            races=$(grep -c 'WARNING: ThreadSanitizer' run$run.log || true)
+            echo "run $run: $races races; $(grep 'test result' run$run.log)"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tsan-fix-${{ matrix.job }}
+          path: run*.log
