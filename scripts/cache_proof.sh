@@ -163,10 +163,9 @@ miri() {
 
 sanitizers() {
   local target
-  # The thread sanitizer cannot see the order `membarrier` imposes on Linux
-  # pins, and reports the reads it protects as races; its builds take the
-  # portable fences instead, and Loom models check the barrier's protocol.
-  local tsan="-Zsanitizer=thread --cfg packedgen_portable_fences"
+  # The thread sanitizer does not model fences; its builds release the
+  # store that reuses a parked announcement (see `REUSE_STORE`).
+  local tsan="-Zsanitizer=thread --cfg packedgen_sanitize_thread"
   target="${PACKEDGEN_SANITIZER_TARGET:-$(rustc +nightly -vV | awk '/^host:/ { print $2 }')}"
   RUSTFLAGS="-Zsanitizer=address" RUSTDOCFLAGS="-Zsanitizer=address" \
     cargo +nightly test --target "$target" --test direct_packed_cache -- --test-threads=1

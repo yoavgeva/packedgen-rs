@@ -142,16 +142,26 @@ fn shared_pinners() -> u64 {
 
 /// Whether pins that reuse an announcement need only a compiler fence,
 /// with advances issuing `membarrier` to evict a parked announcement.
-/// Thread-sanitized builds set `packedgen_portable_fences`: the sanitizer
-/// cannot see the order `membarrier` imposes, which the Loom models in
-/// `tests/cache_concurrency_model.rs` check, and reports the reads it
-/// protects as races.
 const ASYMMETRIC: bool = cfg!(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64"),
-    not(miri),
-    not(packedgen_portable_fences)
+    not(miri)
 ));
+
+/// How a pin that reuses a parked announcement stores it. Relaxed suffices:
+/// an advance that reads the reused word blocks on its epoch or checks
+/// another, which the thread left before announcing this one afresh, and
+/// the fence after that fresh store precedes this one, so the advance
+/// synchronizes with the fence and follows the thread's reads in the epoch
+/// it checks. The thread sanitizer does not model fences and reported those
+/// reads as racing the slots' later refills, so sanitized builds
+/// (`--cfg packedgen_sanitize_thread`) release the store instead, which
+/// orders the same reads where it can see them.
+const REUSE_STORE: Ordering = if cfg!(packedgen_sanitize_thread) {
+    Ordering::Release
+} else {
+    Ordering::Relaxed
+};
 
 /// Whether this build can announce pins: on Linux, where `membarrier`
 /// decides at run time, and in tests and Miri elsewhere. Other builds
@@ -413,7 +423,7 @@ impl Epochs {
     fn announce(&self, announcement: &Announcement) -> usize {
         reuse_announcement(
             announcement.word.load(Ordering::Relaxed),
-            |word| announcement.word.store(word, Ordering::Relaxed),
+            |word| announcement.word.store(word, REUSE_STORE),
             light_fence,
             || announcement.evicted.load(Ordering::Relaxed),
             || self.generation.load(Ordering::Relaxed),
