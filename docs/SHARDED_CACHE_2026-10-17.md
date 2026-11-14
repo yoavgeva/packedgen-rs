@@ -289,7 +289,9 @@ entry. Tables are sized once and never rebuilt.
   - guard reads surviving replacement;
   - two-bucket placement under a million-key churn;
   - a reader finding a key that relocation moves between its search of the
-    key's home and of its alternate;
+    key's home and of its alternate, and one reading it midway through the
+    move, published in its alternate and not yet cleared from its home
+    (clearing first passed every other test);
   - unread main-area keys leaving in insertion order;
   - forced pair evictions staying under 0.1%;
   - an 8-thread race of replacements, removals, loads, clears, and evictions
@@ -338,6 +340,26 @@ entry. Tables are sized once and never rebuilt.
     (fails without the resize); `set_max_weight` evicting down and
     refusing values heavier than the new shares; and resizes racing four
     writing threads.
+- **Model test.** Random sequences of every operation run against a model
+  kept exact by the removal listener, which says which entries left and
+  why. After each operation the test checks reads, return values, length,
+  weight, statistics, and each shard's table: every key once, in its own
+  shard and one of its two buckets, under its tag, with its displacement
+  flag and its home's overflow count. Values count their instances, so a
+  leak or a double drop fails. 300 seeds of 2,000 operations run with each
+  of three hashers: a fixed SipHash, eight clustered hash patterns, and
+  one bucket pair for every key. Ten deliberate bugs (lost length or
+  overflow counts, wrong removal causes, unextended idle deadlines, a
+  drain yielding expired entries, resizes ignoring weight, zero tags) each
+  failed it.
+- **Owned-key race.** Four threads each own their keys and run every
+  operation on them, with clears, partial drains, `retain`, iteration, and
+  resizes reaching every thread's keys. A read returns the owner's latest
+  version or nothing, and nothing only for a confirmed version the
+  listener heard leave; afterwards every version the cache confirmed
+  caching left once or stays, at its owner's latest version, and every
+  value is dropped once. It runs twelve seeds with each of two hashers, and
+  under the thread sanitizer.
 - **Arena tests.** They cover:
   - aging of exactly three advances;
   - a pin blocking the second advance past its epoch;
