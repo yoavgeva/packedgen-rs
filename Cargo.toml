@@ -104,6 +104,8 @@ harness = false
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "warn"
+# Set by scripts/cache_proof.sh for thread-sanitized builds.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(packedgen_portable_fences)"] }
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

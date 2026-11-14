@@ -163,13 +163,17 @@ miri() {
 
 sanitizers() {
   local target
+  # The thread sanitizer cannot see the order `membarrier` imposes on Linux
+  # pins, and reports the reads it protects as races; its builds take the
+  # portable fences instead, and Loom models check the barrier's protocol.
+  local tsan="-Zsanitizer=thread --cfg packedgen_portable_fences"
   target="${PACKEDGEN_SANITIZER_TARGET:-$(rustc +nightly -vV | awk '/^host:/ { print $2 }')}"
   RUSTFLAGS="-Zsanitizer=address" RUSTDOCFLAGS="-Zsanitizer=address" \
     cargo +nightly test --target "$target" --test direct_packed_cache -- --test-threads=1
-  RUSTFLAGS="-Zsanitizer=thread" RUSTDOCFLAGS="-Zsanitizer=thread" \
+  RUSTFLAGS="$tsan" RUSTDOCFLAGS="$tsan" \
     cargo +nightly test -Zbuild-std --target "$target" \
     --test direct_packed_cache concurrent_replacement_and_pinned_reads_stay_valid -- --exact
-  RUSTFLAGS="-Zsanitizer=thread" RUSTDOCFLAGS="-Zsanitizer=thread" \
+  RUSTFLAGS="$tsan" RUSTDOCFLAGS="$tsan" \
     cargo +nightly test -Zbuild-std --target "$target" --features prepared-keys \
     --test direct_packed_cache \
     concurrent_prepared_replacement_batches_recycle_without_lost_values -- --exact
@@ -178,9 +182,9 @@ sanitizers() {
     sharded_cache::model_check
   RUSTFLAGS="-Zsanitizer=address" RUSTDOCFLAGS="-Zsanitizer=address" \
     cargo +nightly test --target "$target" --test sharded_cache_every_operation
-  RUSTFLAGS="-Zsanitizer=thread" RUSTDOCFLAGS="-Zsanitizer=thread" \
+  RUSTFLAGS="$tsan" RUSTDOCFLAGS="$tsan" \
     cargo +nightly test -Zbuild-std --target "$target" --test sharded_cache_every_operation
-  RUSTFLAGS="-Zsanitizer=thread" RUSTDOCFLAGS="-Zsanitizer=thread" \
+  RUSTFLAGS="$tsan" RUSTDOCFLAGS="$tsan" \
     cargo +nightly test -Zbuild-std --target "$target" --lib -- \
     sharded_cache::tests::racing sharded_cache::tests::concurrent \
     sharded_cache::tests::get_or_insert_with sharded_cache::tests::a_failed \

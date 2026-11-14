@@ -417,7 +417,12 @@ entry. Tables are sized once and never rebuilt.
 - **CI tools.** `scripts/cache_proof.sh` runs the module under Miri, ASan, and
   TSan. CI runs the tests on x86_64 Linux, Apple Silicon macOS, and x86_64
   Windows; on macOS and Windows, which lack `membarrier` and `madvise`, they
-  run the portable fallbacks.
+  run the portable fallbacks. TSan builds take the portable fences on Linux
+  too (`--cfg packedgen_portable_fences`): it cannot see the order
+  `membarrier` imposes, and under the owned-key race it reported the reads a
+  parked announcement's eviction protects as racing the slots' refills,
+  where the same test under TSan with fences, on macOS, reported none. The
+  barrier's protocol is checked by Loom models with negative controls.
 
 ## Memory
 

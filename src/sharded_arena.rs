@@ -142,10 +142,15 @@ fn shared_pinners() -> u64 {
 
 /// Whether pins that reuse an announcement need only a compiler fence,
 /// with advances issuing `membarrier` to evict a parked announcement.
+/// Thread-sanitized builds set `packedgen_portable_fences`: the sanitizer
+/// cannot see the order `membarrier` imposes, which the Loom models in
+/// `tests/cache_concurrency_model.rs` check, and reports the reads it
+/// protects as races.
 const ASYMMETRIC: bool = cfg!(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64"),
-    not(miri)
+    not(miri),
+    not(packedgen_portable_fences)
 ));
 
 /// Whether this build can announce pins: on Linux, where `membarrier`
