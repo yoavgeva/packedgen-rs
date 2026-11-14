@@ -38,8 +38,8 @@ use crate::cache_arena::{assigned_thread_shards, claimed_thread_shards, direct_a
 pub(crate) use crate::direct_epoch_protocol::reclaim_at;
 use crate::direct_epoch_protocol::{
     Announced, EPOCHS, EVICTED, EVICTING, announce_afresh, classify_announcement, enter_epoch,
-    epoch_slot, eviction_outcome, leave_announcement, leave_epoch, plan_epoch_advance,
-    reuse_announcement,
+    epoch_slot, eviction_outcome, held_announcers, leave_announcement, leave_epoch,
+    plan_epoch_advance, reuse_announcement,
 };
 
 /// Reader counters are spread over this many cache lines per epoch.
@@ -147,21 +147,6 @@ const ASYMMETRIC: bool = cfg!(all(
     any(target_arch = "x86_64", target_arch = "aarch64"),
     not(miri)
 ));
-
-/// How a pin that reuses a parked announcement stores it. Relaxed suffices:
-/// an advance that reads the reused word blocks on its epoch or checks
-/// another, which the thread left before announcing this one afresh, and
-/// the fence after that fresh store precedes this one, so the advance
-/// synchronizes with the fence and follows the thread's reads in the epoch
-/// it checks. The thread sanitizer does not model fences and reported those
-/// reads as racing the slots' later refills, so sanitized builds
-/// (`--cfg packedgen_sanitize_thread`) release the store instead, which
-/// orders the same reads where it can see them.
-const REUSE_STORE: Ordering = if cfg!(packedgen_sanitize_thread) {
-    Ordering::Release
-} else {
-    Ordering::Relaxed
-};
 
 /// Whether this build can announce pins: on Linux, where `membarrier`
 /// decides at run time, and in tests and Miri elsewhere. Other builds
@@ -423,7 +408,7 @@ impl Epochs {
     fn announce(&self, announcement: &Announcement) -> usize {
         reuse_announcement(
             announcement.word.load(Ordering::Relaxed),
-            |word| announcement.word.store(word, REUSE_STORE),
+            |word| announcement.word.store(word, Ordering::Relaxed),
             light_fence,
             || announcement.evicted.load(Ordering::Relaxed),
             || self.generation.load(Ordering::Relaxed),
@@ -518,7 +503,7 @@ impl Epochs {
         let announcers = if self.announcements.is_empty() {
             0
         } else {
-            ANNOUNCERS_HELD.load(Ordering::Relaxed)
+            held_announcers(|order| ANNOUNCERS_HELD.load(order))
         };
         let mut evicting = 0_u64;
         let Some(advance) = plan_epoch_advance(generation, |epoch| {

@@ -377,7 +377,10 @@ entry. Tables are sized once and never rebuilt.
     under a pin a thread-local still holds keeping its slot (each verified
     to fail without its condition);
   - on Linux, `membarrier` registering and an advance evicting a parked
-    announcement.
+    announcement;
+  - an advance acquiring the held-slot mask before skipping an exited
+    thread's announcement (a Loom model; loading it relaxed races the
+    thread's reads with the reclamation).
 - **Layout and sizing tests.** They check that a write's shard state spans
   two cache lines, that shards share one bucket table, that the default
   shard count gives every extra shard at least 256 entries, that a cache
@@ -417,13 +420,7 @@ entry. Tables are sized once and never rebuilt.
 - **CI tools.** `scripts/cache_proof.sh` runs the module under Miri, ASan, and
   TSan. CI runs the tests on x86_64 Linux, Apple Silicon macOS, and x86_64
   Windows; on macOS and Windows, which lack `membarrier` and `madvise`, they
-  run the portable fallbacks. TSan builds set
-  `--cfg packedgen_sanitize_thread`, which releases the store of a pin that
-  reuses a parked announcement. Relaxed, it follows the fence of the
-  announcement's fresh store, and an advance that reads it synchronizes
-  with that fence; the sanitizer does not model fences, and under the
-  owned-key race it reported reads of entry slots as racing the slots'
-  later refills, with every value and drop count right.
+  run the portable fallbacks.
 
 ## Memory
 
@@ -682,6 +679,16 @@ On Linux, threads now announce their pins:
 - A thread returns its slot when it exits, unless it still holds a pin
   that another thread-local's destructor drops later. The slot then stays
   held for good.
+- An advance skips the slots no thread holds, so it acquires the mask of
+  held slots: a thread gives its slot back with a release, and that
+  acquire is all that orders the reads the thread made before exiting
+  ahead of a reclamation. The mask was loaded relaxed until the owned-key
+  race ran under the thread sanitizer on 4-vCPU Linux runners, which
+  reported every such read racing the slot's later refill; in all 26
+  reports read in full, the reader had exited. Hardware orders the reads
+  before the release, so no run failed, but the language's memory model
+  left them racing. A Loom model with a negative control checks the
+  acquire.
 - These pin through the counters as before: threads past the 64th, threads
   pinning during their exit, kernels without `membarrier`, and other
   platforms.

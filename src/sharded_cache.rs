@@ -7200,12 +7200,13 @@ mod tests {
     #[test]
     fn a_reserve_keeps_the_entry_limit_the_cache_was_built_with() {
         // Shards counted for the reserve alone raised a ten-entry limit to
-        // one entry per shard: at least 16, and 256 on sixteen threads.
+        // one entry per shard: at least 16 for a reserve of 4,096, and 256
+        // for a million on sixteen threads.
         let cache = ShardedCacheBuilder::new(10)
-            .max_capacity(1_000_000)
+            .max_capacity(4_096)
             .build::<u64, u64>();
         assert_eq!(cache.capacity(), 10);
-        for key in 0..1_000 {
+        for key in 0..200 {
             cache.insert(key, key);
         }
         assert!(
@@ -7213,10 +7214,11 @@ mod tests {
             "{} entries in a cache of 10",
             cache.len()
         );
-        assert_eq!(cache.set_capacity(1_000_000), 1_000_000);
+        assert_eq!(cache.set_capacity(4_096), 4_096);
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "four hundred thousand hashes and thousands of inserts")]
     fn a_resized_shard_counts_keys_in_a_sketch_sized_for_its_new_capacity() {
         // A sketch kept at the capacity a cache was built with gave each
         // counter of one grown sixteenfold sixteen times the keys.

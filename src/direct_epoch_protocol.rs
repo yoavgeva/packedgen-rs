@@ -48,6 +48,19 @@ pub(crate) fn reclaim_at(tag: usize) -> usize {
     tag.saturating_add(AGING_ADVANCES + 1)
 }
 
+/// The announcer slots an advance checks, from `load` of the held-slot
+/// mask. A thread that exits gives its slot back with a release, and the
+/// advance then skips its announcement, so only this load can order the
+/// pins the thread made before it exited ahead of a reclamation.
+#[allow(dead_code, reason = "each including crate uses a different subset")]
+#[inline]
+pub(crate) fn held_announcers<Load>(load: Load) -> u64
+where
+    Load: FnOnce(std::sync::atomic::Ordering) -> u64,
+{
+    load(std::sync::atomic::Ordering::Acquire)
+}
+
 #[inline]
 pub(crate) fn enter_epoch<Load, Acquire, Release>(
     mut load_generation: Load,
