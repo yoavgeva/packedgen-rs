@@ -124,6 +124,7 @@ struct Exercised {
     resizes: u64,
     pair_evictions: u64,
     relocations: u64,
+    overflowed: u64,
 }
 
 struct Model {
@@ -401,10 +402,15 @@ impl<S: BuildHasher> Run<'_, S> {
     }
 
     fn insert(&mut self, key: u64) {
-        let (version, weight) = (self.model.version(), self.weight());
+        let weight = self.weight();
         let ttl = self
             .rng
             .pick(&[Ttl::Default, Ttl::Default, Ttl::Hour, Ttl::Zero]);
+        self.write(key, weight, ttl);
+    }
+
+    fn write(&mut self, key: u64, weight: u64, ttl: Ttl) {
+        let version = self.model.version();
         let value = Versioned::new(version, weight);
         let cached = match ttl {
             Ttl::Default => self.cache.insert(key, value),
@@ -643,6 +649,49 @@ impl<S: BuildHasher> Run<'_, S> {
         assert_eq!(borrowed.map(|value| (value.version, value.weight)), kept);
     }
 
+    /// Holds a guard across more writes than the slab region has slots, so
+    /// entries move into overflow chunks, and checks every value it
+    /// borrowed before them.
+    fn long_pin(&mut self) {
+        let cache = self.cache;
+        let guard = cache.pin();
+        let mut borrowed = Vec::new();
+        for key in 0..self.keys {
+            let value = guard.get(&key);
+            let modeled = self.model.read(key);
+            assert_eq!(
+                value.map(|value| value.version),
+                modeled.map(|modeled| modeled.version)
+            );
+            borrowed.extend(value.map(|value| (value, value.version)));
+        }
+        let mut writes = 0;
+        while cache.slots.overflow_chunks() == 0 {
+            assert!(
+                writes < 3 * cache.slots.region_slots(),
+                "{writes} writes under a guard stayed within the region"
+            );
+            // Weightless, so no write is refused.
+            let key = self.rng.below(self.keys);
+            if self.rng.below(8) == 0 {
+                self.remove(key);
+            } else {
+                self.write(key, 0, Ttl::Default);
+            }
+            writes += 1;
+        }
+        // Some cached entries then live in overflow slots.
+        for _ in 0..64 {
+            let key = self.rng.below(self.keys);
+            self.write(key, 0, Ttl::Default);
+        }
+        self.check();
+        for (value, version) in borrowed {
+            assert_eq!(value.version, version);
+        }
+        self.exercised.overflowed += 1;
+    }
+
     fn retain(&mut self) {
         let salt = self.rng.below(3);
         let mut offered = HashMap::new();
@@ -860,7 +909,14 @@ fn run<S: BuildHasher + Clone>(seed: u64, hasher: &S, steps: usize, exercised: &
         };
         let (pairs, relocations) = (WINDOW_EVICTIONS.get(), RELOCATIONS.get());
         for step in 0..steps {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run.step()));
+            // One run in ten pins past the slab region once, midway.
+            let long_pin = !cfg!(miri) && seed % 10 == 0 && step == steps / 2;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if long_pin {
+                    run.long_pin();
+                }
+                run.step();
+            }));
             if let Err(panic) = result {
                 eprintln!(
                     "seed {seed}, step {step}: {shards} shards, capacity {capacity} of \
@@ -877,6 +933,7 @@ fn run<S: BuildHasher + Clone>(seed: u64, hasher: &S, steps: usize, exercised: &
         exercised.resizes += run.exercised.resizes;
         exercised.pair_evictions += WINDOW_EVICTIONS.get() - pairs;
         exercised.relocations += RELOCATIONS.get() - relocations;
+        exercised.overflowed += run.exercised.overflowed;
     }
     assert_eq!(
         VERSIONED_ALIVE.get(),
@@ -909,6 +966,7 @@ fn run_seeds<S: BuildHasher + Clone>(first: u64, hasher: &S, relocates: bool, fi
         resizes,
         pair_evictions,
         relocations,
+        overflowed,
     } = &exercised;
     assert!(
         [
@@ -917,7 +975,8 @@ fn run_seeds<S: BuildHasher + Clone>(first: u64, hasher: &S, relocates: bool, fi
             refusals,
             loads_cached,
             replacements,
-            resizes
+            resizes,
+            overflowed
         ]
         .iter()
         .all(|count| **count > 0)
