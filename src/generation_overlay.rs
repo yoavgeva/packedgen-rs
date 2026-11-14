@@ -3409,21 +3409,17 @@ impl<C: StableCell, const KEY_BYTES: usize, const KEY_WORDS: usize>
     }
 
     fn write_key(&self, index: usize, key: &[u8]) {
-        for word in 0..KEY_WORDS {
-            self.slots[index].key_words[word].store(key_word(key, word), Ordering::Relaxed);
+        for (word, stored) in self.slots[index].key_words.iter().enumerate() {
+            stored.store(key_word(key, word), Ordering::Relaxed);
         }
     }
 
     fn load_key(&self, index: usize) -> [u8; KEY_BYTES] {
         let mut key = [0_u8; KEY_BYTES];
-        for word in 0..KEY_WORDS {
+        for (word, stored) in self.slots[index].key_words.iter().enumerate() {
             let begin = word * size_of::<u64>();
             let end = begin + size_of::<u64>();
-            key[begin..end].copy_from_slice(
-                &self.slots[index].key_words[word]
-                    .load(Ordering::Relaxed)
-                    .to_ne_bytes(),
-            );
+            key[begin..end].copy_from_slice(&stored.load(Ordering::Relaxed).to_ne_bytes());
         }
         key
     }
