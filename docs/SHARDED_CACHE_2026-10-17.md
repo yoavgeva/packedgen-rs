@@ -246,16 +246,21 @@ entry. Tables are sized once and never rebuilt.
 - **Resizing.** `set_capacity` and `set_max_weight` change the limits at
   run time.
   - Tables are never rebuilt, so the builder's `max_capacity` reserves the
-    table, the slab region, the main queues' rings, and the shard count for
+    table, the slab region, the frequency sketches, and the shard count for
     the largest capacity, about 8 bytes of table per reserved entry beyond
-    the limit. Without it, the reserve is the built capacity.
+    the limit; the region and the sketches are zeroed memory, untouched
+    until the capacity grows into them. Without it, the reserve is the
+    built capacity.
   - `set_capacity` returns the limit it set: the request, raised to one
     entry per shard or lowered to the reserve.
   - Under a cache-wide resize lock, each shard takes its new shares under
     its own lock and evicts down to them before the call returns, so the
     listener hears `Size` for each. A shard whose entry share changes
     starts its ghost and main filters afresh at the new size, keeping its
-    probation target within the new bounds.
+    probation target within the new bounds, and places its sketch's
+    counters in the lines sized for its new share, forgetting the counts.
+    Before, the sketch kept its built size: a cache grown sixteenfold gave
+    each counter sixteen times the keys.
   - Shard limits became atomics read with relaxed loads under the shard
     lock. `get` and `evict` compile to the same instructions; the insert
     body to 1,229 against 1,234.
@@ -327,8 +332,10 @@ entry. Tables are sized once and never rebuilt.
     the retirement on drop); `memory_used` counting the table, slots
     handed out, and their reuse;
   - `set_capacity` evicting down at once and growing back within the
-    reserve, `set_max_weight` evicting down and refusing values heavier
-    than the new shares, and resizes racing four writing threads.
+    reserve, and sizing each shard's sketch as one built at its new share
+    (fails without the resize); `set_max_weight` evicting down and
+    refusing values heavier than the new shares; and resizes racing four
+    writing threads.
 - **Arena tests.** They cover:
   - aging of exactly three advances;
   - a pin blocking the second advance past its epoch;

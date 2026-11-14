@@ -237,8 +237,9 @@ pub struct ShardedCacheMemory {
     /// never handed out are not counted: a large slab region's untouched
     /// pages take no memory.
     pub entries: usize,
-    /// Each shard's policy state: its filters of evicted keys, its frequency
-    /// sketch, its main queue's ring, and its probation queue.
+    /// Each shard's policy state: its filters of evicted keys, the lines of
+    /// its frequency sketch its capacity uses, its main queue's ring, and
+    /// its probation queue.
     pub policy: usize,
     /// Everything else: the epochs' reader counters, the queues of removed
     /// entries awaiting reclamation, the shards' locks and counters, and the
@@ -336,10 +337,11 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
 
     /// Lets [`ShardedCache::set_capacity`] raise the entry limit up to
     /// `max_capacity`. Tables are never rebuilt, so the table, the slab
-    /// region, and the shard count are sized for `max_capacity` from the
-    /// start: about 8 bytes of table per reserved entry beyond the entry
-    /// limit. Without it, a cache can shrink and grow back up to the
-    /// capacity it was built with.
+    /// region, the frequency sketches, and the shard count are sized for
+    /// `max_capacity` from the start: about 8 bytes of table per reserved
+    /// entry beyond the entry limit. The slab region and the sketches take
+    /// memory only as the capacity grows into them. Without it, a cache can
+    /// shrink and grow back up to the capacity it was built with.
     #[must_use]
     pub fn max_capacity(mut self, max_capacity: usize) -> Self {
         self.max_capacity = Some(max_capacity);
@@ -517,6 +519,7 @@ impl<W, S, L> ShardedCacheBuilder<W, S, L> {
                 .map(|index| {
                     Shard::new(
                         share(max_entries, shards, index),
+                        shard_reserve,
                         weight_share(max_weight, shards, index),
                         self.probation_bps,
                     )
@@ -1585,7 +1588,8 @@ where
     /// Each shard over its new share evicts down to it before this returns,
     /// as inserts would evict, and the removal listener hears
     /// [`RemovalCause::Size`] for each. A shard whose share changes starts
-    /// its filters of evicted keys afresh, sized for the new share.
+    /// its filters of evicted keys and its frequency sketch afresh, sized
+    /// for the new share.
     pub fn set_capacity(&self, max_entries: usize) -> usize {
         let _resizing = self.resizing.lock();
         let max_entries = max_entries.clamp(self.shards.len(), self.max_capacity);
@@ -1626,6 +1630,11 @@ where
                         .probation_target()
                         .clamp(1, shard.limits.probation_max());
                     writer.filters = Filters::new(capacity, target);
+                    shard.state.sketch.resize(capacity);
+                    // The victims' average and the pending counts were
+                    // taken in the old sketch.
+                    writer.victim_counts = 0;
+                    writer.pending = PendingCounts::default();
                 }
                 shard
                     .limits
@@ -2866,7 +2875,7 @@ where
                 writer.filters.lines.len() * size_of::<FilterLine>()
                     + writer.main.records.len() * size_of::<u32>()
                     + writer.probation.capacity() * size_of::<Probationary>()
-                    + size_of_val(&*shard.sketch.lines)
+                    + shard.sketch.in_use() * size_of::<SketchLine>()
             })
             .sum();
         let flights = self
@@ -3429,15 +3438,15 @@ impl<K, V, W, S, L> Drop for ShardedCache<K, V, W, S, L> {
 }
 
 impl<T> Shard<T> {
-    /// A shard holding `capacity` entries.
-    fn new(capacity: usize, weight_limit: u64, probation_bps: u16) -> Self {
+    /// A shard holding `capacity` entries, with room to grow to `reserve`.
+    fn new(capacity: usize, reserve: usize, weight_limit: u64, probation_bps: u16) -> Self {
         let limits = ShardLimits::new(capacity, weight_limit);
         let probation_target =
             (capacity * usize::from(probation_bps) / 10_000).clamp(1, limits.probation_max());
         let main = MainQueue::with_capacity(limits.main_limit() + 1);
         Self {
             limits,
-            sketch: FrequencySketch::new(capacity),
+            sketch: FrequencySketch::new(capacity, reserve),
             writer: ShardLock {
                 len: AtomicUsize::new(0),
                 weight: AtomicU64::new(0),
@@ -3911,18 +3920,31 @@ const fn overflow(meta: u64) -> u64 {
 /// and is advised for huge pages before its first write.
 #[allow(unsafe_code, reason = "an all-zero bucket is empty")]
 fn empty_table(buckets: usize) -> Box<[Bucket]> {
-    let layout = std::alloc::Layout::array::<Bucket>(buckets).expect("the table fits isize");
-    assert_ne!(layout.size(), 0, "a table has buckets");
+    // SAFETY: a bucket is atomics and arrays of them, valid as all-zero
+    // bits, and zero tags and handles mark every slot empty.
+    let table = unsafe { zeroed_slice::<Bucket>(buckets) };
+    advise_huge_pages(table.as_ptr().cast(), size_of_val(&*table));
+    table
+}
+
+/// `len` values from zeroed memory, which a large allocation takes straight
+/// from the kernel, untouched until written.
+///
+/// # Safety
+///
+/// All-zero bits must be a valid `T`.
+#[allow(unsafe_code, reason = "builds values from zeroed memory")]
+unsafe fn zeroed_slice<T>(len: usize) -> Box<[T]> {
+    let layout = std::alloc::Layout::array::<T>(len).expect("the slice fits isize");
+    assert_ne!(layout.size(), 0, "a zeroed slice has a size");
     // SAFETY: the layout has a nonzero size.
-    let table = unsafe { std::alloc::alloc_zeroed(layout) };
-    if table.is_null() {
+    let memory = unsafe { std::alloc::alloc_zeroed(layout) };
+    if memory.is_null() {
         std::alloc::handle_alloc_error(layout);
     }
-    advise_huge_pages(table, layout.size());
-    // SAFETY: the global allocator gave `table` the layout a boxed slice of
-    // `buckets` buckets uses. A bucket is atomics and arrays of them, valid
-    // as all-zero bits, and zero tags and handles mark every slot empty.
-    unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(table.cast(), buckets)) }
+    // SAFETY: the global allocator gave `memory` the layout a boxed slice of
+    // `len` values uses, and the caller proves its zero bits valid values.
+    unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(memory.cast(), len)) }
 }
 
 /// The tick `elapsed` nanoseconds after a cache was built; it saturates
@@ -4321,8 +4343,15 @@ impl Filters {
 /// cache line, so counting or estimating a key touches one line. Writers
 /// change it only under the shard lock; its words are atomic so that it can
 /// sit outside the lock, where an insert finds its line before locking.
+///
+/// It holds lines for the shard's reserve, and places counters in those
+/// sized for its capacity, so a resize can widen or narrow it in place.
+/// Lines are zeroed memory, untouched until a capacity uses them.
 struct FrequencySketch {
     lines: Box<[SketchLine]>,
+    /// The lines counters are placed in, sized for the shard's capacity.
+    /// Changed only under the shard lock, by a resize.
+    in_use: AtomicUsize,
 }
 
 /// Eight words of sixteen 4-bit counters.
@@ -4333,14 +4362,38 @@ struct SketchLine([AtomicU64; SKETCH_WORDS_PER_LINE]);
 type SketchCounter = (usize, usize, u32);
 
 impl FrequencySketch {
-    fn new(capacity: usize) -> Self {
-        let lines =
-            (capacity.max(1) * SKETCH_COUNTERS_PER_ENTRY).div_ceil(SKETCH_COUNTERS_PER_LINE);
+    /// A sketch for `capacity` keys, with lines for up to `reserve`.
+    #[allow(unsafe_code, reason = "builds the lines from zeroed memory")]
+    fn new(capacity: usize, reserve: usize) -> Self {
+        let lines = Self::lines_for(reserve.max(capacity));
         Self {
-            lines: (0..lines)
-                .map(|_| SketchLine(std::array::from_fn(|_| AtomicU64::new(0))))
-                .collect(),
+            // SAFETY: a line is atomics, valid as all-zero bits: counts of
+            // zero.
+            lines: unsafe { zeroed_slice(lines) },
+            in_use: AtomicUsize::new(Self::lines_for(capacity)),
         }
+    }
+
+    /// The lines that hold counters for `capacity` keys.
+    fn lines_for(capacity: usize) -> usize {
+        (capacity.max(1) * SKETCH_COUNTERS_PER_ENTRY).div_ceil(SKETCH_COUNTERS_PER_LINE)
+    }
+
+    /// The lines counters are placed in.
+    #[inline]
+    fn in_use(&self) -> usize {
+        self.in_use.load(Ordering::Relaxed)
+    }
+
+    /// Places counters in the lines sized for `capacity` keys, and forgets
+    /// every count, as counters move with the lines' number. Requires the
+    /// shard lock.
+    fn resize(&self, capacity: usize) {
+        self.in_use.store(
+            Self::lines_for(capacity).min(self.lines.len()),
+            Ordering::Relaxed,
+        );
+        self.clear();
     }
 
     /// The bits that place `hash` in the sketch: its high half, which the
@@ -4354,8 +4407,14 @@ impl FrequencySketch {
 
     #[inline]
     fn line_index(&self, mixed: u64) -> usize {
-        usize::try_from(((mixed >> 32) * self.lines.len() as u64) >> 32)
+        usize::try_from(((mixed >> 32) * self.in_use() as u64) >> 32)
             .expect("a sketch line index fits usize")
+    }
+
+    /// The lines counters are placed in.
+    #[cfg(test)]
+    fn lines(&self) -> usize {
+        self.in_use()
     }
 
     /// The line holding `hash`'s counters.
@@ -4455,7 +4514,7 @@ impl FrequencySketch {
     #[inline]
     fn age(&self, evictions: u64) {
         if evictions.trailing_zeros() >= SKETCH_AGING_SHIFT {
-            let words = (self.lines.len() * SKETCH_WORDS_PER_LINE) as u64;
+            let words = (self.in_use() * SKETCH_WORDS_PER_LINE) as u64;
             let index = usize::try_from((evictions >> SKETCH_AGING_SHIFT) % words)
                 .expect("a sketch word index fits usize");
             let word = &self.lines[index / SKETCH_WORDS_PER_LINE].0[index % SKETCH_WORDS_PER_LINE];
@@ -4468,7 +4527,7 @@ impl FrequencySketch {
 
     /// Forgets every count. Requires the shard lock.
     fn clear(&self) {
-        for word in self.lines.iter().flat_map(|line| &line.0) {
+        for word in self.lines[..self.in_use()].iter().flat_map(|line| &line.0) {
             word.store(0, Ordering::Relaxed);
         }
     }
@@ -6801,7 +6860,7 @@ mod tests {
         let sketches = cache
             .shards
             .iter()
-            .map(|shard| size_of_val(&*shard.sketch.lines))
+            .map(|shard| shard.sketch.lines() * size_of::<SketchLine>())
             .sum::<usize>();
         assert!(sketches >= 1_000 * SKETCH_COUNTERS_PER_ENTRY / 2);
         assert!(empty.policy > sketches);
@@ -7069,6 +7128,38 @@ mod tests {
             reserved.len()
         );
         assert!(reserved.memory_used().policy > bare.policy);
+    }
+
+    #[test]
+    fn a_resized_shard_counts_keys_in_a_sketch_sized_for_its_new_capacity() {
+        // A sketch kept at the capacity a cache was built with gave each
+        // counter of one grown sixteenfold sixteen times the keys.
+        let lines = |cache: &ShardedCache<u64, u64>| cache.shards[0].sketch.lines();
+        let built = |capacity| ShardedCacheBuilder::new(capacity).shards(1).build();
+        let cache = ShardedCacheBuilder::new(256)
+            .max_capacity(4_096)
+            .shards(1)
+            .build::<u64, u64>();
+        for capacity in [256, 4_096, 64, 1_000] {
+            cache.set_capacity(capacity);
+            let sketch = &cache.shards[0].sketch;
+            assert_eq!(lines(&cache), lines(&built(capacity)), "at {capacity}");
+            // Keys spread over every line of it and none past.
+            let reached: std::collections::HashSet<usize> = (0..100_000_u64)
+                .map(|key| sketch.line_index(FrequencySketch::mixed(cache.hash(&key))))
+                .collect();
+            assert_eq!(reached.len(), lines(&cache), "at {capacity}");
+            assert!(reached.iter().all(|line| *line < lines(&cache)));
+            for key in 0..2 * capacity as u64 {
+                cache.insert(key, key);
+                let _ = cache.get(&(key / 2));
+            }
+        }
+        // The memory report counts the lines in use.
+        let (policy, wide) = (cache.memory_used().policy, lines(&cache));
+        cache.set_capacity(64);
+        let narrowed = (wide - lines(&cache)) * size_of::<SketchLine>();
+        assert!(policy - cache.memory_used().policy >= narrowed);
     }
 
     #[test]
@@ -7941,7 +8032,7 @@ mod tests {
     fn an_increment_loads_each_of_its_two_words_once() {
         // Relaxed atomic loads are never merged: reading each counter and
         // then its word again to raise it loaded four times.
-        let sketch = FrequencySketch::new(1_024);
+        let sketch = FrequencySketch::new(1_024, 1_024);
         let hash = BuildHasherDefault::<DefaultHasher>::default().hash_one(7_u64);
         for count in 1..=3 {
             SKETCH_LOADS.with(|loads| loads.set(0));
@@ -7953,7 +8044,7 @@ mod tests {
 
     #[test]
     fn the_frequency_sketch_counts_each_key_up_to_fifteen() {
-        let sketch = FrequencySketch::new(1_024);
+        let sketch = FrequencySketch::new(1_024, 1_024);
         let hash = |key: u64| BuildHasherDefault::<DefaultHasher>::default().hash_one(key);
         for count in 1..=20_u8 {
             sketch.increment(hash(1));
@@ -7974,7 +8065,7 @@ mod tests {
     fn the_frequency_sketch_raises_only_a_keys_smallest_counters() {
         // In a one-line sketch keys often share a counter. A key whose other
         // counter is lower leaves the shared one to the key that raised it.
-        let sketch = FrequencySketch::new(16);
+        let sketch = FrequencySketch::new(16, 16);
         let hash = |key: u64| BuildHasherDefault::<DefaultHasher>::default().hash_one(key);
         let first = sketch.counters(hash(1));
         let other = (2..10_000_u64)
@@ -8002,7 +8093,7 @@ mod tests {
     #[test]
     fn the_frequency_sketch_halves_every_counter_once_per_aging_period() {
         let capacity = 1_024;
-        let sketch = FrequencySketch::new(capacity);
+        let sketch = FrequencySketch::new(capacity, capacity);
         let hash = |key: u64| BuildHasherDefault::<DefaultHasher>::default().hash_one(key);
         for _ in 0..12 {
             sketch.increment(hash(1));
@@ -8130,7 +8221,15 @@ mod tests {
         // shard state a write touches moves to its core while it holds the
         // lock. Replacing needs the lock word and the counts; an insert that
         // evicts from probation needs the probation queue, then the filters.
-        let shard = Shard::<(u64, u64)>::new(64, u64::MAX, DEFAULT_PROBATION_BPS);
+        let shard = Shard::<(u64, u64)>::new(64, 64, u64::MAX, DEFAULT_PROBATION_BPS);
+        // Inserts read the limits and place keys in the sketch from one line.
+        let limits = std::ptr::addr_of!(shard.limits) as usize;
+        let sketch_end = std::ptr::addr_of!(shard.sketch) as usize + size_of::<FrequencySketch>();
+        assert_eq!(
+            limits / 64,
+            (sketch_end - 1) / 64,
+            "the sketch leaves the limits' line"
+        );
         let base = std::ptr::addr_of!(shard.writer) as usize;
         let line = |field: usize, size: usize| {
             let first = (field - base) / 64;
