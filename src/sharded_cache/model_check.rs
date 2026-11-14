@@ -910,7 +910,7 @@ fn run<S: BuildHasher + Clone>(seed: u64, hasher: &S, steps: usize, exercised: &
         let (pairs, relocations) = (WINDOW_EVICTIONS.get(), RELOCATIONS.get());
         for step in 0..steps {
             // One run in ten pins past the slab region once, midway.
-            let long_pin = !cfg!(miri) && seed % 10 == 0 && step == steps / 2;
+            let long_pin = !cfg!(miri) && seed.is_multiple_of(10) && step == steps / 2;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if long_pin {
                     run.long_pin();
