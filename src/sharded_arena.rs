@@ -34,13 +34,13 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use parking_lot::Mutex;
 
-use crate::cache_arena::{assigned_thread_shards, claimed_thread_shards, direct_arena_thread};
 pub(crate) use crate::direct_epoch_protocol::reclaim_at;
 use crate::direct_epoch_protocol::{
     Announced, EPOCHS, EVICTED, EVICTING, announce_afresh, classify_announcement, enter_epoch,
     epoch_slot, eviction_outcome, held_announcers, leave_announcement, leave_epoch,
     plan_epoch_advance, reuse_announcement,
 };
+use crate::thread_index::{assigned_thread_shards, claimed_thread_shards, thread_index};
 
 /// Reader counters are spread over this many cache lines per epoch.
 const READER_SHARDS: usize = 64;
@@ -125,7 +125,7 @@ impl Drop for AnnouncerRelease {
 /// Sets this thread's bit in `SHARED_PINNERS`, sequentially consistently,
 /// before its first pin through the shared counters.
 fn claim_shared_pinner() {
-    SHARED_PINNERS.fetch_or(1 << (direct_arena_thread() & 63), Ordering::SeqCst);
+    SHARED_PINNERS.fetch_or(1 << (thread_index() & 63), Ordering::SeqCst);
 }
 
 /// The shared pinners, read with a zero-delta read-modify-write, which
@@ -392,7 +392,7 @@ impl Epochs {
     /// Pins through the shared counters.
     #[inline]
     fn pin_shared(&self) -> EpochPin<'_> {
-        let shard = direct_arena_thread() & (READER_SHARDS - 1);
+        let shard = thread_index() & (READER_SHARDS - 1);
         EpochPin {
             epochs: self,
             epoch: self.enter(shard),
@@ -964,7 +964,7 @@ const RETIRED_QUEUES: usize = READER_SHARDS;
 /// The retired queue this thread uses in every cache.
 #[inline]
 pub(crate) fn retired_queue_index() -> usize {
-    direct_arena_thread() & (RETIRED_QUEUES - 1)
+    thread_index() & (RETIRED_QUEUES - 1)
 }
 /// A thread drains another thread's aged slots once per this many of its
 /// own retirements, so a queue whose thread stopped writing still drains.

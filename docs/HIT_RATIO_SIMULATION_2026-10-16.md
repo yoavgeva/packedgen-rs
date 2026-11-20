@@ -23,7 +23,7 @@ qualify a release.
 
 ## Method
 
-`examples/hit_ratio_sim.rs` replays a fixed trace on one thread through:
+`crates/research/examples/hit_ratio_sim.rs` replays a fixed trace on one thread through:
 
 - the direct cache, in every admission mode,
 - QuickCache 0.7's `unsync` cache with a fixed hasher,
@@ -182,7 +182,7 @@ on recency-heavy traffic, as Caffeine's adaptive W-TinyLFU window does.
 
 ## Memory
 
-`tests/direct_cache_memory.rs` measures requested live bytes (`stats_alloc`,
+`crates/research/tests/direct_cache_memory.rs` measures requested live bytes (`stats_alloc`,
 not RSS) for 32-byte keys and `u64` values, with and without probation. Each
 cache is measured once filled to capacity and once after inserting twice its
 capacity:

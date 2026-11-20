@@ -54,7 +54,7 @@ The pre-fix root-only lint was also RED:
 docker run --rm --cpus=2 --memory=4g --user 0:0 --mount type=bind,src=/Users/yoavgea/repos/packedgen-rs,dst=/src,readonly --mount type=bind,src=/Users/yoavgea/repos/packedgen-rs/target/linux-verification,dst=/work --workdir /src --env HOME=/work --env CARGO_HOME=/work/cargo --env CARGO_TARGET_DIR=/work/target rust@sha256:38bc5a86d998772d4aec2348656ed21438d20fcdce2795b56ca434cf21430d89 sh -c 'rustup component add clippy && cargo clippy --locked -p packedgen --no-deps --all-targets --features cache-production-diagnostics,prepared-keys -- -D warnings'
 ```
 
-It exited 101 on `src/cache.rs:6545`, `clippy::unused_self`, in the
+It exited 101 on `crates/research/src/cache.rs:6545`, `clippy::unused_self`, in the
 no-pressure-timing cfg stub.
 
 The fixes were intentionally narrow: a justified `clippy::unused_self` allow
@@ -92,7 +92,7 @@ verification log and below as historical evidence.
 The pre-strengthening run did not include the new Loom model. Its earlier RED
 failure was in
 `direct_packed_cache::concurrent_async_admission_never_crosses_the_configured_hard_limit`
-at `tests/direct_packed_cache.rs:2372:5` on:
+at `crates/research/tests/direct_packed_cache.rs:2372:5` on:
 
 ```text
 assert!(diagnostics.peak_weight <= u64::try_from(HARD_LIMIT).unwrap())
@@ -100,7 +100,7 @@ assert!(diagnostics.peak_weight <= u64::try_from(HARD_LIMIT).unwrap())
 
 The captured full-package failure output did not print numeric assertion
 operands. A later bounded pre-fix stress with enriched assertions reproduced
-the same race at `tests/direct_packed_cache.rs:2385:5`: `peak_weight=283` and
+the same race at `crates/research/tests/direct_packed_cache.rs:2385:5`: `peak_weight=283` and
 `hard_limit_weight=282`, with `current_entries=281` and `current_weight=281`.
 The failure was not attributed to UID differences.
 

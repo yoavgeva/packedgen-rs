@@ -30,8 +30,8 @@ cp "${CARGO_TARGET_DIR:-target}/release/examples/bounded_cache_probe" "$output/p
     printf '%s\n' 'unique cold-fill keys; synchronous default; same entry/weight limits'
     printf 'RUSTFLAGS=%s\nCARGO_ENCODED_RUSTFLAGS=%s\n' "${RUSTFLAGS:-}" "${CARGO_ENCODED_RUSTFLAGS:-}"
 } > "$output/environment.txt"
-shasum -a 256 "$output/probe" Cargo.toml Cargo.lock src/cache.rs src/cache_arena.rs \
-    examples/bounded_cache_probe.rs scripts/bounded_cache_admission.sh \
+shasum -a 256 "$output/probe" Cargo.toml Cargo.lock crates/research/src/cache.rs crates/research/src/cache_arena.rs \
+    crates/research/examples/bounded_cache_probe.rs scripts/bounded_cache_admission.sh \
     scripts/summarize_bounded_cache.awk > "$output/hashes.txt"
 git diff --binary > "$output/tracked-diff.patch"
 

@@ -1412,7 +1412,7 @@ const OWNED_SEEDS: u64 = if cfg!(miri) { 1 } else { 12 };
 #[cfg_attr(miri, ignore = "parking_lot's futex wait fails Miri's variadic check")]
 fn owners_racing_every_operation_read_only_their_latest_versions() {
     for seed in 0..OWNED_SEEDS {
-        run_owned(seed, &hashbrown::DefaultHashBuilder::default());
+        run_owned(seed, &crate::DefaultHashBuilder::default());
         run_owned(100 + seed, &Clustered);
     }
 }

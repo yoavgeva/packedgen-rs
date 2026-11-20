@@ -18,10 +18,10 @@ package run before the diagnostic ordering and Release/Acquire repair is
 retained as historical RED: exit 101 after `289` passing tests, one failure,
 and one ignored test. Its failure was
 `concurrent_async_admission_never_crosses_the_configured_hard_limit` at
-`tests/direct_packed_cache.rs:2372:5`, on the
+`crates/research/tests/direct_packed_cache.rs:2372:5`, on the
 `diagnostics.peak_weight <= ...` assertion; the captured output omitted
 numeric operands. A later pre-fix enriched stress reproduced `peak_weight=283`
-against `hard_limit_weight=282` at `tests/direct_packed_cache.rs:2385:5`.
+against `hard_limit_weight=282` at `crates/research/tests/direct_packed_cache.rs:2385:5`.
 The combined repair then passed 50/50 repeated feature stress attempts, so the
 historical failure is not treated as current, and no UID causation is claimed.
 The earlier macOS startup-limited allocation attempts remain historical and
@@ -51,7 +51,7 @@ sanitizer qualification was run in this verification pass.
 
 ## Test change reviewed
 
-`tests/direct_cache_allocations.rs` remains one test binary because
+`crates/research/tests/direct_cache_allocations.rs` remains one test binary because
 `stats_alloc` measures process-wide allocations. The retained test covers warm
 tracked/untracked borrowed reads and `Arc` cloned reads, with a deep-copy
 positive control.
@@ -101,7 +101,7 @@ reporting:
 
 ```text
 Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 53s
-Running tests/direct_cache_allocations.rs (target/debug/deps/direct_cache_allocations-b8d23ad363ce8a03)
+Running crates/research/tests/direct_cache_allocations.rs (target/debug/deps/direct_cache_allocations-b8d23ad363ce8a03)
 ```
 
 The executable (observed as PID `12596`) then stayed at 0.0% CPU before
@@ -155,7 +155,7 @@ suite reported `75 passed; 1 failed`; the failing test was
 `concurrent_async_large_replacements_keep_exact_capacity`. Two scoped writer
 threads panicked at `/src/src/cache.rs:7363` with `attempt to subtract with
 overflow`, and the scoped test then panicked at
-`tests/direct_packed_cache.rs:2470`. This is a runtime correctness failure
+`crates/research/tests/direct_packed_cache.rs:2470`. This is a runtime correctness failure
 under the requested feature combination and must not be marked passed.
 
 The prepared-read allocation extension was not present in either Linux test
@@ -170,7 +170,7 @@ docker run --rm --cpus=2 --memory=4g --mount type=bind,src=/Users/yoavgea/repos/
 ```
 
 Exit 101: `0 passed; 1 failed; 145 filtered out`; it panicked at
-`src/cache.rs:7363:21` with `attempt to subtract with overflow`.
+`crates/research/src/cache.rs:7363:21` with `attempt to subtract with overflow`.
 
 ```text
 docker run --rm --cpus=2 --memory=4g --mount type=bind,src=/Users/yoavgea/repos/packedgen-rs,dst=/src,readonly --mount type=bind,src=/Users/yoavgea/repos/packedgen-rs/target/linux-verification,dst=/work --workdir /src --user "$(id -u):$(id -g)" --env HOME=/work --env CARGO_HOME=/work/cargo --env CARGO_TARGET_DIR=/work/target rust@sha256:38bc5a86d998772d4aec2348656ed21438d20fcdce2795b56ca434cf21430d89 cargo test --locked --features cache-production-diagnostics,prepared-keys --lib cache::tests::weight_pressure_transitions_follow_wrapped_reordered_deltas -- --exact --nocapture
@@ -238,7 +238,7 @@ docker run --rm --cpus=2 --memory=4g --user 0:0 --mount type=bind,src=/Users/yoa
 It exited 101 after `289` tests passed, one failed, and one explicitly
 ignored long soak. The failure was
 `direct_packed_cache::concurrent_async_admission_never_crosses_the_configured_hard_limit`
-at `tests/direct_packed_cache.rs:2372:5` on:
+at `crates/research/tests/direct_packed_cache.rs:2372:5` on:
 
 ```text
 assert!(diagnostics.peak_weight <= u64::try_from(HARD_LIMIT).unwrap())
@@ -275,7 +275,7 @@ cargo fmt --all -- --check
 
 Final result: exit 0 after formatting the source changes. An earlier
 pre-fix formatting check had reported a test wrapping difference and an
-unrelated existing `src/cache_arena.rs:381` difference; that historical output
+unrelated existing `crates/research/src/cache_arena.rs:381` difference; that historical output
 does not describe the final tree.
 
 ### Strict Clippy
@@ -297,9 +297,9 @@ The final scoped `packedgen`-only command was also run as requested:
 docker run --rm --cpus=2 --memory=4g --user 0:0 --mount type=bind,src=/Users/yoavgea/repos/packedgen-rs,dst=/src,readonly --mount type=bind,src=/Users/yoavgea/repos/packedgen-rs/target/linux-verification,dst=/work --workdir /src --env HOME=/work --env CARGO_HOME=/work/cargo --env CARGO_TARGET_DIR=/work/target rust@sha256:38bc5a86d998772d4aec2348656ed21438d20fcdce2795b56ca434cf21430d89 sh -c 'rustup component add clippy && cargo clippy --locked -p packedgen --no-deps --all-targets --features cache-production-diagnostics,prepared-keys -- -D warnings'
 ```
 
-Historical pre-fix result: it exited 101 on `src/cache.rs:6545`
+Historical pre-fix result: it exited 101 on `crates/research/src/cache.rs:6545`
 (`clippy::unused_self`) in the cfg stub. An earlier scoped attempt also
-reported `src/cache_arena.rs:3627` (`clippy::ptr_as_ptr`), which belongs to the
+reported `crates/research/src/cache_arena.rs:3627` (`clippy::ptr_as_ptr`), which belongs to the
 new memory-agent pointer-buffer test and was corrected with `.cast()`.
 
 After the narrow cfg-stub allow and redundant funnel `.into_iter()` removal,
@@ -323,7 +323,7 @@ installation was performed.
 The assigned allocation test was formatted successfully with:
 
 ```text
-rustfmt --edition 2024 tests/direct_cache_allocations.rs
+rustfmt --edition 2024 crates/research/tests/direct_cache_allocations.rs
 ```
 
 The runtime-file formatting difference was not changed by this agent.

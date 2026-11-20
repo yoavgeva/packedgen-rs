@@ -23,7 +23,7 @@ single favorable operation or machine is not enough.
 | Distribution | The owned companion is now `packedgen-opthash 0.1.0`; both companion and root package archives verify in publication order | Code blocker fixed; publish the companion before `packedgen` |
 | Dependency advisories | Fresh RustSec scan plus a machine-checked dependency-path exception | No vulnerability advisory; the `fxhash 0.2.1` unmaintained notice is confined to unused PtrHash aliases and fails review if that path or source usage changes |
 
-The two new tests live in `tests/direct_cache_differential.rs`. The ordinary
+The two new tests live in `crates/research/tests/direct_cache_differential.rs`. The ordinary
 test is deliberately deterministic: failures report both the seed and exact
 operation number, so a mismatch can be replayed.
 

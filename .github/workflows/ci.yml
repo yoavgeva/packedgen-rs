@@ -27,12 +27,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv
-      - name: Check every PackedGen target and feature
+      - name: Check every target and feature of the cache and research crates
         env:
           # gxhash deliberately refuses to compile unless the target enables
           # the AES/SSE2 instructions required by its explicit opt-in feature.
           RUSTFLAGS: -C target-cpu=native
-        run: cargo check -p packedgen --all-targets --all-features
+        run: cargo check -p packedgen -p packedgen-research --all-targets --all-features
       - name: Check the paper-reference crate's stable feature set
         run: cargo check -p packedgen-opthash --all-targets
       - name: Check the no-std core as an rlib
@@ -96,14 +96,14 @@ jobs:
         with:
           tool: cargo-nextest@0.9.148
           fallback: none
-      - name: Root runtime tests with every feature
+      - name: Research runtime tests with every feature
         env:
           RUSTFLAGS: -C target-cpu=native
-        run: cargo nextest run --no-fail-fast -p packedgen --lib --bins --tests --examples --all-features
-      - name: Root benches in test mode with every feature
+        run: cargo nextest run --no-fail-fast -p packedgen-research --lib --bins --tests --examples --all-features
+      - name: Research benches in test mode with every feature
         env:
           RUSTFLAGS: -C target-cpu=native
-        run: cargo test -p packedgen --benches --all-features
+        run: cargo test -p packedgen-research --benches --all-features
 
   lint:
     name: Lints, audit, and packaging
@@ -125,7 +125,7 @@ jobs:
       - name: Clippy
         env:
           RUSTFLAGS: -C target-cpu=native
-        run: cargo clippy -p packedgen --all-targets --all-features -- -D warnings
+        run: cargo clippy -p packedgen -p packedgen-research --all-targets --all-features -- -D warnings
       - name: Clippy for the paper-reference crate
         run: cargo clippy -p packedgen-opthash --all-targets -- -D warnings
       - name: Clippy for the Python extension feature
@@ -149,9 +149,11 @@ jobs:
         include:
           - name: default features
             key: default
+            packages: -p packedgen -p packedgen-research
             features: ""
           - name: prepared keys and diagnostics
             key: prepared
+            packages: -p packedgen-research
             features: prepared-keys,prepared-batch-gate,cache-production-diagnostics
     steps:
       - uses: actions/checkout@v4
@@ -164,9 +166,9 @@ jobs:
           tool: cargo-nextest@0.9.148
           fallback: none
       - name: PackedGen tests
-        run: cargo nextest run --locked --no-fail-fast -p packedgen --lib --bins --tests --examples --features "${{ matrix.features }}"
+        run: cargo nextest run --locked --no-fail-fast ${{ matrix.packages }} --lib --bins --tests --examples --features "${{ matrix.features }}"
       - name: PackedGen benches in test mode
-        run: cargo test --locked -p packedgen --benches --features "${{ matrix.features }}"
+        run: cargo test --locked ${{ matrix.packages }} --benches --features "${{ matrix.features }}"
 
   test-windows:
     name: Stable tests on Windows (${{ matrix.name }})
@@ -190,7 +192,7 @@ jobs:
           - name: prepared keys and diagnostics
             key: prepared
             command: >-
-              nextest run --no-fail-fast -p packedgen --lib --bins --tests --examples
+              nextest run --no-fail-fast -p packedgen-research --lib --bins --tests --examples
               --features prepared-keys,prepared-batch-gate,cache-production-diagnostics
           - name: benches in test mode
             key: benches
@@ -232,7 +234,7 @@ jobs:
         with:
           key: loom
       - name: Exhaustive concurrency models
-        run: cargo test --release --test cache_concurrency_model
+        run: cargo test --release -p packedgen --test cache_concurrency_model
 
   miri:
     name: Miri (${{ matrix.name }})

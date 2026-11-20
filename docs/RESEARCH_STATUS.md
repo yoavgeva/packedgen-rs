@@ -5,7 +5,8 @@ PackedGen's research components: the packed generational maps, the
 lock-free and lock-based concurrent maps, `DirectPackedCache`, the segment
 caches, and the paper-derived Elastic and Funnel hashing backends. It moved
 here from the README, which now leads with `ShardedCache`. None of these
-components is production-ready.
+components is production-ready. They live in `crates/research`, as the
+unpublished `packedgen-research` crate.
 
 ## Status
 
@@ -173,7 +174,7 @@ lock-free. General upsert and multi-step TTL coordination retain compact
 striped serialization.
 
 ```rust
-use packedgen::{CacheConfig, CacheWriteOutcome, DirectPackedCache};
+use packedgen_research::{CacheConfig, CacheWriteOutcome, DirectPackedCache};
 
 let cache = DirectPackedCache::try_new(
     CacheConfig::new(1_024).with_max_entries(16),
@@ -769,7 +770,7 @@ production architecture:
 ## Example
 
 ```rust
-use packedgen::{ElasticConfig, FixedElasticMap, InsertOutcome};
+use packedgen_research::{ElasticConfig, FixedElasticMap, InsertOutcome};
 
 let config = ElasticConfig::new(1_000_000)
     .with_reserve_exponent(6) // delta = 1/64, target occupancy ~98.4%
@@ -790,7 +791,7 @@ the partial map.
 The concurrent binary-key API uses owned lookup results by default:
 
 ```rust
-use packedgen::ConcurrentSwissMap;
+use packedgen_research::ConcurrentSwissMap;
 
 let map = ConcurrentSwissMap::with_capacity(1_000_000);
 map.try_insert(b"key", 41_u64).unwrap();
@@ -802,7 +803,7 @@ assert!(!map.try_insert_new(b"key", 99).unwrap());
 The allocation-free atomic generation uses a checked value domain:
 
 ```rust
-use packedgen::{AtomicPackedGenMap, NonMaxU64};
+use packedgen_research::{AtomicPackedGenMap, NonMaxU64};
 
 let map = AtomicPackedGenMap::try_from_entries(
     [(b"counter".as_slice(), NonMaxU64::new(0).unwrap())],
@@ -819,7 +820,7 @@ assert_eq!(map.get(b"counter").map(NonMaxU64::get), Some(1));
 With `--features prepared-keys`, repeated hot-key access can prepare a handle:
 
 ```rust
-use packedgen::{AtomicPackedGenMap, NonMaxU64};
+use packedgen_research::{AtomicPackedGenMap, NonMaxU64};
 
 let map = AtomicPackedGenMap::try_from_entries(
     [(b"hot".as_slice(), NonMaxU64::new(7).unwrap())],

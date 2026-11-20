@@ -425,8 +425,8 @@ entry. Tables are sized once and never rebuilt.
 ## Memory
 
 Requested live bytes per resident entry after inserting twice the capacity,
-from `examples/cache_density_compare.rs` (`stats_alloc`, not RSS). Allocator
-rounding of the boxed entries is not included.
+from `crates/research/examples/cache_density_compare.rs` (`stats_alloc`, not
+RSS). Allocator rounding of the boxed entries is not included.
 
 | Entries | Key | Value | ShardedCache | DirectPackedCache | quick_cache |
 | ---: | --- | --- | ---: | ---: | ---: |
@@ -1295,7 +1295,7 @@ The probe's 32-byte keys and `Arc` payloads cost both caches hashing and
 reference counts. With `u64` keys and values those costs fall away, and
 ShardedCache's fixed work per operation shows: the epoch pin, and on writes
 the new entry and the retirement of the old one, where quick_cache
-overwrites in place under its shard lock. A scratch benchmark, at 50,000
+overwrites in place under its shard lock. A benchmark, at 50,000
 entries, ran `get` hits on resident keys with room to spare, and upserts of
 the seeded keys into an exactly full cache; each figure is the range over
 three runs of the best of seven:
@@ -1316,6 +1316,42 @@ and 53 to 54% on Linux. On macOS a pin
 is two read-modify-writes on shared counters, where Linux reuses a parked
 announcement (see "Parked pin announcements"), which leaves single-thread
 hits behind there and level on Linux.
+
+`crates/research/examples/small_entry_probe.rs` now runs these workloads
+with each cache's defaults, and two more: a look-aside mix that reads
+Zipf-distributed keys (exponent 1.0) over ten times the capacity and
+inserts each one it misses, and churn, inserts of distinct new keys into
+a full cache. On an M4 Max at 100,000 entries, sharing the machine with
+other work, medians of five runs at one thread and three at eight
+(Mops/s):
+
+| Workload | ShardedCache 1T | quick_cache 1T | ShardedCache 8T | quick_cache 8T |
+| --- | ---: | ---: | ---: | ---: |
+| Resident hit | 123.1 | 123.9 | 951 | 90 |
+| Zipf reads alone, 78% hits | 78.3 | 80.5 | | |
+| Zipf look-aside, 82% hits | 34.3 | 55.3 | 117 | 53 |
+| Upsert into a full cache | 36.9 | 59.6 | 56 | 44 |
+| Churn | 17.6 | 22.8 | 32.7 | 33.0 |
+
+The processor's counters, over two run lengths at one thread, put the
+difference in instructions. ShardedCache ran 193 instructions per hit, 558
+per upsert, and 1,117 per churned insert, at 5.0 to 5.2 per cycle;
+quick_cache ran 129, 207, and 475, at 2.7 to 3.4 per cycle, stalling where
+ShardedCache executes. Hits took 37 and 38 cycles; writes took 117 and
+222 cycles against 73 and 176. On the Linux VM, Callgrind
+split a churned insert's 1,112 instructions into the insert's own path
+(533: the pin, finding the key in two buckets, the ghost and sketch
+admission, the eviction prefetch, and taking and filling a slot), retiring
+the evicted entry, reclaiming an aged one, and unpinning (193), evicting it from probation (176,
+45 of them remembering it in the ghost), placing the new key (71), counting
+it in the sketch (50), and clearing the victim's slot (44). No one step
+holds a large share. The look-aside mix pays this on each miss, and each
+of its reads runs the lookup's two-bucket search and the pin.
+
+Prefetching the next two probation victims instead of one, so that
+evictions that pass over several records find each loaded, moved
+one-thread churn and the look-aside mix at 1,000,000 entries by 0% and
+−2%, medians of seven pairs.
 
 ### Batched inserts
 
@@ -2185,6 +2221,9 @@ git push origin HEAD:refs/heads/bench/NAME   # the same on x86_64, and against H
 sh scripts/mokabench.sh 3 1,4,8,16 "s3 ds1 p8 s1 p3 oltp" target/mokabench.csv
 python3 scripts/summarize_mokabench.py target/mokabench.csv
 $PROBE sharded-batch replace 1000000 4000000 1 64 1
+cargo build --release --example small_entry_probe
+target/release/examples/small_entry_probe sharded zipf 100000 20000000 1 1
+target/release/examples/small_entry_probe quickcache churn 100000 20000000 1 1
 # Instructions per write, on Linux: run twice and subtract.
 valgrind --tool=cachegrind --cache-sim=yes $PROBE sharded replace 50000 400000 1 64 1
 valgrind --tool=cachegrind --cache-sim=yes $PROBE sharded replace 50000 800000 1 64 1

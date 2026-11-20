@@ -33,10 +33,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use hashbrown::DefaultHashBuilder;
+use crate::DefaultHashBuilder;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 
-use crate::cache_arena::direct_arena_thread;
 use crate::sharded_arena::{
     EpochPin, Epochs, MAX_EXPIRY_TICK, MAX_WEIGHT, OVERFLOW_HANDLE, RECLAIM_BATCH, Reclaimed,
     RetiredSlots, Slot, SlotDecoder, SlotStore, advise_huge_pages, drop_value, fill, prefetch,
@@ -44,6 +43,7 @@ use crate::sharded_arena::{
 };
 #[cfg(test)]
 use crate::sharded_arena::{PREFETCHED, STACK_BORROWS, STACK_SEARCHES};
+use crate::thread_index::thread_index;
 
 const SLOTS: usize = 10;
 /// Slots whose tags fill a bucket's tag word; the rest are in its meta word.
@@ -1037,7 +1037,7 @@ struct StatStripe {
 #[cold]
 #[inline(never)]
 fn count_read(stripes: &[StatStripe], hit: bool) {
-    let stripe = &stripes[direct_arena_thread() & (STAT_STRIPES - 1)];
+    let stripe = &stripes[thread_index() & (STAT_STRIPES - 1)];
     if hit {
         stripe.hits.fetch_add(1, Ordering::Relaxed);
     } else {

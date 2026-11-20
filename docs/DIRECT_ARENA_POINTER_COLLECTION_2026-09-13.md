@@ -2,7 +2,7 @@
 
 ## Candidate
 
-`drain_retired_epoch` in `src/cache_arena.rs` converts an owning
+`drain_retired_epoch` in `crates/research/src/cache_arena.rs` converts an owning
 `Vec<RemovedDirectHandle>` into a `Vec<*mut DirectArenaEntry<V>>`. The original
 `.iter().map(...).collect()` keeps the handle vector and a second pointer
 vector alive at the same time. The candidate uses the owning `.into_iter()`.
@@ -52,7 +52,7 @@ state cache-memory claim. Empty collections remain allocation-free, and the
 existing handle ownership/drop behavior remains covered by the panic tests.
 
 An exploratory B/C screen was run after the correctness gates. B is the
-capacity-corrected tree with the exact original `src/cache_arena.rs` from
+capacity-corrected tree with the exact original `crates/research/src/cache_arena.rs` from
 `26d1d93`; C is the same tree with the owning `.into_iter()` candidate. All
 other source, `Cargo.lock`, compiler, feature flags, probe settings, and
 container limits were identical. The two sessions used seven fresh-process
@@ -121,6 +121,6 @@ result directories. The resulting binary hashes were B
 The snapshot source hashes are recorded in each session's
 `source-hashes.tsv`: B arena `f00cd62a460d1a24a7ac0b1028fb9ba930a350c16e3549ffc8468cee096b9609`,
 C arena `22d9e6bb4fb709fbc1b39dddf1ccfc96edb92965875663525de5a68e0bef842b`,
-and common `src/cache.rs`
+and common `crates/research/src/cache.rs`
 `c2ddfabce71499e8eb3833805e64386b3a838f35997b24af50842d36cd3a0ec5`.
-`diff -rq --exclude=.git B C` reported only `src/cache_arena.rs`.
+`diff -rq --exclude=.git B C` reported only `crates/research/src/cache_arena.rs`.

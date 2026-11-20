@@ -1,14 +1,16 @@
 # PackedGen
 
-PackedGen's main component is `ShardedCache`, a bounded concurrent cache for
-any `K: Hash + Eq`. Reads are lock-free, per-shard tables are sized once and
+The `packedgen` crate is `ShardedCache`, a bounded concurrent cache for any
+`K: Hash + Eq`. Reads are lock-free, per-shard tables are sized once and
 never rebuilt, and eviction follows S3-FIFO. Its overhead beyond the key and
-value is about 28 requested bytes per entry at 1,000,000 entries.
+value is about 28 requested bytes per entry at 1,000,000 entries. It depends
+on `parking_lot` and `foldhash` alone.
 
-The repository also holds research data structures: packed generational
-maps, lock-free and lock-based concurrent maps, the byte-keyed
-`DirectPackedCache`, and paper-derived Elastic and Funnel hashing backends.
-They are experimental; see [Research components](#research-components).
+The repository also holds research data structures, in the unpublished
+`packedgen-research` crate: packed generational maps, lock-free and
+lock-based concurrent maps, the byte-keyed `DirectPackedCache`, and
+paper-derived Elastic and Funnel hashing backends. They are experimental;
+see [Research components](#research-components).
 
 PackedGen currently supports 64-bit targets only. The research caches store
 native pointers in compact 64-bit handles, and unsupported pointer widths
@@ -44,7 +46,11 @@ values, one thread's upserts into a full cache ran at 0.51 to 0.59 times
 quick_cache's throughput on macOS and Linux, as each writes a new entry and
 retires the old one where quick_cache overwrites in place; at eight threads
 those upserts ran 18 to 29% ahead, and hits ran 7 to 9 times
-quick_cache's.
+quick_cache's. A look-aside mix of `u64`s, reading Zipf-distributed keys
+and inserting each one missed, ran at 0.62 times quick_cache's throughput
+on one thread and 2.2 times on eight: one thread executes 2.3 times
+quick_cache's instructions per churned insert, at about twice its
+instructions per cycle.
 
 With 1,000,000 entries on Apple Silicon, one thread was level on hits (+2%),
 ahead on writes by 12 to 47%, and 50% behind on misses, whose tag words
@@ -168,7 +174,8 @@ VM hosted there, and on GitHub's x86_64 runners.
 ## Research components
 
 These components are research and comparison code, not recommended for
-production use. Their status, measurements, examples, and the claims they
+production use, in [`crates/research`](crates/research), whose crate is not
+published. Their status, measurements, examples, and the claims they
 must still prove are in [`docs/RESEARCH_STATUS.md`](docs/RESEARCH_STATUS.md),
 and their design is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
@@ -196,6 +203,10 @@ cargo run --release --example cache_density_compare
 cargo run --release --example bounded_cache_probe -- sharded turnover 50000 8000000 8 64 1
 scripts/audit.sh                       # the complete local release audit
 ```
+
+Plain cargo commands at the root cover both crates, and `-p packedgen`
+limits one to the cache. The comparison probes, such as
+`bounded_cache_probe`, live in the research crate.
 
 The research components' probes are listed in
 [`docs/RESEARCH_STATUS.md`](docs/RESEARCH_STATUS.md#research-probes).

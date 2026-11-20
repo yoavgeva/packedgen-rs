@@ -10,11 +10,11 @@ if ! command -v cargo-audit >/dev/null 2>&1; then
 fi
 
 # PtrHash 2.x declares fxhash for public convenience aliases even when its
-# caller supplies a custom KeyHasher, as PackedGen does. RustSec classifies the
+# caller supplies a custom KeyHasher, as the research crate does. RustSec classifies the
 # crate as unmaintained, not vulnerable, and publishes no patched fxhash
 # version. Keep this narrow exception only while the dependency tree and source
 # usage remain exactly constrained below.
-if grep -rnE 'ptr_hash::hash::(FastIntHash|FxHash)|fxhash::' src tests examples benches; then
+if grep -rnE 'ptr_hash::hash::(FastIntHash|FxHash)|fxhash::' src tests crates/research; then
   printf 'PackedGen started using the excepted fxhash API directly\n' >&2
   exit 1
 fi
@@ -27,7 +27,7 @@ line_three="$(printf '%s\n' "$tree" | sed -n '3p')"
 if [[ "$line_count" != 3 \
   || "$line_one" != 'fxhash v0.2.1' \
   || "$line_two" != 'ptr_hash v2.1.1' \
-  || "$line_three" != packedgen\ v0.1.0\ * ]]; then
+  || "$line_three" != packedgen-research\ v0.1.0\ * ]]; then
   printf 'fxhash dependency path changed; review the RustSec exception:\n%s\n' "$tree" >&2
   exit 1
 fi

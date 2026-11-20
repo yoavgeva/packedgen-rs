@@ -220,7 +220,7 @@ Stable generic cells successfully remove repeated key allocation, reducing the
 Papaya-style path from 89 to 24 allocated bytes/update. They still allocate a
 new `Arc<V>` and flatten under allocator contention. Direct atomic slots remove
 that final allocation. The reproducible probe is
-`examples/mutation_allocation_probe.rs`.
+`crates/research/examples/mutation_allocation_probe.rs`.
 
 ## Concurrent operation matrix
 
@@ -275,7 +275,7 @@ control in this focused run. It also wins RAM. The dense ArcSwap table is a
 clear rejection: despite its RAM reduction, insertion is about 14x slower than
 the boxed control.
 
-The focused probe is `examples/atomic_overlay_probe.rs`. These remain unpinned
+The focused probe is `crates/research/examples/atomic_overlay_probe.rs`. These remain unpinned
 Apple M4 Max results; alternating order reduces, but does not eliminate,
 platform noise.
 
