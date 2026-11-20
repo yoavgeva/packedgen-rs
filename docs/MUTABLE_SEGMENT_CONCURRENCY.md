@@ -8,7 +8,7 @@ already replaces Papaya or `DirectPackedCache` in every workload.
 
 ## Method
 
-The probe is `examples/mutable_segment_concurrency_probe.rs`. Every data point
+The probe is `crates/research/examples/mutable_segment_concurrency_probe.rs`. Every data point
 starts in a fresh process with:
 
 - Apple M4 Max, 16 physical/logical cores, unpinned macOS threads;
@@ -410,7 +410,7 @@ filter is the balanced miss-heavy profile.
 
 ### Live compaction sample
 
-`examples/online_segment_compaction_probe.rs` runs one online compaction under
+`crates/research/examples/online_segment_compaction_probe.rs` runs one online compaction under
 continuous 95/5 traffic. With one million entries, 100,000 prepared updates, a
 200,000-record delta budget, and 16 workers, three fresh processes produced:
 

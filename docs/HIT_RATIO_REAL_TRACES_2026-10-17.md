@@ -264,7 +264,7 @@ Requested live bytes after inserting twice the capacity in 32-byte keys with
 | 65,536 | 119.7 | 119.6 |
 
 The ghost filter stays at 2 bytes per expected entry, and
-`tests/direct_cache_memory.rs` still bounds probation's overhead at 6 B/entry.
+`crates/research/tests/direct_cache_memory.rs` still bounds probation's overhead at 6 B/entry.
 
 ## Throughput screen
 

@@ -425,8 +425,8 @@ entry. Tables are sized once and never rebuilt.
 ## Memory
 
 Requested live bytes per resident entry after inserting twice the capacity,
-from `examples/cache_density_compare.rs` (`stats_alloc`, not RSS). Allocator
-rounding of the boxed entries is not included.
+from `crates/research/examples/cache_density_compare.rs` (`stats_alloc`, not
+RSS). Allocator rounding of the boxed entries is not included.
 
 | Entries | Key | Value | ShardedCache | DirectPackedCache | quick_cache |
 | ---: | --- | --- | ---: | ---: | ---: |

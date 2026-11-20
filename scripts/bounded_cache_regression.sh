@@ -50,7 +50,8 @@ cp "${CARGO_TARGET_DIR:-target}/release/examples/bounded_cache_probe" "$output/c
     printf 'RUSTFLAGS=%s\nCARGO_ENCODED_RUSTFLAGS=%s\n' "${RUSTFLAGS:-}" "${CARGO_ENCODED_RUSTFLAGS:-}"
 } > "$output/environment.txt"
 shasum -a 256 "$output/baseline-probe" "$output/candidate-probe" Cargo.toml Cargo.lock \
-    src/cache.rs src/cache_arena.rs examples/bounded_cache_probe.rs \
+    crates/research/src/cache.rs crates/research/src/cache_arena.rs \
+    crates/research/examples/bounded_cache_probe.rs \
     scripts/bounded_cache_regression.sh > "$output/hashes.txt"
 git diff --binary > "$output/tracked-diff.patch"
 

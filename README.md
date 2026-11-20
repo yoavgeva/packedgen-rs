@@ -1,14 +1,16 @@
 # PackedGen
 
-PackedGen's main component is `ShardedCache`, a bounded concurrent cache for
-any `K: Hash + Eq`. Reads are lock-free, per-shard tables are sized once and
+The `packedgen` crate is `ShardedCache`, a bounded concurrent cache for any
+`K: Hash + Eq`. Reads are lock-free, per-shard tables are sized once and
 never rebuilt, and eviction follows S3-FIFO. Its overhead beyond the key and
-value is about 28 requested bytes per entry at 1,000,000 entries.
+value is about 28 requested bytes per entry at 1,000,000 entries. It depends
+on `parking_lot` and `foldhash` alone.
 
-The repository also holds research data structures: packed generational
-maps, lock-free and lock-based concurrent maps, the byte-keyed
-`DirectPackedCache`, and paper-derived Elastic and Funnel hashing backends.
-They are experimental; see [Research components](#research-components).
+The repository also holds research data structures, in the unpublished
+`packedgen-research` crate: packed generational maps, lock-free and
+lock-based concurrent maps, the byte-keyed `DirectPackedCache`, and
+paper-derived Elastic and Funnel hashing backends. They are experimental;
+see [Research components](#research-components).
 
 PackedGen currently supports 64-bit targets only. The research caches store
 native pointers in compact 64-bit handles, and unsupported pointer widths
@@ -168,7 +170,8 @@ VM hosted there, and on GitHub's x86_64 runners.
 ## Research components
 
 These components are research and comparison code, not recommended for
-production use. Their status, measurements, examples, and the claims they
+production use, in [`crates/research`](crates/research), whose crate is not
+published. Their status, measurements, examples, and the claims they
 must still prove are in [`docs/RESEARCH_STATUS.md`](docs/RESEARCH_STATUS.md),
 and their design is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
@@ -196,6 +199,10 @@ cargo run --release --example cache_density_compare
 cargo run --release --example bounded_cache_probe -- sharded turnover 50000 8000000 8 64 1
 scripts/audit.sh                       # the complete local release audit
 ```
+
+Plain cargo commands at the root cover both crates, and `-p packedgen`
+limits one to the cache. The comparison probes, such as
+`bounded_cache_probe`, live in the research crate.
 
 The research components' probes are listed in
 [`docs/RESEARCH_STATUS.md`](docs/RESEARCH_STATUS.md#research-probes).

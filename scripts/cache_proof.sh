@@ -11,15 +11,15 @@ result_dir="$result_root/$run_id"
 
 quick() {
   cargo fmt --all -- --check
-  cargo test --locked --test direct_cache_differential
-  cargo test --locked --test direct_packed_cache
-  cargo test --locked --test direct_cache_allocations
-  cargo test --locked --test cache_concurrency_model
-  cargo clippy --locked --all-targets --all-features -- -D warnings
+  cargo test --locked -p packedgen-research --test direct_cache_differential
+  cargo test --locked -p packedgen-research --test direct_packed_cache
+  cargo test --locked -p packedgen-research --test direct_cache_allocations
+  cargo test --locked -p packedgen --test cache_concurrency_model
+  cargo clippy --locked -p packedgen -p packedgen-research --all-targets --all-features -- -D warnings
 }
 
 msrv() {
-  cargo +1.88.0 check --all-targets --all-features
+  cargo +1.88.0 check -p packedgen -p packedgen-research --all-targets --all-features
   cargo +1.88.0 check -p packedgen-opthash --all-targets
 }
 
@@ -56,28 +56,28 @@ bench() {
   for workload in $workloads; do
     for thread_count in $threads; do
       append_csv "$result_dir/throughput.csv" \
-        cargo run --locked --quiet --release --features "$features" --example cache_probe -- \
+        cargo run --locked --quiet --release -p packedgen-research --features "$features" --example cache_probe -- \
         "$entries" "$operations" "$thread_count" "$samples" "$workload"
     done
   done
 
   for count in $memory_entries; do
     append_csv "$result_dir/memory.csv" \
-      cargo run --locked --quiet --release --features "$features" --example memory_probe -- \
+      cargo run --locked --quiet --release -p packedgen-research --features "$features" --example memory_probe -- \
       direct-packed-cache-mixed-value64 "$count"
     append_csv "$result_dir/memory.csv" \
-      cargo run --locked --quiet --release --features "$features" --example memory_probe -- \
+      cargo run --locked --quiet --release -p packedgen-research --features "$features" --example memory_probe -- \
       direct-packed-cache-batch-admission-mixed-value64 "$count"
     append_csv "$result_dir/memory.csv" \
-      cargo run --locked --quiet --release --features "$features" --example memory_probe -- \
+      cargo run --locked --quiet --release -p packedgen-research --features "$features" --example memory_probe -- \
       papaya-cache-compact-mixed-value64 "$count"
     append_csv "$result_dir/memory.csv" \
-      cargo run --locked --quiet --release --features "$features" --example memory_probe -- \
+      cargo run --locked --quiet --release -p packedgen-research --features "$features" --example memory_probe -- \
       papaya-cache-inline-compact-mixed-value64 "$count"
   done
 
   append_csv "$result_dir/latency.csv" \
-    cargo run --locked --quiet --release --features "$features" --example cache_latency_probe -- \
+    cargo run --locked --quiet --release -p packedgen-research --features "$features" --example cache_latency_probe -- \
     "$entries" "$operations" "$write_operations" 8 2 "$samples"
 
   printf 'PackedGen cache proof results: %s\n' "$result_dir"
@@ -85,7 +85,7 @@ bench() {
 
 soak() {
   PACKEDGEN_SOAK_OPERATIONS="${PACKEDGEN_SOAK_OPERATIONS:-2000000}" \
-    cargo test --release --test direct_cache_differential \
+    cargo test --release -p packedgen-research --test direct_cache_differential \
     concurrent_reclamation_and_rebuild_soak -- --ignored --nocapture
 }
 
@@ -96,7 +96,7 @@ miri_exact() {
   shift
   local log
   log="$(mktemp)"
-  MIRIFLAGS="$flags" cargo +nightly miri test "$@" -- --exact 2>&1 | tee "$log"
+  MIRIFLAGS="$flags" cargo +nightly miri test -p packedgen-research "$@" -- --exact 2>&1 | tee "$log"
   if ! grep -Eq 'test result: .*[^0-9]1 passed;' "$log"; then
     printf 'no test ran under Miri for: %s\n' "$*" >&2
     rm "$log"
@@ -146,12 +146,12 @@ miri_sharded() {
   cargo +nightly miri setup
   if [[ -n "${PACKEDGEN_MIRI_PARTITION:-}" ]]; then
     MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
-      cargo +nightly miri nextest run --lib --no-fail-fast \
+      cargo +nightly miri nextest run -p packedgen --lib --no-fail-fast \
       --partition "$PACKEDGEN_MIRI_PARTITION" \
       -E 'test(/^sharded_(cache|arena)::tests::/) | test(/^sharded_cache::model_check::/)'
   else
     MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
-      cargo +nightly miri test --lib -- sharded_cache::tests sharded_arena::tests \
+      cargo +nightly miri test -p packedgen --lib -- sharded_cache::tests sharded_arena::tests \
       sharded_cache::model_check
   fi
 }
@@ -166,23 +166,23 @@ sanitizers() {
   local tsan="-Zsanitizer=thread"
   target="${PACKEDGEN_SANITIZER_TARGET:-$(rustc +nightly -vV | awk '/^host:/ { print $2 }')}"
   RUSTFLAGS="-Zsanitizer=address" RUSTDOCFLAGS="-Zsanitizer=address" \
-    cargo +nightly test --target "$target" --test direct_packed_cache -- --test-threads=1
+    cargo +nightly test --target "$target" -p packedgen-research --test direct_packed_cache -- --test-threads=1
   RUSTFLAGS="$tsan" RUSTDOCFLAGS="$tsan" \
-    cargo +nightly test -Zbuild-std --target "$target" \
+    cargo +nightly test -Zbuild-std --target "$target" -p packedgen-research \
     --test direct_packed_cache concurrent_replacement_and_pinned_reads_stay_valid -- --exact
   RUSTFLAGS="$tsan" RUSTDOCFLAGS="$tsan" \
-    cargo +nightly test -Zbuild-std --target "$target" --features prepared-keys \
+    cargo +nightly test -Zbuild-std --target "$target" -p packedgen-research --features prepared-keys \
     --test direct_packed_cache \
     concurrent_prepared_replacement_batches_recycle_without_lost_values -- --exact
   RUSTFLAGS="-Zsanitizer=address" RUSTDOCFLAGS="-Zsanitizer=address" \
-    cargo +nightly test --target "$target" --lib -- sharded_cache::tests sharded_arena::tests \
+    cargo +nightly test --target "$target" -p packedgen --lib -- sharded_cache::tests sharded_arena::tests \
     sharded_cache::model_check
   RUSTFLAGS="-Zsanitizer=address" RUSTDOCFLAGS="-Zsanitizer=address" \
-    cargo +nightly test --target "$target" --test sharded_cache_every_operation
+    cargo +nightly test --target "$target" -p packedgen --test sharded_cache_every_operation
   RUSTFLAGS="$tsan" RUSTDOCFLAGS="$tsan" \
-    cargo +nightly test -Zbuild-std --target "$target" --test sharded_cache_every_operation
+    cargo +nightly test -Zbuild-std --target "$target" -p packedgen --test sharded_cache_every_operation
   RUSTFLAGS="$tsan" RUSTDOCFLAGS="$tsan" \
-    cargo +nightly test -Zbuild-std --target "$target" --lib -- \
+    cargo +nightly test -Zbuild-std --target "$target" -p packedgen --lib -- \
     sharded_cache::tests::racing sharded_cache::tests::concurrent \
     sharded_cache::tests::get_or_insert_with sharded_cache::tests::a_failed \
     sharded_cache::tests::a_thread_that_exits sharded_cache::tests::dropping_a_cache \
@@ -199,10 +199,10 @@ memory_soak() {
   mkdir -p "$result_dir"
   : >"$result_dir/memory-soak.csv"
   append_csv "$result_dir/memory-soak.csv" \
-    cargo run --quiet --release --features "$features" --example cache_memory_soak -- \
+    cargo run --quiet --release -p packedgen-research --features "$features" --example cache_memory_soak -- \
     direct "$entries" "$cycles" "$threads"
   append_csv "$result_dir/memory-soak.csv" \
-    cargo run --quiet --release --features "$features" --example cache_memory_soak -- \
+    cargo run --quiet --release -p packedgen-research --features "$features" --example cache_memory_soak -- \
     papaya-inline "$entries" "$cycles" "$threads"
   printf 'PackedGen memory-soak results: %s\n' "$result_dir/memory-soak.csv"
 }
@@ -217,7 +217,7 @@ endurance() {
   local features="${PACKEDGEN_ENDURANCE_FEATURES:-gxhash,jemalloc-probe}"
   local cpuset="${PACKEDGEN_ENDURANCE_CPUSET:-}"
   local -a command=(
-    cargo run --quiet --release --features "$features" --example cache_memory_soak --
+    cargo run --quiet --release -p packedgen-research --features "$features" --example cache_memory_soak --
     direct "$entries" 0 "$threads" "$seconds"
   )
   if [[ -n "$cpuset" ]]; then

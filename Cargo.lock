@@ -865,25 +865,10 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 name = "packedgen"
 version = "0.1.0"
 dependencies = [
- "arc-swap",
- "criterion 0.7.0",
- "dashmap",
- "flurry",
- "gxhash",
- "hashbrown 0.17.1",
+ "foldhash",
  "loom",
- "packedgen-opthash",
- "papaya",
  "parking_lot",
- "ph",
- "ptr_hash",
- "quick_cache",
- "rapidhash",
- "scc",
- "seize 0.5.1",
  "stats_alloc",
- "tikv-jemallocator",
- "wide",
 ]
 
 [[package]]
@@ -896,6 +881,32 @@ dependencies = [
  "foldhash",
  "hashbrown 0.17.1",
  "pyo3",
+]
+
+[[package]]
+name = "packedgen-research"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "criterion 0.7.0",
+ "dashmap",
+ "flurry",
+ "gxhash",
+ "hashbrown 0.17.1",
+ "loom",
+ "packedgen",
+ "packedgen-opthash",
+ "papaya",
+ "parking_lot",
+ "ph",
+ "ptr_hash",
+ "quick_cache",
+ "rapidhash",
+ "scc",
+ "seize 0.5.1",
+ "stats_alloc",
+ "tikv-jemallocator",
+ "wide",
 ]
 
 [[package]]

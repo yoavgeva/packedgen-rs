@@ -13,7 +13,7 @@ removing that overlay sets the base tombstone so the old value cannot reappear.
 
 ## Correctness
 
-`tests/hybrid_map.rs` covers binary and empty keys, base/delta precedence,
+`crates/research/tests/hybrid_map.rs` covers binary and empty keys, base/delta precedence,
 delete-reinsert-delete behavior, and 50,000 randomized operations checked after
 every step against `std::collections::HashMap`.
 

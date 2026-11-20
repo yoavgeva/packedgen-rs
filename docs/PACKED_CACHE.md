@@ -37,7 +37,7 @@ reduction at 33.4%. The first inline operation and tail-latency reruns are in
    new value pointer. New-key admission uses the index's fused
    `get_or_insert`; a speculative arena value is retired if another writer won.
 
-Unsafe code is confined to `src/cache_arena.rs`. Its boundary protects atomic
+Unsafe code is confined to `crates/research/src/cache_arena.rs`. Its boundary protects atomic
 pointers before dereference, retires only pointers removed from publication,
 keeps the collector alive as long as an owned guard, and drops the epoch guard
 before the final collector reference. The rest of the crate remains under the
