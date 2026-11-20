@@ -38,8 +38,8 @@ use crate::cache_arena::{assigned_thread_shards, claimed_thread_shards, direct_a
 pub(crate) use crate::direct_epoch_protocol::reclaim_at;
 use crate::direct_epoch_protocol::{
     Announced, EPOCHS, EVICTED, EVICTING, announce_afresh, classify_announcement, enter_epoch,
-    epoch_slot, eviction_outcome, leave_announcement, leave_epoch, plan_epoch_advance,
-    reuse_announcement,
+    epoch_slot, eviction_outcome, held_announcers, leave_announcement, leave_epoch,
+    plan_epoch_advance, reuse_announcement,
 };
 
 /// Reader counters are spread over this many cache lines per epoch.
@@ -503,7 +503,7 @@ impl Epochs {
         let announcers = if self.announcements.is_empty() {
             0
         } else {
-            ANNOUNCERS_HELD.load(Ordering::Relaxed)
+            held_announcers(|order| ANNOUNCERS_HELD.load(order))
         };
         let mut evicting = 0_u64;
         let Some(advance) = plan_epoch_advance(generation, |epoch| {

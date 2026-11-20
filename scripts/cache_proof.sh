@@ -148,10 +148,11 @@ miri_sharded() {
     MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
       cargo +nightly miri nextest run --lib --no-fail-fast \
       --partition "$PACKEDGEN_MIRI_PARTITION" \
-      -E 'test(/^sharded_(cache|arena)::tests::/)'
+      -E 'test(/^sharded_(cache|arena)::tests::/) | test(/^sharded_cache::model_check::/)'
   else
     MIRIFLAGS="${MIRIFLAGS:--Zmiri-permissive-provenance}" \
-      cargo +nightly miri test --lib -- sharded_cache::tests sharded_arena::tests
+      cargo +nightly miri test --lib -- sharded_cache::tests sharded_arena::tests \
+      sharded_cache::model_check
   fi
 }
 
@@ -162,29 +163,32 @@ miri() {
 
 sanitizers() {
   local target
+  local tsan="-Zsanitizer=thread"
   target="${PACKEDGEN_SANITIZER_TARGET:-$(rustc +nightly -vV | awk '/^host:/ { print $2 }')}"
   RUSTFLAGS="-Zsanitizer=address" RUSTDOCFLAGS="-Zsanitizer=address" \
     cargo +nightly test --target "$target" --test direct_packed_cache -- --test-threads=1
-  RUSTFLAGS="-Zsanitizer=thread" RUSTDOCFLAGS="-Zsanitizer=thread" \
+  RUSTFLAGS="$tsan" RUSTDOCFLAGS="$tsan" \
     cargo +nightly test -Zbuild-std --target "$target" \
     --test direct_packed_cache concurrent_replacement_and_pinned_reads_stay_valid -- --exact
-  RUSTFLAGS="-Zsanitizer=thread" RUSTDOCFLAGS="-Zsanitizer=thread" \
+  RUSTFLAGS="$tsan" RUSTDOCFLAGS="$tsan" \
     cargo +nightly test -Zbuild-std --target "$target" --features prepared-keys \
     --test direct_packed_cache \
     concurrent_prepared_replacement_batches_recycle_without_lost_values -- --exact
   RUSTFLAGS="-Zsanitizer=address" RUSTDOCFLAGS="-Zsanitizer=address" \
-    cargo +nightly test --target "$target" --lib -- sharded_cache::tests sharded_arena::tests
+    cargo +nightly test --target "$target" --lib -- sharded_cache::tests sharded_arena::tests \
+    sharded_cache::model_check
   RUSTFLAGS="-Zsanitizer=address" RUSTDOCFLAGS="-Zsanitizer=address" \
     cargo +nightly test --target "$target" --test sharded_cache_every_operation
-  RUSTFLAGS="-Zsanitizer=thread" RUSTDOCFLAGS="-Zsanitizer=thread" \
+  RUSTFLAGS="$tsan" RUSTDOCFLAGS="$tsan" \
     cargo +nightly test -Zbuild-std --target "$target" --test sharded_cache_every_operation
-  RUSTFLAGS="-Zsanitizer=thread" RUSTDOCFLAGS="-Zsanitizer=thread" \
+  RUSTFLAGS="$tsan" RUSTDOCFLAGS="$tsan" \
     cargo +nightly test -Zbuild-std --target "$target" --lib -- \
     sharded_cache::tests::racing sharded_cache::tests::concurrent \
     sharded_cache::tests::get_or_insert_with sharded_cache::tests::a_failed \
     sharded_cache::tests::a_thread_that_exits sharded_cache::tests::dropping_a_cache \
     sharded_cache::tests::other_writers_drain sharded_cache::tests::loads_racing \
-    sharded_cache::tests::async_and_blocking sharded_cache::tests::callers_wait
+    sharded_cache::tests::async_and_blocking sharded_cache::tests::callers_wait \
+    sharded_cache::model_check::owners_racing
 }
 
 memory_soak() {

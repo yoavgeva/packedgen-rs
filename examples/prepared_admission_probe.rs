@@ -155,8 +155,8 @@ impl<const N: usize, const WORDS: usize> Table<N, WORDS> {
                     continue;
                 }
                 let index = bucket * BUCKET_SLOTS + offset;
-                for word in 0..WORDS {
-                    self.slots[index].words[word].store(key.word(word), Ordering::Relaxed);
+                for (word, stored) in self.slots[index].words.iter().enumerate() {
+                    stored.store(key.word(word), Ordering::Relaxed);
                 }
                 let byte_mask = u64::from(u8::MAX) << shift;
                 let published = (control & !byte_mask) | (u64::from(tag) << shift);

@@ -246,16 +246,23 @@ entry. Tables are sized once and never rebuilt.
 - **Resizing.** `set_capacity` and `set_max_weight` change the limits at
   run time.
   - Tables are never rebuilt, so the builder's `max_capacity` reserves the
-    table, the slab region, the main queues' rings, and the shard count for
+    table, the slab region, the frequency sketches, and the shard count for
     the largest capacity, about 8 bytes of table per reserved entry beyond
-    the limit. Without it, the reserve is the built capacity.
+    the limit; the region and the sketches are zeroed memory, untouched
+    until the capacity grows into them. Without it, the reserve is the
+    built capacity. The default shard count stays within the entry limit:
+    counted for the reserve alone, it raised a ten-entry limit with a
+    reserve of a million to 256, one entry per shard.
   - `set_capacity` returns the limit it set: the request, raised to one
     entry per shard or lowered to the reserve.
   - Under a cache-wide resize lock, each shard takes its new shares under
     its own lock and evicts down to them before the call returns, so the
     listener hears `Size` for each. A shard whose entry share changes
     starts its ghost and main filters afresh at the new size, keeping its
-    probation target within the new bounds.
+    probation target within the new bounds, and places its sketch's
+    counters in the lines sized for its new share, forgetting the counts.
+    Before, the sketch kept its built size: a cache grown sixteenfold gave
+    each counter sixteen times the keys.
   - Shard limits became atomics read with relaxed loads under the shard
     lock. `get` and `evict` compile to the same instructions; the insert
     body to 1,229 against 1,234.
@@ -282,7 +289,9 @@ entry. Tables are sized once and never rebuilt.
   - guard reads surviving replacement;
   - two-bucket placement under a million-key churn;
   - a reader finding a key that relocation moves between its search of the
-    key's home and of its alternate;
+    key's home and of its alternate, and one reading it midway through the
+    move, published in its alternate and not yet cleared from its home
+    (clearing first passed every other test);
   - unread main-area keys leaving in insertion order;
   - forced pair evictions staying under 0.1%;
   - an 8-thread race of replacements, removals, loads, clears, and evictions
@@ -327,8 +336,30 @@ entry. Tables are sized once and never rebuilt.
     the retirement on drop); `memory_used` counting the table, slots
     handed out, and their reuse;
   - `set_capacity` evicting down at once and growing back within the
-    reserve, `set_max_weight` evicting down and refusing values heavier
-    than the new shares, and resizes racing four writing threads.
+    reserve, and sizing each shard's sketch as one built at its new share
+    (fails without the resize); `set_max_weight` evicting down and
+    refusing values heavier than the new shares; and resizes racing four
+    writing threads.
+- **Model test.** Random sequences of every operation run against a model
+  kept exact by the removal listener, which says which entries left and
+  why. After each operation the test checks reads, return values, length,
+  weight, statistics, and each shard's table: every key once, in its own
+  shard and one of its two buckets, under its tag, with its displacement
+  flag and its home's overflow count. Values count their instances, so a
+  leak or a double drop fails. 300 seeds of 2,000 operations run with each
+  of three hashers: a fixed SipHash, eight clustered hash patterns, and
+  one bucket pair for every key. Ten deliberate bugs (lost length or
+  overflow counts, wrong removal causes, unextended idle deadlines, a
+  drain yielding expired entries, resizes ignoring weight, zero tags) each
+  failed it.
+- **Owned-key race.** Four threads each own their keys and run every
+  operation on them, with clears, partial drains, `retain`, iteration, and
+  resizes reaching every thread's keys. A read returns the owner's latest
+  version or nothing, and nothing only for a confirmed version the
+  listener heard leave; afterwards every version the cache confirmed
+  caching left once or stays, at its owner's latest version, and every
+  value is dropped once. It runs twelve seeds with each of two hashers, and
+  under the thread sanitizer.
 - **Arena tests.** They cover:
   - aging of exactly three advances;
   - a pin blocking the second advance past its epoch;
@@ -346,7 +377,10 @@ entry. Tables are sized once and never rebuilt.
     under a pin a thread-local still holds keeping its slot (each verified
     to fail without its condition);
   - on Linux, `membarrier` registering and an advance evicting a parked
-    announcement.
+    announcement;
+  - an advance acquiring the held-slot mask before skipping an exited
+    thread's announcement (a Loom model; loading it relaxed races the
+    thread's reads with the reclamation).
 - **Layout and sizing tests.** They check that a write's shard state spans
   two cache lines, that shards share one bucket table, that the default
   shard count gives every extra shard at least 256 entries, that a cache
@@ -645,6 +679,16 @@ On Linux, threads now announce their pins:
 - A thread returns its slot when it exits, unless it still holds a pin
   that another thread-local's destructor drops later. The slot then stays
   held for good.
+- An advance skips the slots no thread holds, so it acquires the mask of
+  held slots: a thread gives its slot back with a release, and that
+  acquire is all that orders the reads the thread made before exiting
+  ahead of a reclamation. The mask was loaded relaxed until the owned-key
+  race ran under the thread sanitizer on 4-vCPU Linux runners, which
+  reported every such read racing the slot's later refill; in all 26
+  reports read in full, the reader had exited. Hardware orders the reads
+  before the release, so no run failed, but the language's memory model
+  left them racing. A Loom model with a negative control checks the
+  acquire.
 - These pin through the counters as before: threads past the 64th, threads
   pinning during their exit, kernels without `membarrier`, and other
   platforms.

@@ -9,8 +9,8 @@ use loom::thread;
 
 use direct_epoch_protocol::{
     ANNOUNCED, Announced, EPOCHS, EVICTED, EVICTING, announce_afresh, classify_announcement,
-    enter_epoch, epoch_slot, eviction_outcome, leave_announcement, leave_epoch, next_epoch_token,
-    plan_epoch_advance, reclaim_at, reuse_announcement,
+    enter_epoch, epoch_slot, eviction_outcome, held_announcers, leave_announcement, leave_epoch,
+    next_epoch_token, plan_epoch_advance, reclaim_at, reuse_announcement,
 };
 
 const ABSENT: usize = 0;
@@ -887,4 +887,46 @@ fn evicting_without_the_heavy_fence_can_reclaim_under_a_reused_announcement() {
     // Negative control: the heavy fence orders the eviction mark before the
     // advance reads the announcement again.
     model_announced_reclamation(ANNOUNCED, 1, true, false);
+}
+
+/// A reader that read an entry under its pin, then exited and gave back its
+/// announcer slot, races an advance that finds the slot free, skips its
+/// announcement, and reclaims the entry. `held` loads the held-slot mask
+/// for the advance.
+#[allow(unsafe_code, reason = "Loom's cell accesses are unsafe")]
+fn model_exited_announcer(held: fn(&AtomicUsize) -> u64) {
+    model_bounded(move || {
+        let mask = Arc::new(AtomicUsize::new(1));
+        let entry = Arc::new(loom::cell::UnsafeCell::new(OLD));
+        let reader = {
+            let (mask, entry) = (Arc::clone(&mask), Arc::clone(&entry));
+            thread::spawn(move || {
+                // SAFETY: a read the model checks for a race with the
+                // reclamation's write.
+                let value = entry.with(|value| unsafe { *value });
+                assert_eq!(value, OLD);
+                mask.fetch_and(!1, Ordering::Release);
+            })
+        };
+        if held(&mask) & 1 == 0 {
+            // SAFETY: as above.
+            entry.with_mut(|value| unsafe { *value = ABSENT });
+        }
+        reader.join().unwrap();
+    });
+}
+
+#[test]
+fn an_advance_orders_an_exited_announcers_reads_before_reclaiming() {
+    model_exited_announcer(|mask| {
+        held_announcers(|order| u64::try_from(mask.load(order)).expect("fits"))
+    });
+}
+
+#[test]
+#[should_panic(expected = "Causality violation")]
+fn an_advance_that_loads_the_mask_relaxed_races_an_exited_announcers_reads() {
+    // Negative control: a relaxed load of the mask leaves the exited
+    // reader's read unordered with the reclamation.
+    model_exited_announcer(|mask| u64::try_from(mask.load(Ordering::Relaxed)).expect("fits"));
 }

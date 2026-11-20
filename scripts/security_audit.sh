@@ -14,7 +14,7 @@ fi
 # crate as unmaintained, not vulnerable, and publishes no patched fxhash
 # version. Keep this narrow exception only while the dependency tree and source
 # usage remain exactly constrained below.
-if rg -n 'ptr_hash::hash::(FastIntHash|FxHash)|fxhash::' src tests examples benches; then
+if grep -rnE 'ptr_hash::hash::(FastIntHash|FxHash)|fxhash::' src tests examples benches; then
   printf 'PackedGen started using the excepted fxhash API directly\n' >&2
   exit 1
 fi
