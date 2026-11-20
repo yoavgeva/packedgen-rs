@@ -46,7 +46,11 @@ values, one thread's upserts into a full cache ran at 0.51 to 0.59 times
 quick_cache's throughput on macOS and Linux, as each writes a new entry and
 retires the old one where quick_cache overwrites in place; at eight threads
 those upserts ran 18 to 29% ahead, and hits ran 7 to 9 times
-quick_cache's.
+quick_cache's. A look-aside mix of `u64`s, reading Zipf-distributed keys
+and inserting each one missed, ran at 0.62 times quick_cache's throughput
+on one thread and 2.2 times on eight: one thread executes 2.3 times
+quick_cache's instructions per churned insert, at about twice its
+instructions per cycle.
 
 With 1,000,000 entries on Apple Silicon, one thread was level on hits (+2%),
 ahead on writes by 12 to 47%, and 50% behind on misses, whose tag words
